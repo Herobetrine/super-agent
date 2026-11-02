@@ -144,4 +144,5 @@ class MessageText(QTextBrowser):
 
 def public_text(text):
     return "\n".join(line for line in text.split("\n")
-                     if not line.lstrip().startswith(("SA_SEND ","SA_NOTE ","SA_ROLE ","SA_GOAL ","SA_NEXT ","SA_FINISH "))).strip()
+                     if not line.lstrip().startswith(("SA_SEND ","SA_NOTE ","SA_ROLE ","SA_GOAL ","SA_NEXT ",
+                                                      "SA_FINISH ","SA_LEARN ","SA_EXHAUSTED "))).strip()

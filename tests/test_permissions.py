@@ -10,6 +10,11 @@ from threading import Event
 from engine import Engine, Store
 
 
+def checked_exhaustion(emit):
+    emit("native",{"type":"tool_result","callId":"inspect","status":"ok","result":"fixture verified"})
+    return 'SA_EXHAUSTED {"status":"done","summary":"fixture complete","checks":["checked fixture"],"alternatives":["no other authorized work"]}'
+
+
 class PermissionsTests(unittest.TestCase):
     def setUp(self):
         tmp=tempfile.TemporaryDirectory()
@@ -50,14 +55,16 @@ class PermissionsTests(unittest.TestCase):
             if p["turn"]==2:
                 self.assertEqual(p["next_step"]["body"],"run check")
                 return 'SA_SEND {"id":"review","to":"antigravity","body":"check","write":false}'
+            if p["autonomy"]["phase"]=="discover":
+                return checked_exhaustion(emit)
             self.assertEqual(p["reports"][0]["result"],"verified")
             return 'SA_FINISH {"status":"done","summary":"verified twice"}'
         self.run_workers(worker)
         self.wait(lambda:self.root(t)["state"]=="done")
-        self.assertEqual(len(seen),4)
+        self.assertEqual(len(seen),5)
         self.assertTrue(all(x[1:3]==("auto",True) for x in seen))
         self.assertEqual(seen[-1][-1],"validate")
-        self.assertEqual(len(self.s.rows("SELECT seq FROM events WHERE kind='auto.finish'")),1)
+        self.assertEqual(len(self.s.rows("SELECT seq FROM events WHERE kind='auto.exhausted'")),1)
 
     def test_allow_deny_cancel_and_expiration(self):
         decisions=[]
@@ -87,6 +94,8 @@ class PermissionsTests(unittest.TestCase):
                 release.wait(3)
                 return 'SA_GOAL {"objective":"stale"}\nSA_FINISH {"status":"done","summary":"stale"}'
             self.assertIn("new requirement",p["user_updates"])
+            if p["autonomy"]["phase"]=="discover":
+                return checked_exhaustion(emit)
             return 'SA_GOAL {"objective":"revised"}\nSA_FINISH {"status":"done","summary":"new work verified"}'
         t=self.s.create("first",self.base,"codex",permission_profile="auto")
         self.run_workers(worker)
@@ -95,7 +104,7 @@ class PermissionsTests(unittest.TestCase):
         release.set()
         self.wait(lambda:self.root(t)["state"]=="done")
         self.assertEqual(self.s.rows("SELECT objective FROM tickets WHERE id=?",(t,))[0]["objective"],"revised")
-        self.assertEqual(self.root(t)["turn"],2)
+        self.assertEqual(self.root(t)["turn"],3)
 
     def test_recovery_never_reuses_approval(self):
         for mode in ("ask","auto"):
@@ -118,6 +127,8 @@ class PermissionsTests(unittest.TestCase):
         def worker(p,emit,cancel,opts):
             if p["depth"]:
                 raise RuntimeError("fixture failure")
+            if p["autonomy"]["phase"]=="discover":
+                return checked_exhaustion(emit)
             if p["turn"]==1:
                 return 'SA_SEND {"id":"one","to":"codex","body":"inspect"}'
             if p["turn"]==2:
@@ -128,7 +139,7 @@ class PermissionsTests(unittest.TestCase):
                        resolved=[dict(job=failed,evidence="checked output against test fixture")]))
         self.run_workers(worker)
         self.wait(lambda:self.root(t)["state"]=="done")
-        self.assertEqual(self.root(t)["turn"],3)
-        results=self.s.rows("SELECT payload FROM events WHERE kind='auto.finish'")
+        self.assertEqual(self.root(t)["turn"],4)
+        results=self.s.rows("SELECT payload FROM events WHERE kind='auto.milestone'")
         self.assertEqual(len(results),1)
         self.assertTrue(json.loads(results[0]["payload"])["resolved"])

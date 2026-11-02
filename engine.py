@@ -10,6 +10,7 @@ from pathlib import Path
 from artifacts import snapshot
 from permissions import PROFILES, UNRESTRICTED, AUTO_GUIDE, controls, child_profiles
 from task_routing import discover_options, select_model
+import continuous
 
 AGENTS = ("codex", "claude", "deepseek", "antigravity")
 PROJECT_WRITERS = frozenset(("codex", "deepseek"))
@@ -97,6 +98,15 @@ class Store:
           id INTEGER PRIMARY KEY,ticket INTEGER NOT NULL REFERENCES tickets,job INTEGER NOT NULL REFERENCES jobs,
           turn INTEGER NOT NULL,action TEXT NOT NULL,decision TEXT NOT NULL DEFAULT 'pending');
         CREATE INDEX IF NOT EXISTS approvals_pending ON approvals(id) WHERE decision='pending';
+        CREATE TABLE IF NOT EXISTS continuous_runs(
+          ticket INTEGER PRIMARY KEY REFERENCES tickets, phase TEXT NOT NULL DEFAULT 'work',
+          milestone INTEGER NOT NULL DEFAULT 0, learning TEXT NOT NULL DEFAULT '',
+          boundary_job INTEGER NOT NULL DEFAULT 0, boundary_seq INTEGER NOT NULL DEFAULT 0,
+          probe INTEGER NOT NULL DEFAULT 0, success INTEGER NOT NULL DEFAULT 0,
+          stalls INTEGER NOT NULL DEFAULT 0, last_signal TEXT NOT NULL DEFAULT '');
+        CREATE INDEX IF NOT EXISTS jobs_ticket_id ON jobs(ticket,id);
+        CREATE INDEX IF NOT EXISTS jobs_ticket_root ON jobs(ticket) WHERE parent IS NULL;
+        CREATE INDEX IF NOT EXISTS events_ticket_kind ON events(ticket,kind,seq);
         """)
         with self.tx() as db:
             # Different desktop clients can open an existing DB concurrently.
@@ -149,7 +159,13 @@ class Store:
 
     def event(self, job, kind, data):
         with self.tx() as db:
-            self.log(db, job, kind, data)
+            seq=self.log(db,job,kind,data)
+            proof=continuous.tool_result(data) if kind=="native" and job.get("continuous_ticket") else None
+            if proof:
+                db.execute("""UPDATE continuous_runs SET probe=?,success=CASE WHEN ?='ok' THEN ? ELSE success END
+                              WHERE ticket=? AND phase='discover' AND boundary_seq<? AND EXISTS
+                              (SELECT 1 FROM jobs WHERE id=? AND state='running' AND turn=?)""",
+                           (seq,proof,seq,job["ticket"],job["admission"],job["id"],job["turn"]))
 
     def interrupt(self,db,job):
         reason="上次执行中断，已产生的文件或远端操作可能仍然存在。"
@@ -169,6 +185,9 @@ class Store:
                               ON t.id=j.ticket WHERE j.id=?""",(job["id"],)).fetchone()
             if (not row or row["state"]!="running" or row["turn"]!=job["turn"] or
                 row["permission_profile"] not in ("ask","partial") or cancel.is_set()):
+                return False
+            if db.execute("SELECT 1 FROM continuous_runs WHERE ticket=?",(job["ticket"],)).fetchone():
+                self.log(db,job,"approval.unattended_decline",{"action":action})
                 return False
             aid=db.execute("INSERT INTO approvals(ticket,job,turn,action) VALUES(?,?,?,?)",
                            (job["ticket"],job["id"],job["turn"],encode(action))).lastrowid
@@ -251,6 +270,8 @@ class Store:
                                 VALUES(?,'user',?,?,?,0,'queued')""",
                              (ticket,lead,goal,int(bool(writes) and (lead in PROJECT_WRITERS or permission_profile in UNRESTRICTED)))).lastrowid
             self.log(db, dict(ticket=ticket,id=jid,turn=1), "user", goal)
+            if permission_profile=="auto":
+                db.execute("INSERT INTO continuous_runs(ticket) VALUES(?)",(ticket,))
         return ticket
 
     def dispatch(self, job, command, *, catalog=None):
@@ -268,8 +289,13 @@ class Store:
             not isinstance(body,str) or not body.strip() or type(writing) is not bool):
             raise ValueError("SA_SEND 的 id/to/body/write 无效")
         with self.tx() as db:
+            db.execute("BEGIN IMMEDIATE")
             current = db.execute("SELECT * FROM jobs WHERE id=?", (job["id"],)).fetchone()
             if current["state"] != "running" or current["turn"] != job["turn"]:
+                return
+            if job.get("continuous_ticket") and current["parent"] is None and db.execute(
+                    "SELECT 1 FROM events WHERE ticket=? AND kind='user.follow' AND seq>? LIMIT 1",
+                    (current["ticket"],job["admission"])).fetchone():
                 return
             ticket = db.execute("SELECT * FROM tickets WHERE id=?", (current["ticket"],)).fetchone()
             overrides="model" in command or "permission_profile" in command
@@ -304,7 +330,9 @@ class Store:
                 raise ValueError("工单未启用项目写入")
             if writing and agent not in PROJECT_WRITERS and effective not in UNRESTRICTED:
                 raise ValueError(f"{agent} 的本机适配器没有受控项目写入能力")
-            count = db.execute("SELECT count(*) FROM jobs WHERE ticket=?", (job["ticket"],)).fetchone()[0]
+            ongoing=db.execute("SELECT 1 FROM continuous_runs WHERE ticket=?",(job["ticket"],)).fetchone()
+            status_filter=" AND state NOT IN ('done','partial','failed','cancelled')" if ongoing else ""
+            count=db.execute("SELECT count(*) FROM jobs WHERE ticket=?"+status_filter,(job["ticket"],)).fetchone()[0]
             if count >= MAX_NODES or job["depth"] >= MAX_DEPTH:
                 raise ValueError("工单派发预算已用完")
             manifest = snapshot(ticket["cwd"],files,self.path/"objects") if files != [] else []
@@ -345,8 +373,10 @@ class Store:
         rejection = None
         if not target or target["state"] not in ("queued","running","waiting"):
             rejection = "收件任务不存在于本工单或已停止接收消息"
-        elif source and db.execute("""SELECT count(*) FROM mailbox m JOIN events e ON e.seq=m.seq
-                    WHERE e.ticket=? AND m.source IS NOT NULL AND m.target IS NOT NULL""",
+        elif source and db.execute("""SELECT count(*) FROM mailbox m JOIN events e ON e.seq=m.seq JOIN jobs j ON j.id=m.target
+                                   WHERE e.ticket=? AND m.source IS NOT NULL AND (NOT EXISTS
+                                   (SELECT 1 FROM continuous_runs c WHERE c.ticket=e.ticket) OR
+                                   (m.consumed_turn IS NULL AND j.state NOT IN ('done','partial','failed','cancelled')))""",
                                    (ticket,)).fetchone()[0] >= MAX_AGENT_NOTES:
             rejection = f"本工单已用完 {MAX_AGENT_NOTES} 封自动信件额度"
         if rejection and source is None:
@@ -399,22 +429,30 @@ class Store:
             if accepted:
                 self.log(db,job,"note.accepted",{"seqs":accepted,"via":"native"})
 
-    def follow(self, ticket, body):
+    def follow(self, ticket, body, *, resume=False):
         if not body.strip():
             raise ValueError("追加指令为空")
         with self.tx() as db:
+            db.execute("BEGIN IMMEDIATE")
             root = db.execute("SELECT * FROM jobs WHERE ticket=? AND parent IS NULL",(ticket,)).fetchone()
             if not root:
                 raise ValueError("工单不存在")
-            if root["state"] in ("draining","interrupted"):
+            ongoing=db.execute("SELECT * FROM continuous_runs WHERE ticket=?",(ticket,)).fetchone()
+            if root["state"] in ("draining","interrupted") and not ongoing:
                 raise ValueError("请先处理统筹任务的失败或中断，再追加指令")
-            self.log(db,root,"user.follow",body)
+            if ongoing and root["state"]=="cancelled" and resume is not True:
+                raise ValueError("此工单已停止，需要明确恢复后才能继续。")
+            seq=self.log(db,root,"user.follow",body)
+            if ongoing:
+                db.execute("""UPDATE continuous_runs SET phase='work',probe=0,success=0,stalls=0,last_signal='',
+                           boundary_seq=? WHERE ticket=?""",(seq,ticket))
+                db.execute("UPDATE jobs SET ready_after=0 WHERE id=?",(root["id"],))
             auto=db.execute("SELECT permission_profile FROM tickets WHERE id=?",(ticket,)).fetchone()[0]=="auto"
             if auto:
                 db.execute("UPDATE tickets SET auto_cycles=0,objective=? WHERE id=?",(body,ticket))
             if root["state"] in TERMINAL:
                 db.execute("UPDATE jobs SET state='queued',turn=turn+1 WHERE id=?", (root["id"],))
-            elif auto and root["state"]=="waiting":
+            elif auto and (root["state"]=="waiting" or (ongoing and root["state"] in ("draining","interrupted"))):
                 db.execute("UPDATE jobs SET state='queued',turn=turn+1 WHERE id=?",(root["id"],))
 
     def retry(self, jid):
@@ -436,6 +474,7 @@ class Store:
 
     def cancel(self, ticket):
         with self.tx() as db:
+            db.execute("BEGIN IMMEDIATE")
             db.execute("UPDATE approvals SET decision='expired' WHERE ticket=? AND decision='pending'",(ticket,))
             for job in db.execute("""SELECT * FROM jobs WHERE ticket=? AND state NOT IN
                                  ('done','partial','failed','cancelled')""", (ticket,)).fetchall():
@@ -457,20 +496,28 @@ class Store:
 
     def envelope(self, db, job):
         ticket = db.execute("SELECT * FROM tickets WHERE id=?", (job["ticket"],)).fetchone()
+        run=db.execute("SELECT * FROM continuous_runs WHERE ticket=?",(job["ticket"],)).fetchone()
+        floor=run["boundary_job"] if run else 0
         reports = [dict(r) for r in db.execute("""SELECT id,agent AS sender,role,body AS assignment,state,result
-                            FROM jobs WHERE parent=? ORDER BY id""",(job["id"],))]
+                            FROM jobs WHERE parent=? AND id>? ORDER BY id""",(job["id"],floor))]
         notes = [json.loads(r[0]) for r in db.execute(
             "SELECT payload FROM events WHERE ticket=? AND kind='user.follow' ORDER BY seq",(job["ticket"],))]
         saved = db.execute("SELECT manifest FROM job_files WHERE job=?", (job["id"],)).fetchone()
         roster = [dict(r) for r in db.execute("""SELECT id AS job,agent,role,state,parent FROM jobs
-                       WHERE ticket=? ORDER BY id""",(job["ticket"],))]
+                       WHERE ticket=? AND (parent IS NULL OR id>?) ORDER BY id""",(job["ticket"],floor))]
         profile=job["permission_override"] or ticket["permission_profile"]
         high=profile in UNRESTRICTED
         step=db.execute("""SELECT payload FROM events WHERE job=? AND kind='auto.next'
                            AND seq>coalesce((SELECT max(seq) FROM events WHERE ticket=?
-                           AND kind IN ('user.follow','auto.finish')),0) ORDER BY seq DESC LIMIT 1""",
+                           AND kind IN ('user.follow','auto.finish','auto.milestone','auto.discovered','auto.exhausted')),0)
+                           ORDER BY seq DESC LIMIT 1""",
                         (job["id"],job["ticket"])).fetchone() if ticket["permission_profile"]=="auto" else None
+        recent=[] if not run else [dict(seq=r["seq"],kind=r["kind"],data=json.loads(r["payload"])) for r in
+            reversed(db.execute("""SELECT seq,kind,payload FROM events WHERE ticket=?
+                AND kind IN ('auto.milestone','auto.discovered') ORDER BY seq DESC LIMIT 8""",(job["ticket"],)).fetchall())]
         return dict(ticket=job["ticket"],job=job["id"],turn=job["turn"],agent=job["agent"],
+                    autonomy=(dict(phase=run["phase"],milestone=run["milestone"],learning=run["learning"],
+                                   recent=recent,last_inspection_seq=run["probe"]) if run else None),
                     permission_profile=profile,objective=ticket["objective"] or ticket["goal"],
                     allow_lead_routing=bool(ticket["allow_lead_routing"] and job["parent"] is None),
                     allowed_child_permissions=child_profiles(profile) if ticket["allow_lead_routing"] and job["parent"] is None else [],
@@ -516,7 +563,8 @@ To message an existing queued/running/waiting job in THIS ticket, use its numeri
 SA_NOTE {"id":"unique-note-key","job":42,"body":"full exact message to that job"}
 Use SA_NOTE for actionable information. Do not send acknowledgements back and forth. Read addressed messages in notes.
 The roster is a snapshot. A job may have already finished when your note arrives.
-Each ticket has a budget of 128 delivered agent notes. Exact replays and operator notes do not use it.
+In continuous tickets the 128-note limit counts pending agent notes to active jobs. Other tickets count delivered
+agent notes over their lifetime. Exact replays and operator notes do not use the budget.
 Do authorized edits yourself when this_turn_can_write is true, or select a write-capable peer with write:true.
 The platform serializes tasks declared as writers. In full and auto mode all participants have full OS-user access;
 declare write:true for meaningful changes so other writers can be scheduled. If a delegated writer needs your slot, end this turn
@@ -572,12 +620,14 @@ class Engine:
 
     def step(self):
         with self.guard, self.store.tx() as db:
+            db.execute("BEGIN IMMEDIATE")
             self.store.wake(db)
             jobs = db.execute("""SELECT jobs.*,tickets.cwd,tickets.claude_route,tickets.follow_config,tickets.agent_routes,
                                  tickets.permission_profile AS ticket_profile,
                                  coalesce(jobs.permission_override,tickets.permission_profile) AS permission_profile,
-                                 tickets.auto_cycles,native_routes.route AS bound_route
+                                 tickets.auto_cycles,native_routes.route AS bound_route,c.ticket AS continuous_ticket,c.boundary_job AS floor
                                  FROM jobs JOIN tickets ON tickets.id=jobs.ticket LEFT JOIN native_routes ON native_routes.job=jobs.id
+                                 LEFT JOIN continuous_runs c ON c.ticket=tickets.id
                                  WHERE state='queued' AND jobs.ready_after<=? ORDER BY jobs.id""",(time.time(),)).fetchall()
             for row in jobs:
                 if len(self.active) >= self.capacity:
@@ -589,7 +639,7 @@ class Engine:
                 if job["writing"] and any(r[3] for r in self.active.values()):
                     continue
                 if job["permission_profile"]=="auto" and job["parent"] is None:
-                    if job["auto_cycles"]>=MAX_AUTO_CYCLES:
+                    if not job["continuous_ticket"] and job["auto_cycles"]>=MAX_AUTO_CYCLES:
                         reason="自动续轮已达到本次目标的运行预算，请查看进度后追加目标继续。"
                         unfinished=db.execute("""SELECT 1 FROM jobs WHERE parent=? AND state NOT IN
                              ('done','failed','partial','cancelled') LIMIT 1""",(job["id"],)).fetchone()
@@ -601,7 +651,8 @@ class Engine:
                 packet = self.store.envelope(db,job)
                 job["selection"]=(json.loads(job["bound_route"]) if job["bound_route"] else packet["selected_execution"])
                 packet["depth"] = job["depth"]
-                guide=GUIDE+(AUTO_GUIDE if job["permission_profile"]=="auto" else "")
+                guide=GUIDE+(continuous.GUIDE if job["continuous_ticket"] and job["parent"] is None else
+                             AUTO_GUIDE if job["permission_profile"]=="auto" and not job["continuous_ticket"] else "")
                 db.execute("UPDATE jobs SET state='running' WHERE id=?", (job["id"],))
                 job["admission"]=self.store.log(db,job,"turn.admitted",{})
                 db.execute("UPDATE mailbox SET consumed_turn=? WHERE target=? AND consumed_turn IS NULL",
@@ -616,6 +667,8 @@ class Engine:
         pending = ""
         reports=packet["reports"]
         catalog={}
+        continuous_root=bool(job["continuous_ticket"] and job["parent"] is None)
+        invalid_controls={}
         timedout = threading.Event()
         def expire():
             timedout.set()
@@ -632,6 +685,19 @@ class Engine:
             elif text.startswith(ROLE_PREFIX):
                 s.set_role(job,json.loads(text[len(ROLE_PREFIX):]))
 
+        def apply_line(text,*,streaming=False):
+            try:
+                line(text)
+            except ValueError as exc:
+                if streaming and isinstance(exc,json.JSONDecodeError):
+                    s.event(job,"protocol.preview_invalid",{"tag":text.partition(" ")[0]})
+                    return
+                if not continuous_root:
+                    raise
+                tag=text.partition(" ")[0]
+                invalid_controls[tag]=str(exc)
+                s.event(job,"auto.protocol",{"tag":tag,"reason":str(exc)})
+
         def emit(kind,data):
             nonlocal pending
             s.event(job,kind,data)
@@ -647,7 +713,7 @@ class Engine:
 
         def preview(text):
             try:
-                line(text.rstrip("\r"))
+                apply_line(text.rstrip("\r"),streaming=True)
             except json.JSONDecodeError:
                 # A projected stream can cross a native text boundary. The final reply remains authoritative.
                 s.event(job,"protocol.preview_invalid",{"tag":text.partition(" ")[0]})
@@ -668,6 +734,9 @@ class Engine:
                 legacy=job["claude_route"] if job["follow_config"]!=1 else None
                 catalog=discover_options(self.adapters,json.loads(job["agent_routes"]),legacy_claude_route=legacy)
             packet["delegate_models"]=catalog
+            if job["continuous_ticket"]:
+                from continuous_context import compact_packet
+                packet=compact_packet(packet,guide,s.path)
             prompt=guide+"\n"+encode(packet)
             if cancel.is_set():
                 raise RuntimeError("任务中止")
@@ -714,15 +783,18 @@ class Engine:
             if not isinstance(result,str) or not result.strip():
                 raise ValueError("适配器未返回正文")
             for complete in result.split("\n"):
-                line(complete.rstrip("\r"))
+                apply_line(complete.rstrip("\r"))
             with s.tx() as db:
-                if db.execute("SELECT state FROM jobs WHERE id=?", (job["id"],)).fetchone()[0] != "running":
+                db.execute("BEGIN IMMEDIATE")
+                if not db.execute("SELECT 1 FROM jobs WHERE id=? AND turn=? AND state='running'",
+                                  (job["id"],job["turn"])).fetchone():
                     return
                 # A waiting parent can wake for a note before its children
                 # finish. Reconcile every child's outcome against this input.
                 seen = {r["id"]:(r["state"],r["result"]) for r in reports}
                 children = any(r["state"] not in TERMINAL or seen.get(r["id"]) != (r["state"],r["result"])
-                               for r in db.execute("SELECT id,state,result FROM jobs WHERE parent=?", (job["id"],)))
+                               for r in db.execute("SELECT id,state,result FROM jobs WHERE parent=? AND id>?",
+                                                   (job["id"],job["floor"] or 0)))
                 mail = db.execute("SELECT 1 FROM mailbox WHERE target=? AND consumed_turn IS NULL LIMIT 1",
                                   (job["id"],)).fetchone()
                 follow = False
@@ -730,7 +802,20 @@ class Engine:
                     follow = db.execute("SELECT 1 FROM events WHERE ticket=? AND kind='user.follow' AND seq>? LIMIT 1",
                                         (job["ticket"],job["admission"])).fetchone()
                 state = "waiting" if children or follow or mail else "done"
-                if profile=="auto" and job["parent"] is None and not follow:
+                if continuous_root and not follow:
+                    run=db.execute("SELECT * FROM continuous_runs WHERE ticket=?",(job["ticket"],)).fetchone()
+                    try:
+                        if invalid_controls:
+                            raise ValueError(str(invalid_controls))
+                        actions=controls(result,continuous=True)
+                        correction=None
+                    except ValueError as exc:
+                        actions={}
+                        correction=f"修正控制消息后继续：{exc}"
+                    state,reset_session=continuous.advance(db,s,job,run,actions,reports,state=="done",correction)
+                    if reset_session:
+                        session=None
+                elif profile=="auto" and job["parent"] is None and not follow:
                     try:
                         actions=controls(result)
                         correction=None
@@ -764,25 +849,37 @@ class Engine:
                 redirected=profile=="auto" and bool(follow)
                 if redirected:
                     state="queued"
-                db.execute("UPDATE jobs SET result=?,session=?,state=?,dispatch_turn=NULL,turn=turn+? WHERE id=?",
-                           (result,session,state,int(redirected),job["id"]))
+                db.execute("""UPDATE jobs SET result=?,session=?,state=?,dispatch_turn=NULL,turn=turn+?
+                              WHERE id=? AND state='running' AND turn=?""",
+                           (result,session,state,int(redirected),job["id"],job["turn"]))
                 s.log(db,job,"reply",dict(text=result,sha256=digest(result),session=session,state=state))
         except Exception as exc:
             with s.tx() as db:
+                db.execute("BEGIN IMMEDIATE")
+                if not db.execute("SELECT 1 FROM jobs WHERE id=? AND state='running' AND turn=?",
+                                  (job["id"],job["turn"])).fetchone():
+                    return
                 state = "interrupted" if self.stop.is_set() else "failed"
                 reason = "任务超时。请检查项目状态后决定是否重试。" if timedout.is_set() else str(exc)
                 if (state=="interrupted" and job["ticket_profile"]=="auto" and
                     db.execute("SELECT state FROM jobs WHERE id=?",(job["id"],)).fetchone()[0]=="running"):
                     s.interrupt(db,job)
                     return
+                if continuous_root and db.execute("""SELECT 1 FROM events WHERE ticket=? AND kind='user.follow'
+                                                     AND seq>? LIMIT 1""",(job["ticket"],job["admission"])).fetchone():
+                    db.execute("""UPDATE jobs SET state='queued',turn=turn+1,dispatch_turn=NULL,ready_after=0,result=?
+                                  WHERE id=?""",(reason,job["id"]))
+                    s.log(db,job,"auto.retry",{"reason":"按新追加的要求重新核对。","after_seconds":0})
+                    return
                 if (job["permission_profile"]=="auto" and job["parent"] is None and state=="failed" and
                     (timedout.is_set() or isinstance(exc,(TimeoutError,ConnectionError)) or
-                     any(code in reason.lower() for code in ("http 429","http 502","http 503","http 504","connection reset")))):
+                     any(code in reason.lower() for code in ("http 429","http 500","http 502","http 503","http 504",
+                        "connection reset","timed out","rate limit","service unavailable","stream disconnected","暂时不可用")))):
                     attempts=db.execute("""SELECT count(*) FROM events WHERE job=? AND kind='auto.retry' AND seq>
                         coalesce((SELECT max(seq) FROM events WHERE job=? AND kind IN ('reply','user.follow')),0)""",
                         (job["id"],job["id"])).fetchone()[0]
-                    if attempts<2 and db.execute("SELECT state FROM jobs WHERE id=?",(job["id"],)).fetchone()[0]=="running":
-                        delay=2**(attempts+1)
+                    if continuous_root or attempts<2:
+                        delay=min(300,2**min(attempts+1,9))
                         s.interrupt(db,job)
                         db.execute("UPDATE jobs SET ready_after=? WHERE id=?",(time.time()+delay,job["id"]))
                         s.log(db,job,"auto.retry",{"after_seconds":delay,"reason":reason})

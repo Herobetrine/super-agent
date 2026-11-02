@@ -41,6 +41,7 @@ credentials.json
 /control-room/
 /checks/
 /objects/
+/context-objects/
 /workspaces/
 /dsh-runtime/
 /private-docs/

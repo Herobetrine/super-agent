@@ -15,6 +15,15 @@ def send(**fields):
     return "SA_SEND "+json.dumps({**command,**fields},ensure_ascii=False)
 
 
+def reviewed_finish(project,emit):
+    paths=sorted(p.name for p in project.iterdir() if p.name!="state")
+    emit("native",{"type":"tool_result","callId":"route-review","status":"ok",
+                   "result":f"Inspected disposable project after routing test, entries={paths!r}"})
+    return 'SA_EXHAUSTED '+json.dumps({"status":"done","summary":"Confirmed original routing result",
+        "checks":["Checked all prior delegate reports","Inspected current project for unfinished requests"],
+        "alternatives":["Replaying a delivered command duplicates work","No other local project artifact needs change"]})
+
+
 class LeadRoutingTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -161,6 +170,8 @@ class LeadRoutingTest(unittest.TestCase):
         self.choices=paused
         ticket=self.create(profile="auto")
         def worker(name,p,emit,cancel):
+            if p["autonomy"]["phase"]=="discover":
+                return reviewed_finish(self.path,emit)
             return 'SA_FINISH {"status":"done","summary":"checked"}'
         self.start(worker)
         try:
@@ -169,11 +180,11 @@ class LeadRoutingTest(unittest.TestCase):
         finally:
             release.set()
         root=self.finish(ticket)[0]
-        self.assertEqual(root["turn"],2)
+        self.assertGreaterEqual(root["turn"],3)
         inputs=[p for _,p,_ in self.calls]
         self.assertEqual(inputs[-1]["objective"],"updated while opening model directories")
         self.assertEqual(inputs[-1]["user_updates"],["updated while opening model directories"])
-        self.assertEqual(self.store.rows("SELECT turn FROM events WHERE ticket=? AND kind='auto.finish'",(ticket,)),
+        self.assertEqual(self.store.rows("SELECT turn FROM events WHERE ticket=? AND kind='auto.milestone'",(ticket,)),
                          [{"turn":2}])
 
     def test_worker_cannot_override_or_launder_its_readonly_grant(self):
@@ -244,6 +255,8 @@ class LeadRoutingTest(unittest.TestCase):
         self.store=Store(self.path/"state")
         self.extra.clear()
         def recovered(name,p,emit,cancel):
+            if p["autonomy"]["phase"]=="discover":
+                return reviewed_finish(self.path,emit)
             return wire+'\nSA_FINISH {"status":"done","summary":"existing report verified"}'
         self.start(recovered)
         root,child=self.finish(ticket)

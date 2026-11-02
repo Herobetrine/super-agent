@@ -165,6 +165,58 @@ class DesktopFlowTests(unittest.TestCase):
         self.assertIn("bound-model", self.ui.job_text.toPlainText())
         self.assertNotIn("selected-model", self.ui.job_text.toPlainText())
 
+    def test_continuous_progress_stop_and_explicit_resume(self):
+        tid=self.store.create("首个目标",self.project,"codex",permission_profile="auto")
+        with self.store.tx() as db:
+            db.execute("UPDATE continuous_runs SET phase='discover',milestone=1,learning=? WHERE ticket=?",
+                       ("只按新证据派工",tid))
+        self.ui.open_chat(tid)
+        self.app.processEvents()
+        self.assertTrue(self.ui.auto_stop_button.isVisibleTo(self.ui))
+        self.assertIn("搜寻下一步",self.ui.auto_phase_label.text())
+        self.assertIn("只按新证据派工",self.ui.auto_memory_label.toolTip())
+        self.ui.auto_stop_button.click()
+        self.ui.new_chat()
+        self.ui.open_chat(tid)
+        self.ui.refresh()
+        self.assertIn("已停止",self.ui.auto_phase_label.text())
+        self.assertFalse(self.ui.auto_stop_button.isVisibleTo(self.ui))
+        self.assertEqual(self.ui.send_button.text(),"恢复并发送")
+        self.assertFalse(self.ui.send_button.isEnabled())
+        self.ui.editor.setPlainText("核查下一份文件")
+        with patch.object(QMessageBox,"question",return_value=QMessageBox.StandardButton.No):
+            self.ui.send_button.click()
+        self.assertEqual(self.store.rows("SELECT state FROM jobs")[0]["state"],"cancelled")
+        self.assertEqual(self.ui.editor.toPlainText(),"核查下一份文件")
+        with patch.object(QMessageBox,"question",return_value=QMessageBox.StandardButton.Yes):
+            self.ui.send_button.click()
+        self.assertEqual(self.store.rows("SELECT state FROM jobs")[0]["state"],"queued")
+        self.assertTrue(self.ui.auto_stop_button.isVisibleTo(self.ui))
+        self.send("停止")
+        self.assertEqual(self.store.rows("SELECT state FROM jobs")[0]["state"],"cancelled")
+
+    def test_continuous_preview_is_bounded_without_truncating_the_ledger(self):
+        tid=self.store.create("持续工单",self.project,"codex",permission_profile="auto")
+        with self.store.tx() as db:
+            root=db.execute("SELECT * FROM jobs WHERE ticket=?",(tid,)).fetchone()
+            for i in range(150):
+                self.store.log(db,root,"auto.learn",{"lesson":f"经验 {i}"})
+            db.executemany("""INSERT INTO jobs(ticket,parent,agent,body,writing,depth,state)
+                          VALUES(?,?,'codex',?,0,1,'done')""",
+                           [(tid,root["id"],f"记录 {i}") for i in range(80)])
+        self.ui.open_chat(tid)
+        self.app.processEvents()
+        self.assertTrue(self.ui.archive_link.isVisibleTo(self.ui))
+        self.assertLessEqual(self.ui.timeline.count(),101)
+        self.assertEqual(len(self.ui.tasks),41)  # root plus the recent 40 completed tasks
+        with self.store.tx() as db:
+            for i in range(2100):
+                self.store.log(db,root,"native",{"counter":i})
+        self.ui.refresh()
+        end=self.store.rows("SELECT max(seq) AS last FROM events WHERE ticket=?",(tid,))[0]["last"]
+        self.assertEqual(self.ui.cursor,end)
+        self.assertEqual(self.store.rows("SELECT count(*) AS n FROM events WHERE kind='auto.learn'")[0]["n"],150)
+
     def test_approval_ui_targets_only_the_pending_request(self):
         tid=self.store.create("approval",self.project,"codex",permission_profile="ask")
         job=self.store.rows("SELECT id FROM jobs WHERE ticket=?",(tid,))[0]["id"]

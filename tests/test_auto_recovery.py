@@ -21,9 +21,12 @@ class AutoRecoveryTests(unittest.TestCase):
             def worker(prompt,cwd,emit,cancel,**opts):
                 packet = json.loads(prompt.rsplit("\n",1)[1])
                 packets.append(packet)
+                if packet["autonomy"]["phase"]=="discover":
+                    emit("native",{"type":"tool_result","callId":"check","status":"ok"})
+                    return 'SA_EXHAUSTED {"status":"done","summary":"checked","checks":["scope checked"],"alternatives":["no remaining work"]}',None
                 if packet["turn"] == 1:
                     return 'SA_GOAL {"objective":"clean staging"}\nSA_NEXT {"body":"remove old staging"}',None
-                if packet["turn"] == 3:
+                if packet["turn"] == 4:
                     entered.set()
                     release.wait(4)
                     return 'SA_GOAL {"objective":"superseded"}\nSA_NEXT {"body":"stale in-flight plan"}',None
@@ -43,14 +46,14 @@ class AutoRecoveryTests(unittest.TestCase):
                 await_done()
                 store.follow(ticket,"Inspect only; stop old cleanup.")
                 self.assertTrue(entered.wait(4))
-                self.assertEqual(packets[2]["objective"],"Inspect only; stop old cleanup.")
-                self.assertIsNone(packets[2]["next_step"])
+                self.assertEqual(packets[3]["objective"],"Inspect only; stop old cleanup.")
+                self.assertIsNone(packets[3]["next_step"])
                 store.follow(ticket,"Final instruction; drop previous inspection.")
                 release.set()
                 await_done()
-                self.assertEqual(packets[3]["objective"],"Final instruction; drop previous inspection.")
-                self.assertIsNone(packets[3]["next_step"])
-                self.assertEqual(len(packets),4)
+                self.assertEqual(packets[4]["objective"],"Final instruction; drop previous inspection.")
+                self.assertIsNone(packets[4]["next_step"])
+                self.assertEqual(len(packets),6)
             finally:
                 release.set()
                 engine.close()
@@ -96,6 +99,9 @@ class AutoRecoveryTests(unittest.TestCase):
         def worker(prompt,cwd,emit,cancel,**opts):
             packet = json.loads(prompt.rsplit("\n",1)[1])
             ran.append(packet["job"])
+            if packet["autonomy"]["phase"]=="discover":
+                emit("native",{"type":"tool_result","callId":"check","status":"ok"})
+                return 'SA_EXHAUSTED {"status":"done","summary":"checked","checks":["inspected"],"alternatives":["no open tasks"]}',None
             emit("delta",wire+"\n")
             return wire+'\nSA_FINISH {"status":"done","summary":"checked"}', None
 
@@ -107,7 +113,7 @@ class AutoRecoveryTests(unittest.TestCase):
                 time.sleep(.01)
         finally:
             engine.close()
-        self.assertEqual(ran,[initial["id"]])
+        self.assertEqual(ran,[initial["id"],initial["id"]])
         self.assertEqual((parent()["state"],parent()["dispatch_turn"]),("done",None))
         self.assertEqual(store.rows("SELECT id FROM jobs WHERE parent=?",(initial["id"],)),[{"id":child}])
         self.assertEqual(store.rows("SELECT seq,source_turn,target FROM mailbox WHERE source=?",(initial["id"],)),

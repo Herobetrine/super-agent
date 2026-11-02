@@ -1,6 +1,7 @@
 """Conversation-first native workspace for the local agent scheduler."""
 import json
 import threading
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -25,6 +26,8 @@ STATE = {"queued":"等待开始","running":"工作中","waiting":"等待协作",
          "done":"已完成","partial":"部分完成","failed":"执行失败","interrupted":"已中断","cancelled":"已停止"}
 INBOX = {"queued","running","waiting"}
 ID = Qt.ItemDataRole.UserRole
+LIVE_EVENT_WINDOW = 2000
+LIVE_CARD_LIMIT = 100
 
 
 def box(parent=None, *, vertical=True, margins=(0,0,0,0), gap=0):
@@ -59,6 +62,9 @@ class Studio(QMainWindow):
         self.store,self.engine = store,engine
         self.settings = settings if settings is not None else QSettings("SuperAgent","Studio")
         self.tid = self.to_job = None
+        self.auto_stopped = False
+        self.continuous = False
+        self.archive_link = None
         self.project = self.settings.value("project","",type=str)
         if self.project and not Path(self.project).is_dir():
             self.project = ""
@@ -83,6 +89,9 @@ class Studio(QMainWindow):
         canvas = box(self.canvas)
         canvas.addWidget(self._header())
         canvas.addWidget(divider())
+        self.auto_panel = self._auto_banner()
+        canvas.addWidget(self.auto_panel)
+        self.auto_panel.hide()
         mainrow = box(vertical=False)
         canvas.addLayout(mainrow,1)
         column = QWidget(objectName="sheet")
@@ -165,6 +174,24 @@ class Studio(QMainWindow):
         row.addWidget(more)
         self.more_button=more
         return bar
+
+    def _auto_banner(self):
+        panel=QFrame(objectName="activity")
+        layout=box(panel,margins=(16,5,16,6),gap=2)
+        top=box(vertical=False,gap=8)
+        self.auto_phase_label=label("", "speaker")
+        top.addWidget(self.auto_phase_label)
+        top.addStretch()
+        self.auto_stop_button=button("停止自动运行",self.cancel,style="risk",glyph="stop",
+                                     tip="停止这张工单的运行和后续自动调度")
+        top.addWidget(self.auto_stop_button)
+        layout.addLayout(top)
+        self.auto_goal_label=label("", "hint")
+        self.auto_memory_label=label("", "micro")
+        for item in (self.auto_goal_label,self.auto_memory_label):
+            item.setSizePolicy(QSizePolicy.Policy.Ignored,QSizePolicy.Policy.Preferred)
+            layout.addWidget(item)
+        return panel
 
     def _welcome(self):
         page=QWidget(objectName="hero")
@@ -257,7 +284,8 @@ class Studio(QMainWindow):
         head.addWidget(label("本次协作","title"),1)
         head.addWidget(button("",self.toggle_drawer,glyph="close",tip="关闭协作面板"))
         col.addLayout(head)
-        col.addWidget(label("任务出现后，可在这里查看分工和回报。","micro",wrap=True))
+        self.jobs_hint=label("任务出现后，可在这里查看分工和回报。","micro",wrap=True)
+        col.addWidget(self.jobs_hint)
         self.jobs_list=QListWidget(objectName="jobs")
         self.jobs_list.currentItemChanged.connect(self._job_detail)
         col.addWidget(self.jobs_list,1)
@@ -311,6 +339,7 @@ class Studio(QMainWindow):
                 item.widget().deleteLater()
         self.cursor=0
         self.live_widget=self.live_turn=None
+        self.archive_link=None
         self.pieces.clear()
         self.jobs_key=None
 
@@ -487,7 +516,10 @@ class Studio(QMainWindow):
                                 if picked else "跟随本机适配器默认配置")
         self.recipient.setVisible(self.to_job is not None)
         self.editor.setPlaceholderText("给任务留言…" if self.to_job else
-                                       ("继续这次对话，或补充新的要求…" if self.tid else "描述你的目标，或先选一个项目…"))
+                                       ("输入恢复后要做的工作…" if self.auto_stopped else
+                                        "继续这次对话，或补充新的要求…" if self.tid else "描述你的目标，或先选一个项目…"))
+        self.send_button.setText("恢复并发送" if self.auto_stopped else "发送")
+        self.send_button.setToolTip("确认后以这条新指令恢复自动运行" if self.auto_stopped else "发送消息  Ctrl+Enter")
         self.detail_button.setEnabled(bool(self.tid))
         self._send_state()
 
@@ -500,7 +532,19 @@ class Studio(QMainWindow):
         if not body.strip():
             return
         try:
-            if self.tid is None:
+            if (self.tid and self.info["permission_profile"]=="auto" and self.to_job is None
+                    and body.strip().rstrip("。！!") in ("停止","停止工单","停止自动运行","/stop")):
+                self.cancel()
+                self.editor.clear()
+                return
+            if self.auto_stopped:
+                confirm=QMessageBox.question(self,"恢复自动运行","以输入框中的这条新指令恢复完全访问和持续模型调用？",
+                      QMessageBox.StandardButton.Yes|QMessageBox.StandardButton.No,QMessageBox.StandardButton.No)
+                if confirm!=QMessageBox.StandardButton.Yes:
+                    return
+                self.store.follow(self.tid,body,resume=True)
+                self.editor.clear()
+            elif self.tid is None:
                 if self.project:
                     cwd=Path(self.project)
                 else:
@@ -577,7 +621,7 @@ class Studio(QMainWindow):
         item=self.jobs_list.currentItem()
         job=next((j for j in self.tasks if item and j["id"]==item.data(ID)),None)
         self.note_button.setEnabled(bool(job and job["state"] in INBOX))
-        self.retry_button.setEnabled(bool(job and job["state"] in ("failed","interrupted")))
+        self.retry_button.setEnabled(bool(job and not self.auto_stopped and job["state"] in ("failed","interrupted")))
         bound_route=job["route"] if job else None
         if job:
             job=self.store.rows("SELECT * FROM jobs WHERE id=?",(job["id"],))[0]
@@ -603,10 +647,17 @@ class Studio(QMainWindow):
             ("\n\n最近回报\n"+job["result"] if job.get("result") else "")))
 
     def _jobs(self):
+        where="j.ticket=?"
+        params=(self.tid,)
+        if self.continuous:
+            where="""j.id IN (SELECT id FROM jobs WHERE ticket=? AND parent IS NULL
+                      UNION SELECT id FROM jobs WHERE ticket=? AND state IN ('running','queued','waiting','draining')
+                      UNION SELECT id FROM (SELECT id FROM jobs WHERE ticket=? ORDER BY id DESC LIMIT 40))"""
+            params=(self.tid,)*3
         rows=self.store.rows("""SELECT j.id,j.parent,j.agent,j.state,j.turn,j.writing,j.role,
                                       substr(j.body,1,80) AS body,j.permission_override,j.route_override,n.route
                                 FROM jobs j LEFT JOIN native_routes n ON n.job=j.id
-                                WHERE j.ticket=? ORDER BY j.id""",(self.tid,)) if self.tid else []
+                                WHERE """+where+" ORDER BY j.id",params) if self.tid else []
         if rows!=self.jobs_key:
             self.tasks=self.jobs_key=rows
             selected=self.jobs_list.currentItem()
@@ -625,7 +676,9 @@ class Studio(QMainWindow):
                 self.jobs_list.setCurrentRow(0)
             self.jobs_list.blockSignals(False)
             self._job_detail()
-        self.detail_button.setText(f"协作  {len(rows)}" if rows else "协作")
+        self.jobs_hint.setText("显示主控、活动任务及最近 40 项。完整派工可导出。" if self.continuous else
+                               "任务出现后，可在这里查看分工和回报。")
+        self.detail_button.setText(f"协作  {len(rows)}" if rows and not self.continuous else "协作")
         self.badge.setText(STATE[rows[0]["state"]] if rows else "待开始")
 
     def _message(self,name,body,stamp,*,user=False,live=False):
@@ -649,6 +702,8 @@ class Studio(QMainWindow):
         return frame
 
     def _activity(self,msg,error=False):
+        if self.continuous and len(msg)>2400:
+            msg=msg[:2400]+"…（可导出完整记录）"
         frame=QFrame(objectName="errorCard" if error else "activity")
         row=box(frame,vertical=False,margins=(10,6,9,6),gap=8)
         sig=label()
@@ -664,23 +719,99 @@ class Studio(QMainWindow):
             self.live_widget=None
         self.live_turn=None
 
+    def _auto_progress(self):
+        if not self.info or self.info["permission_profile"]!="auto":
+            self.auto_stopped=False
+            self.continuous=False
+            self.auto_panel.hide()
+            return
+        data=self.store.rows("""SELECT t.objective,c.phase,c.milestone,c.learning,j.state,j.ready_after
+                    FROM tickets t JOIN jobs j ON j.ticket=t.id AND j.parent IS NULL
+                    LEFT JOIN continuous_runs c ON c.ticket=t.id WHERE t.id=?""",(self.tid,))[0]
+        state=data["state"]
+        phase=data["phase"]
+        self.continuous=phase is not None
+        self.auto_stopped=state=="cancelled"
+        if self.auto_stopped and self.to_job is not None:
+            self.clear_target()
+        active=state in INBOX or state=="draining"
+        if self.auto_stopped:
+            text="已停止 · 需明确恢复才会继续"
+        elif not active:
+            text="已提交穷尽说明" if phase=="exhausted" else STATE.get(state,state)
+        elif phase=="discover":
+            text="正在搜寻下一步"
+        elif phase=="work":
+            text=f"执行阶段 {data['milestone']+1}"
+        else:
+            text="原工单 · "+STATE.get(state,state)
+        remaining=int((data["ready_after"] or 0)-time.time())
+        if state=="queued" and remaining>0:
+            text+=f" · {remaining} 秒后再试"
+        self.auto_phase_label.setText("自动运行   /   "+text)
+        self.auto_stop_button.setVisible(active)
+        self.auto_panel.show()
+        fields=[(self.auto_goal_label,"当前目标",data["objective"] or self.info["goal"]),
+                (self.auto_memory_label,"最近经验",data["learning"] or "暂无记录")]
+        for widget,title,body in fields:
+            full=title+" · "+" ".join(body.split())
+            widget.setText(QFontMetrics(widget.font()).elidedText(full,Qt.TextElideMode.ElideRight,
+                                                                  max(100,widget.width())))
+            widget.setToolTip(full[:1200])
+        self.auto_memory_label.setVisible(phase is not None)
+
+    def _archive_preview(self):
+        if not self.archive_link:
+            self.archive_link=button("正在显示近期活动 · 导出完整记录",self.export,style="chip",glyph="book")
+            self.timeline.insertWidget(0,self.archive_link,0,Qt.AlignmentFlag.AlignLeft)
+        while self.timeline.count()>LIVE_CARD_LIMIT+1:
+            old=self.timeline.takeAt(1).widget()
+            if old is self.live_widget:
+                self.live_widget=self.live_turn=None
+            old.hide()
+            old.deleteLater()
+
     def _events(self):
         if not self.tasks:
             return
         root=self.tasks[0]
+        upper=2**63-1
+        order="ORDER BY e.seq LIMIT 250"
+        if self.continuous:
+            upper=self.store.rows("SELECT max(seq) AS hi FROM events WHERE ticket=?",(self.tid,))[0]["hi"] or 0
+            if upper<=self.cursor:
+                return
+            cutoff=self.store.rows("""SELECT seq FROM events WHERE ticket=? AND seq>? AND seq<=?
+                                  ORDER BY seq DESC LIMIT 1 OFFSET ?""",(self.tid,self.cursor,upper,LIVE_EVENT_WINDOW))
+            if cutoff:
+                self.cursor=cutoff[0]["seq"]
+                self._remove_live()
+                self.pieces.clear()
+                self._archive_preview()
+            order=f"ORDER BY e.seq DESC LIMIT {LIVE_CARD_LIMIT+1}"
         sql="""SELECT e.seq,e.ts,e.kind,e.payload,e.job,e.turn,j.agent FROM events e JOIN jobs j ON j.id=e.job
-               WHERE e.ticket=? AND e.seq>? AND (e.kind IN ('user','user.follow','send','note','role','failed',
+               WHERE e.ticket=? AND e.seq>? AND e.seq<=? AND (e.kind IN ('user','user.follow','send','note','role','failed',
                 'cancelled','interrupted','draining','note.rejected','auto.goal','auto.next','auto.finish','auto.recover',
+                'auto.milestone','auto.learn','auto.discovered','auto.exhausted','auto.retry','auto.backoff',
                 'approval.request','approval.decision') OR
                 (e.job=? AND (e.kind='reply' OR (e.kind='delta' AND j.state='running' AND e.turn=j.turn))))
-               ORDER BY e.seq LIMIT 250"""
-        rows=self.store.rows(sql,(self.tid,self.cursor,root["id"]))
+               """+order
+        rows=self.store.rows(sql,(self.tid,self.cursor,upper,root["id"]))
+        if self.continuous:
+            if len(rows)>LIVE_CARD_LIMIT:
+                self._remove_live()
+                self.pieces.clear()
+                self._archive_preview()
+                rows.pop()
+            rows.reverse()
+            self.cursor=upper
         if not rows:
             return
         scroll=self.scroll.verticalScrollBar()
         bottom=scroll.value()>=scroll.maximum()-8
         for e in rows:
-            self.cursor=e["seq"]
+            if not self.continuous:
+                self.cursor=e["seq"]
             k=e["kind"]
             p=json.loads(e["payload"])
             agent=NAMES[e["agent"]]
@@ -707,6 +838,20 @@ class Studio(QMainWindow):
                 self._activity("当前阶段目标 · "+p["objective"])
             elif k=="auto.next":
                 self._activity("自动续轮 · "+p["body"])
+            elif k=="auto.milestone":
+                status="遇阻" if p["status"]=="blocked" else "已完成"
+                self._activity(f'阶段{status} · {p["summary"]}')
+            elif k=="auto.learn":
+                self._activity("经验摘要 · "+p["lesson"])
+            elif k=="auto.discovered":
+                self._activity(f'选定下一步 · {p["objective"]}\n依据：{p["evidence"]}\n行动：{p["body"]}')
+            elif k=="auto.exhausted":
+                checks="；".join(p["checks"])
+                alternatives="；".join(p["alternatives"])
+                self._activity(f'穷尽说明 · {p["summary"]}\n已核查：{checks}\n替代路径：{alternatives}',
+                               p["status"]=="blocked")
+            elif k in ("auto.retry","auto.backoff"):
+                self._activity(f'自动重试 · 等待 {p["after_seconds"]:g} 秒\n{p["reason"]}')
             elif k=="auto.finish":
                 self._activity(("阻塞 · " if p["status"]=="blocked" else "目标已核验 · ")+p["summary"],p["status"]=="blocked")
             elif k=="auto.recover":
@@ -721,7 +866,11 @@ class Studio(QMainWindow):
                     self.pieces.pop(e["turn"],None)
                 self._activity(f'{agent} · {STATE.get(k,k)}\n{str(p)[:1200]}',True)
         if root["state"]=="running" and root["turn"] in self.pieces:
-            text=public_text("".join(self.pieces[root["turn"]]))
+            accumulated="".join(self.pieces[root["turn"]])
+            if self.continuous and len(accumulated)>32000:
+                accumulated=accumulated[-32000:]
+                self.pieces[root["turn"]]=[accumulated]
+            text=public_text(accumulated)
             if text and not text.startswith(("SA_","SA ")):
                 if self.live_turn!=root["turn"]:
                     self._remove_live()
@@ -730,11 +879,14 @@ class Studio(QMainWindow):
                 else:
                     self.live_widget.original=text
                     self.live_widget.view.put(text[-32000:],False)
+        if self.continuous and self.timeline.count()>LIVE_CARD_LIMIT:
+            self._archive_preview()
         if bottom:
             QTimer.singleShot(0,lambda:scroll.setValue(scroll.maximum()))
 
     def refresh(self):
         self._history()
+        self._auto_progress()
         self._jobs()
         self._events()
         count=self.store.rows("SELECT count(*) AS n FROM approvals WHERE decision='pending'")[0]["n"]
@@ -816,6 +968,9 @@ class Studio(QMainWindow):
                 self.message(str(exc))
 
     def retry(self):
+        if self.auto_stopped:
+            self.message("此工单已停止。请输入新指令并明确恢复。")
+            return
         selected=self.jobs_list.currentItem()
         if selected:
             try:
@@ -850,7 +1005,14 @@ class Studio(QMainWindow):
         QMessageBox.information(self,"连接与诊断 · 入口检测",text)
 
     def closeEvent(self,event):
-        if self.engine.active and QMessageBox.question(self,"结束本次运行","关闭窗口会中断正在执行的任务。确定关闭吗？")!=QMessageBox.StandardButton.Yes:
+        pending_auto=self.engine.thread.is_alive() and self.store.rows("""SELECT 1 FROM jobs j JOIN tickets t
+             ON t.id=j.ticket WHERE t.permission_profile='auto' AND j.parent IS NULL AND
+             j.state IN ('queued','running','waiting','draining') LIMIT 1""")
+        message=("未停止的自动工单下次启动后可以继续执行并产生费用。要结束自动运行，请先停止工单。现在关闭窗口？"
+                 if pending_auto else "关闭窗口会中断正在执行的任务。确定关闭吗？")
+        if (self.engine.active or pending_auto) and QMessageBox.question(
+                self,"关闭工作台",message,QMessageBox.StandardButton.Yes|QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No)!=QMessageBox.StandardButton.Yes:
             event.ignore()
             return
         self.timer.stop()
