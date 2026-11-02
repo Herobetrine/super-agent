@@ -22,6 +22,8 @@ python -X utf8 tests/live_model_selection.py --agent claude --provider "<供应�
 
 ## 自主分工与四方交付
 
+- `python -X utf8 tests/live_lead_routing.py` 验证主控从获准来源选择非默认协作者型号、派发只读执行并收到真实回报。该检查需要 DeepSeek 与拥有至少两个可用型号的 Claude CLI 供应商。对照派工快照、原生模型回执、读取工具事件和终稿，而非依赖模型自述。
+
 - `python -X utf8 tests/live_studio.py` 在独立的测试工作区运行会话，检查主控能否自行回答简单问题，并为需要独立核对的任务选择协作者。
 - `python -X utf8 tests/live_check.py` 向运行中的本机桌面调度器提交一张四方工单。先启动窗口，准备好四种 CLI、相应认证和必要的任务授权。脚本创建随机文件，让多个执行者各自读回并回报，检查写者生成的文件字节以及完整回报是否传回主控。
 - Windows 上可双击桌面快捷方式两次，确认第二次启动聚焦已有窗口。执行任务时关闭再打开，检查中断记录与已变更的工作区，再根据工单状态决定是否重试。

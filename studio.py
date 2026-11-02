@@ -63,6 +63,7 @@ class Studio(QMainWindow):
         if self.project and not Path(self.project).is_dir():
             self.project = ""
         self.lead,self.profile = "deepseek","readonly"
+        self.allow_lead_routing = True
         self.default_routes=self.store.get_routes()
         self.draft_routes=None
         self.drafts,self.tasks,self.pieces = {},[],{}
@@ -216,9 +217,24 @@ class Studio(QMainWindow):
         self.editor.submit.connect(self.send)
         self.editor.textChanged.connect(self._send_state)
         inner.addWidget(self.editor)
+        permission_row=box(vertical=False,gap=8)
+        self.permission_label=label("权限","permissionLabel")
+        self.permission_picker=QComboBox(objectName="permissionProfile")
+        self.permission_picker.setAccessibleName("本次会话权限")
+        self.permission_label.setBuddy(self.permission_picker)
+        for key,(name,description) in PROFILES.items():
+            display=name+" · 高危" if key in UNRESTRICTED and "高危" not in name else name
+            self.permission_picker.addItem(display,key)
+            self.permission_picker.setItemData(self.permission_picker.count()-1,description,Qt.ItemDataRole.ToolTipRole)
+        self.permission_picker.activated.connect(self._pick_permission)
+        self.permission_hint=label("","micro",wrap=True)
+        permission_row.addWidget(self.permission_label)
+        permission_row.addWidget(self.permission_picker)
+        permission_row.addWidget(self.permission_hint,1)
+        inner.addLayout(permission_row)
         actions=box(vertical=False,gap=4)
         self.project_button=button("选择项目",self.browse,style="chip",glyph="folder")
-        self.mode_button=button("",self.options,style="chip",glyph="sliders",tip="本会话的主控、项目权限和路由")
+        self.mode_button=button("",self.options,style="chip",glyph="sliders",tip="会话设置：主控、模型与协作者授权")
         actions.addWidget(self.project_button)
         actions.addWidget(self.mode_button)
         actions.addStretch()
@@ -305,6 +321,7 @@ class Studio(QMainWindow):
         elif self.editor.toPlainText():
             self._save_draft()
         self.profile="readonly"
+        self.allow_lead_routing=True
         self.tid=self.to_job=None
         self.info=None
         self.tasks=[]
@@ -394,62 +411,75 @@ class Studio(QMainWindow):
         lead.setCurrentIndex(lead.findData(current.get("lead",self.lead)))
         form.addRow("主控模型入口",lead)
         form.addRow("各 agent 的执行配置",button("选择供应商、模型和执行端…",lambda:self.configure_agents(),style="chip"))
-        profile=QComboBox(objectName="permissionProfile")
-        for key,(name,_) in PROFILES.items():
-            profile.addItem(name,key)
-        actual=current.get("permission_profile",self.profile)
-        if actual=="legacy":
-            profile.addItem("旧工单 · "+("受控写入" if current["writes"] else "只读"),"legacy")
-        profile.setCurrentIndex(profile.findData(actual))
-        form.addRow("权限预设",profile)
+        delegated=QCheckBox("允许主控为协作者选择模型和子任务权限")
+        delegated.setObjectName("allowLeadRouting")
+        delegated.setChecked(bool(current.get("allow_lead_routing",self.allow_lead_routing)))
+        form.addRow("协作者授权",delegated)
+        form.addRow("本次权限",label(self.permission_picker.currentText()))
         form.addRow("工作目录",label(current.get("cwd",self.project) or "独立临时项目",wrap=True))
         col.addLayout(form)
         fixed=self.tid is not None
-        for w in (lead,profile):
+        for w in (lead,delegated):
             w.setEnabled(not fixed)
-        description=label("","hint",wrap=True)
-        warning=label(DISCLAIMER,"riskWarning",wrap=True)
-        consent=QCheckBox("我已阅读免责声明，为本次工单授予上述权限。")
-        consent.setObjectName("riskConsent")
-        col.addWidget(description)
-        col.addWidget(warning)
-        col.addWidget(consent)
-        col.addWidget(label("这些设置在新对话时确定。主控会按任务决定是否调用协作者。","micro",wrap=True))
+        col.addWidget(label("协作者权限以本次会话的授权为上限。权限预设位于输入框下方，发送首条消息后锁定。","micro",wrap=True))
         buttons=QDialogButtonBox(QDialogButtonBox.StandardButton.Ok if fixed else
                                  QDialogButtonBox.StandardButton.Ok|QDialogButtonBox.StandardButton.Cancel)
         buttons.accepted.connect(dlg.accept)
         buttons.rejected.connect(dlg.reject)
         col.addWidget(buttons)
-        def policy_changed(*_):
-            key=profile.currentData()
-            description.setText(PROFILES[key][1] if key in PROFILES else "此工单保留创建时的权限。")
-            warning.setVisible(key in UNRESTRICTED)
-            consent.setVisible(not fixed and key in UNRESTRICTED)
-            consent.setChecked(False)
-            buttons.button(QDialogButtonBox.StandardButton.Ok).setEnabled(fixed or key not in UNRESTRICTED)
-        profile.currentIndexChanged.connect(policy_changed)
-        consent.toggled.connect(lambda checked:buttons.button(QDialogButtonBox.StandardButton.Ok).setEnabled(
-            fixed or profile.currentData() not in UNRESTRICTED or checked))
-        policy_changed()
         if dlg.exec() and not fixed:
-            self.lead,self.profile=lead.currentData(),profile.currentData()
+            self.lead,self.allow_lead_routing=lead.currentData(),delegated.isChecked()
             self._controls()
+
+    def _pick_permission(self,index):
+        key=self.permission_picker.itemData(index)
+        if self.tid is not None or key not in PROFILES or key==self.profile:
+            return
+        if key in UNRESTRICTED:
+            # Keep the actual selection unchanged until this specific grant is confirmed.
+            self.permission_picker.setCurrentIndex(self.permission_picker.findData(self.profile))
+            dlg=QMessageBox(self)
+            dlg.setWindowTitle("确认本次高危授权")
+            dlg.setIcon(QMessageBox.Icon.Warning)
+            dlg.setText("为本次新会话启用“"+self.permission_picker.itemText(index)+"”？")
+            dlg.setInformativeText(PROFILES[key][1]+"\n\n"+DISCLAIMER)
+            cancel=dlg.addButton(QMessageBox.StandardButton.Cancel)
+            grant=dlg.addButton("我已了解风险，启用此档位",QMessageBox.ButtonRole.AcceptRole)
+            dlg.setDefaultButton(cancel)
+            dlg.setEscapeButton(cancel)
+            dlg.exec()
+            if dlg.clickedButton()!=grant:
+                return
+        self.profile=key
+        self._controls()
 
     def _controls(self):
         info=self.info or {}
         path=info.get("cwd",self.project)
         lead=info.get("lead",self.lead)
         profile=info.get("permission_profile",self.profile)
-        title=PROFILES[profile][0] if profile in PROFILES else ("受控写入" if info.get("writes") else "只读")
         self.project_button.setText(compact(Path(path).name,18) if path else "选择项目")
         self.project_button.setToolTip(path or "可选；直接发送将在独立临时目录中工作")
-        self.mode_button.setText(NAMES[lead]+" · "+title)
-        style="risk" if profile in UNRESTRICTED else "chip"
-        if self.mode_button.objectName()!=style:
-            self.mode_button.setObjectName(style)
-            self.style().unpolish(self.mode_button)
-            self.style().polish(self.mode_button)
-        self.mode_button.setToolTip(DISCLAIMER if profile in UNRESTRICTED else "本会话的主控、项目权限和路由")
+        self.mode_button.setText("主控 · "+NAMES[lead])
+        legacy=self.permission_picker.findData("legacy")
+        if profile=="legacy":
+            legacy_text="旧工单 · "+("受控写入" if info.get("writes") else "只读")
+            if legacy<0:
+                self.permission_picker.addItem(legacy_text,"legacy")
+            else:
+                self.permission_picker.setItemText(legacy,legacy_text)
+        elif legacy>=0:
+            self.permission_picker.removeItem(legacy)
+        self.permission_picker.setCurrentIndex(self.permission_picker.findData(profile))
+        is_draft=self.tid is None
+        self.permission_picker.setEnabled(is_draft)
+        self.permission_picker.setToolTip(PROFILES[profile][1] if profile in PROFILES else "沿用创建时的权限")
+        self.permission_hint.setText("发送首条消息前可选择" if is_draft else "本工单已锁定 · 新建对话可更改")
+        risky=profile in UNRESTRICTED
+        if self.permission_picker.property("highRisk")!=risky:
+            self.permission_picker.setProperty("highRisk",risky)
+            self.style().unpolish(self.permission_picker)
+            self.style().polish(self.permission_picker)
         selections=json.loads(info["agent_routes"]) if info else (
             self.default_routes if self.draft_routes is None else self.draft_routes)
         picked=selections.get(lead)
@@ -478,7 +508,8 @@ class Studio(QMainWindow):
                     spaces=self.store.path/"workspaces"
                     spaces.mkdir(parents=True,exist_ok=True)
                     cwd=Path(tempfile.mkdtemp(prefix="chat-",dir=spaces))
-                tid=self.store.create(body,cwd,self.lead,selections=self.draft_routes,permission_profile=self.profile)
+                tid=self.store.create(body,cwd,self.lead,selections=self.draft_routes,permission_profile=self.profile,
+                                      allow_lead_routing=self.allow_lead_routing)
                 self.editor.clear()
                 self.drafts.pop((None,None),None)
                 self.open_chat(tid)
@@ -547,24 +578,35 @@ class Studio(QMainWindow):
         job=next((j for j in self.tasks if item and j["id"]==item.data(ID)),None)
         self.note_button.setEnabled(bool(job and job["state"] in INBOX))
         self.retry_button.setEnabled(bool(job and job["state"] in ("failed","interrupted")))
+        bound_route=job["route"] if job else None
         if job:
             job=self.store.rows("SELECT * FROM jobs WHERE id=?",(job["id"],))[0]
-        dest=json.loads(self.info["agent_routes"]).get(job["agent"]) if job and self.info else None
+        dest=None
+        source="工单配置"
         if job:
-            actual=self.store.rows("SELECT route FROM native_routes WHERE job=?",(job["id"],))
-            if actual:
-                dest=json.loads(actual[0]["route"])
-        path=(f'{dest["provider"]} / {dest["model"]} · {dest["mode"]}' if dest else "跟随适配器默认")
+            dest=json.loads(self.info["agent_routes"]).get(job["agent"])
+            if job.get("route_override"):
+                dest=json.loads(job["route_override"])
+                source="主控指定"
+            if bound_route:
+                dest=json.loads(bound_route)
+                source="执行时绑定"
+        path=(f'{source}\n{dest["provider"]} / {dest["model"]} · {dest["mode"]}' if dest else "跟随适配器默认")
+        profile=(job.get("permission_override") or self.info["permission_profile"]) if job else None
+        permission=PROFILES[profile][0] if profile in PROFILES else ("受控写入" if job and job["writing"] else "只读")
+        if job:
+            permission+=" · "+("主控指定" if job.get("permission_override") else "沿用工单")
         self.job_text.setPlainText(("" if not job else
             "任务内容\n"+job["body"]+"\n\n当前职能\n"+(job.get("role") or "尚未命名")+
-            "\n\n工单执行配置\n"+path+
-            "\n\n权限预设\n"+(PROFILES[self.info["permission_profile"]][0] if self.info["permission_profile"] in PROFILES
-                                 else ("受控写入" if job["writing"] else "只读"))+
+            "\n\n任务执行配置\n"+path+
+            "\n\n任务权限\n"+permission+
             ("\n\n最近回报\n"+job["result"] if job.get("result") else "")))
 
     def _jobs(self):
-        rows=self.store.rows("""SELECT id,parent,agent,state,turn,writing,role,substr(body,1,80) AS body
-                                FROM jobs WHERE ticket=? ORDER BY id""",(self.tid,)) if self.tid else []
+        rows=self.store.rows("""SELECT j.id,j.parent,j.agent,j.state,j.turn,j.writing,j.role,
+                                      substr(j.body,1,80) AS body,j.permission_override,j.route_override,n.route
+                                FROM jobs j LEFT JOIN native_routes n ON n.job=j.id
+                                WHERE j.ticket=? ORDER BY j.id""",(self.tid,)) if self.tid else []
         if rows!=self.jobs_key:
             self.tasks=self.jobs_key=rows
             selected=self.jobs_list.currentItem()

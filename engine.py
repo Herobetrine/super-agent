@@ -8,7 +8,8 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 from artifacts import snapshot
-from permissions import PROFILES, UNRESTRICTED, AUTO_GUIDE, controls
+from permissions import PROFILES, UNRESTRICTED, AUTO_GUIDE, controls, child_profiles
+from task_routing import discover_options, select_model
 
 AGENTS = ("codex", "claude", "deepseek", "antigravity")
 PROJECT_WRITERS = frozenset(("codex", "deepseek"))
@@ -107,7 +108,8 @@ class Store:
                 db.execute("ALTER TABLE tickets ADD COLUMN agent_routes TEXT NOT NULL DEFAULT '{}'")
             ticket_columns={r["name"] for r in db.execute("PRAGMA table_info(tickets)")}
             for column,definition in (("permission_profile","TEXT NOT NULL DEFAULT 'legacy'"),
-                                      ("objective","TEXT"),("auto_cycles","INTEGER NOT NULL DEFAULT 0")):
+                                      ("objective","TEXT"),("auto_cycles","INTEGER NOT NULL DEFAULT 0"),
+                                      ("allow_lead_routing","INTEGER NOT NULL DEFAULT 0")):
                 if column not in ticket_columns:
                     db.execute(f"ALTER TABLE tickets ADD COLUMN {column} {definition}")
             if "follow_config" not in {r["name"] for r in db.execute("PRAGMA table_info(tickets)")}:
@@ -117,6 +119,9 @@ class Store:
                 db.execute("ALTER TABLE jobs ADD COLUMN dispatch_turn INTEGER")
             if "ready_after" not in existing:
                 db.execute("ALTER TABLE jobs ADD COLUMN ready_after REAL NOT NULL DEFAULT 0")
+            for column in ("route_override","permission_override"):
+                if column not in existing:
+                    db.execute(f"ALTER TABLE jobs ADD COLUMN {column} TEXT")
             for column in ("role","assigned_role"):
                 if column not in existing:
                     db.execute(f"ALTER TABLE jobs ADD COLUMN {column} TEXT NOT NULL DEFAULT ''")
@@ -124,7 +129,7 @@ class Store:
             return
         with self.tx() as db:
             db.execute("UPDATE approvals SET decision='expired' WHERE decision='pending'")
-            for row in db.execute("""SELECT jobs.*,tickets.permission_profile FROM jobs JOIN tickets
+            for row in db.execute("""SELECT jobs.*,tickets.permission_profile AS ticket_profile FROM jobs JOIN tickets
                                   ON jobs.ticket=tickets.id WHERE jobs.state='running'""").fetchall():
                 self.interrupt(db,row)
 
@@ -148,7 +153,7 @@ class Store:
 
     def interrupt(self,db,job):
         reason="上次执行中断，已产生的文件或远端操作可能仍然存在。"
-        if job["permission_profile"]=="auto":
+        if job["ticket_profile"]=="auto":
             # Start a reconciliation turn; do not replay the interrupted wire request.
             db.execute("UPDATE jobs SET state='queued',dispatch_turn=coalesce(dispatch_turn,turn),turn=turn+1,result=? WHERE id=?",
                        (reason+"继续前先核对实际状态与已经派出的任务。",job["id"]))
@@ -159,7 +164,8 @@ class Store:
 
     def request_approval(self,job,action,cancel):
         with self.tx() as db:
-            row=db.execute("""SELECT j.state,j.turn,t.permission_profile FROM jobs j JOIN tickets t
+            row=db.execute("""SELECT j.state,j.turn,coalesce(j.permission_override,t.permission_profile) AS permission_profile
+                              FROM jobs j JOIN tickets t
                               ON t.id=j.ticket WHERE j.id=?""",(job["id"],)).fetchone()
             if (not row or row["state"]!="running" or row["turn"]!=job["turn"] or
                 row["permission_profile"] not in ("ask","partial") or cancel.is_set()):
@@ -212,11 +218,12 @@ class Store:
             changed=[a for a in AGENTS if previous.get(a)!=routes.get(a)]
             for name in changed:
                 db.execute("DELETE FROM native_routes WHERE job IN (SELECT id FROM jobs WHERE ticket=? AND agent=?)",(ticket,name))
-                db.execute("UPDATE jobs SET session=NULL WHERE ticket=? AND agent=?",(ticket,name))
+                db.execute("UPDATE jobs SET session=NULL,route_override=NULL WHERE ticket=? AND agent=?",(ticket,name))
             db.execute("UPDATE tickets SET agent_routes=? WHERE id=?",(encode(routes),ticket))
             self.log(db,jobs[0],"routes.changed",{"old":previous,"new":routes,"new_native_session":changed})
 
-    def create(self, goal, cwd, lead, writes=False, *, claude_route=None, selections=None,permission_profile=None):
+    def create(self, goal, cwd, lead, writes=False, *, claude_route=None, selections=None,permission_profile=None,
+               allow_lead_routing=True):
         if not str(cwd).strip():
             raise ValueError("先选择项目目录")
         legacy_route=claude_route or "cc-switch"
@@ -229,26 +236,31 @@ class Store:
             if permission_profile not in PROFILES:
                 raise ValueError("未知权限预设")
             writes=permission_profile!="readonly"
+        if type(allow_lead_routing) is not bool:
+            raise ValueError("主控分配授权必须为明确的开关")
         with self.tx() as db:
             db.execute("BEGIN IMMEDIATE")
             routes=self.get_routes() if selections is None else checked_routes(selections)
             if selections is None and claude_route is not None:
                 routes.pop("claude",None)
-            ticket = db.execute("""INSERT INTO tickets(goal,cwd,writes,lead,created,claude_route,agent_routes,follow_config,permission_profile)
-                                VALUES(?,?,?,?,?,?,?,?,?)""",
-                                (goal,str(root),int(writes),lead,time.time(),legacy_route,encode(routes),1 if claude_route is None else 2,permission_profile or "legacy")).lastrowid
+            ticket = db.execute("""INSERT INTO tickets(goal,cwd,writes,lead,created,claude_route,agent_routes,follow_config,
+                                permission_profile,allow_lead_routing) VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                                (goal,str(root),int(writes),lead,time.time(),legacy_route,encode(routes),1 if claude_route is None else 2,
+                                 permission_profile or "legacy",int(allow_lead_routing))).lastrowid
             jid = db.execute("""INSERT INTO jobs(ticket,sender,agent,body,writing,depth,state)
                                 VALUES(?,'user',?,?,?,0,'queued')""",
                              (ticket,lead,goal,int(bool(writes) and (lead in PROJECT_WRITERS or permission_profile in UNRESTRICTED)))).lastrowid
             self.log(db, dict(ticket=ticket,id=jid,turn=1), "user", goal)
         return ticket
 
-    def dispatch(self, job, command):
+    def dispatch(self, job, command, *, catalog=None):
         if not isinstance(command, dict):
             raise ValueError("SA_SEND 必须包含 JSON 对象")
         key, agent, body = (command.get(k) for k in ("id","to","body"))
         writing = command.get("write", False)
         role = command.get("role", "")
+        if any(k in command for k in ("provider","mode","selection","route","route_override","permission_override")):
+            raise ValueError("派工不能更换工单指定的供应商或执行端")
         if not isinstance(role, str) or len(role) > 120:
             raise ValueError("role 须为 120 字以内的职能名称")
         files = command.get("files", [])
@@ -259,32 +271,52 @@ class Store:
             current = db.execute("SELECT * FROM jobs WHERE id=?", (job["id"],)).fetchone()
             if current["state"] != "running" or current["turn"] != job["turn"]:
                 return
+            ticket = db.execute("SELECT * FROM tickets WHERE id=?", (current["ticket"],)).fetchone()
+            overrides="model" in command or "permission_profile" in command
+            if overrides and (current["parent"] is not None or not ticket["allow_lead_routing"]):
+                raise ValueError("本次派工没有主控模型或权限选择授权")
+            parent_profile=current["permission_override"] or ticket["permission_profile"]
+            override=command.get("permission_profile",current["permission_override"])
+            if "permission_profile" in command and override not in child_profiles(parent_profile):
+                raise ValueError("子任务权限不能超出工单授权")
+            effective=override or parent_profile
+            model=command.get("model")
+            if "model" in command and (not isinstance(model,str) or not model.strip()):
+                raise ValueError("派工须指定有效模型 ID")
             logical_turn=current["dispatch_turn"] or current["turn"]
             old = db.execute("SELECT * FROM jobs WHERE parent=? AND source_turn=? AND msgkey=?",
                              (job["id"],logical_turn,key)).fetchone()
             if old:
                 saved = db.execute("SELECT manifest FROM job_files WHERE job=?", (old["id"],)).fetchone()
                 names = [f["name"] for f in json.loads(saved[0])] if saved else []
-                if (old["agent"],old["body"],bool(old["writing"]),old["assigned_role"],names) != (agent,body,writing,role,files):
+                old_model=json.loads(old["route_override"])["model"] if old["route_override"] else None
+                if (old["agent"],old["body"],bool(old["writing"]),old["assigned_role"],names,old_model,old["permission_override"]) != (
+                        agent,body,writing,role,files,model,override):
                     raise ValueError("同一消息 ID 携带了不同的指令")
                 return
-            ticket = db.execute("SELECT * FROM tickets WHERE id=?", (job["ticket"],)).fetchone()
-            if writing and not ticket["writes"]:
+            selected=None
+            if model is not None:
+                selected=select_model(catalog or {},agent,model)
+                pinned=json.loads(ticket["agent_routes"]).get(agent)
+                if pinned and any(selected[k]!=pinned[k] for k in ("provider","mode")):
+                    raise ValueError("主控只能在工单指定的供应商和执行端内选型")
+            if writing and (not ticket["writes"] or effective=="readonly"):
                 raise ValueError("工单未启用项目写入")
-            if writing and agent not in PROJECT_WRITERS and ticket["permission_profile"] not in UNRESTRICTED:
+            if writing and agent not in PROJECT_WRITERS and effective not in UNRESTRICTED:
                 raise ValueError(f"{agent} 的本机适配器没有受控项目写入能力")
             count = db.execute("SELECT count(*) FROM jobs WHERE ticket=?", (job["ticket"],)).fetchone()[0]
             if count >= MAX_NODES or job["depth"] >= MAX_DEPTH:
                 raise ValueError("工单派发预算已用完")
             manifest = snapshot(ticket["cwd"],files,self.path/"objects") if files != [] else []
             jid = db.execute("""INSERT INTO jobs(ticket,parent,sender,agent,body,writing,depth,
-                   source_turn,msgkey,state,role,assigned_role) VALUES(?,?,?,?,?,?,?,?,?,'queued',?,?)""",
+                   source_turn,msgkey,state,role,assigned_role,route_override,permission_override)
+                   VALUES(?,?,?,?,?,?,?,?,?,'queued',?,?,?,?)""",
                    (job["ticket"],job["id"],job["agent"],agent,body,writing,job["depth"]+1,
-                    logical_turn,key,role,role)).lastrowid
+                    logical_turn,key,role,role,encode(selected) if selected else None,override)).lastrowid
             if manifest:
                 db.execute("INSERT INTO job_files VALUES(?,?)",(jid,encode(manifest)))
             self.log(db,job,"send",dict(to=agent, child=jid, body=body, sha256=digest(body),
-                                        write=writing,files=manifest,role=role))
+                                        write=writing,files=manifest,role=role,selection=selected,permission_profile=effective))
             return jid
 
     def set_role(self, job, command):
@@ -432,20 +464,24 @@ class Store:
         saved = db.execute("SELECT manifest FROM job_files WHERE job=?", (job["id"],)).fetchone()
         roster = [dict(r) for r in db.execute("""SELECT id AS job,agent,role,state,parent FROM jobs
                        WHERE ticket=? ORDER BY id""",(job["ticket"],))]
-        high=ticket["permission_profile"] in UNRESTRICTED
+        profile=job["permission_override"] or ticket["permission_profile"]
+        high=profile in UNRESTRICTED
         step=db.execute("""SELECT payload FROM events WHERE job=? AND kind='auto.next'
                            AND seq>coalesce((SELECT max(seq) FROM events WHERE ticket=?
                            AND kind IN ('user.follow','auto.finish')),0) ORDER BY seq DESC LIMIT 1""",
                         (job["id"],job["ticket"])).fetchone() if ticket["permission_profile"]=="auto" else None
         return dict(ticket=job["ticket"],job=job["id"],turn=job["turn"],agent=job["agent"],
-                    permission_profile=ticket["permission_profile"],objective=ticket["objective"] or ticket["goal"],
+                    permission_profile=profile,objective=ticket["objective"] or ticket["goal"],
+                    allow_lead_routing=bool(ticket["allow_lead_routing"] and job["parent"] is None),
+                    allowed_child_permissions=child_profiles(profile) if ticket["allow_lead_routing"] and job["parent"] is None else [],
                     next_step=json.loads(step[0]) if step else None,
                     files=json.loads(saved[0]) if saved else [],
                     roster=roster,role=job["role"],notes=self.notes(db,job["id"]),claude_route=ticket["claude_route"],
-                    selected_execution=json.loads(ticket["agent_routes"]).get(job["agent"]),
+                    selected_execution=(json.loads(job["route_override"]) if job["route_override"] else
+                                        json.loads(ticket["agent_routes"]).get(job["agent"])),
                     harness_capabilities={a:{"read_project":True, "write_project":high or a in PROJECT_WRITERS} for a in AGENTS},
                     sender=job["sender"],goal=ticket["goal"],assignment=job["body"],user_updates=notes,
-                    project=ticket["cwd"],can_assign_write=bool(ticket["writes"]),
+                    project=ticket["cwd"],can_assign_write=profile!="readonly" and bool(ticket["writes"]),
                     this_turn_can_write=high or bool(job["writing"]),previous_reply=job["result"],reports=reports)
 
     def export(self, ticket, filename):
@@ -469,6 +505,12 @@ You can record your own role with a plain-text line: SA_ROLE {"role":"your funct
 To ask a peer for work or send it information, OUTPUT a separate plain-text line starting at column one:
 SA_SEND {"id":"unique-short-key","to":"<harness from harness_capabilities>","role":"<chosen function>","body":"full exact instruction","write":false}
 The role field is optional. You can also start a separate task using your own harness.
+If allow_lead_routing is true, you may add "model":"<exact ID from this recipient's delegate_models.models>"
+and/or "permission_profile":"<one of allowed_child_permissions>" to SA_SEND. Choose a model suited to the
+assignment and grant only the needed access. Use readonly for unrestricted-ticket checks that need no edits.
+The provider and runtime are chosen by the operator. Omit overrides to inherit. Never choose a new provider,
+grant powers beyond your ticket, or use a permission preset as a role name. In autonomous projects avoid
+requesting an interactive child write profile unless the operator requires a human checkpoint.
 Only emit this line for an intentional dispatch. No markdown fence. Use JSON escapes for multiline text. The receiver gets body verbatim.
 To message an existing queued/running/waiting job in THIS ticket, use its numeric job from roster:
 SA_NOTE {"id":"unique-note-key","job":42,"body":"full exact message to that job"}
@@ -531,7 +573,9 @@ class Engine:
     def step(self):
         with self.guard, self.store.tx() as db:
             self.store.wake(db)
-            jobs = db.execute("""SELECT jobs.*,tickets.cwd,tickets.claude_route,tickets.follow_config,tickets.permission_profile,
+            jobs = db.execute("""SELECT jobs.*,tickets.cwd,tickets.claude_route,tickets.follow_config,tickets.agent_routes,
+                                 tickets.permission_profile AS ticket_profile,
+                                 coalesce(jobs.permission_override,tickets.permission_profile) AS permission_profile,
                                  tickets.auto_cycles,native_routes.route AS bound_route
                                  FROM jobs JOIN tickets ON tickets.id=jobs.ticket LEFT JOIN native_routes ON native_routes.job=jobs.id
                                  WHERE state='queued' AND jobs.ready_after<=? ORDER BY jobs.id""",(time.time(),)).fetchall()
@@ -558,20 +602,20 @@ class Engine:
                 job["selection"]=(json.loads(job["bound_route"]) if job["bound_route"] else packet["selected_execution"])
                 packet["depth"] = job["depth"]
                 guide=GUIDE+(AUTO_GUIDE if job["permission_profile"]=="auto" else "")
-                prompt = guide+"\n"+encode(packet)
                 db.execute("UPDATE jobs SET state='running' WHERE id=?", (job["id"],))
-                self.store.log(db,job,"input",packet)
+                job["admission"]=self.store.log(db,job,"turn.admitted",{})
                 db.execute("UPDATE mailbox SET consumed_turn=? WHERE target=? AND consumed_turn IS NULL",
                            (job["turn"],job["id"]))
-                self.store.log(db,job,"running",{"prompt_sha256":digest(prompt),"guide":guide})
                 cancel = threading.Event()
-                worker = threading.Thread(target=self._run,args=(job,prompt,cancel,packet["reports"]),daemon=True)
+                worker = threading.Thread(target=self._run,args=(job,guide,packet,cancel),daemon=True)
                 self.active[job["id"]] = worker,cancel,job["ticket"],job["writing"]
                 worker.start()
 
-    def _run(self,job,prompt,cancel,reports):
+    def _run(self,job,guide,packet,cancel):
         s = self.store
         pending = ""
+        reports=packet["reports"]
+        catalog={}
         timedout = threading.Event()
         def expire():
             timedout.set()
@@ -582,7 +626,7 @@ class Engine:
 
         def line(text):
             if text.startswith(PREFIX):
-                s.dispatch(job,json.loads(text[len(PREFIX):]))
+                s.dispatch(job,json.loads(text[len(PREFIX):]),catalog=catalog)
             elif text.startswith(NOTE_PREFIX):
                 s.note_agent(job,json.loads(text[len(NOTE_PREFIX):]))
             elif text.startswith(ROLE_PREFIX):
@@ -620,6 +664,16 @@ class Engine:
         emit.approve = lambda action: s.request_approval(job,action,cancel)
 
         try:
+            if packet["allow_lead_routing"]:
+                legacy=job["claude_route"] if job["follow_config"]!=1 else None
+                catalog=discover_options(self.adapters,json.loads(job["agent_routes"]),legacy_claude_route=legacy)
+            packet["delegate_models"]=catalog
+            prompt=guide+"\n"+encode(packet)
+            if cancel.is_set():
+                raise RuntimeError("任务中止")
+            with s.tx() as db:
+                s.log(db,job,"input",packet)
+                s.log(db,job,"running",{"prompt_sha256":digest(prompt),"guide":guide})
             if len(prompt.encode("utf-8")) > 6*1024*1024:
                 raise ValueError("输入超过单轮 6 MiB 上限，原文已保存在事件记录。请拆分工单。")
             profile=job["permission_profile"]
@@ -673,9 +727,8 @@ class Engine:
                                   (job["id"],)).fetchone()
                 follow = False
                 if job["parent"] is None:
-                    follow = db.execute("""SELECT 1 FROM events WHERE ticket=? AND kind='user.follow' AND seq >
-                      (SELECT max(seq) FROM events WHERE job=? AND kind='input') LIMIT 1""",
-                      (job["ticket"],job["id"])).fetchone()
+                    follow = db.execute("SELECT 1 FROM events WHERE ticket=? AND kind='user.follow' AND seq>? LIMIT 1",
+                                        (job["ticket"],job["admission"])).fetchone()
                 state = "waiting" if children or follow or mail else "done"
                 if profile=="auto" and job["parent"] is None and not follow:
                     try:
@@ -718,7 +771,7 @@ class Engine:
             with s.tx() as db:
                 state = "interrupted" if self.stop.is_set() else "failed"
                 reason = "任务超时。请检查项目状态后决定是否重试。" if timedout.is_set() else str(exc)
-                if (state=="interrupted" and job["permission_profile"]=="auto" and
+                if (state=="interrupted" and job["ticket_profile"]=="auto" and
                     db.execute("SELECT state FROM jobs WHERE id=?",(job["id"],)).fetchone()[0]=="running"):
                     s.interrupt(db,job)
                     return

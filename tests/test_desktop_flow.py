@@ -9,7 +9,7 @@ from unittest.mock import patch
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PyQt6.QtCore import QSettings, Qt, QTimer
 from PyQt6.QtTest import QTest
-from PyQt6.QtWidgets import QApplication, QCheckBox, QComboBox, QDialogButtonBox, QPushButton, QTextBrowser
+from PyQt6.QtWidgets import QApplication, QCheckBox, QComboBox, QDialogButtonBox, QMessageBox, QPushButton, QTextBrowser
 
 from engine import Engine, Store
 from studio import Studio
@@ -71,44 +71,99 @@ class DesktopFlowTests(unittest.TestCase):
         self.assertNotEqual(Path(row["cwd"]).resolve(), Path.cwd().resolve())
         self.assertEqual(row["writes"], 0)
 
-    def test_edit_permission_stays_with_the_original_chat(self):
+    def select_permission(self, key):
+        picker = self.ui.permission_picker
+        picker.showPopup()
+        index = picker.model().index(picker.findData(key), 0)
+        point = picker.view().visualRect(index).center()
+        QTest.mouseClick(picker.view().viewport(), Qt.MouseButton.LeftButton, pos=point)
+        self.app.processEvents()
+
+    def test_inline_permission_is_visible_and_stays_with_the_original_chat(self):
+        self.ui.resize(800, 570)
         self.ui.set_project(str(self.project))
-
-        def allow_edits():
-            dialog = self.app.activeModalWidget()
-            profile=dialog.findChild(QComboBox,"permissionProfile")
-            profile.setCurrentIndex(profile.findData("partial"))
-            buttons = dialog.findChild(QDialogButtonBox)
-            buttons.button(QDialogButtonBox.StandardButton.Ok).click()
-
-        QTimer.singleShot(0, allow_edits)
-        self.ui.mode_button.click()
+        self.app.processEvents()
+        picker = self.ui.permission_picker
+        self.assertEqual(self.ui.permission_label.text(), "权限")
+        for widget in (self.ui.permission_label, picker, self.ui.send_button):
+            self.assertTrue(widget.isVisibleTo(self.ui))
+            self.assertTrue(self.ui.rect().contains(widget.mapTo(self.ui, widget.rect().bottomRight())))
+        self.select_permission("partial")
         self.send("实施已授权的修改")
+        self.assertFalse(picker.isEnabled())
+        self.assertEqual(picker.currentData(), "partial")
+        self.assertIn("新建对话", self.ui.permission_hint.text())
         self.ui.new_chat()
+        self.assertTrue(picker.isEnabled())
+        self.assertEqual(picker.currentData(), "readonly")
         self.send("只审查这个项目")
         rows = self.store.rows("SELECT writes FROM tickets ORDER BY id")
         self.assertEqual([r["writes"] for r in rows], [1, 0])
 
     def test_high_risk_acknowledgement_and_new_ticket_reset(self):
-        def pick_auto():
-            dlg=self.app.activeModalWidget()
-            profile=dlg.findChild(QComboBox,"permissionProfile")
-            profile.setCurrentIndex(profile.findData("auto"))
-            ok=dlg.findChild(QDialogButtonBox).button(QDialogButtonBox.StandardButton.Ok)
-            self.assertFalse(ok.isEnabled())
-            consent=dlg.findChild(QCheckBox,"riskConsent")
-            self.assertTrue(consent.isVisible())
-            consent.setChecked(True)
-            self.assertTrue(ok.isEnabled())
-            ok.click()
-        QTimer.singleShot(0,pick_auto)
-        self.ui.mode_button.click()
-        self.assertIn("高危",self.ui.mode_button.text())
+        observations = []
+        def choose(key, grant):
+            def answer():
+                dialog = self.app.activeModalWidget()
+                cancel = dialog.button(QMessageBox.StandardButton.Cancel)
+                observations.append(("免责声明" in dialog.informativeText(), dialog.defaultButton() is cancel))
+                if grant:
+                    next(b for b in dialog.buttons() if dialog.buttonRole(b) == QMessageBox.ButtonRole.AcceptRole).click()
+                else:
+                    cancel.click()
+            QTimer.singleShot(30, answer)
+            self.select_permission(key)
+
+        choose("full", False)
+        self.assertEqual(self.ui.permission_picker.currentData(), "readonly")
+        choose("auto", True)
+        self.assertEqual(observations, [(True,True),(True,True)])
+        self.assertIn("高危", self.ui.permission_picker.currentText())
         self.send("autonomous")
         self.ui.new_chat()
         self.send("read only")
         profiles=self.store.rows("SELECT permission_profile FROM tickets ORDER BY id")
         self.assertEqual([r["permission_profile"] for r in profiles],["auto","readonly"])
+
+    def test_delegation_is_explicit_and_resets_for_each_new_ticket(self):
+        recorded = []
+        def opt_out():
+            dialog = self.app.activeModalWidget()
+            switch = dialog.findChild(QCheckBox, "allowLeadRouting")
+            recorded.append(switch.isChecked())
+            switch.setChecked(False)
+            dialog.findChild(QDialogButtonBox).button(QDialogButtonBox.StandardButton.Ok).click()
+        QTimer.singleShot(0, opt_out)
+        self.ui.mode_button.click()
+        self.send("固定协作配置")
+        self.ui.new_chat()
+        self.send("自主选择")
+        rows = self.store.rows("SELECT allow_lead_routing FROM tickets ORDER BY id")
+        self.assertEqual(recorded, [True])
+        self.assertEqual([r["allow_lead_routing"] for r in rows], [0, 1])
+
+    def test_job_detail_shows_effective_profile_and_bound_route(self):
+        tid = self.store.create("review", self.project, "deepseek", permission_profile="partial")
+        job, = self.store.rows("SELECT * FROM jobs WHERE ticket=?", (tid,))
+        with self.store.tx() as db:
+            db.execute("UPDATE jobs SET state='running' WHERE id=?", (job["id"],))
+        jid = self.store.dispatch(job, {"id":"peer","to":"claude","body":"review test",
+                                        "permission_profile":"readonly"})
+        chosen = {"provider":"configured","model":"selected-model","mode":"cli"}
+        with self.store.tx() as db:
+            db.execute("UPDATE jobs SET route_override=? WHERE id=?", (json.dumps(chosen), jid))
+        self.ui.open_chat(tid)
+        self.ui.jobs_list.setCurrentRow(1)
+        self.assertIn("只读", self.ui.job_text.toPlainText())
+        self.assertIn("主控指定", self.ui.job_text.toPlainText())
+        self.assertIn("selected-model", self.ui.job_text.toPlainText())
+        with self.store.tx() as db:
+            db.execute("INSERT INTO native_routes(job,route) VALUES(?,?)",
+                       (jid, json.dumps({**chosen,"model":"bound-model"})))
+        self.ui.refresh()
+        self.assertIn("执行时绑定", self.ui.job_text.toPlainText())
+        self.assertIn("bound-model", self.ui.job_text.toPlainText())
+        self.assertNotIn("selected-model", self.ui.job_text.toPlainText())
 
     def test_approval_ui_targets_only_the_pending_request(self):
         tid=self.store.create("approval",self.project,"codex",permission_profile="ask")

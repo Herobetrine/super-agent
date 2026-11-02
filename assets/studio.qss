@@ -36,6 +36,11 @@ QPushButton#send:disabled { background: #dce5d7; color: #6c806b; }
 QPushButton#suggest { border: 1px solid #d7e1d4; border-radius: 11px; background: #ffffff; text-align: left; }
 QPushButton#suggest:hover { background: #edf4e7; border: 1px solid #b6cba8; }
 QFrame#composer { background: #ffffff; border: 1px solid #bdcdbb; border-radius: 15px; }
+QLabel#permissionLabel { color: #294a38; font-weight: 650; }
+QComboBox#permissionProfile { background: #edf4e8; color: #253f2f; border: 1px solid #9eb299; border-radius: 6px; padding: 3px 8px; min-height: 22px; }
+QComboBox#permissionProfile:hover, QComboBox#permissionProfile:focus { border-color: #547754; }
+QComboBox#permissionProfile:disabled { background: #f1f3ef; color: #435546; border-color: #cad4c8; }
+QComboBox#permissionProfile[highRisk="true"] { background: #fbeadd; color: #813411; border-color: #c88861; }
 QFrame#userCard { background: #e8f1e0; border-radius: 12px; }
 QFrame#activity { background: #edf2eb; border-radius: 7px; }
 QFrame#errorCard { background: #f9ece0; border-radius: 9px; }

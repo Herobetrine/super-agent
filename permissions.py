@@ -7,6 +7,13 @@ PROFILES = {
     "auto": ("自动模式 · 高危", "主控可调整阶段目标、分派工作、复核并主动续轮。所有参与者继承完全访问，执行期间不请求人工审批。"),
 }
 UNRESTRICTED = frozenset(("full","auto"))
+AUTHORITY = ("readonly","ask","partial","full","auto")
+
+
+def child_profiles(parent):
+    return list(AUTHORITY[:AUTHORITY.index(parent)+1]) if parent in AUTHORITY else ["readonly"]
+
+
 DISCLAIMER = ("高危授权与免责声明：参与的 agent 可访问当前系统用户有权访问的文件、网络服务及本机凭据，"
               "可能删除或覆盖数据、对外传输项目内容，并产生模型或服务费用。"
               "自动模式可以连续发起多轮调用。请仅在信任的项目和环境中启用；需要时可停止工单。"
