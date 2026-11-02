@@ -12,6 +12,7 @@ build/
 dist/
 *.egg-info/
 node_modules/
+/native/target/
 
 # Local IDE, authentication and gateway configuration
 .idea/

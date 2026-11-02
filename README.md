@@ -2,28 +2,28 @@
 
 在一个 Windows 窗口里指挥 Codex、Claude Code、DeepSeek Harness 和 Antigravity。向主控提出目标，它可以自己回答，也可以分派任务、接收其他 agent 的完整回报，再继续工作。你可以在对话中补充要求、给具体任务留言或停止执行。
 
+主控根据任务依赖、独立收益和调用成本决定如何分工。同一种执行端可以同时承担多个独立任务，主控也可以独自完成。调度器不设协作者总数、每种执行端的人数、只读并发数或委派层数上限。声明为写入的任务按顺序执行。实际可同时运行的进程数受本机资源和供应商配额影响，调用按各执行端的计费规则计算。
+
 例如，选中项目后输入「修复导入器无法处理中文文件名的问题。先写出复现步骤，修改后运行相关测试，再请另一个 agent 审查」。打开 **协作** 可看到实际参与的 agent、当前分工和回报。
 
 ## 安装与启动
 
-需要 Windows、Python 3.10 或更高版本，以及至少一种已安装并完成认证的 agent CLI。桌面程序使用 PyQt6，调度和消息存储在本机运行；选定的推理供应商会收到执行任务所需的上下文。
+桌面端使用 Electron。Node.js 子进程独立调度 CLI、处理模型流和审批，将完整事件写入 SQLite。Rust 服务负责项目文件检索、SHA-256 快照、长上下文归档，以及 Windows 工单库的独占锁和子进程回收。
 
-在 PowerShell 中从源码启动工作台。
+从源码构建需要 Windows、Node.js 24 或更高版本、Rust stable（1.89 或更高版本）和至少一个已登录的 agent CLI。在 PowerShell 执行以下命令。
 
 ```powershell
 git clone https://github.com/Herobetrine/super-agent.git
 cd super-agent
-python -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
-.\.venv\Scripts\python.exe desktop.pyw
-```
-
-要创建桌面快捷方式，在项目目录激活同一个虚拟环境后运行安装脚本。脚本会重新读取快捷方式，核对解释器和程序入口。
-
-```powershell
-.\.venv\Scripts\Activate.ps1
+npm ci
+node node_modules/electron/install.js
+npm run build:native
 .\Install-Desktop.ps1
 ```
+
+双击桌面的 **Super Agent**，也可以运行 `npm start`。在 Windows 使用 Rust MSVC 工具链时需要 Visual Studio C++ Build Tools。GNU 工具链需要可用的 MinGW binutils，使用独立 LLVM 的 `dlltool.exe` 时可通过 `SUPERAGENT_DLLTOOL` 指定路径。重建前先关闭运行中的工作台。[Rust Windows 安装说明](https://rust-lang.github.io/rustup/installation/windows.html)
+
+升级已有安装时，先停止需要终止的工单并退出旧窗口。新版直接打开原工单库和附件目录，继续使用本机供应商配置。旧自动工单遵守创建时的规则。Python 和 Qt 源文件保留用于迁移对照及回归测试。
 
 | Agent | 自动执行入口 | 配置和安装 |
 | --- | --- | --- |
@@ -36,15 +36,22 @@ python -m venv .venv
 
 ## 开始工作
 
-1. 点击 **新对话**，选择项目。没有项目时，平台会创建独立临时工作目录。
-2. **在消息输入框正下方找到「权限」下拉框**，它位于项目和主控按钮上方。发送第一条消息前选择权限档位。点 **主控** 可更换主理 agent 或调整协作者选型授权。只安装了一种 CLI 时，请选择已准备好的那一种。
-3. 输入目标并点击 **发送**，或按 `Ctrl+Enter`。同一对话里的后续消息会交给主控。
-4. 展开 **协作** 查看各项任务，选中执行者可以定向留言。右上角更多菜单可以查看原生事件、导出完整记录或停止。
-5. 检查项目中的实际文件和测试结果。若进程异常退出，重新打开后，可核对已经发生的文件操作再重试中断任务。
+1. 点击 **新建对话**，选择项目。在输入区选主控和权限，将任务发给主控。使用临时项目时，工作台会创建独立目录。
+2. 输入 `@` 搜索项目内文件，或点击附件按钮。发送时 Rust 保存所选文件的字节快照和摘要，并把清单交给主控。新会话默认只读。
+3. 在 **项目面板** 查看协作任务、定向留言、计划和 Git 变更。计划保存在工单里，下一轮主控可以读取。变更页区分暂存、未暂存及未跟踪文件状态。
+4. 左侧搜索可查找会话和项目。`Ctrl+K` 打开命令面板，`Ctrl+Enter` 发送。会话菜单支持停止、调整设置和导出经摘要核验的完整记录。
+
+### MCP 与技能
+
+从左侧打开 **MCP 与技能**。新建 stdio 服务时填写已安装的可执行程序和独立参数。连接会以当前系统用户身份启动该程序。也可选 Streamable HTTP，填写 HTTPS 服务地址（回环服务可用 HTTP）。需要 Bearer 令牌时，填写专用于该服务的 `MCP_` 环境变量名称。在启动工作台前设置该变量。
+
+点击连接以实际读取工具目录，启用并勾选所需服务。可保存为新会话默认，或为草稿单独选择。主控通过 MCP 工具回执继续工作。只读工单禁用这些外部工具，寻求审批和部分审批逐次询问，完全访问和自动模式可以调用已授权的工具。禁用服务或改变启动配置会撤销旧工单的对应绑定。HTTP OAuth 交互登录尚未接入。[MCP 标准传输](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports)
+
+工作台读取用户和项目技能目录中的 `SKILL.md`，也可通过选择文件夹登记其他本机技能。先预览说明，再为草稿或新会话默认授权。创建工单时保存所选技能的正文、来源路径和摘要。取消登记保留磁盘文件。[Agent Skills 格式](https://agentskills.io/specification)
 
 ### 会话权限与自动目标
 
-![权限下拉框位于消息输入框下方](docs/images/composer-permissions.png)
+![Electron 工作台的输入区和权限选择](docs/images/composer-permissions.png)
 
 新对话默认只读。需要你决定的动作出现在窗口顶部的 **待审批** 中，可检查工单、执行者和请求内容后批准或拒绝。
 
@@ -68,7 +75,7 @@ python -m venv .venv
 
 窗口顶部的**自动运行**栏显示执行阶段或“正在搜寻下一步”、当前目标、最近经验以及退避等待。你可以追加指令调整工作方向。要终止后续调度，点击 **停止自动运行**，也可以给主控单独发送“停止”。已停止的持续工单在刷新或重开后保持停止状态；输入新的工作指令，点击 **恢复并发送** 并确认，才会继续。
 
-持续工单的消息区最多保留 100 张近期卡片。重新打开很长的工单时，从最近 2,000 条原始事件中提取可见活动；协作面板展示主控、活动任务和最近 40 项任务。较早记录仍在本地账本中，可用预览提示或右上角菜单导出完整记录。
+界面按游标获取近期活动并限制单次预览大小。较早的任务、原生工具结果和完整模型输出保存在本地账本，可用会话菜单导出。
 
 **持续费用。** 搜寻新目标、核查路径、自动重试以及重启后的恢复检查，都可能产生新的模型请求。已完成阶段和暂时没有新成果时也可能继续计费。关闭窗口会中断本机执行，重开后未停止的自动工单可能继续；需要结束运行时，请先停止工单。已产生的费用和文件变更保留。
 
@@ -83,14 +90,15 @@ python -m venv .venv
 
 ## 测试与设计来源
 
-本地回归覆盖调度、恢复、权限、消息、模型配置和 Qt 交互。真实 CLI 核验会产生模型请求，按需使用独立测试项目。[验证方法](docs/verification.md)
+运行原生层、调度器、扩展和桌面测试。真实执行器联测需使用本机模型配额。[验证方法](docs/verification.md)
 
 ```powershell
-.\.venv\Scripts\python.exe -X utf8 -m unittest discover -s tests -v
+npm run build:native
+npm test
 ```
 
 本地统筹、独立 worker 和持久化消息参考了 DeepSeek 的 Super-agent 原型。权限设计也参考了 OpenHands 的确认策略及 OpenCode 的请求、允许、拒绝规则。[DeepSeek 原型](https://github.com/deepseek-ai/dsh-superagent-prototype/tree/6337fc823ce20251c8de8085948165c81aaa701e) · [OpenHands 确认策略](https://github.com/OpenHands/software-agent-sdk/blob/main/openhands-sdk/openhands/sdk/security/confirmation_policy.py) · [OpenCode 权限规则](https://opencode.ai/docs/permissions/)
 
 ## 许可证
 
-本项目按 **GPL-3.0-only** 发布。Python 依赖和单独安装的商业或开源 CLI 适用各自条款。[许可证全文](LICENSE) · [依赖与第三方说明](docs/licenses.md)
+本项目按 **GPL-3.0-only** 发布。第三方依赖和单独安装的 CLI 适用各自条款。[许可证全文](LICENSE) · [依赖与第三方说明](docs/licenses.md)

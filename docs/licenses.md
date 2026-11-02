@@ -2,7 +2,13 @@
 
 Super Agent 源码和仓库自有资源采用 `GPL-3.0-only`。[许可证全文](../LICENSE) · [GNU GPL v3](https://www.gnu.org/licenses/gpl-3.0.html)
 
-## Python 运行依赖
+## Electron 桌面运行依赖
+
+Electron 使用 MIT 许可证并随附 Chromium 等组件的额外通知。Node.js 使用自身的 MIT 许可证和捆绑组件通知。MCP 客户端使用官方 TypeScript SDK（MIT）。`yaml` 采用 ISC，`smol-toml` 采用 BSD-3-Clause，浏览器验证工具 Playwright 采用 Apache-2.0。源码安装会随相应包下载许可文件。重新分发二进制时应一并保留上游的许可证和第三方通知。[Electron](https://github.com/electron/electron/blob/main/LICENSE) · [MCP SDK](https://github.com/modelcontextprotocol/typescript-sdk) · [Playwright](https://github.com/microsoft/playwright)
+
+Rust 源码依赖及其精确版本由 `native/Cargo.toml`、`native/Cargo.lock` 记录。Node.js 的精确依赖记录在 `package-lock.json`。仓库保留 GPL-3.0-only 许可证。
+
+## Python 迁移基线
 
 | 组件 | 在项目中的用途 | 发行者的许可说明 |
 | --- | --- | --- |

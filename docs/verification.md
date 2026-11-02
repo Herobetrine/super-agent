@@ -1,6 +1,19 @@
 # 验证方法
 
-在项目根目录、已安装 Python 依赖的环境中执行命令。每次给模型的真实请求都使用对应 CLI 的认证与配额。
+以下命令在项目根目录执行。真实请求使用对应 CLI 的认证与配额。
+
+## Electron、Node.js 和 Rust 工作台
+
+先运行 `npm ci`、`node node_modules/electron/install.js` 和 `npm run build:native`。运行 `npm test` 检查本地协议、持续工单、锁与恢复、文件快照、扩展授权、真实 stdio 和回环 HTTP 服务。默认跳过计费及吞吐专项用例。
+
+- `node scripts/live-electron.cjs` 使用隔离的 Electron 配置和临时项目，从窗口发送带附件的工单。它用真实 MCP 服务、临时技能和本机 DeepSeek 检查审批、工具调用、逐字回传、计划持久化和窗口重开。文件夹选择器由测试指定，桌面按钮通过 Playwright 操作。
+- 设 `SUPERAGENT_NODE_ENGINE_LIVE=1` 后执行 `node --test tests-node/adapters-engine-live.test.cjs`，核对四个执行器的原生终稿、协作回报和输出文件。用完清除该测试环境变量。单独的 `tests-node/adapters-live.test.cjs` 和 `tests-node/adapters-permissions-live.test.cjs` 在文件开头列出各自的真实验证开关。
+- `node tests-node/engine-live.cjs` 在临时项目授予实际完整权限，用阶段性需求检查主动发现、协作、学习、耗尽和停止。查看独立回执中的各项布尔值。
+- `node scripts/benchmark-context.cjs` 在同一合成输入上核对新旧归档及裁剪，预热后各运行五次，输出中位数。旧基线使用本机 Python。设 `SUPERAGENT_NODE_BENCHMARK=1` 后运行 `node --test tests-node/adapters-batch.test.cjs` 可比较同一原生帧在 SQLite WAL + FULL 下逐条提交及整帧提交的耗时。
+
+## 历史版迁移基线
+
+以下项目用于对照 Python/Qt 版本。按旧版 requirements 安装其依赖后执行。
 
 ## 自动化回归
 
