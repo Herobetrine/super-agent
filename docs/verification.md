@@ -11,6 +11,8 @@
 - `node tests-node/engine-live.cjs` 在临时项目授予实际完整权限，用阶段性需求检查主动发现、协作、学习、耗尽和停止。查看独立回执中的各项布尔值。
 - `node scripts/benchmark-context.cjs` 在同一合成输入上核对新旧归档及裁剪，预热后各运行五次，输出中位数。旧基线使用本机 Python。设 `SUPERAGENT_NODE_BENCHMARK=1` 后运行 `node --test tests-node/adapters-batch.test.cjs` 可比较同一原生帧在 SQLite WAL + FULL 下逐条提交及整帧提交的耗时。
 
+通过 `node --test tests-node/progress.test.cjs tests-node/native-activity.test.cjs tests-node/harness-activity.test.cjs` 验证可视进展。用独立工单操作桌面时，核对输入区从左到右的加号、权限、模型、发送位置。运行中应在原发送位置出现停止键；空草稿也能停止，有草稿时保留内容。用 `--observe=<工单号>` 验证只读窗口，确认它能跟随新事件、翻看早期回执，原工单的执行进程继续工作。
+
 ## 历史版迁移基线
 
 以下项目用于对照 Python/Qt 版本。按旧版 requirements 安装其依赖后执行。

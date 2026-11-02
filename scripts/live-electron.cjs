@@ -128,8 +128,8 @@ async function run() {
     await app.close();
     app = await start();
     const restored = await app.firstWindow();
-    await restored.waitForSelector('#history button');
-    await restored.locator('#history button').first().click();
+    await restored.waitForSelector('#history button[data-ticket-id]');
+    await restored.locator('#history button[data-ticket-id]').first().click();
     const after = await restored.evaluate((ticket) => window.studio.invoke('snapshot', { ticket }), id);
     assert.equal(after.ticket.state, 'done');
     assert.equal(after.plan[0].body, 'Review the proof');

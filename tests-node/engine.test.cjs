@@ -83,6 +83,93 @@ const begin = async (f, fields = {}) => {
 };
 const finish = (f, id, state = 'done') => until(() => f.engine.root(id).state === state, f.engine);
 
+test('member progress arrives during execution and exact replay is scoped to the job and logical turn', async (t) => {
+  const release = gate(),
+    progress = (summary) => wire('SA_PROGRESS', { id: 'measure', summary });
+  const summary = ' 已校验  3 个文件 🔎e\u0301 ',
+    report = progress(summary);
+  const f = fixture(t, async ({ packet: p, o }) => {
+    if (p.depth) return progress('协作者已核对输入。');
+    if (p.turn > 1) return progress('主控已核对回执。');
+    o.emit('delta', report.slice(0, 12));
+    o.emit('delta', report.slice(12));
+    o.emit('message.boundary', null);
+    await release.promise;
+    return [report, send()].join('\n');
+  });
+  const id = await begin(f);
+  const rows = () =>
+    f.engine.all(
+      "SELECT job,turn,payload FROM events WHERE ticket=? AND kind='job.progress' ORDER BY seq",
+      id
+    );
+  try {
+    await until(() => rows().length === 1, f.engine);
+    assert.equal(f.engine.root(id).state, 'running');
+    assert.deepEqual(JSON.parse(rows()[0].payload), { id: 'measure', summary });
+  } finally {
+    release.resolve();
+  }
+  await finish(f, id);
+  assert.deepEqual(
+    rows().map((r) => JSON.parse(r.payload).summary),
+    [summary, '协作者已核对输入。', '主控已核对回执。']
+  );
+  assert.equal(f.engine.one('SELECT count(*) AS n FROM progress_receipts').n, 3);
+});
+
+test('invalid or conflicting progress never overwrites the original or fails the work', async (t) => {
+  const p = (payload) => wire('SA_PROGRESS', payload);
+  const f = fixture(t, () =>
+    [
+      p({ id: 'key', summary: '第一条' }),
+      p({ id: 'key', summary: '改写' }),
+      'SA_PROGRESS {broken',
+      p({ id: '', summary: 'no key' }),
+      p({ id: 'large', summary: '字'.repeat(321) }),
+      p({ id: 'line', summary: 'a\nb' }),
+      p({ id: 'extra', summary: 'ok', secret: 'sensitive' }),
+      'checked'
+    ].join('\n')
+  );
+  const id = await begin(f);
+  await finish(f, id);
+  const accepted = f.engine.all("SELECT payload FROM events WHERE kind='job.progress'");
+  assert.deepEqual(
+    accepted.map((r) => JSON.parse(r.payload)),
+    [{ id: 'key', summary: '第一条' }]
+  );
+  const errors = f.engine.all("SELECT payload FROM events WHERE kind='protocol.progress_invalid'");
+  assert.deepEqual(
+    errors.map((r) => JSON.parse(r.payload)),
+    [{ reason: 'conflicting_id' }, { reason: 'invalid_json' }, ...Array(4).fill({ reason: 'invalid_fields' })]
+  );
+});
+
+for (const action of ['cancel', 'follow']) {
+  test(action + ' suppresses late streamed and final progress from the old worker', async (t) => {
+    const release = gate();
+    const f = fixture(t, async ({ packet: p, o }) => {
+      if (!p.depth) return p.turn === 1 ? send() : 'merged';
+      await release.promise;
+      const stale = wire('SA_PROGRESS', { id: 'old', summary: '过期进展' });
+      o.emit('delta', stale + '\n');
+      return stale;
+    });
+    const id = await begin(f);
+    try {
+      await until(() => f.calls.some((x) => x.packet.depth), f.engine);
+      if (action === 'cancel') f.engine.cancel({ ticket: id });
+      else f.engine.follow({ ticket: id, body: '新的指令' });
+    } finally {
+      release.resolve();
+    }
+    if (action === 'follow') await finish(f, id);
+    await until(() => !f.engine.active.size, f.engine);
+    assert.equal(f.engine.one("SELECT count(*) AS n FROM events WHERE kind='job.progress'").n, 0);
+  });
+}
+
 test('streaming starts a peer; exact model/permission, text, evidence and hashes survive replay', async (t) => {
   const entered = gate(),
     body = '收到  \r\n😀e\u0301\u2028尾   ';

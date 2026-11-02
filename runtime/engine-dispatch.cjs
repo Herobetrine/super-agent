@@ -123,11 +123,63 @@ async function dispatch(store, ctx, cmd) {
   });
 }
 
+function progress(store, { job, signal }, json) {
+  store.tx(() => {
+    if (
+      signal.aborted ||
+      !store.live(job) ||
+      store.one(
+        "SELECT 1 FROM events WHERE ticket=? AND kind='user.follow' AND seq>? LIMIT 1",
+        job.ticket,
+        job.admission
+      )
+    )
+      return;
+    // Reject optional updates without quoting the malformed content or failing the agent's assignment.
+    const reject = (reason) => store.log(job, 'protocol.progress_invalid', { reason });
+    let cmd;
+    try {
+      cmd = JSON.parse(json);
+    } catch {
+      return reject('invalid_json');
+    }
+    if (
+      !P.isObj(cmd) ||
+      Object.keys(cmd).length !== 2 ||
+      !P.ident(cmd.id) ||
+      cmd.id.length > 96 ||
+      !P.validText(cmd.summary, 320) ||
+      /[\p{Cc}\p{Zl}\p{Zp}\u202a-\u202e\u2066-\u2069]/u.test(cmd.summary)
+    )
+      return reject('invalid_fields');
+    const logical = job.dispatch_turn || job.turn;
+    const old = store.one(
+      'SELECT e.payload FROM progress_receipts p JOIN events e ON e.seq=p.seq WHERE p.job=? AND p.source_turn=? AND p.msgkey=?',
+      job.id,
+      logical,
+      cmd.id
+    );
+    if (old) {
+      if (JSON.parse(old.payload).summary !== cmd.summary) return reject('conflicting_id');
+      return;
+    }
+    const seq = store.log(job, 'job.progress', { id: cmd.id, summary: cmd.summary });
+    store.run(
+      'INSERT INTO progress_receipts(job,source_turn,msgkey,seq) VALUES(?,?,?,?)',
+      job.id,
+      logical,
+      cmd.id,
+      seq
+    );
+  });
+}
+
 async function command(store, ctx, line) {
   if (ctx.signal.aborted) return;
   const sep = line.indexOf(' ');
   if (sep < 0) return;
   const tag = line.slice(0, sep);
+  if (tag === 'SA_PROGRESS') return progress(store, ctx, line.slice(sep + 1));
   if (!['SA_ROLE', 'SA_SEND', 'SA_NOTE', 'SA_TOOL'].includes(tag)) return;
   const cmd = JSON.parse(line.slice(sep + 1));
   if (tag === 'SA_SEND') return dispatch(store, ctx, cmd);

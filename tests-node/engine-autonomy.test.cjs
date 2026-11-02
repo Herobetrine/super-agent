@@ -85,7 +85,8 @@ test('new continuous goal must follow a real inspection; learning and review sur
     }
     assert.equal(p.autonomy.learning, 'remember exact bytes');
     if (p.autonomy.milestone === 1) {
-      if (premature++ === 0) return later;
+      if (premature++ === 0)
+        return cmd('SA_PROGRESS', { id: 'inspection', summary: '已检查项目。' }) + '\n' + later;
       prove(o);
       return later;
     }
@@ -106,6 +107,7 @@ test('new continuous goal must follow a real inspection; learning and review sur
     tid
   );
   assert.deepEqual({ ...counts }, { milestones: 2, exhausted: 1, discovered: 1 });
+  assert.equal(f.e.one("SELECT count(*) AS n FROM events WHERE ticket=? AND kind='job.progress'", tid).n, 1);
   assert.ok(premature >= 2 && missingProof >= 2);
 });
 
@@ -140,6 +142,7 @@ test('interrupted turn cannot replay a writer or a delivered mailbox receipt', a
   const text = '原样\r\n  ';
   let f;
   const send = cmd('SA_SEND', { id: 'once', to: 'claude', body: 'isolated', permission_profile: 'readonly' });
+  const progress = cmd('SA_PROGRESS', { id: 'start-check', summary: '开始核对记录。' });
   f = setup(t, async (p, o) => {
     if (p.depth) {
       childId = p.job;
@@ -151,11 +154,11 @@ test('interrupted turn cannot replay a writer or a delivered mailbox receipt', a
       return ended;
     }
     if (stopping) {
-      o.emit('delta', send + '\n');
+      o.emit('delta', progress + '\n' + send + '\n');
       await new Promise((r) => o.signal.addEventListener('abort', r, { once: true }));
       return 'interrupted';
     }
-    return send + '\n' + done;
+    return progress + '\n' + send + '\n' + done;
   });
   const id = await create(f, 'auto');
   f.e.start();
@@ -168,6 +171,7 @@ test('interrupted turn cannot replay a writer or a delivered mailbox receipt', a
   await wait(f, () => f.e.root(id).state === 'done');
   assert.equal(f.calls.filter((p) => p.depth).length, 1);
   assert.equal(f.e.all("SELECT seq FROM events WHERE kind='send'").length, 1);
+  assert.equal(f.e.all("SELECT seq FROM events WHERE kind='job.progress'").length, 1);
   assert.equal(f.e.notes(rootId).find((n) => n.seq === seq).body, text);
 });
 

@@ -14,15 +14,25 @@
     closeDialog,
     ask,
     textView,
+    cleanReply,
     compact,
     basename,
     stamp,
+    activityTime,
     agents,
     states,
     profiles
   } = StudioUI;
   const drafts = new Map(),
     recent = new Map();
+  const observeParam = new URLSearchParams(location.search).get('observe');
+  const observing = observeParam !== null;
+  const eventLabels = {
+    delta: '收到文本输出', reply: '收到回报', send: '分派任务', role: '记录分工',
+    'approval.request': '请求审批', 'approval.decision': '审批已处理',
+    'mcp.result': '收到 MCP 工具回执', failed: '任务失败', interrupted: '任务中断',
+    'auto.retry': '安排自动重试', 'auto.backoff': '等待重试', 'auto.milestone': '收到阶段回报'
+  };
   let current = null,
     snapshot = null,
     view = emptyView(),
@@ -37,7 +47,7 @@
     draftExtensions = null,
     target = null,
     attachments = [];
-  let sending = false,
+  let sending = false, stopping = false,
     fileRun = 0,
     fileTimer = 0,
     fileIndex = 0,
@@ -52,7 +62,9 @@
       streams: new Map(),
       request: null,
       goal: false,
-      rootReply: false
+      rootReply: false,
+      latestEvent: null,
+      progressGroup: null
     };
   }
   function ticket() {
@@ -105,6 +117,7 @@
     } else shell.classList.toggle('rail-off');
   }
   function newChat() {
+    closeModelMenu();
     if (current == null && !target) {
       $('editor').focus();
       return;
@@ -128,8 +141,10 @@
     renderHeader();
     renderHistory();
     $('editor').focus();
+    if (!observing) document.dispatchEvent(new CustomEvent('studio:ticket-changed', { detail: current }));
   }
   async function openChat(id, recordDraft = true) {
+    closeModelMenu();
     if (id === current) {
       $('shell').classList.remove('mobile-rail');
       return;
@@ -149,30 +164,20 @@
     renderHistory();
     await refresh();
     $('editor').focus();
+    if (id === current && !observing) document.dispatchEvent(new CustomEvent('studio:ticket-changed', { detail: current }));
   }
   function renderHistory() {
     const rows = [...recent.values()],
       box = $('history');
-    const key = JSON.stringify([current, rows.map((r) => [r.id, r.goal, r.cwd, r.state, r.created])]);
+    const key = JSON.stringify([current, $('history-search').value, rows.map((r) => [r.id, r.goal, r.cwd, r.state, r.created])]);
     if (key === historyKey) return;
     historyKey = key;
     const offset = box.scrollTop;
     box.replaceChildren();
-    let group = '';
     for (const r of rows) {
-      const date = new Date(Number(r.created) * 1000);
-      const today = new Date().toDateString();
-      const day = Number.isNaN(date.valueOf())
-        ? '会话'
-        : date.toDateString() === today
-          ? '今天'
-          : date.toLocaleDateString('zh-CN');
-      if (day !== group) {
-        box.append(el('div', 'history-group', day));
-        group = day;
-      }
       const b = el('button', r.id === current ? 'active' : '');
       b.type = 'button';
+      b.dataset.ticketId = r.id;
       if (r.id === current) b.setAttribute('aria-current', 'page');
       b.title = r.goal || '会话';
       b.append(
@@ -184,6 +189,7 @@
     }
     if (!rows.length)
       box.append(el('div', 'empty', $('history-search').value ? '没找到匹配的会话。' : '还没有会话。'));
+    if (!observing && typeof Workbench !== 'undefined') Workbench.organizeHistory(box, rows);
     box.scrollTop = offset;
   }
   async function history() {
@@ -195,14 +201,48 @@
     connected(true);
     renderHistory();
   }
+  function renderActivity(status) {
+    const live = $('live-activity');
+    live.hidden = !snapshot || !active(status);
+    if (live.hidden) return;
+    const leader = rootJob();
+    const running = new Map();
+    for (const job of snapshot.jobs) {
+      if (job.state !== 'running' || job.id === leader?.id) continue;
+      const name = agents[job.agent] || job.agent;
+      running.set(name, (running.get(name) || 0) + 1);
+    }
+    const parts = ['主控 ' + (agents[ticket().lead] || ticket().lead) + ' · ' + (states[status] || status)];
+    if (running.size) {
+      const peers = [...running].map(([name,count]) => name + (count > 1 ? ' ×' + count : ''));
+      const partial = snapshot.totalJobs > snapshot.jobs.length;
+      parts.push((partial ? '概览中执行的协作者 · ' : '执行中的协作者 · ') + peers.join('、'));
+    }
+    $('live-agents').textContent = parts.join('　/　');
+    const native = snapshot.nativeActivity?.latest;
+    const last = native && (!view.latestEvent || native.ts >= view.latestEvent.ts) ? native : view.latestEvent;
+    let detail = status === 'queued' ? '等待调度' : '等待首个执行事件';
+    if (last) {
+      const source = snapshot.jobs.find(j => j.id === last.job);
+      const agent = source?.agent || last.agent;
+      detail = ['最近活动', [agents[agent] || agent, last.job ? '#' + last.job : ''].filter(Boolean).join(' '),
+        last.turn ? '第 ' + last.turn + ' 轮' : '', compact(last.label, 160)].filter(Boolean).join(' · ');
+    }
+    $('live-detail').textContent = detail;
+    $('live-detail').title = detail;
+    $('live-time').textContent = last ? activityTime(last.ts) : '';
+  }
   function renderHeader() {
+    if (typeof Workbench !== 'undefined' && !observing) Workbench.update(snapshot, tab => StudioPanels.select(tab));
     const t = ticket(),
       name = t?.goal || recent.get(current)?.goal || '新对话';
     $('chat-title').textContent = compact(name, 120);
     $('chat-title').title = name;
     $('welcome').hidden = current !== null;
+    $('activity-history').hidden = !t;
     const status = state() || (current == null ? 'draft' : 'loading'),
       badge = $('state-badge');
+    renderActivity(status);
     badge.textContent = states[status] || { draft: '草稿', loading: '载入中' }[status] || status;
     badge.className = 'badge ' + (status === 'running' ? 'running' : status === 'failed' ? 'failed' : '');
     const approvals = snapshot?.approvals || [];
@@ -229,7 +269,31 @@
       $('auto-goal').title = t.objective || t.goal;
       $('auto-learning').textContent = '最近经验 · ' + (run?.learning || '暂无记录');
       $('auto-learning').title = run?.learning || '';
-      $('auto-stop').hidden = !active(status);
+    }
+  }
+  const defaultModels = new Map();
+  async function readDefaultModel(agent) {
+    if (observing) return;
+    let entry = defaultModels.get(agent);
+    if (!entry) {
+      entry = {};
+      defaultModels.set(agent, entry);
+    }
+    if (entry.pending || Date.now() < (entry.nextCheck || 0)) return;
+    entry.pending = true;
+    try {
+      const revision = await invoke('catalogRevision', { agent });
+      if (revision === entry.revision) return;
+      const catalog = await invoke('catalog', { agent });
+      entry.revision = revision;
+      entry.route = catalog?.default;
+    } catch {
+      delete entry.route;
+      delete entry.revision;
+    } finally {
+      entry.pending = false;
+      entry.nextCheck = Date.now() + 10000;
+      if ((ticket()?.lead || lead) === agent) renderComposer();
     }
   }
   function renderComposer() {
@@ -244,7 +308,7 @@
     picker.value = perm;
     picker.disabled = fixed || sending;
     picker.classList.toggle('risky', perm === 'auto' || perm === 'full');
-    $('permission-hint').textContent = fixed ? '已锁定 · 新建对话可更改' : '发送前可调整';
+    picker.title = fixed ? '权限已锁定 · 新建对话可更改' : '选择会话权限';
     const dir = cwd(),
       ap = t?.lead || lead;
     $('project-button').querySelector('span').textContent = dir ? basename(dir) : '选择项目';
@@ -252,10 +316,15 @@
     $('session-settings').querySelector('span').textContent = '主控 · ' + (agents[ap] || ap || '载入中');
     $('attach-button').disabled = fixed || !dir || sending;
     $('attach-button').title = fixed ? '项目文件可在新会话首条消息中附加' : '选择项目上下文文件';
-    const chosen = routeMap(t?.agent_routes || draftRoutes || defaults)[ap];
-    $('route-hint').textContent = chosen
-      ? (chosen.mode === 'cli' ? 'CLI' : '桌面端') + ' / ' + chosen.model
-      : '跟随本机适配器配置';
+    const chosen = rootJob()?.route || routeMap(t?.agent_routes || draftRoutes || defaults)[ap];
+    if (!chosen && !observing) void readDefaultModel(ap);
+    const displayRoute = chosen || defaultModels.get(ap)?.route;
+    const modelButton = $('model-button');
+    modelButton.querySelector('span').textContent = chosen?.model || (displayRoute?.model ? displayRoute.model + ' · 默认' : '跟随默认');
+    const modelName = [agents[ap] || ap, displayRoute?.provider, displayRoute?.model || '跟随本机默认模型'].filter(Boolean).join(' / ');
+    modelButton.title = '主控模型 · ' + modelName;
+    modelButton.setAttribute('aria-label', '选择主控模型 · ' + modelName);
+    modelButton.disabled = (fixed && !t) || sending;
     const to = $('recipient');
     to.hidden = !target;
     to.replaceChildren();
@@ -290,8 +359,25 @@
         : fixed
           ? '继续这次对话，或补充新的要求…'
           : '描述你的目标，或输入 @ 选择项目文件…';
-    $('send').querySelector('span').textContent = sending ? '发送中' : stopped ? '恢复并发送' : '发送';
-    $('send').disabled = sending || !$('editor').value.trim() || (fixed && !t);
+    const inFlight = fixed && active(state());
+    const hasDraft = Boolean($('editor').value.trim());
+    const submit = $('send'), action = inFlight ? 'stop' : 'send';
+    if (action !== submit.dataset.action) {
+      submit.dataset.action = action;
+      submit.replaceChildren(icon(inFlight ? 'stop' : 'up'));
+    }
+    const noteOnly = target && !active(target.state);
+    const caption = inFlight ? '停止工单' : stopped ? '恢复并发送' : '发送';
+    submit.title = caption;
+    submit.setAttribute('aria-label', caption);
+    submit.disabled = sending || stopping || (!inFlight && (!hasDraft || noteOnly || (fixed && !t)));
+    const append = $('append');
+    append.hidden = !inFlight || !hasDraft;
+    append.textContent = target ? '定向留言' : '追加';
+    append.title = target ? '向选中的任务发送留言' : '向主控追加指令';
+    append.disabled = sending || stopping || noteOnly;
+    $('submit-hint').textContent = noteOnly ? '任务已停止 · 留言草稿已保留' :
+      'Enter ' + (inFlight ? target ? '定向留言' : '追加指令' : '发送') + ' · Shift+Enter 换行';
   }
   function setTarget(job) {
     saveDraft();
@@ -299,24 +385,18 @@
     restoreDraft();
     $('editor').focus();
   }
-  const cleanReply = (s) =>
-    String(s || '')
-      .split('\n')
-      .filter((l) => !/^\s*SA_(SEND|ROLE|NOTE|TOOL|GOAL|NEXT|FINISH|LEARN|EXHAUSTED)(?:\s|$)/.test(l))
-      .join('\n')
-      .trim();
-  function card(key, type, label, body, ts, error = false) {
-    let node = view.entries.get(key);
-    if (!node) {
-      node = el('article');
-      view.entries.set(key, node);
-      $('feed').append(node);
-      if (view.entries.size > 120) {
-        const oldest = view.entries.keys().next().value;
-        view.entries.get(oldest).remove();
-        view.entries.delete(oldest);
-      }
+  function addEntry(key, node) {
+    view.entries.set(key, node);
+    $('feed').append(node);
+    if (view.entries.size > 120) {
+      const oldest = view.entries.keys().next().value;
+      view.entries.get(oldest).remove();
+      view.entries.delete(oldest);
     }
+    return node;
+  }
+  function card(key, type, label, body, ts, error = false) {
+    const node = view.entries.get(key) || addEntry(key, el('article'));
     node.className = 'entry ' + type + (error ? ' error' : '');
     node.replaceChildren();
     if (type === 'activity') {
@@ -346,7 +426,25 @@
         job = snapshot.jobs?.find((j) => j.id === e.job),
         label = agents[job?.agent] || job?.agent || '执行者';
       const key = 'event-' + e.seq;
+      if (eventLabels[e.kind] && e.job && e.turn && Number.isFinite(e.ts)) {
+        view.latestEvent = { job: e.job, turn: e.turn, label: eventLabels[e.kind], ts: e.ts };
+      }
       switch (e.kind) {
+        case 'activity': {
+          view.latestEvent = { job: e.job, turn: e.turn, label: StudioActivity.title(e), ts: e.ts, agent: e.agent || p.agent };
+          if (p.category === 'report') {
+            addEntry(key, StudioActivity.report(e, snapshot.jobs));
+            break;
+          }
+          let group = view.progressGroup;
+          if (!group || group.count >= 24 || group.element !== $('feed').lastElementChild) {
+            group = StudioActivity.group();
+            addEntry(key, group.element);
+            view.progressGroup = group;
+          }
+          group.add(e, snapshot.jobs);
+          break;
+        }
         case 'user':
         case 'user.follow':
           if (e.kind === 'user' && view.goal) break;
@@ -503,7 +601,10 @@
       if (view !== targetView || current !== id) return;
       snapshot = data;
       const recipient = target && data.jobs.find((j) => j.id === target.id);
-      if (recipient && !active(recipient.state)) setTarget(null);
+      if (recipient && !active(recipient.state)) {
+        if ($('editor').value.trim()) target = recipient;
+        else setTarget(null);
+      }
       ingest(data.events || []);
       targetView.cursor = Math.max(targetView.cursor, Number(data.cursor) || 0);
       renderHeader();
@@ -553,14 +654,18 @@
     renderComposer();
   }
   async function stop() {
-    if (!ticket()) return;
+    if (!ticket() || !active(state()) || stopping || sending) return;
     const id = current;
-    await invoke('cancel', { ticket: id });
-    if (id !== current) return;
-    if (target) setTarget(null);
-    await refresh();
-    notice('已停止此工单的后续调度。');
-    await history();
+    stopping = true;
+    renderComposer();
+    try {
+      await invoke('cancel', { ticket: id });
+      if (id !== current) return;
+      if (target) target = { ...target, state: 'cancelled' };
+      await refresh();
+      notice('已停止此工单的后续调度。');
+      await history();
+    } finally { stopping = false; renderComposer(); }
   }
   async function send() {
     const editor = $('editor'),
@@ -568,17 +673,7 @@
       id = current,
       v = view,
       job = target?.id;
-    if (sending || !body.trim() || (id !== null && !ticket())) return;
-    if (
-      ticket()?.permission_profile === 'auto' &&
-      !job &&
-      /^(停止|停止工单|停止自动运行|\/stop)[。！!]*$/.test(body.trim())
-    ) {
-      await stop();
-      editor.value = '';
-      renderComposer();
-      return;
-    }
+    if (sending || stopping || !body.trim() || (id !== null && !ticket()) || (target && !active(target.state))) return;
     const resume = ticket()?.permission_profile === 'auto' && state() === 'cancelled' && !job;
     if (
       resume &&
@@ -642,22 +737,83 @@
     ModelSettings.open({
       title: scope === 'global' ? '模型与执行端 · 新会话默认' : '本次会话的模型与执行端',
       routes: chosen,
+      initialAgent: ticket()?.lead || lead,
       locked: readOnly,
       onSave: async (selections) => {
         if (scope === 'global') {
           await invoke('saveDefaults', { selections });
           defaults = selections;
-        } else if (id === null) {
-          if (current !== null) throw Error('会话已改变，请重新打开设置。');
-          draftRoutes = selections;
-        } else {
-          await invoke('saveRoutes', { ticket: id, selections });
-          await refresh();
-        }
+        } else await saveSessionModels(id, selections);
         renderComposer();
         notice('模型与执行端设置已保存。');
       }
     });
+  }
+  async function saveSessionModels(id, selections) {
+    if (id !== current) throw Error('会话已改变，请重新打开模型选择。');
+    if (id === null) draftRoutes = selections;
+    else {
+      await invoke('saveRoutes', { ticket: id, selections });
+      await refresh();
+    }
+  }
+  let modelMenuRun = 0;
+  function closeModelMenu() {
+    ++modelMenuRun;
+    $('model-popover').hidden = true;
+    $('model-button').setAttribute('aria-expanded', 'false');
+  }
+  async function modelMenu() {
+    const menu = $('model-popover');
+    if (!menu.hidden) { closeModelMenu(); return; }
+    closeFiles();
+    const run = ++modelMenuRun, id = current, agent = ticket()?.lead || lead;
+    const routes = structuredClone(id === null ? draftRoutes ?? defaults : routeMap(ticket()?.agent_routes));
+    const pinned = routes[agent], bound = rootJob()?.route;
+    const locked = id !== null && (snapshot?.jobs || []).some(j => active(j.state) || j.state === 'interrupted');
+    menu.hidden = false;
+    $('model-button').setAttribute('aria-expanded','true');
+    const heading = el('strong','',agents[agent] + ' · 主控模型');
+    const status = el('div','small-note',locked ? '当前工单的模型已锁定。' : '正在读取模型…');
+    const list = el('div','model-choices');
+    const more = button('更多模型与执行端…',()=>{closeModelMenu();modelSettings('session');},'quiet');
+    menu.replaceChildren(heading,status,list,more);
+    more.focus();
+    async function choose(route) {
+      if (locked || run !== modelMenuRun) return;
+      for (const b of list.children) b.disabled = true;
+      if (route) routes[agent] = route; else delete routes[agent];
+      try {
+        await saveSessionModels(id,routes);
+        if (run !== modelMenuRun) return;
+        closeModelMenu();renderComposer();$('model-button').focus();
+      } catch (e) {
+        if (run === modelMenuRun) { status.textContent = e.message; for (const b of list.children) b.disabled = b.dataset.unavailable === 'true'; }
+      }
+    }
+    function option(label,route,selected,disabled=false) {
+      const b=button(label,()=>choose(route),'model-choice',selected?'check':null);
+      b.title=label;b.disabled=locked || disabled;b.dataset.unavailable=String(disabled);
+      b.setAttribute('aria-pressed',String(selected));list.append(b);
+    }
+    try {
+      const c=await invoke('catalog',{agent});
+      if (run !== modelMenuRun) return;
+      const route=bound || pinned || c.default || {};
+      const provider=c.providers?.find(p=>p.id===route.provider);
+      const mode=c.modes?.find(m=>m.id===route.mode);
+      status.textContent=[provider?.label || route.provider, locked?'执行中或已中断，当前配置只读':''].filter(Boolean).join(' · ');
+      option('跟随默认',null,!pinned && !bound);
+      for (const m of provider?.models || []) {
+        option(m.label || m.id,{mode:route.mode,provider:route.provider,model:m.id},
+          m.id===route.model && !!(pinned || bound),
+          !mode || mode.available===false || provider.available===false || m.available===false ||
+          (mode.providers && !mode.providers.includes(route.provider)));
+      }
+      if (route.model && !provider?.models?.some(m=>m.id===route.model))
+        option(route.model+' · 当前不可用',null,true,true);
+      (list.querySelector('[aria-pressed=true]:enabled') || list.querySelector('button:enabled') || more).focus();
+    } catch (e) { if (run===modelMenuRun) status.textContent=e.message; }
   }
   function extensionSettings(scope) {
     const fixed = scope !== 'global' && current !== null;
@@ -860,7 +1016,6 @@
     command('本次会话的模型与执行端', () => modelSettings('session'), 'layers');
     command('本次会话的 MCP 与技能', () => extensionSettings('draft'), 'layers');
     command('导出完整事件记录…', exportTicket, 'download', !ticket());
-    command('停止工单', stop, 'stop', !active(state()));
     d.foot.append(button('关闭', closeDialog, 'quiet'));
   }
   function commandItems() {
@@ -888,8 +1043,7 @@
       ['查看协作任务', () => StudioPanels.select('tasks'), 'chat', ''],
       ['打开项目计划', () => StudioPanels.select('plan'), 'plan', ''],
       ['查看 Git 变更', () => StudioPanels.select('diff'), 'git', ''],
-      ...(ticket() ? [['导出完整记录', exportTicket, 'download', '']] : []),
-      ...(active(state()) ? [['停止当前工单', stop, 'stop', '']] : [])
+      ...(ticket() ? [['导出完整记录', exportTicket, 'download', '']] : [])
     ];
   }
   function execute(i) {
@@ -922,18 +1076,19 @@
     $('command-search').focus();
   }
   function bind(id, fn) {
+    if (observing && id !== 'activity-history') return;
     $(id).addEventListener('click', () => Promise.resolve().then(fn).catch(report));
   }
   for (const [id, title] of Object.entries(profiles)) opt($('profile'), id, title);
   $('profile').onchange = () => void changeProfile().catch(report);
   $('editor').oninput = observeMention;
   $('editor').onkeydown = (e) => {
-    if (e.isComposing) return;
+    if (observing || e.isComposing) return;
     if (fileKeys(e)) {
       e.preventDefault();
       return;
     }
-    if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+    if (e.key === 'Enter' && !e.shiftKey && !e.altKey && e.keyCode !== 229) {
       e.preventDefault();
       void send().catch(report);
     }
@@ -943,6 +1098,7 @@
     if (!e.isComposing && fileKeys(e)) e.preventDefault();
   };
   document.addEventListener('pointerdown', (e) => {
+    if (!$('model-popover').hidden && !$('model-popover').contains(e.target) && !$('model-button').contains(e.target)) closeModelMenu();
     if (
       !$('file-popover').hidden &&
       !$('file-popover').contains(e.target) &&
@@ -969,8 +1125,11 @@
     }
   };
   window.addEventListener('keydown', (e) => {
-    if (e.isComposing) return;
+    if (observing || e.isComposing) return;
     if ($('dialog').open || $('palette').open) return;
+    if (!$('model-popover').hidden && e.key === 'Escape') {
+      closeModelMenu();$('model-button').focus();return;
+    }
     if (e.ctrlKey || e.metaKey) {
       const key = e.key.toLowerCase();
       if (key === 'k') {
@@ -1017,14 +1176,23 @@
     closeFiles();
     $('editor').focus();
   });
-  bind('send', send);
+  $('model-button').setAttribute('aria-haspopup','dialog');
+  $('model-button').setAttribute('aria-expanded','false');
+  bind('model-button', modelMenu);
+  bind('append', send);
+  bind('send', () => active(state()) ? stop() : send());
   bind('more', more);
-  bind('auto-stop', stop);
+  bind('activity-history', () => StudioActivity.history(current, snapshot?.jobs || []));
   bind('approval-shortcut', StudioPanels.showApprovals);
   bind('command-button', palette);
   bind('palette-close', () => $('palette').close());
-  StudioPanels.init({ snapshot: () => snapshot, ticket, cwd, refresh, target: setTarget });
-  async function boot() {
+  StudioPanels.init({ snapshot: () => snapshot, ticket, cwd, refresh, target: setTarget, observing });
+  document.addEventListener('studio:navigate-ticket', e => {
+    if (observing) return;
+    if (e.detail === null) newChat();
+    else if (Number.isSafeInteger(e.detail) && e.detail > 0) void openChat(e.detail).catch(report);
+  });
+  async function bootEditor() {
     renderHeader();
     renderComposer();
     $('editor').focus();
@@ -1037,6 +1205,21 @@
       defaults = routeMap(results[1].value);
       renderComposer();
     } else report(results[1].reason);
+  }
+  async function boot() {
+    if (observing) {
+      document.body.classList.add('observing');
+      $('observer-label').hidden = false;
+      $('welcome').hidden = true;
+      const id = Number(observeParam);
+      if (!Number.isSafeInteger(id) || id < 1) throw Error('观察工单编号无效。');
+      document.title = 'Super Agent · 工单 #' + id + ' 实时进展';
+      try { await openChat(id, false); } catch (e) { report(e); }
+      StudioPanels.select('tasks');
+    } else {
+      if (typeof Workbench !== 'undefined') Workbench.init();
+      await bootEditor();
+    }
     let ticking = false,
       ticks = 0;
     setInterval(async () => {
@@ -1044,7 +1227,7 @@
       ticking = true;
       try {
         await refresh();
-        if (++ticks % 5 === 0) await history();
+        if (!observing && ++ticks % 5 === 0) await history();
       } catch (e) {
         connected(false);
         notice('读取工作台失败：' + String(e.message || e), true);

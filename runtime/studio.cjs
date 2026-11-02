@@ -9,6 +9,7 @@ const os = require('node:os');
 const { once } = require('node:events');
 const { finished } = require('node:stream/promises');
 const { which } = require('./adapters/common.cjs');
+const { ProgressJournal } = require('./progress.cjs');
 
 const AGENTS = ['codex', 'claude', 'deepseek', 'antigravity'];
 const VISIBLE = [
@@ -110,10 +111,11 @@ function git(cwd, args) {
 }
 
 class Studio {
-  constructor(engine, native, adapters, dataDir) {
+  constructor(engine, native, adapters, dataDir, {readOnly=false}={}) {
     Object.assign(this, { engine, native, adapters, dataDir, db: engine.db });
     this.roots = new Set();
-    this.db.exec(`CREATE TABLE IF NOT EXISTS studio_plan(id INTEGER PRIMARY KEY,
+    this.progress=new ProgressJournal(this.db);
+    if(!readOnly)this.db.exec(`CREATE TABLE IF NOT EXISTS studio_plan(id INTEGER PRIMARY KEY,
       ticket INTEGER NOT NULL REFERENCES tickets,body TEXT NOT NULL,done INTEGER NOT NULL DEFAULT 0);
       CREATE INDEX IF NOT EXISTS studio_plan_ticket ON studio_plan(ticket,id)`);
   }
@@ -148,9 +150,20 @@ class Studio {
     const jobs = rows.slice(0, 80).map(jobView);
     return { jobs, more: rows.length > 80, next: jobs.at(-1)?.id ?? null };
   }
-  snapshot({ ticket, after = 0 }) {
+  async activityPage({ticket,before}) {
+    id(ticket);
+    const high=before==null?Number.MAX_SAFE_INTEGER:id(before)-1;
+    const end=this.db.prepare('SELECT coalesce(max(seq),0) n FROM events WHERE ticket=? AND seq<=?').get(ticket,high).n;
+    await this.progress.ensure(ticket,end);
+    const page=this.progress.read(ticket,0,end,true,81);
+    const events=page.slice(0,80);
+    return {events,more:page.length>80,next:events.at(-1)?.seq??null};
+  }
+  async snapshot({ ticket, after = 0 }) {
     id(ticket);
     expect(Number.isSafeInteger(after) && after >= 0, '事件游标无效');
+    const end = this.db.prepare('SELECT coalesce(max(seq),0) n FROM events WHERE ticket=?').get(ticket).n;
+    const native=await this.progress.ensure(ticket,end);
     const t = this.db
       .prepare(
         `SELECT t.id,t.goal,t.objective,t.cwd,t.lead,t.created,t.permission_profile,
@@ -159,7 +172,8 @@ class Studio {
       .get(ticket);
     expect(t, '工单不存在');
     t.agent_routes = JSON.parse(t.agent_routes);
-    const totalJobs = this.db.prepare('SELECT count(*) n FROM jobs WHERE ticket=?').get(ticket).n;
+    const {totalJobs,runningPeers}=this.db.prepare(`SELECT count(*) totalJobs,
+      count(*) FILTER (WHERE parent IS NOT NULL AND state='running') runningPeers FROM jobs WHERE ticket=?`).get(ticket);
     const jobs = this.db
       .prepare(
         JOB_DETAILS +
@@ -168,7 +182,6 @@ class Studio {
       )
       .all(ticket)
       .map(jobView);
-    const end = this.db.prepare('SELECT coalesce(max(seq),0) n FROM events WHERE ticket=?').get(ticket).n;
     const kinds = VISIBLE.map(() => '?').join(',');
     // Work only on visible events. Project reply text before crossing IPC.
     const rows = this.db
@@ -183,8 +196,17 @@ class Studio {
       ORDER BY seq ${after ? 'ASC' : 'DESC'} LIMIT 180`
       )
       .all(ticket, after, end, ...VISIBLE);
-    if (!after) rows.reverse();
-    const cursor = after && rows.length === 180 ? rows.at(-1).seq : end;
+    const extra=this.progress.read(ticket,after,end,!after,180,VISIBLE);
+    const merged=[...rows.map(r=>({...r,payload:JSON.parse(r.payload)})),...extra].sort((a,b)=>a.seq-b.seq);
+    const visible=after?merged.slice(0,180):merged.slice(-180);
+    const cursor = after && visible.length === 180 ? visible.at(-1).seq : end;
+    const owners=new Map(jobs.map(j=>[j.id,j]));
+    const tasks=native.tasks.map(task=>{
+      if(task.state!=='running')return task;
+      if(!owners.has(task.job))owners.set(task.job,this.db.prepare('SELECT state,turn FROM jobs WHERE id=? AND ticket=?').get(task.job,ticket));
+      const owner=owners.get(task.job);
+      return owner?.state==='running'&&owner.turn===task.turn?task:{...task,state:'unknown'};
+    });
     const approvals = this.db
       .prepare("SELECT id,job,action FROM approvals WHERE ticket=? AND decision='pending' ORDER BY id")
       .all(ticket);
@@ -192,7 +214,9 @@ class Studio {
       ticket: t,
       jobs,
       totalJobs,
-      events: rows.map((r) => ({ ...r, payload: JSON.parse(r.payload) })),
+      runningPeers,
+      nativeActivity:{tasks,latest:native.latest},
+      events: visible,
       cursor,
       approvals: approvals.map((r) => ({ ...r, action: JSON.parse(r.action) })),
       run:
@@ -335,14 +359,19 @@ class Studio {
   planAdd({ ticket, body }) {
     text(body, 2000);
     expect(body.trim(), '计划项不能为空');
-    this.db.prepare('INSERT INTO studio_plan(ticket,body) VALUES(?,?)').run(id(ticket), body.trim());
+    this.engine.tx(()=>{
+      const job=this.engine.root(id(ticket));
+      const row=this.db.prepare('INSERT INTO studio_plan(ticket,body) VALUES(?,?)').run(ticket,body.trim());
+      this.engine.log(job,'plan.add',{id:Number(row.lastInsertRowid)});
+    });
   }
   planToggle({ ticket, id: row }) {
-    expect(
-      this.db.prepare('UPDATE studio_plan SET done=1-done WHERE ticket=? AND id=?').run(id(ticket), id(row))
-        .changes,
-      '计划项不存在'
-    );
+    this.engine.tx(()=>{
+      const job=this.engine.root(id(ticket));
+      const item=this.db.prepare('UPDATE studio_plan SET done=1-done WHERE ticket=? AND id=? RETURNING done').get(ticket,id(row));
+      expect(item,'计划项不存在');
+      this.engine.log(job,item.done?'plan.done':'plan.reopen',{id:row});
+    });
   }
   async exportTo({ ticket, filename }) {
     id(ticket);

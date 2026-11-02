@@ -350,6 +350,7 @@ class Extensions {
       result = await withClient({ ...s, args: JSON.parse(s.args) }, signal, (client) => {
         signal.throwIfAborted();
         check(current() && binding(), '指令或服务授权已改变');
+        this.engine.log(jobRow,'mcp.started',{id,server,tool});
         issued = true;
         return client.callTool({ name: tool, arguments: args }, undefined, { signal, timeout: 60000 });
       });

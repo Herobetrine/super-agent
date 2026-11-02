@@ -23,7 +23,7 @@ test('ticket preview and collaboration pages preserve every task address', async
     );
     for (let n = 0; n < 207; n++) insert.run(ticket, root.id, 'check ' + n);
   });
-  const view = store.snapshot({ ticket });
+  const view = await store.snapshot({ ticket });
   assert.equal(view.totalJobs, 208);
   assert.ok(view.jobs.length < view.totalJobs);
   const ids = new Set();

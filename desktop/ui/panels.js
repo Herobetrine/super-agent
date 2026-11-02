@@ -13,7 +13,8 @@ const StudioPanels = (() => {
     agents,
     states,
     profiles,
-    compact
+    compact,
+    activityTime
   } = StudioUI;
   let app,
     tab = 'tasks',
@@ -115,6 +116,30 @@ const StudioPanels = (() => {
     nav.append(controls);
     return nav;
   }
+  function nativeTasks(tasks) {
+    const section = el('section', 'native-tasks');
+    section.setAttribute('aria-label', 'Claude 内部任务');
+    section.append(el('h3', 'task-section-title', 'Claude 内部任务'));
+    if (!tasks.length) {
+      section.append(el('p', 'small-note', '尚未收到内部任务事件。'));
+      return section;
+    }
+    const names = {running: '执行中', done: '已完成', completed: '已完成', failed: '失败', stopped: '已停止', unknown: '状态未知'};
+    for (const task of tasks) {
+      const row = el('article', 'native-task');
+      row.append(el('strong', '', compact(task.label || '内部任务', 120)),
+        el('span', 'tag ' + (task.state === 'failed' ? 'failed' : ''), names[task.state] || names.unknown));
+      if(task.title)row.append(el('div','',task.title));
+      const meta = ['平台任务 #' + task.job, '第 ' + task.turn + ' 轮'];
+      if (task.id) meta.push('内部任务 ' + compact(task.id, 48));
+      if (Number.isSafeInteger(task.toolUses) && task.toolUses >= 0) meta.push('已用工具 ' + task.toolUses + ' 次');
+      if (task.lastTool) meta.push('最近工具 ' + compact(task.lastTool, 80));
+      if (activityTime(task.ts)) meta.push(activityTime(task.ts));
+      row.append(el('div', 'small-note', meta.join(' · ')));
+      section.append(row);
+    }
+    return section;
+  }
   async function loadDiff() {
     const path = app.cwd();
     if (!path) {
@@ -154,7 +179,7 @@ const StudioPanels = (() => {
     const jobs = page ? page.jobs.map((job) => fresh.get(job.id) || job) : preview;
     const key =
       tab === 'tasks'
-        ? JSON.stringify([tab, ticket?.id, total, jobs, approvals])
+        ? JSON.stringify([tab, ticket?.id, total, jobs, approvals, snap?.nativeActivity?.tasks])
         : tab === 'plan'
           ? JSON.stringify([tab, ticket?.id, plan])
           : JSON.stringify([tab, app.cwd(), diffBusy, diffText]);
@@ -244,8 +269,12 @@ const StudioPanels = (() => {
       };
       box.append(form);
     } else {
-      if (approvals.length)
+      if (approvals.length && !app.observing)
         box.append(button('处理待审批请求 · ' + approvals.length, showApprovals, 'danger compact', 'shield'));
+      const native = snap?.nativeActivity?.tasks || [];
+      if (native.length || ticket.lead === 'claude' || preview.some(j => j.agent === 'claude'))
+        box.append(nativeTasks(native));
+      box.append(el('h3', 'task-section-title', '平台工单任务'));
       box.append(taskNavigation(total, jobs.length));
       if (!jobs.length) box.append(el('p', 'empty', '正在等候首个任务。'));
       for (const job of jobs) {
@@ -297,11 +326,11 @@ const StudioPanels = (() => {
               el('p', 'small-note', '模型 · ' + [r.provider, r.model, r.mode].filter(Boolean).join(' / '))
             );
         }
-        if (job.result) card.append(el('p', '', String(job.result).slice(0, 1600)));
+        if (job.result) card.append(el('p', '', StudioUI.cleanReply(job.result).slice(0, 1600)));
         const actions = el('div', 'head-actions');
-        if (['running', 'queued', 'waiting'].includes(job.state))
+        if (!app.observing && ['running', 'queued', 'waiting'].includes(job.state))
           actions.append(button('定向留言', () => app.target(job), 'quiet', 'chat'));
-        if (['failed', 'interrupted'].includes(job.state) && ticket.state !== 'cancelled') {
+        if (!app.observing && ['failed', 'interrupted'].includes(job.state) && ticket.state !== 'cancelled') {
           actions.append(
             button(
               '重试',

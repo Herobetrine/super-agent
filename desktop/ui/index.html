@@ -10,14 +10,20 @@
     <title>Super Agent · 项目工作台</title>
     <link rel="icon" href="mark.svg" />
     <link rel="stylesheet" href="studio.css" />
+    <link rel="stylesheet" href="workbench.css" />
+    <link rel="stylesheet" href="frame.css" />
     <script defer src="common.js"></script>
     <script defer src="models.js"></script>
     <script defer src="extensions.js"></script>
+    <script defer src="activity.js"></script>
     <script defer src="panels.js"></script>
+    <script defer src="frame.js"></script>
+    <script defer src="workbench.js"></script>
     <script defer src="studio.js"></script>
   </head>
   <body>
     <div class="shell" id="shell">
+      <nav id="app-nav" aria-label="工作台导航"></nav>
       <aside class="rail" aria-label="会话侧栏">
         <div class="brand">
           <img src="mark.svg" alt="" />
@@ -33,7 +39,6 @@
         <div class="rail-bottom">
           <button id="open-extensions"><i data-icon="layers"></i>MCP 与技能</button>
           <button id="open-models"><i data-icon="sliders"></i>模型与执行端</button>
-          <button id="command-button"><i data-icon="command"></i>命令面板<kbd>Ctrl K</kbd></button>
           <div class="connection">
             <span id="connection-dot"></span><span id="connection">正在连接调度器</span>
           </div>
@@ -50,10 +55,12 @@
             <i data-icon="panel"></i>
           </button>
           <div class="breadcrumb"><span>工作台</span><b>／</b><strong id="chat-title">新对话</strong></div>
+          <span id="observer-label" class="badge" hidden>实时进展 · 只读</span>
           <span id="state-badge" class="badge">草稿</span>
           <button class="tool-button" id="approval-shortcut" hidden>
             <i data-icon="shield"></i><span id="approval-count"></span>
           </button>
+          <button class="tool-button" id="activity-history" hidden><i data-icon="activity"></i>进展记录</button>
           <button class="tool-button" id="toggle-inspector" aria-expanded="false">
             <i data-icon="layout"></i>项目面板
           </button>
@@ -63,14 +70,20 @@
         </header>
         <section id="auto-strip" class="auto-strip" aria-label="自动运行状态" hidden>
           <div class="auto-top">
-            <strong id="auto-phase"></strong
-            ><button id="auto-stop" class="danger compact"><i data-icon="stop"></i>停止自动运行</button>
+            <strong id="auto-phase"></strong>
           </div>
           <div id="auto-goal"></div>
           <div id="auto-learning" class="muted"></div>
         </section>
         <div class="workspace">
           <section class="conversation" aria-label="对话">
+            <section id="live-activity" class="live-activity" aria-label="执行动态" hidden>
+              <div class="live-status">
+                <i data-icon="activity"></i><strong id="live-agents"></strong>
+                <time id="live-time"></time>
+              </div>
+              <div id="live-detail" class="live-detail"></div>
+            </section>
             <div id="scroll" class="scroll">
               <div class="welcome" id="welcome">
                 <div class="hero-art" aria-hidden="true">
@@ -111,25 +124,16 @@
                   placeholder="描述你的目标，或输入 @ 选择项目文件…"
                   spellcheck="false"
                 ></textarea>
-                <div class="permission-row">
-                  <label for="profile">权限</label
-                  ><select id="profile" aria-label="会话权限"></select
-                  ><span id="permission-hint">发送前可调整</span>
-                </div>
                 <div class="compose-tools">
-                  <button id="project-button" class="chip">
-                    <i data-icon="folder"></i><span>选择项目</span></button
-                  ><button id="session-settings" class="chip">
-                    <i data-icon="sliders"></i><span>主控 · DeepSeek</span></button
-                  ><button
-                    id="attach-button"
-                    class="icon-button"
-                    title="选择上下文文件"
-                    aria-label="选择上下文文件"
-                  >
-                    <i data-icon="attach"></i></button
-                  ><button id="send" class="primary" disabled><i data-icon="up"></i><span>发送</span></button>
+                  <button id="command-button" class="icon-button" title="命令面板 (Ctrl+K)" aria-label="命令面板"><i data-icon="plus"></i></button>
+                  <div class="permission-row">
+                    <i data-icon="shield"></i><select id="profile" aria-label="会话权限"></select>
+                  </div>
+                  <button id="append" class="quiet" hidden>追加</button>
+                  <button id="model-button" class="chip" title="选择主控模型"><span>跟随默认</span><i data-icon="chevron"></i></button>
+                  <button id="send" class="primary" aria-label="发送" title="发送" disabled><i data-icon="up"></i></button>
                 </div>
+                <div id="model-popover" class="file-popover model-popover" role="dialog" aria-label="选择主控模型" hidden></div>
                 <div id="file-popover" class="file-popover" role="dialog" aria-label="选择上下文文件" hidden>
                   <div class="popover-head">
                     <strong>项目文件</strong
@@ -142,8 +146,10 @@
                 </div>
               </div>
               <div class="compose-foot">
-                <span id="route-hint">跟随本机适配器配置</span
-                ><span><kbd>Ctrl</kbd> + <kbd>Enter</kbd> 发送</span>
+                <button id="project-button" class="chip"><i data-icon="folder"></i><span>选择项目</span></button>
+                <button id="session-settings" class="chip"><span>主控</span></button>
+                <button id="attach-button" class="icon-button" title="选择上下文文件" aria-label="选择上下文文件"><i data-icon="attach"></i></button>
+                <span id="submit-hint">Enter 发送 · Shift+Enter 换行</span>
               </div>
             </section>
           </section>

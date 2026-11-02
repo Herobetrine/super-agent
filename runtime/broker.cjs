@@ -15,6 +15,7 @@ let engine,
 const studioOps = new Set([
   'history',
   'snapshot',
+  'activityPage',
   'jobsPage',
   'defaults',
   'saveDefaults',

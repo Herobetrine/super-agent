@@ -9,13 +9,13 @@ const ModelSettings = (() => {
     select.value = id || '';
     if (select.selectedIndex < 0) select.selectedIndex = 0;
   }
-  function open({ title, routes = {}, locked = false, onSave }) {
+  function open({ title, routes = {}, locked = false, initialAgent = 'deepseek', onSave }) {
     const chosen = structuredClone(routes),
       catalogs = {},
       statuses = {},
       revisions = {},
       pending = new Set();
-    let agent = 'deepseek',
+    let agent = initialAgent,
       refreshTimer = null,
       saveBusy = false;
     const d = dialog(title, () => clearInterval(refreshTimer));

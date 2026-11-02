@@ -4,6 +4,8 @@ const allowed = new Set([
   'chooseProject',
   'history',
   'snapshot',
+  'windowMenu',
+  'activityPage',
   'jobsPage',
   'defaults',
   'saveDefaults',

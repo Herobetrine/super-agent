@@ -25,6 +25,7 @@ const StudioUI = (() => {
     auto: '自动模式 · 高危'
   };
   const icons = {
+    chevron: 'm7 10 5 5 5-5',
     plus: 'M12 5v14M5 12h14',
     search: 'M20 20l-5-5M17 10a7 7 0 1 1-14 0 7 7 0 0 1 14 0',
     sliders: 'M3 6h8m4 0h6M11 3v6M3 17h4m4 0h10M7 14v6',
@@ -241,7 +242,18 @@ const StudioUI = (() => {
       ? ''
       : date.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false });
   };
+  const cleanReply = (s) => String(s || '').split('\n')
+    .filter(l => !/^\s*SA_(SEND|ROLE|NOTE|TOOL|PROGRESS|GOAL|NEXT|FINISH|LEARN|EXHAUSTED)(?:\s|$)/.test(l))
+    .join('\n').trim();
+  function activityTime(ts) {
+    if (!Number.isFinite(ts) || ts <= 0) return '';
+    const date = new Date(ts * 1000);
+    const day = date.toDateString() === new Date().toDateString() ? '' : date.toLocaleDateString('zh-CN') + ' ';
+    return day + date.toLocaleTimeString('zh-CN', { hour12: false });
+  }
   return {
+    cleanReply,
+    activityTime,
     $,
     el,
     icon,

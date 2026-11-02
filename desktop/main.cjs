@@ -4,8 +4,12 @@ const { fork } = require('node:child_process');
 const path = require('node:path');
 const { pathToFileURL } = require('node:url');
 const { once } = require('node:events');
+const { windowMenu }=require('./window-menu.cjs');
 const page = path.join(__dirname, 'ui', 'index.html');
-const origin = pathToFileURL(page).href;
+const observeArg=process.argv.find(a=>a.startsWith('--observe='));
+const observed=observeArg?Number(observeArg.slice('--observe='.length)):null;
+if(observeArg && (!Number.isSafeInteger(observed)||observed<1))throw Error('无效的观察工单');
+const origin = pathToFileURL(page).href+(observed?'?observe='+observed:'');
 let win,
   child,
   seq = 0,
@@ -21,6 +25,7 @@ ready.catch(() => {});
 const methods = new Set([
   'history',
   'snapshot',
+  'activityPage',
   'jobsPage',
   'defaults',
   'saveDefaults',
@@ -63,7 +68,7 @@ const hosts = new Set([
 ]);
 
 function startBroker() {
-  child = fork(path.join(__dirname, '../runtime/broker.cjs'), [], {
+  child = fork(path.join(__dirname, observed?'../runtime/observer.cjs':'../runtime/broker.cjs'), observed?[String(observed)]:[], {
     env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' },
     stdio: ['ignore', 'ignore', 'inherit', 'ipc'],
     windowsHide: true
@@ -131,7 +136,8 @@ function show() {
     height: 880,
     minWidth: 760,
     minHeight: 570,
-    backgroundColor: '#15191e',
+    backgroundColor: '#ffffff',
+    ...(process.platform==='win32'?{titleBarStyle:'hidden',titleBarOverlay:{height:35,color:'#edf2f7',symbolColor:'#363b42'}}:{}),
     icon: path.join(__dirname, '../assets/super-agent.ico'),
     show: false,
     webPreferences: {
@@ -149,10 +155,11 @@ function show() {
   win.on('closed', () => {
     win = null;
   });
-  return win.loadFile(page);
+  return win.loadFile(page,observed?{query:{observe:String(observed)}}:undefined);
 }
 if (process.env.SUPERAGENT_ELECTRON_PROFILE)
   app.setPath('userData', path.resolve(process.env.SUPERAGENT_ELECTRON_PROFILE));
+if(observed) app.setPath('userData',path.join(app.getPath('userData'),'observers',String(observed)));
 if (!app.requestSingleInstanceLock()) {
   app.quit();
 } else {
@@ -172,6 +179,12 @@ if (!app.requestSingleInstanceLock()) {
         )
           throw new Error('拒绝来自其他页面的请求');
         if (p === null || typeof p !== 'object' || Array.isArray(p)) throw new Error('参数格式无效');
+        if(method==='windowMenu')return windowMenu(win,p,!!observed);
+        if(observed){
+          if(!['history','defaults','snapshot','activityPage','jobsPage'].includes(method))
+            throw new Error('实时进展窗口为只读');
+          return call(method,p);
+        }
         if (method === 'importSkill') {
           const result = await dialog.showOpenDialog(win, {
             title: '选择含有 SKILL.md 的技能文件夹',

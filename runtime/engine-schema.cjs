@@ -27,6 +27,9 @@ CREATE TABLE IF NOT EXISTS mailbox(
   source INTEGER REFERENCES jobs,source_turn INTEGER,msgkey TEXT,consumed_turn INTEGER,
   UNIQUE(source,source_turn,msgkey));
 CREATE INDEX IF NOT EXISTS mailbox_target ON mailbox(target,consumed_turn,seq);
+CREATE TABLE IF NOT EXISTS progress_receipts(
+  job INTEGER NOT NULL REFERENCES jobs,source_turn INTEGER NOT NULL,msgkey TEXT NOT NULL,
+  seq INTEGER NOT NULL REFERENCES events,PRIMARY KEY(job,source_turn,msgkey)) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS route_defaults(singleton INTEGER PRIMARY KEY CHECK(singleton=1), routes TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS native_routes(job INTEGER PRIMARY KEY REFERENCES jobs,route TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS approvals(

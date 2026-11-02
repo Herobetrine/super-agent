@@ -273,7 +273,7 @@ class Engine extends Journal {
       ctx.controller.abort();
     }, this.timeoutMs);
     const submit = (line, streaming) => {
-      if (!/^SA_(SEND|NOTE|ROLE|TOOL) /.test(line)) return;
+      if (!/^SA_(SEND|NOTE|ROLE|TOOL|PROGRESS) /.test(line)) return;
       if (streaming && line.startsWith('SA_TOOL ')) return; // external effects require the authoritative final reply
       queue = queue.then(async () => {
         if (fatal || signal.aborted) return;
