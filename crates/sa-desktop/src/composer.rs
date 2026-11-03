@@ -197,9 +197,18 @@ impl App {
         let Some(host) = &self.host else { return };
         let outcomes: Vec<_> = host.rx.try_iter().collect();
         let catalogs: Vec<_> = host.catalogs.try_iter().collect();
-        if let Some(d) = self.models.as_mut() {
-            for c in catalogs {
+        let probes: Vec<_> = host.probes.try_iter().collect();
+        for c in catalogs {
+            if let Some(d) = self.models.as_mut() {
+                d.answer(&c.agent, c.result.clone());
+            }
+            if let Some(d) = self.providers.as_mut() {
                 d.answer(&c.agent, c.result);
+            }
+        }
+        if let Some(d) = self.providers.as_mut() {
+            for p in probes {
+                d.probed(p);
             }
         }
         if outcomes.is_empty() {
@@ -241,6 +250,7 @@ impl App {
                 (ActionKind::Follow, Ok(_)) => {}
                 (ActionKind::Routes, r) => self.routes_saved(r.map(|_| ())),
                 (ActionKind::Knowledge, r) => self.knowledge_saved(r.map(|_| ())),
+                (ActionKind::Providers, r) => self.providers_saved(r.map(|_| ())),
                 (_, Err(e)) => self.composer.message = Some((e, true)),
             }
         }

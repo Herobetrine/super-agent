@@ -16,6 +16,7 @@ mod labels;
 mod markdown;
 mod models;
 mod ops;
+mod providers;
 mod sidebar;
 mod theme;
 #[cfg(test)]

@@ -14,7 +14,11 @@ use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use sa_engine::adapter::{AGENTS, Adapter};
 use std::collections::HashMap;
-use std::sync::{Arc, mpsc};
+use sa_adapters::Registry;
+use sa_engine::adapter::Route;
+use sa_engine::runner::RotationSource;
+use sa_store::providers::{self, CustomProvider, Rotation};
+use std::sync::{Arc, RwLock, mpsc};
 use std::thread::JoinHandle;
 
 /// One operator action. Mirrors the broker's `engineOps` and the studio
@@ -79,6 +83,16 @@ pub enum Action {
         id: i64,
         archived: bool,
     },
+    /// Add or update an operator-managed provider (empty id adds).
+    ProviderSave {
+        provider: CustomProvider,
+    },
+    ProviderRemove {
+        id: String,
+    },
+    RotationSave {
+        rotation: Rotation,
+    },
 }
 
 impl Action {
@@ -93,6 +107,9 @@ impl Action {
             Action::PlanAdd { .. } | Action::PlanToggle { .. } => ActionKind::Plan,
             Action::SaveDefaults { .. } | Action::SaveRoutes { .. } => ActionKind::Routes,
             Action::KnowledgeAdd { .. } | Action::KnowledgeArchive { .. } => ActionKind::Knowledge,
+            Action::ProviderSave { .. } | Action::ProviderRemove { .. } | Action::RotationSave { .. } => {
+                ActionKind::Providers
+            }
         }
     }
 }
@@ -108,6 +125,7 @@ pub enum ActionKind {
     Plan,
     Routes,
     Knowledge,
+    Providers,
 }
 
 /// Result of one action; `value` is the new ticket id for `Create`.
@@ -126,6 +144,56 @@ pub struct CatalogReply {
 
 type Notify = Arc<dyn Fn() + Send + Sync>;
 
+/// Rotation candidates from the operator's saved order (empty when off).
+/// The host refreshes the cache after every provider or rotation edit.
+pub struct DbRotation(pub Arc<RwLock<Rotation>>);
+
+impl RotationSource for DbRotation {
+    fn candidates(&self, agent: &str) -> Vec<Route> {
+        let r = self.0.read().unwrap_or_else(|p| p.into_inner());
+        if !r.enabled {
+            return vec![];
+        }
+        r.order
+            .get(agent)
+            .into_iter()
+            .flatten()
+            .map(|x| Route {
+                provider: x.provider.clone(),
+                model: x.model.clone(),
+                mode: x.mode.clone(),
+            })
+            .collect()
+    }
+}
+
+/// Provider registry and rotation shared by the adapters, the engine and the UI.
+#[derive(Clone)]
+pub struct Shared {
+    pub registry: Registry,
+    pub rotation: Arc<RwLock<Rotation>>,
+}
+
+impl Shared {
+    fn new() -> Self {
+        Self {
+            registry: sa_adapters::registry(vec![]),
+            rotation: Arc::default(),
+        }
+    }
+
+    /// Reload both caches from the journal.
+    fn reload(&self, engine: &Engine) -> Result<()> {
+        let (list, rotation) = engine.db().with(|q| {
+            providers::ensure_schema(q.conn())?;
+            Ok((providers::list(q.conn())?, providers::rotation(q.conn())?))
+        })?;
+        *self.registry.write().unwrap_or_else(|p| p.into_inner()) = list;
+        *self.rotation.write().unwrap_or_else(|p| p.into_inner()) = rotation;
+        Ok(())
+    }
+}
+
 pub struct Host {
     tx: Option<tokio::sync::mpsc::UnboundedSender<Action>>,
     pub rx: mpsc::Receiver<Outcome>,
@@ -135,6 +203,10 @@ pub struct Host {
     adapters: Arc<HashMap<String, Arc<dyn Adapter>>>,
     catalog_tx: mpsc::Sender<CatalogReply>,
     pub catalogs: mpsc::Receiver<CatalogReply>,
+    probe_tx: mpsc::Sender<Result<Vec<String>, String>>,
+    /// Answers of [`Host::probe_models`].
+    pub probes: mpsc::Receiver<Result<Vec<String>, String>>,
+    shared: Shared,
     notify: Notify,
 }
 
@@ -142,15 +214,17 @@ impl Host {
     /// Claim `dir`, open the journal and start scheduling. `notify` is called
     /// after every outcome (the UI repaints).
     pub fn start(dir: PathBuf, notify: impl Fn() + Send + Sync + 'static) -> Result<Self> {
-        Self::start_with(dir, || sa_adapters::all(Sys::from_process()), notify)
+        Self::start_with(dir, |shared| sa_adapters::all_with(Sys::from_process(), shared.registry.clone()), notify)
     }
 
     /// [`start`](Self::start) with explicit harness adapters (tests).
     pub fn start_with(
         dir: PathBuf,
-        adapters: impl FnOnce() -> Vec<Arc<dyn Adapter>> + Send + 'static,
+        adapters: impl FnOnce(&Shared) -> Vec<Arc<dyn Adapter>> + Send + 'static,
         notify: impl Fn() + Send + Sync + 'static,
     ) -> Result<Self> {
+        let shared = Shared::new();
+        let for_thread = shared.clone();
         type Ready = (Engine, tokio::runtime::Handle, Vec<Arc<dyn Adapter>>);
         let notify: Notify = Arc::new(notify);
         let wake = notify.clone();
@@ -180,8 +254,8 @@ impl Host {
                             return;
                         }
                     };
-                    let adapters = adapters();
-                    let engine = match open_engine(&dir, adapters.clone()) {
+                    let adapters = adapters(&for_thread);
+                    let engine = match open_engine(&dir, adapters.clone(), &for_thread) {
                         Ok(e) => e,
                         Err(e) => {
                             let _ = ready_tx.send(Err(format!("{e:#}")));
@@ -194,7 +268,7 @@ impl Host {
                         let kind = action.kind();
                         // Create awaits attachment snapshots; run every action in
                         // order so the UI sees outcomes in submission order.
-                        let result = execute(&engine, action).await.map_err(|e| format!("{e:#}"));
+                        let result = execute(&engine, &for_thread, action).await.map_err(|e| format!("{e:#}"));
                         let _ = out_tx.send(Outcome { kind, result });
                         wake();
                     }
@@ -207,7 +281,11 @@ impl Host {
         match ready_rx.recv() {
             Ok(Ok((engine, runtime, adapters))) => {
                 let (catalog_tx, catalogs) = mpsc::channel();
+                let (probe_tx, probes) = mpsc::channel();
                 Ok(Self {
+                    probe_tx,
+                    probes,
+                    shared,
                     tx: Some(tx),
                     rx: out_rx,
                     engine,
@@ -252,6 +330,30 @@ impl Host {
         });
     }
 
+    /// Fetch the model list of an unsaved provider (`/v1/models`).
+    pub fn probe_models(&self, provider: CustomProvider) {
+        if self.tx.is_none() {
+            return;
+        }
+        let (tx, notify) = (self.probe_tx.clone(), self.notify.clone());
+        self.runtime.spawn(async move {
+            let cancel = tokio_util::sync::CancellationToken::new();
+            let r = sa_adapters::probe_models(&provider, &Sys::from_process(), &cancel)
+                .await
+                .map_err(|e| format!("{e:#}"));
+            let _ = tx.send(r);
+            notify();
+        });
+    }
+
+    pub fn providers(&self) -> Vec<CustomProvider> {
+        self.shared.registry.read().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    pub fn rotation(&self) -> Rotation {
+        self.shared.rotation.read().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
     /// Saved routes for new conversations (`route_defaults`).
     pub fn defaults(&self) -> Value {
         self.engine
@@ -292,11 +394,17 @@ impl Drop for Host {
     }
 }
 
-fn open_engine(dir: &Path, adapters: Vec<Arc<dyn Adapter>>) -> Result<Engine> {
-    let engine = Engine::open(dir, adapters, EngineOptions::default())?;
+fn open_engine(dir: &Path, adapters: Vec<Arc<dyn Adapter>>, shared: &Shared) -> Result<Engine> {
+    let opts = EngineOptions {
+        rotation: Arc::new(DbRotation(shared.rotation.clone())),
+        ..Default::default()
+    };
+    let engine = Engine::open(dir, adapters, opts)?;
     engine
         .db()
         .with(|q| Ok(q.conn().execute_batch(sa_store::STUDIO_PLAN)?))?;
+    // Providers and rotation must be loaded before the first admission.
+    shared.reload(&engine)?;
     engine.start()?;
     Ok(engine)
 }
@@ -341,7 +449,7 @@ async fn create(
     engine.create(params).await
 }
 
-async fn execute(engine: &Engine, action: Action) -> Result<Option<i64>> {
+async fn execute(engine: &Engine, shared: &Shared, action: Action) -> Result<Option<i64>> {
     match action {
         Action::Create {
             goal,
@@ -416,6 +524,21 @@ async fn execute(engine: &Engine, action: Action) -> Result<Option<i64>> {
         }
         Action::KnowledgeArchive { id, archived } => {
             engine.archive_knowledge(id, archived)?;
+            Ok(None)
+        }
+        Action::ProviderSave { provider } => {
+            engine.db().with(|q| providers::save(q.conn(), &provider))?;
+            shared.reload(engine)?;
+            Ok(None)
+        }
+        Action::ProviderRemove { id } => {
+            engine.db().with(|q| providers::remove(q.conn(), &id))?;
+            shared.reload(engine)?;
+            Ok(None)
+        }
+        Action::RotationSave { rotation } => {
+            engine.db().with(|q| providers::save_rotation(q.conn(), &rotation))?;
+            shared.reload(engine)?;
             Ok(None)
         }
     }
@@ -558,7 +681,7 @@ pub(crate) mod tests {
         }
     }
 
-    pub(crate) fn fakes() -> Vec<Arc<dyn Adapter>> {
+    pub(crate) fn fakes(_: &Shared) -> Vec<Arc<dyn Adapter>> {
         sa_engine::adapter::AGENTS
             .iter()
             .map(|a| Arc::new(Echo(a)) as Arc<dyn Adapter>)
@@ -640,7 +763,7 @@ pub(crate) mod tests {
             }
             out
         };
-        let adapters = move || {
+        let adapters = move |_: &Shared| {
             AGENTS
                 .iter()
                 .map(|a| Arc::new(Permissive(a, routes.clone())) as Arc<dyn Adapter>)

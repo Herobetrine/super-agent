@@ -1,11 +1,11 @@
 //! Command line: `super-agent [--data <dir>] [--ticket <id>] [--demo] [--observe] [--schedule] [--dark]
-//! [--inspector [tab]] [--dialog models] [--screenshot <out.png> [--size WxH]]`.
+//! [--inspector [tab]] [--dialog models|providers|rotation] [--screenshot <out.png> [--size WxH]]`.
 
 use anyhow::{Context, Result, bail};
 use std::path::PathBuf;
 
 pub const USAGE: &str = "用法: super-agent [--data <目录>] [--ticket <编号>] [--demo] [--observe] [--schedule] [--dark] \
-[--inspector [collab|native|plan|approvals|diff]] [--dialog models] [--at-top] [--expand-all] [--screenshot <输出.png> [--size 宽x高]]";
+[--inspector [collab|native|plan|approvals|diff]] [--dialog models|providers|rotation] [--at-top] [--expand-all] [--screenshot <输出.png> [--size 宽x高]]";
 
 #[derive(Clone, Debug, Default)]
 pub struct Options {
@@ -63,7 +63,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Options> {
             "--at-top" => o.at_top = true,
             "--expand-all" => o.expand_all = true,
             "--dialog" => match value("--dialog")?.as_str() {
-                "models" => o.dialog = Some("models".into()),
+                d @ ("models" | "providers" | "rotation") => o.dialog = Some(d.into()),
                 other => bail!("未知对话框：{other}"),
             },
             "--screenshot" => o.screenshot = Some(PathBuf::from(value("--screenshot")?)),

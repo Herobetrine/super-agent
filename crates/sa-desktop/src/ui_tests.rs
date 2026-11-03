@@ -281,6 +281,87 @@ fn knowledge_tab_lists_adds_and_archives_project_entries() {
 }
 
 #[test]
+fn providers_dialog_saves_custom_providers_and_rotation() {
+    use sa_engine::runner::RotationSource;
+    let data = tempfile::tempdir().unwrap();
+    let mut h = harness(data.path(), "readonly");
+    h.run_steps(4);
+    h.get_by_label("供应商与轮换").click();
+    h.run_steps(2);
+    h.get_by_label("添加供应商").click();
+    h.run_steps(2);
+    for (role, label, text) in [
+        (Role::TextInput, "名称", "公司网关"),
+        (Role::TextInput, "接口地址", "https://gateway.example.com/v1"),
+        (Role::TextInput, "密钥环境变量", "SA_TEST_GATEWAY_KEY"),
+        (Role::TextInput, "模型", "model-a"),
+    ] {
+        let f = h.get_by_role_and_label(role, label);
+        f.focus();
+        f.type_text(text);
+        h.run_steps(1);
+    }
+    h.get_by_label("保存供应商").click();
+    until(&mut h, "provider saved", |a| {
+        a.host.as_ref().unwrap().providers().len() == 1 && a.providers.as_ref().is_some_and(|d| d.form.is_none())
+    });
+    let p = h.state().host.as_ref().unwrap().providers().remove(0);
+    assert_eq!((p.agent.as_str(), p.name.as_str(), p.key_env.as_str()), ("claude", "公司网关", "SA_TEST_GATEWAY_KEY"));
+    assert_eq!(p.models, vec!["model-a".to_string()]);
+    // Nothing secret is stored: only the variable name.
+    let stored: String = rusqlite::Connection::open(data.path().join(sa_store::DB_FILE))
+        .unwrap()
+        .query_row("SELECT group_concat(base_url||key_env||models) FROM studio_providers", [], |r| r.get(0))
+        .unwrap();
+    assert!(stored.contains("SA_TEST_GATEWAY_KEY"));
+
+    // Rotation: enable and order two routes for Claude, then save.
+    h.run_steps(3);
+    assert!(h.state().providers.is_some(), "dialog closed");
+    h.get_by_label("轮换").click();
+    h.run_steps(2);
+    h.get_by_label("启用供应商轮换").click();
+    h.run_steps(1);
+    let first = sa_store::providers::RouteRef {
+        provider: p.route_id(),
+        model: "model-a".into(),
+        mode: "cli".into(),
+    };
+    let second = sa_store::providers::RouteRef {
+        provider: "test-local".into(),
+        model: "default".into(),
+        mode: "cli".into(),
+    };
+    h.state_mut()
+        .providers
+        .as_mut()
+        .unwrap()
+        .rotation
+        .order
+        .insert("claude".into(), vec![first.clone(), second]);
+    h.run_steps(2);
+    h.get_by_label("保存轮换设置").click();
+    until(&mut h, "rotation saved", |a| a.host.as_ref().unwrap().rotation().enabled);
+    let rot = h.state().host.as_ref().unwrap().rotation();
+    assert_eq!(rot.order["claude"].len(), 2);
+    let source = crate::host::DbRotation(std::sync::Arc::new(std::sync::RwLock::new(rot)));
+    assert_eq!(source.candidates("claude")[0].provider, first.provider);
+    assert!(source.candidates("codex").is_empty());
+
+    // Removing the provider also drops it from the rotation order.
+    h.run_steps(3);
+    h.get_by_label("自定义供应商").click();
+    h.run_steps(3);
+    assert!(
+        h.state().providers.as_ref().is_some_and(|d| d.page == crate::providers::Page::Providers),
+        "dialog closed or page unchanged"
+    );
+    h.get_by_label("删除供应商 公司网关").click();
+    until(&mut h, "provider removed", |a| a.host.as_ref().unwrap().providers().is_empty());
+    assert_eq!(h.state().host.as_ref().unwrap().rotation().order["claude"].len(), 1);
+}
+
+#[test]
 fn second_window_on_an_owned_journal_is_a_read_only_observer() {
     let data = tempfile::tempdir().unwrap();
     let _owner = sa_engine::owner::claim(data.path()).unwrap();

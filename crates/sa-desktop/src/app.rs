@@ -125,6 +125,7 @@ pub struct App {
     pub diff: DiffState,
     pub export: Option<Pending<PathBuf>>,
     pub knowledge: crate::knowledge::KnowledgeState,
+    pub providers: Option<crate::providers::ProvidersDialog>,
 }
 
 /// Git changes of one project (inspector "变更" tab).
@@ -198,6 +199,7 @@ impl App {
             diff: DiffState::default(),
             export: None,
             knowledge: Default::default(),
+            providers: None,
             host_error: host.as_ref().err().cloned(),
             host: host.ok(),
             worker,
@@ -207,8 +209,16 @@ impl App {
             app.select(Some(t));
             app.auto_selected = true;
         }
-        if app.opts.dialog.as_deref() == Some("models") {
-            app.open_models(crate::models::Scope::Defaults);
+        match app.opts.dialog.as_deref() {
+            Some("models") => app.open_models(crate::models::Scope::Defaults),
+            Some("providers") => app.open_providers(),
+            Some("rotation") => {
+                app.open_providers();
+                if let Some(d) = app.providers.as_mut() {
+                    d.page = crate::providers::Page::Rotation;
+                }
+            }
+            _ => {}
         }
         app
     }
@@ -537,6 +547,7 @@ impl eframe::App for App {
             .show(ctx, |ui| self.conversation(ui));
         self.confirm_dialog(ctx);
         self.models_dialog(ctx);
+        self.providers_dialog(ctx);
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
@@ -698,6 +709,14 @@ impl App {
                     .clicked()
             {
                 self.open_models(crate::models::Scope::Defaults);
+            }
+            if self.writable() {
+                let r = widgets::icon_button(ui, icon::PLUGS, 38.0, pal.rail_ink, hover, false)
+                    .on_hover_text("供应商与轮换");
+                r.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "供应商与轮换"));
+                if r.clicked() {
+                    self.open_providers();
+                }
             }
         });
         ui.with_layout(egui::Layout::bottom_up(egui::Align::Center), |ui| {

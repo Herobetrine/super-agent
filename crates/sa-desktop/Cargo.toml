@@ -17,6 +17,7 @@ sa-store = { path = "../sa-store" }
 sa-engine = { path = "../sa-engine" }
 sa-adapters = { path = "../sa-adapters" }
 tokio.workspace = true
+tokio-util.workspace = true
 tempfile.workspace = true
 rusqlite.workspace = true
 sha2.workspace = true
@@ -29,5 +30,4 @@ pulldown-cmark = { version = "0.13", default-features = false }
 chrono = { version = "0.4.41", default-features = false, features = ["clock"] }
 
 [dev-dependencies]
-tokio-util.workspace = true
 egui_kittest = { version = "0.33.3", features = ["eframe"] }
