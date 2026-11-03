@@ -52,6 +52,9 @@ pub struct Composer {
     /// Explicit routes for the next new conversation; `None` follows
     /// `route_defaults`.
     pub routes: Option<serde_json::Value>,
+    /// MCP/skill grants for the next new conversation; `None` follows the
+    /// global defaults.
+    pub extensions: Option<serde_json::Value>,
     /// Body of the last submitted create/follow/note (cleared on success).
     last_body: Option<String>,
     last_plan: Option<String>,
@@ -72,6 +75,7 @@ impl Composer {
             confirm: None,
             plan_draft: String::new(),
             routes: None,
+            extensions: None,
             last_body: None,
             last_plan: None,
             focus: false,
@@ -270,6 +274,7 @@ impl App {
                 profile: self.composer.profile.clone(),
                 files: self.composer.attachments.clone(),
                 selections: self.composer.routes.clone(),
+                extensions: self.composer.extensions.clone(),
             },
             Some(ticket) => match &self.composer.target {
                 Some(_) if !cur.target_active => return,
@@ -371,6 +376,7 @@ impl App {
         let mut pick_project = false;
         let mut pick_files = false;
         let mut models = None;
+        let mut exts = None;
         Frame::new()
             .fill(pal.surface_alt)
             .stroke(Stroke::new(1.0_f32, pal.line))
@@ -466,6 +472,13 @@ impl App {
                             {
                                 models = Some(crate::models::Scope::Ticket(t));
                             }
+                            if let Some(t) = cur.ticket
+                                && widgets::icon_button(ui, icon::PUZZLE_PIECE, 26.0, pal.mute, pal.hover, false)
+                                    .on_hover_text("本次会话的 MCP 与技能")
+                                    .clicked()
+                            {
+                                exts = Some(crate::extensions::ExtScope::Ticket(t));
+                            }
                         }
                     } else {
                         let folder = self
@@ -522,6 +535,12 @@ impl App {
                             .clicked()
                         {
                             models = Some(crate::models::Scope::Draft);
+                        }
+                        if widgets::icon_button(ui, icon::PUZZLE_PIECE, 30.0, pal.mute, pal.hover, self.composer.extensions.is_some())
+                            .on_hover_text("本次新会话的 MCP 与技能")
+                            .clicked()
+                        {
+                            exts = Some(crate::extensions::ExtScope::Draft);
                         }
                         if next != self.composer.profile {
                             if matches!(next.as_str(), "full" | "auto") {
@@ -586,6 +605,9 @@ impl App {
         }
         if let Some(scope) = models {
             self.open_models(scope);
+        }
+        if let Some(scope) = exts {
+            self.open_extensions(scope);
         }
         if stop && let Some(ticket) = cur.ticket {
             self.submit(Action::Cancel { ticket });

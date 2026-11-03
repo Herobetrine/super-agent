@@ -34,6 +34,8 @@ pub enum Action {
         files: Vec<String>,
         /// Per-agent routes; `None` follows `route_defaults`.
         selections: Option<Value>,
+        /// `{skills, servers}` ids; `None` follows the extension defaults.
+        extensions: Option<Value>,
     },
     Follow {
         ticket: i64,
@@ -207,6 +209,7 @@ pub struct Host {
     /// Answers of [`Host::probe_models`].
     pub probes: mpsc::Receiver<Result<Vec<String>, String>>,
     shared: Shared,
+    ext: sa_ext::ProjectExtensions,
     notify: Notify,
 }
 
@@ -225,7 +228,7 @@ impl Host {
     ) -> Result<Self> {
         let shared = Shared::new();
         let for_thread = shared.clone();
-        type Ready = (Engine, tokio::runtime::Handle, Vec<Arc<dyn Adapter>>);
+        type Ready = (Engine, tokio::runtime::Handle, Vec<Arc<dyn Adapter>>, sa_ext::ProjectExtensions);
         let notify: Notify = Arc::new(notify);
         let wake = notify.clone();
         let (ready_tx, ready_rx) = mpsc::channel::<Result<Ready, String>>();
@@ -255,7 +258,14 @@ impl Host {
                         }
                     };
                     let adapters = adapters(&for_thread);
-                    let engine = match open_engine(&dir, adapters.clone(), &for_thread) {
+                    let ext = match sa_ext::ProjectExtensions::open(&dir) {
+                        Ok(x) => x,
+                        Err(e) => {
+                            let _ = ready_tx.send(Err(format!("MCP 与技能服务无法打开：{e:#}")));
+                            return;
+                        }
+                    };
+                    let engine = match open_engine(&dir, adapters.clone(), &for_thread, &ext) {
                         Ok(e) => e,
                         Err(e) => {
                             let _ = ready_tx.send(Err(format!("{e:#}")));
@@ -263,7 +273,7 @@ impl Host {
                         }
                     };
                     let handle = tokio::runtime::Handle::current();
-                    let _ = ready_tx.send(Ok((engine.clone(), handle, adapters)));
+                    let _ = ready_tx.send(Ok((engine.clone(), handle, adapters, ext.clone())));
                     while let Some(action) = rx.recv().await {
                         let kind = action.kind();
                         // Create awaits attachment snapshots; run every action in
@@ -273,19 +283,21 @@ impl Host {
                         wake();
                     }
                     engine.close().await;
+                    ext.close();
                     // `_owner` drops here: the lock is released after the
                     // journal is closed.
                 });
             })
             .context("无法启动调度线程")?;
         match ready_rx.recv() {
-            Ok(Ok((engine, runtime, adapters))) => {
+            Ok(Ok((engine, runtime, adapters, ext))) => {
                 let (catalog_tx, catalogs) = mpsc::channel();
                 let (probe_tx, probes) = mpsc::channel();
                 Ok(Self {
                     probe_tx,
                     probes,
                     shared,
+                    ext,
                     tx: Some(tx),
                     rx: out_rx,
                     engine,
@@ -346,6 +358,15 @@ impl Host {
         });
     }
 
+    /// The MCP and skill service (management calls run off the UI thread).
+    pub fn ext(&self) -> sa_ext::ProjectExtensions {
+        self.ext.clone()
+    }
+
+    pub fn runtime(&self) -> tokio::runtime::Handle {
+        self.runtime.clone()
+    }
+
     pub fn providers(&self) -> Vec<CustomProvider> {
         self.shared.registry.read().unwrap_or_else(|p| p.into_inner()).clone()
     }
@@ -394,9 +415,15 @@ impl Drop for Host {
     }
 }
 
-fn open_engine(dir: &Path, adapters: Vec<Arc<dyn Adapter>>, shared: &Shared) -> Result<Engine> {
+fn open_engine(
+    dir: &Path,
+    adapters: Vec<Arc<dyn Adapter>>,
+    shared: &Shared,
+    ext: &sa_ext::ProjectExtensions,
+) -> Result<Engine> {
     let opts = EngineOptions {
         rotation: Arc::new(DbRotation(shared.rotation.clone())),
+        extensions: Some(Arc::new(ext.clone())),
         ..Default::default()
     };
     let engine = Engine::open(dir, adapters, opts)?;
@@ -410,15 +437,19 @@ fn open_engine(dir: &Path, adapters: Vec<Arc<dyn Adapter>>, shared: &Shared) -> 
 }
 
 /// `Studio.create` checks (ST:299-317) before `Engine::create`.
-async fn create(
-    engine: &Engine,
-    goal: String,
-    cwd: Option<PathBuf>,
-    lead: String,
-    profile: String,
-    files: Vec<String>,
-    selections: Option<Value>,
-) -> Result<i64> {
+async fn create(engine: &Engine, action: Action) -> Result<i64> {
+    let Action::Create {
+        goal,
+        cwd,
+        lead,
+        profile,
+        files,
+        selections,
+        extensions,
+    } = action
+    else {
+        bail!("不是新建操作");
+    };
     if goal.trim().is_empty() {
         bail!("请输入目标");
     }
@@ -446,19 +477,13 @@ async fn create(
     let mut params = CreateParams::new(goal, cwd).lead(&lead).profile(&profile);
     params.files = files;
     params.selections = selections.map(parse_routes).transpose()?;
+    params.extensions = extensions;
     engine.create(params).await
 }
 
 async fn execute(engine: &Engine, shared: &Shared, action: Action) -> Result<Option<i64>> {
     match action {
-        Action::Create {
-            goal,
-            cwd,
-            lead,
-            profile,
-            files,
-            selections,
-        } => Ok(Some(create(engine, goal, cwd, lead, profile, files, selections).await?)),
+        a @ Action::Create { .. } => Ok(Some(create(engine, a).await?)),
         Action::Follow { ticket, body, resume } => {
             engine.follow(ticket, &body, resume)?;
             Ok(None)
@@ -884,6 +909,7 @@ pub(crate) mod tests {
             profile: "readonly".into(),
             files,
             selections: None,
+            extensions: None,
         }));
         let o = outcome(&host);
         assert_eq!(o.kind, ActionKind::Create);
@@ -928,6 +954,7 @@ pub(crate) mod tests {
             profile: "readonly".into(),
             files: vec![],
             selections: None,
+            extensions: None,
         });
         assert_eq!(outcome(&host).result.unwrap_err(), "请输入目标");
 

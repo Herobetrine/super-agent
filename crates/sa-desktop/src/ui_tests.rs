@@ -361,6 +361,102 @@ fn providers_dialog_saves_custom_providers_and_rotation() {
     assert_eq!(h.state().host.as_ref().unwrap().rotation().order["claude"].len(), 1);
 }
 
+/// The `sa-ext` fixture MCP server next to this test binary (built by
+/// `cargo build --workspace`), if present.
+fn fixture_mcp() -> Option<std::path::PathBuf> {
+    let deps = std::env::current_exe().ok()?.parent()?.to_path_buf();
+    let exe = deps.parent()?.join(format!("sa-ext-fixture-mcp{}", std::env::consts::EXE_SUFFIX));
+    exe.is_file().then_some(exe)
+}
+
+#[test]
+fn extensions_dialog_grants_skills_and_probed_mcp_servers() {
+    let data = tempfile::tempdir().unwrap();
+    let skill = tempfile::tempdir().unwrap();
+    std::fs::write(
+        skill.path().join("SKILL.md"),
+        "---\nname: sa-ui-test-skill\ndescription: 界面测试技能\n---\n# 说明\n",
+    )
+    .unwrap();
+    let mut h = harness(data.path(), "readonly");
+    h.run_steps(4);
+    let skill_id = h.state().host.as_ref().unwrap().ext().import_skill(skill.path()).unwrap();
+
+    h.get_by_label("MCP 与技能").click();
+    let loaded = |a: &App| a.extensions.as_ref().is_some_and(|d| matches!(d.data, Some(Ok(_))));
+    until(&mut h, "extension list", loaded);
+    h.run_steps(3);
+    // The machine's own skills are listed too: filter down to the test skill.
+    let search = h.get_by_role_and_label(Role::TextInput, "搜索技能或来源");
+    search.focus();
+    search.type_text("sa-ui-test");
+    h.run_steps(3);
+    h.get_by_label("选择 sa-ui-test-skill").click();
+    h.run_steps(2);
+
+    let fixture = fixture_mcp();
+    if let Some(exe) = &fixture {
+        let secret = data.path().join("mcp-secret");
+        std::fs::write(&secret, "s3cret").unwrap();
+        h.get_by_label("MCP 服务 0").click();
+        h.run_steps(3);
+        h.get_by_label("添加服务").click();
+        h.run_steps(3);
+        let args = serde_json::to_string(&[secret.display().to_string()]).unwrap();
+        for (label, text) in [("服务名称", "proof"), ("可执行程序", &*exe.display().to_string()), ("启动参数", &*args)] {
+            if label == "启动参数"
+                && let Some(crate::extensions::View::Edit(f)) = h.state_mut().extensions.as_mut().map(|d| &mut d.view)
+            {
+                // Replace the initial "[]".
+                f.args.clear();
+            }
+            h.run_steps(1);
+            let f = h.get_by_role_and_label(Role::TextInput, label);
+            f.focus();
+            f.type_text(text);
+            h.run_steps(1);
+        }
+        h.get_by_label("启用服务，允许将它授予会话").click();
+        h.run_steps(1);
+        h.get_by_label("我信任上述程序或服务来源").click();
+        h.run_steps(1);
+        h.get_by_label("保存服务").click();
+        until(&mut h, "server saved", |a| {
+            a.extensions.as_ref().is_some_and(|d| {
+                matches!(d.view, crate::extensions::View::List)
+                    && d.data.as_ref().and_then(|r| r.as_ref().ok()).is_some_and(|v| v["servers"].as_array().is_some_and(|s| s.len() == 1))
+            })
+        });
+        h.run_steps(3);
+        h.get_by_label("探测 proof").click();
+        h.run_steps(3);
+        h.get_by_label("连接并读取工具").click();
+        until(&mut h, "probe", |a| {
+            a.extensions.as_ref().is_some_and(|d| matches!(&d.view, crate::extensions::View::Probe { result: Some(_), .. }))
+        });
+        if let Some(crate::extensions::View::Probe { result: Some(r), .. }) = h.state().extensions.as_ref().map(|d| &d.view) {
+            let tools = r.as_ref().expect("probe ok");
+            assert!(tools.as_array().unwrap().iter().any(|t| t["name"] == "challenge"), "{tools}");
+        }
+        h.run_steps(2);
+        h.get_by_label("返回列表").click();
+        until(&mut h, "list after probe", |a| {
+            loaded(a) && a.extensions.as_ref().is_some_and(|d| matches!(d.view, crate::extensions::View::List))
+        });
+        h.run_steps(3);
+        h.get_by_label("选择 proof").click();
+        h.run_steps(2);
+    } else {
+        eprintln!("sa-ext-fixture-mcp not built; MCP part skipped (run `cargo build --workspace` first)");
+    }
+
+    h.get_by_label("保存授权").click();
+    until(&mut h, "defaults saved", |a| a.extensions.is_none());
+    let defaults = h.state().host.as_ref().unwrap().ext().defaults().unwrap();
+    assert_eq!(defaults["skills"], serde_json::json!([skill_id]), "{defaults}");
+    assert_eq!(defaults["servers"].as_array().unwrap().len(), usize::from(fixture.is_some()), "{defaults}");
+}
+
 #[test]
 fn second_window_on_an_owned_journal_is_a_read_only_observer() {
     let data = tempfile::tempdir().unwrap();

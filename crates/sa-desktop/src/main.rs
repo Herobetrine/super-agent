@@ -8,6 +8,7 @@ mod composer;
 mod conversation;
 mod data;
 mod demo;
+mod extensions;
 mod feed;
 mod host;
 mod inspector;

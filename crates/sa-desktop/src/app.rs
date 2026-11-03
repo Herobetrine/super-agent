@@ -126,6 +126,9 @@ pub struct App {
     pub export: Option<Pending<PathBuf>>,
     pub knowledge: crate::knowledge::KnowledgeState,
     pub providers: Option<crate::providers::ProvidersDialog>,
+    pub extensions: Option<crate::extensions::ExtDialog>,
+    /// For background work started outside `update`.
+    pub ctx: egui::Context,
 }
 
 /// Git changes of one project (inspector "变更" tab).
@@ -200,6 +203,8 @@ impl App {
             export: None,
             knowledge: Default::default(),
             providers: None,
+            extensions: None,
+            ctx: cc.egui_ctx.clone(),
             host_error: host.as_ref().err().cloned(),
             host: host.ok(),
             worker,
@@ -212,6 +217,7 @@ impl App {
         match app.opts.dialog.as_deref() {
             Some("models") => app.open_models(crate::models::Scope::Defaults),
             Some("providers") => app.open_providers(),
+            Some("extensions") => app.open_extensions(crate::extensions::ExtScope::Defaults),
             Some("rotation") => {
                 app.open_providers();
                 if let Some(d) = app.providers.as_mut() {
@@ -470,6 +476,7 @@ impl eframe::App for App {
         self.poll_host();
         self.poll_ops();
         self.poll_knowledge();
+        self.poll_extensions();
         self.drain();
         if self.applied_dark != Some(self.dark) {
             self.pal = Palette::of(self.dark);
@@ -548,6 +555,7 @@ impl eframe::App for App {
         self.confirm_dialog(ctx);
         self.models_dialog(ctx);
         self.providers_dialog(ctx);
+        self.extensions_dialog(ctx);
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
@@ -711,6 +719,12 @@ impl App {
                 self.open_models(crate::models::Scope::Defaults);
             }
             if self.writable() {
+                let r = widgets::icon_button(ui, icon::PUZZLE_PIECE, 38.0, pal.rail_ink, hover, false)
+                    .on_hover_text("MCP 与技能 · 新会话默认");
+                r.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "MCP 与技能"));
+                if r.clicked() {
+                    self.open_extensions(crate::extensions::ExtScope::Defaults);
+                }
                 let r = widgets::icon_button(ui, icon::PLUGS, 38.0, pal.rail_ink, hover, false)
                     .on_hover_text("供应商与轮换");
                 r.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "供应商与轮换"));

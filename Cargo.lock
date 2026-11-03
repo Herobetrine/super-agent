@@ -2967,12 +2967,14 @@ dependencies = [
  "rusqlite",
  "sa-adapters",
  "sa-engine",
+ "sa-ext",
  "sa-store",
  "serde_json",
  "sha2",
  "tempfile",
  "tokio",
  "tokio-util",
+ "url",
 ]
 
 [[package]]
