@@ -24,6 +24,18 @@ mod worker;
 
 use std::sync::{Arc, Mutex};
 
+/// Window and taskbar icon (the shortcut uses the same `.ico`).
+fn icon() -> Option<egui::IconData> {
+    let ico = include_bytes!("../../../assets/super-agent.ico");
+    let img = image::load_from_memory_with_format(ico, image::ImageFormat::Ico).ok()?.into_rgba8();
+    let (width, height) = img.dimensions();
+    Some(egui::IconData {
+        rgba: img.into_raw(),
+        width,
+        height,
+    })
+}
+
 fn main() {
     let opts = match cli::parse(std::env::args().skip(1)) {
         Ok(o) => o,
@@ -38,6 +50,9 @@ fn main() {
         .with_inner_size([w, h])
         .with_min_inner_size([880.0, 600.0])
         .with_app_id("super-agent");
+    if let Some(i) = icon() {
+        viewport = viewport.with_icon(Arc::new(i));
+    }
     if opts.screenshot.is_some() {
         // Exact requested size; the window is not user-resizable during capture.
         viewport = viewport

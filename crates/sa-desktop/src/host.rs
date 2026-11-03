@@ -545,6 +545,144 @@ pub(crate) mod tests {
             .collect()
     }
 
+    /// `Echo` whose catalog accepts every route bound in a legacy journal.
+    struct Permissive(&'static str, Vec<Value>);
+
+    impl Adapter for Permissive {
+        fn agent(&self) -> &'static str {
+            self.0
+        }
+        fn catalog(&self) -> Boxed<anyhow::Result<Catalog>> {
+            let mut providers: Vec<Value> = vec![json!({"id": "test-local", "models": [{"id": "default"}]})];
+            for r in &self.1 {
+                let (p, m) = (r["provider"].as_str().unwrap_or_default(), r["model"].as_str().unwrap_or_default());
+                providers.push(json!({"id": p, "models": [{"id": m}]}));
+            }
+            let route = json!({"provider": "test-local", "model": "default", "mode": "cli"});
+            Box::pin(async move {
+                Ok(Catalog {
+                    value: json!({
+                        "default": route,
+                        "legacy_defaults": {"user": route},
+                        "modes": [{"id": "cli", "available": true}],
+                        "providers": providers
+                    }),
+                })
+            })
+        }
+        fn run(
+            &self,
+            req: RunRequest,
+            host: Arc<dyn TurnHost>,
+            events: EventSink,
+            cancel: CancellationToken,
+        ) -> Boxed<Result<RunOutcome, AdapterError>> {
+            Echo(self.0).run(req, host, events, cancel)
+        }
+    }
+
+    /// `SA_LEGACY_COPY=<dir>`: a COPY of a journal written by the Node
+    /// engine (never the live one). Opens it with the Rust scheduler, checks
+    /// recovery, and follows up every finished non-continuous ticket.
+    #[test]
+    fn legacy_journal_copy_opens_and_resumes() {
+        let Ok(dir) = std::env::var("SA_LEGACY_COPY") else {
+            eprintln!("set SA_LEGACY_COPY to a copied journal directory");
+            return;
+        };
+        let dir = PathBuf::from(dir);
+        assert_ne!(
+            sa_engine::services::realpath(&dir).ok(),
+            sa_engine::services::realpath(&sa_store::default_data_dir()).ok(),
+            "refusing to run against the live journal"
+        );
+        let routes: Vec<Value> = {
+            let db = rusqlite::Connection::open(dir.join(sa_store::DB_FILE)).unwrap();
+            let mut out = vec![];
+            let mut add = |text: String| {
+                if let Ok(v) = serde_json::from_str::<Value>(&text) {
+                    if v.get("provider").is_some() {
+                        out.push(v);
+                    } else if let Some(m) = v.as_object() {
+                        out.extend(m.values().cloned());
+                    }
+                }
+            };
+            for sql in [
+                "SELECT route FROM native_routes",
+                "SELECT agent_routes FROM tickets",
+                "SELECT routes FROM route_defaults",
+            ] {
+                let mut st = db.prepare(sql).unwrap();
+                for r in st.query_map([], |r| r.get::<_, String>(0)).unwrap() {
+                    add(r.unwrap());
+                }
+            }
+            out
+        };
+        let adapters = move || {
+            AGENTS
+                .iter()
+                .map(|a| Arc::new(Permissive(a, routes.clone())) as Arc<dyn Adapter>)
+                .collect()
+        };
+        let host = Host::start_with(dir.clone(), adapters, || {}).unwrap();
+        assert!(host.fault().is_none(), "{:?}", host.fault());
+        let roots = host
+            .engine
+            .db()
+            .with(|q| {
+                q.all(
+                    "SELECT t.id,t.permission_profile p,j.state FROM tickets t JOIN jobs j ON j.ticket=t.id AND j.parent IS NULL",
+                    &[],
+                )
+            })
+            .unwrap();
+        eprintln!("legacy roots: {roots:?}");
+        let running = host
+            .engine
+            .db()
+            .with(|q| q.int("SELECT count(*) FROM jobs WHERE state='running'", &[]))
+            .unwrap();
+        assert_eq!(running, 0, "recovery left running jobs");
+        let mut followed = 0;
+        for r in &roots {
+            let ticket = r["id"].as_i64().unwrap();
+            if r["state"] != json!("done") || r["p"] == json!("auto") {
+                continue;
+            }
+            let replies = |h: &Host| kinds(h, ticket).iter().filter(|k| *k == "reply").count();
+            let before = replies(&host);
+            host.submit(Action::Follow {
+                ticket,
+                body: "核对迁移后的续跑".into(),
+                resume: false,
+            });
+            assert!(outcome(&host).result.is_ok());
+            let end = Instant::now() + Duration::from_secs(30);
+            while !(root_state(&host, ticket) == "done" && replies(&host) > before) {
+                assert!(Instant::now() < end, "ticket {ticket} stuck: {:?}", host.engine.root(ticket));
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            let reply = host
+                .engine
+                .db()
+                .with(|q| q.one("SELECT result FROM jobs WHERE ticket=? AND parent IS NULL", &[&ticket]))
+                .unwrap()
+                .unwrap();
+            eprintln!("ticket {ticket}: {}", reply["result"]);
+            followed += 1;
+        }
+        assert!(host.fault().is_none(), "{:?}", host.fault());
+        eprintln!("followed {followed} legacy tickets");
+        // The read model still opens the migrated journal.
+        drop(host);
+        let mut store = sa_store::Store::open_read_only(&dir).unwrap();
+        for r in &roots {
+            store.snapshot(r["id"].as_i64().unwrap(), 0).unwrap();
+        }
+    }
+
     fn outcome(host: &Host) -> Outcome {
         host.rx.recv_timeout(Duration::from_secs(10)).expect("outcome")
     }
