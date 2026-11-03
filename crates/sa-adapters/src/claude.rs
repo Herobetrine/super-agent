@@ -4,6 +4,7 @@ use crate::common::{
     Emit, cc_rows, endpoint, fingerprint, get_json, local_host, modes, probe_failed, read_json_or,
     route_gone, scope, select, session_mismatch,
 };
+use crate::custom::{self, CustomProvider, Registry};
 use crate::proc::{capture, start, stream};
 use crate::sys::Sys;
 use futures::future::{BoxFuture, join_all};
@@ -23,15 +24,20 @@ static DEFAULT_MODEL_KEY: LazyLock<Regex> =
 
 pub struct Claude {
     sys: Sys,
+    registry: Registry,
 }
 
 impl Claude {
     pub fn new(sys: Sys) -> Self {
-        Self { sys }
+        Self::with_registry(sys, custom::registry(vec![]))
+    }
+
+    pub fn with_registry(sys: Sys, registry: Registry) -> Self {
+        Self { sys, registry }
     }
 }
 
-fn native_file(sys: &Sys) -> PathBuf {
+pub(crate) fn native_file(sys: &Sys) -> PathBuf {
     sys.var("CLAUDE_CONFIG_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| sys.home.join(".claude"))
@@ -49,8 +55,7 @@ pub fn executable(sys: &Sys) -> Option<PathBuf> {
 }
 
 fn api_base(base: &str) -> String {
-    let b = base.trim_end_matches('/');
-    b.strip_suffix("/v1").unwrap_or(b).to_string()
+    custom::anthropic_root(base)
 }
 
 /// `officialEnv()` (CL:33-51): first-party login without gateway overrides.
@@ -431,10 +436,11 @@ impl Adapter for Claude {
 
     fn catalog(&self) -> BoxFuture<'static, anyhow::Result<Catalog>> {
         let sys = self.sys.clone();
+        let customs = custom::snapshot(&self.registry, "claude");
         Box::pin(async move {
-            Ok(Catalog {
-                value: discover(&sys, &CancellationToken::new()).await?.catalog,
-            })
+            let mut value = discover(&sys, &CancellationToken::new()).await?.catalog;
+            custom::merge(&mut value, &customs, &sys);
+            Ok(Catalog { value })
         })
     }
 
@@ -446,7 +452,8 @@ impl Adapter for Claude {
         cancel: CancellationToken,
     ) -> BoxFuture<'static, Result<RunOutcome, AdapterError>> {
         let sys = self.sys.clone();
-        Box::pin(async move { run(sys, request, host, Emit(events), cancel).await })
+        let customs = custom::snapshot(&self.registry, "claude");
+        Box::pin(async move { run(sys, customs, request, host, Emit(events), cancel).await })
     }
 }
 
@@ -457,6 +464,7 @@ fn strip_1m(m: &str) -> &str {
 /// `run(o)` (CL:267-356).
 async fn run(
     sys: Sys,
+    customs: Vec<CustomProvider>,
     req: RunRequest,
     host: Arc<dyn TurnHost>,
     emit: Emit,
@@ -464,14 +472,19 @@ async fn run(
 ) -> Result<RunOutcome, AdapterError> {
     let boundary = scope("claude", &req, &host, &cancel, false).await?;
     let high = boundary == "danger-full-access";
-    let d = discover(&sys, &cancel).await.map_err(|e| probe_failed(&e.to_string()))?;
+    let mut d = discover(&sys, &cancel).await.map_err(|e| probe_failed(&e.to_string()))?;
+    custom::merge(&mut d.catalog, &customs, &sys);
     let s = select(&d.catalog, &req.route)?;
-    let r = d
-        .records
-        .iter()
-        .find(|r| r.id() == s.provider)
-        .cloned()
-        .ok_or_else(|| route_gone("已选供应商或模型失效，请刷新配置"))?;
+    let chosen = custom::lookup(&d.catalog, &customs, &s.provider).cloned();
+    let r = match &chosen {
+        Some(_) => Record::default(),
+        None => d
+            .records
+            .iter()
+            .find(|r| r.id() == s.provider)
+            .cloned()
+            .ok_or_else(|| route_gone("已选供应商或模型失效，请刷新配置"))?,
+    };
     let exe = d.exe.clone().ok_or_else(|| route_gone("本机未安装所选原生执行端"))?;
     let mut args: Vec<String> = [
         "-p",
@@ -503,9 +516,15 @@ async fn run(
             .map(String::from),
         );
     }
-    let sdk = r.auth == "sdk-login";
-    let mut env = if sdk { official_env(&sys) } else { sys.clone() };
-    if !sdk {
+    let sdk = chosen.is_none() && r.auth == "sdk-login";
+    let mut env = match &chosen {
+        // Endpoint, bearer token and model aliases come from the operator's
+        // provider; the key travels only in the child environment.
+        Some(p) => custom::claude_env(p, &s.model, &sys).map_err(|_| route_gone("自定义供应商的密钥环境变量未设置"))?,
+        None if sdk => official_env(&sys),
+        None => sys.clone(),
+    };
+    if !sdk && chosen.is_none() {
         env.retain(|k| {
             let u = k.to_ascii_uppercase();
             !(u.starts_with("ANTHROPIC_")

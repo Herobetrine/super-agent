@@ -10,9 +10,8 @@ use sa_engine::resilience::{CODE_ROUTE_NOT_CONFIGURED, CODE_ROUTE_PROBE_FAILED};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
@@ -112,6 +111,23 @@ fn cc_database(sys: &Sys) -> Result<PathBuf> {
     Ok(folder.join("cc-switch.db"))
 }
 
+/// `ccWatchPaths()` (AC:52-65): the locator and, when its override is usable,
+/// the database and its WAL.
+pub fn cc_watch_paths(sys: &Sys) -> Vec<PathBuf> {
+    let locator = sys.appdata().join("com.ccswitch.desktop/app_paths.json");
+    let mut paths = vec![locator.clone()];
+    let over = read_json_or(&locator)["app_config_dir_override"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from);
+    if over.as_ref().is_none_or(|p| p.is_absolute()) {
+        let db = over.unwrap_or_else(|| sys.home.join(".cc-switch")).join("cc-switch.db");
+        paths.push(db.with_file_name("cc-switch.db-wal"));
+        paths.insert(1, db);
+    }
+    paths
+}
+
 /// `ccRows(...apps)` (AC:66-89): provider rows, read-only.
 pub fn cc_rows(sys: &Sys, apps: &[&str]) -> Result<Vec<Map<String, Value>>> {
     let file = cc_database(sys)?;
@@ -194,96 +210,97 @@ pub fn endpoint(base: &str) -> Result<Url> {
     Ok(u)
 }
 
-/// `getJSON(url, headers)` (AC:124-151) for loopback catalogs: a direct
-/// HTTP/1.1 GET with no proxy and no redirects, 3.5 s, 1 MiB.
+/// Catalog request limits (AC:124-151).
+pub const CATALOG_TIMEOUT: Duration = Duration::from_millis(3500);
+pub const CATALOG_LIMIT: u64 = 1024 * 1024;
+
+/// One shared client: no environment proxy and no redirects (a proxy or a
+/// redirect must never carry the catalog credentials elsewhere), HTTP status
+/// checked by the caller, server certificates verified against the operating
+/// system trust store.
+static HTTP: LazyLock<ureq::Agent> = LazyLock::new(|| {
+    ureq::Agent::config_builder()
+        .proxy(None)
+        .max_redirects(0)
+        .http_status_as_error(false)
+        .tls_config(
+            ureq::tls::TlsConfig::builder()
+                .root_certs(ureq::tls::RootCerts::PlatformVerifier)
+                .build(),
+        )
+        .user_agent("SuperAgent")
+        .build()
+        .into()
+});
+
+/// `getJSON(url, headers)` (AC:124-151): https, or http on a loopback host;
+/// direct connection, no redirects, 3.5 s, 1 MiB.
 pub async fn get_json(url: &str, headers: &[(String, String)], cancel: &CancellationToken) -> Result<Value> {
+    get_json_with(url, headers, CATALOG_TIMEOUT, CATALOG_LIMIT, cancel).await
+}
+
+/// [`get_json`] with an explicit deadline and body limit.
+pub async fn get_json_with(
+    url: &str,
+    headers: &[(String, String)],
+    timeout: Duration,
+    limit: u64,
+    cancel: &CancellationToken,
+) -> Result<Value> {
     let u = Url::parse(url).map_err(|_| anyhow!("无效的目录地址"))?;
     let host = u.host_str().unwrap_or_default().to_string();
-    if u.scheme() != "http" || !local_host(&host) {
-        // Remote HTTPS catalogs are not fetched by the Rust port yet.
-        bail!("目录仅支持本机 HTTP 端点");
+    let scheme_ok = u.scheme() == "https" || (u.scheme() == "http" && local_host(&host));
+    if !scheme_ok || host.is_empty() || !u.username().is_empty() || u.password().is_some() {
+        bail!("目录仅支持 HTTPS 或本机 HTTP 端点");
     }
     for (k, v) in headers {
-        if k.contains(['\r', '\n', ':']) || v.contains(['\r', '\n']) {
+        if k.is_empty() || k.contains(['\r', '\n', ':']) || v.contains(['\r', '\n']) {
             bail!("目录请求头无效");
         }
     }
-    let port = u.port().unwrap_or(80);
-    let path = match u.query() {
-        Some(q) => format!("{}?{q}", u.path()),
-        None => u.path().to_string(),
-    };
-    let authority = if u.port().is_some() { format!("{host}:{port}") } else { host.clone() };
-    let mut request = format!("GET {path} HTTP/1.1\r\nHost: {authority}\r\nAccept: application/json\r\nConnection: close\r\n");
-    for (k, v) in headers {
-        request.push_str(&format!("{k}: {v}\r\n"));
-    }
-    request.push_str("\r\n");
-    let connect_host = host.trim_start_matches('[').trim_end_matches(']').to_string();
-    let fetch = async move {
-        let mut stream = tokio::net::TcpStream::connect((connect_host.as_str(), port)).await?;
-        stream.write_all(request.as_bytes()).await?;
-        let mut raw = Vec::new();
-        let mut chunk = vec![0u8; 16 * 1024];
-        loop {
-            let n = stream.read(&mut chunk).await?;
-            if n == 0 {
-                break;
-            }
-            raw.extend_from_slice(&chunk[..n]);
-            if raw.len() > 1024 * 1024 + 64 * 1024 {
-                bail!("目录超过 1 MiB");
-            }
+    let target = u.to_string();
+    let headers = headers.to_vec();
+    let fetch = tokio::task::spawn_blocking(move || -> Result<(u16, Vec<u8>)> {
+        let mut req = HTTP.get(&target).header("Accept", "application/json");
+        for (k, v) in &headers {
+            req = req.header(k.as_str(), v.as_str());
         }
-        anyhow::Ok(raw)
-    };
-    let raw = tokio::select! {
-        r = tokio::time::timeout(Duration::from_millis(3500), fetch) => r.map_err(|_| anyhow!("目录请求超时"))??,
+        // ureq errors may echo the URL but never request headers.
+        let resp = req
+            .config()
+            .timeout_global(Some(timeout))
+            .build()
+            .call()
+            .map_err(|e| match e {
+                ureq::Error::Timeout(_) => anyhow!("目录请求超时"),
+                ureq::Error::Tls(_) | ureq::Error::Rustls(_) => anyhow!("目录 TLS 握手失败"),
+                _ => anyhow!("目录请求失败"),
+            })?;
+        let status = resp.status().as_u16();
+        if !(200..300).contains(&status) {
+            return Ok((status, vec![]));
+        }
+        let body = resp
+            .into_body()
+            .with_config()
+            .limit(limit)
+            .read_to_vec()
+            .map_err(|e| match e {
+                ureq::Error::BodyExceedsLimit(_) => anyhow!("目录超过 {} KiB", limit / 1024),
+                ureq::Error::Timeout(_) => anyhow!("目录请求超时"),
+                _ => anyhow!("目录响应无效"),
+            })?;
+        Ok((status, body))
+    });
+    let (status, body) = tokio::select! {
+        r = fetch => r.map_err(|_| anyhow!("目录请求失败"))??,
         () = cancel.cancelled() => bail!("已取消"),
     };
-    let split = raw
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .ok_or_else(|| anyhow!("目录响应无效"))?;
-    let head = std::str::from_utf8(&raw[..split]).map_err(|_| anyhow!("目录响应无效"))?;
-    let mut lines = head.split("\r\n");
-    let status: u16 = lines
-        .next()
-        .and_then(|l| l.split(' ').nth(1))
-        .and_then(|s| s.parse().ok())
-        .ok_or_else(|| anyhow!("目录响应无效"))?;
     if !(200..300).contains(&status) {
         bail!("目录 HTTP {status}");
     }
-    let chunked = lines.any(|l| {
-        let l = l.to_ascii_lowercase();
-        l.starts_with("transfer-encoding:") && l.contains("chunked")
-    });
-    let body = &raw[split + 4..];
-    let body = if chunked { dechunk(body)? } else { body.to_vec() };
-    if body.len() > 1024 * 1024 {
-        bail!("目录超过 1 MiB");
-    }
     let text = String::from_utf8(body).map_err(|_| anyhow!("目录不是 UTF-8"))?;
-    Ok(serde_json::from_str(&text)?)
-}
-
-fn dechunk(mut body: &[u8]) -> Result<Vec<u8>> {
-    let mut out = Vec::new();
-    loop {
-        let end = body.windows(2).position(|w| w == b"\r\n").ok_or_else(|| anyhow!("分块响应无效"))?;
-        let size_text = std::str::from_utf8(&body[..end])?;
-        let size = usize::from_str_radix(size_text.split(';').next().unwrap_or("").trim(), 16)?;
-        body = &body[end + 2..];
-        if size == 0 {
-            return Ok(out);
-        }
-        if body.len() < size + 2 {
-            bail!("分块响应无效");
-        }
-        out.extend_from_slice(&body[..size]);
-        body = &body[size + 2..];
-    }
+    serde_json::from_str(&text).map_err(|_| anyhow!("目录不是有效 JSON"))
 }
 
 pub fn high(profile: &str) -> bool {

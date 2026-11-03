@@ -7,13 +7,23 @@
 use sa_engine::adapter::Adapter;
 use std::sync::Arc;
 
+pub use custom::{Registry, probe_models, registry};
+pub use revision::{catalog_revision, catalog_revision_with};
+
 /// All four harness adapters bound to one environment snapshot, in
 /// `AGENTS` order; pass to [`sa_engine::Engine::open`].
 pub fn all(sys: sys::Sys) -> Vec<Arc<dyn Adapter>> {
+    all_with(sys, registry(vec![]))
+}
+
+/// [`all`] with operator-managed custom providers. The registry is read on
+/// every `catalog()`/`run()`, so edits apply without rebuilding adapters.
+/// Antigravity has no custom endpoint support and ignores it.
+pub fn all_with(sys: sys::Sys, registry: Registry) -> Vec<Arc<dyn Adapter>> {
     vec![
-        Arc::new(codex::Codex::new(sys.clone())),
-        Arc::new(claude::Claude::new(sys.clone())),
-        Arc::new(deepseek::DeepSeek::new(sys.clone())),
+        Arc::new(codex::Codex::with_registry(sys.clone(), registry.clone())),
+        Arc::new(claude::Claude::with_registry(sys.clone(), registry.clone())),
+        Arc::new(deepseek::DeepSeek::with_registry(sys.clone(), registry)),
         Arc::new(antigravity::Antigravity::new(sys)),
     ]
 }
@@ -23,6 +33,8 @@ pub mod claude;
 pub mod codex;
 pub mod codex_config;
 pub mod common;
+pub mod custom;
 pub mod deepseek;
 pub mod proc;
+pub mod revision;
 pub mod sys;

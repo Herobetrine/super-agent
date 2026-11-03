@@ -7,6 +7,7 @@
 
 use crate::codex_config::{Discovery, discover, routing};
 use crate::common::{Emit, denied, probe_failed, protocol, route_gone, select, session_mismatch};
+use crate::custom::{self, CustomProvider, Registry};
 use crate::proc::{Lines, Proc, cancelled, capture, start};
 use crate::sys::Sys;
 use futures::future::BoxFuture;
@@ -29,11 +30,16 @@ const MAX_STEER_BYTES: usize = 65_536;
 
 pub struct Codex {
     sys: Sys,
+    registry: Registry,
 }
 
 impl Codex {
     pub fn new(sys: Sys) -> Self {
-        Self { sys }
+        Self::with_registry(sys, custom::registry(vec![]))
+    }
+
+    pub fn with_registry(sys: Sys, registry: Registry) -> Self {
+        Self { sys, registry }
     }
 }
 
@@ -177,8 +183,10 @@ impl Adapter for Codex {
 
     fn catalog(&self) -> BoxFuture<'static, anyhow::Result<Catalog>> {
         let sys = self.sys.clone();
+        let customs = custom::snapshot(&self.registry, "codex");
         Box::pin(async move {
-            let d = discover(&sys, &CancellationToken::new()).await?;
+            let mut d = discover(&sys, &CancellationToken::new()).await?;
+            custom::merge(&mut d.catalog, &customs, &sys);
             Ok(Catalog { value: d.catalog })
         })
     }
@@ -191,22 +199,29 @@ impl Adapter for Codex {
         cancel: CancellationToken,
     ) -> BoxFuture<'static, Result<RunOutcome, AdapterError>> {
         let sys = self.sys.clone();
-        Box::pin(async move { run(sys, request, host, Emit(events), cancel).await })
+        let customs = custom::snapshot(&self.registry, "codex");
+        Box::pin(async move { run(sys, customs, request, host, Emit(events), cancel).await })
     }
 }
 
 async fn run(
     sys: Sys,
+    customs: Vec<CustomProvider>,
     req: RunRequest,
     host: Arc<dyn TurnHost>,
     emit: Emit,
     cancel: CancellationToken,
 ) -> Result<RunOutcome, AdapterError> {
     let perm = policy(&req.profile, req.writable)?;
-    let d: Discovery = discover(&sys, &cancel).await.map_err(|e| probe_failed(&e.to_string()))?;
+    let mut d: Discovery = discover(&sys, &cancel).await.map_err(|e| probe_failed(&e.to_string()))?;
+    custom::merge(&mut d.catalog, &customs, &sys);
     let s = select(&d.catalog, &req.route)?;
     let exe = d.exe.clone().ok_or_else(|| route_gone("本机未安装所选原生执行端"))?;
-    let (mut args, settings) = routing(&d, &s.provider).map_err(|e| route_gone(&e.to_string()))?;
+    let (mut args, settings) = match custom::lookup(&d.catalog, &customs, &s.provider) {
+        // `-c` overrides name the key variable; Codex reads the key itself.
+        Some(p) => custom::codex_routing(p, d.profile.is_some()),
+        None => routing(&d, &s.provider).map_err(|e| route_gone(&e.to_string()))?,
+    };
     if perm.review == "on-request" {
         for setting in [
             "network_access=false",
