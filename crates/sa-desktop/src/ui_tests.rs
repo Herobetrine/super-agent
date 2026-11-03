@@ -243,6 +243,44 @@ fn model_dialog_saves_defaults_and_ticket_routes() {
 }
 
 #[test]
+fn knowledge_tab_lists_adds_and_archives_project_entries() {
+    let data = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let mut h = harness(data.path(), "readonly");
+    h.state_mut().composer.project = Some(sa_engine::services::realpath(project.path()).unwrap());
+    h.run_steps(4);
+    let editor = h.get_by_label("输入框");
+    editor.focus();
+    editor.type_text("整理项目");
+    h.run_steps(2);
+    h.key_press(egui::Key::Enter);
+    until(&mut h, "done", |a| root_state(a) == "done");
+
+    // The finished root recorded its progress automatically.
+    h.state_mut().inspector_open = true;
+    h.state_mut().tab = Tab::Knowledge;
+    let entries = |a: &App| a.knowledge.entries.as_ref().and_then(|r| r.as_ref().ok()).cloned().unwrap_or_default();
+    until(&mut h, "progress entry", |a| entries(a).iter().any(|e| e.kind == "progress"));
+
+    let field = h.get_by_label("知识条目输入");
+    field.focus();
+    field.type_text("构建只用 scripts/cargo.cjs");
+    h.run_steps(2);
+    h.get_by_label("添加条目").click();
+    until(&mut h, "operator entry", |a| {
+        entries(a).iter().any(|e| e.agent.as_deref() == Some("operator") && e.body == "构建只用 scripts/cargo.cjs")
+    });
+    assert!(h.state().knowledge.draft.is_empty());
+    let id = entries(h.state()).iter().find(|e| e.agent.as_deref() == Some("operator")).unwrap().id;
+    h.run_steps(2);
+    h.get_by_label(&format!("归档条目 #{id}")).click();
+    until(&mut h, "archived", |a| entries(a).iter().any(|e| e.id == id && e.archived));
+    let ticket = h.state().view.as_ref().unwrap().id;
+    let k = kinds(h.state(), ticket);
+    assert!(k.iter().any(|x| x == "knowledge.add"), "{k:?}");
+}
+
+#[test]
 fn second_window_on_an_owned_journal_is_a_read_only_observer() {
     let data = tempfile::tempdir().unwrap();
     let _owner = sa_engine::owner::claim(data.path()).unwrap();

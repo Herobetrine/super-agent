@@ -11,6 +11,7 @@ mod demo;
 mod feed;
 mod host;
 mod inspector;
+mod knowledge;
 mod labels;
 mod markdown;
 mod models;

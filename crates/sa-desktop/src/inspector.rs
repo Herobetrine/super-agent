@@ -33,7 +33,7 @@ fn route_text(route: &Option<Value>) -> Option<String> {
     (!parts.is_empty()).then(|| parts.join(" / "))
 }
 
-fn note(ui: &mut Ui, text: &str, pal: &Palette) {
+pub(crate) fn note(ui: &mut Ui, text: &str, pal: &Palette) {
     ui.label(
         RichText::new(text)
             .font(theme::body(theme::TINY + 0.5))
@@ -41,7 +41,7 @@ fn note(ui: &mut Ui, text: &str, pal: &Palette) {
     );
 }
 
-fn empty(ui: &mut Ui, ic: &str, text: &str, pal: &Palette) {
+pub(crate) fn empty(ui: &mut Ui, ic: &str, text: &str, pal: &Palette) {
     ui.add_space(36.0);
     ui.vertical_centered(|ui| {
         ui.label(RichText::new(ic).font(theme::body(28.0)).color(pal.faint));
@@ -95,7 +95,7 @@ impl App {
                     })
                     .show(ui, |ui| {
                         ui.set_width(ui.available_width());
-                        if self.tab == Tab::Diff {
+                        if matches!(self.tab, Tab::Diff | Tab::Knowledge) {
                             let cwd = snap
                                 .as_ref()
                                 .map(|s| s.ticket.cwd.clone())
@@ -104,7 +104,12 @@ impl App {
                                         self.composer.project.as_ref().map(|p| p.display().to_string())
                                     })?
                                 });
-                            self.diff_tab(ui, cwd);
+                            if self.tab == Tab::Diff {
+                                self.diff_tab(ui, cwd);
+                            } else {
+                                let ticket = snap.as_ref().map(|s| s.ticket.id);
+                                self.knowledge_tab(ui, cwd, ticket);
+                            }
                             return;
                         }
                         let Some(snap) = snap else {
@@ -124,7 +129,7 @@ impl App {
                                 action = plan_tab(ui, &snap, &pal, draft);
                             }
                             Tab::Approvals => action = approvals_tab(ui, &snap, &pal, writable),
-                            Tab::Diff => {}
+                            Tab::Diff | Tab::Knowledge => {}
                         }
                     });
             });
@@ -163,6 +168,7 @@ impl App {
                     .map(|n| n.to_string()),
             ),
             (Tab::Diff, "变更", None),
+            (Tab::Knowledge, "知识", None),
         ];
         let resp = Frame::new()
             .fill(if pal.dark { pal.surface } else { pal.hover })
@@ -170,10 +176,41 @@ impl App {
             .inner_margin(Margin::same(3))
             .show(ui, |ui| {
                 ui.spacing_mut().item_spacing.x = 2.0;
-                let w = (ui.available_width() - 6.0) / tabs.len() as f32;
+                let n = tabs.len() as f32;
+                let avail = ui.available_width() - 6.0 - 2.0 * (n - 1.0);
+                // Natural widths; counts are dropped when the panel is too narrow.
+                let galleys: Vec<_> = tabs
+                    .iter()
+                    .map(|(tab, name, count)| {
+                        let selected = self.tab == *tab;
+                        let font = if selected { theme::strong(13.0) } else { theme::body(13.0) };
+                        let color = if selected { pal.ink } else { pal.mute };
+                        let ng = widgets::line_galley(ui, name, font, color, avail);
+                        let tone = if *tab == Tab::Approvals { pal.warn.fg } else { pal.faint };
+                        let cg = count
+                            .as_ref()
+                            .map(|c| widgets::line_galley(ui, c, theme::body(theme::TINY), tone, 60.0));
+                        (ng, cg, color)
+                    })
+                    .collect();
+                let natural = |with_counts: bool| -> Vec<f32> {
+                    galleys
+                        .iter()
+                        .map(|(ng, cg, _)| {
+                            let c = if with_counts { cg.as_ref().map_or(0.0, |g| g.size().x + 5.0) } else { 0.0 };
+                            ng.size().x + c + 14.0
+                        })
+                        .collect()
+                };
+                let mut widths = natural(true);
+                let counts = widths.iter().sum::<f32>() <= avail;
+                if !counts {
+                    widths = natural(false);
+                }
+                let extra = ((avail - widths.iter().sum::<f32>()) / n).max(0.0);
                 ui.horizontal(|ui| {
-                    for (tab, name, count) in &tabs {
-                        let (rect, resp) = ui.allocate_exact_size(vec2(w, 30.0), Sense::click());
+                    for (((tab, _, _), (ng, cg, color)), w) in tabs.iter().zip(galleys).zip(widths) {
+                        let (rect, resp) = ui.allocate_exact_size(vec2(w + extra, 30.0), Sense::click());
                         let selected = self.tab == *tab;
                         let p = ui.painter();
                         if selected {
@@ -194,21 +231,7 @@ impl App {
                                 pal.line_soft.gamma_multiply(0.6),
                             );
                         }
-                        let font = if selected {
-                            theme::strong(13.0)
-                        } else {
-                            theme::body(13.0)
-                        };
-                        let color = if selected { pal.ink } else { pal.mute };
-                        let ng = widgets::line_galley(ui, name, font, color, w);
-                        let cg = count.as_ref().map(|c| {
-                            let tone = if *tab == Tab::Approvals {
-                                pal.warn.fg
-                            } else {
-                                pal.faint
-                            };
-                            widgets::line_galley(ui, c, theme::body(theme::TINY), tone, 60.0)
-                        });
+                        let cg = cg.filter(|_| counts);
                         let total = ng.size().x + cg.as_ref().map_or(0.0, |g| g.size().x + 5.0);
                         let x = rect.center().x - total / 2.0;
                         let nh = ng.size().y;
@@ -272,6 +295,7 @@ impl App {
                     .inner_margin(Margin::same(10))
                     .show(ui, |ui| {
                         ui.set_width(ui.available_width());
+                        egui::ScrollArea::horizontal().id_salt("diff-h").show(ui, |ui| {
                         for line in text.lines().take(4000) {
                             let color = if line.starts_with('+') && !line.starts_with("+++") {
                                 pal.ok.fg
@@ -287,6 +311,7 @@ impl App {
                                     .wrap_mode(egui::TextWrapMode::Extend),
                             );
                         }
+                        });
                     });
             }
         }

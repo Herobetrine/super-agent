@@ -240,6 +240,7 @@ impl App {
                 }
                 (ActionKind::Follow, Ok(_)) => {}
                 (ActionKind::Routes, r) => self.routes_saved(r.map(|_| ())),
+                (ActionKind::Knowledge, r) => self.knowledge_saved(r.map(|_| ())),
                 (_, Err(e)) => self.composer.message = Some((e, true)),
             }
         }

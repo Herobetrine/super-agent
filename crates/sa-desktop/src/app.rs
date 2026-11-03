@@ -27,6 +27,7 @@ pub enum Tab {
     Plan,
     Approvals,
     Diff,
+    Knowledge,
 }
 
 impl Tab {
@@ -37,6 +38,7 @@ impl Tab {
             Tab::Plan => "plan",
             Tab::Approvals => "approvals",
             Tab::Diff => "diff",
+            Tab::Knowledge => "knowledge",
         }
     }
     pub fn from_key(s: &str) -> Option<Self> {
@@ -46,6 +48,7 @@ impl Tab {
             "plan" => Tab::Plan,
             "approvals" | "approval" => Tab::Approvals,
             "diff" | "git" => Tab::Diff,
+            "knowledge" | "memory" => Tab::Knowledge,
             _ => return None,
         })
     }
@@ -121,6 +124,7 @@ pub struct App {
     pub models: Option<crate::models::ModelDialog>,
     pub diff: DiffState,
     pub export: Option<Pending<PathBuf>>,
+    pub knowledge: crate::knowledge::KnowledgeState,
 }
 
 /// Git changes of one project (inspector "变更" tab).
@@ -193,6 +197,7 @@ impl App {
             models: None,
             diff: DiffState::default(),
             export: None,
+            knowledge: Default::default(),
             host_error: host.as_ref().err().cloned(),
             host: host.ok(),
             worker,
@@ -454,6 +459,7 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_host();
         self.poll_ops();
+        self.poll_knowledge();
         self.drain();
         if self.applied_dark != Some(self.dark) {
             self.pal = Palette::of(self.dark);

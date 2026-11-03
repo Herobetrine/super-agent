@@ -68,6 +68,17 @@ pub enum Action {
         ticket: i64,
         selections: Value,
     },
+    /// Operator entry in the project knowledge base.
+    KnowledgeAdd {
+        cwd: String,
+        kind: String,
+        body: String,
+        ticket: Option<i64>,
+    },
+    KnowledgeArchive {
+        id: i64,
+        archived: bool,
+    },
 }
 
 impl Action {
@@ -81,6 +92,7 @@ impl Action {
             Action::Decide { allow, .. } => ActionKind::Decide { allow: *allow },
             Action::PlanAdd { .. } | Action::PlanToggle { .. } => ActionKind::Plan,
             Action::SaveDefaults { .. } | Action::SaveRoutes { .. } => ActionKind::Routes,
+            Action::KnowledgeAdd { .. } | Action::KnowledgeArchive { .. } => ActionKind::Knowledge,
         }
     }
 }
@@ -95,6 +107,7 @@ pub enum ActionKind {
     Decide { allow: bool },
     Plan,
     Routes,
+    Knowledge,
 }
 
 /// Result of one action; `value` is the new ticket id for `Create`.
@@ -396,6 +409,13 @@ async fn execute(engine: &Engine, action: Action) -> Result<Option<i64>> {
         }
         Action::SaveRoutes { ticket, selections } => {
             save_routes(engine, ticket, parse_routes(selections)?)?;
+            Ok(None)
+        }
+        Action::KnowledgeAdd { cwd, kind, body, ticket } => {
+            Ok(Some(engine.add_knowledge(&cwd, &kind, &body, ticket)?))
+        }
+        Action::KnowledgeArchive { id, archived } => {
+            engine.archive_knowledge(id, archived)?;
             Ok(None)
         }
     }
