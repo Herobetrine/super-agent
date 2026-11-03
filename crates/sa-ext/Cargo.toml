@@ -1,0 +1,42 @@
+[package]
+name = "sa-ext"
+description = "Super Agent project extensions: MCP servers (rmcp) and skill catalog"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde_json = { workspace = true, features = ["preserve_order"] }
+sha2.workspace = true
+rusqlite.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+futures.workspace = true
+regex = "1"
+serde_yaml = "0.9"
+url = "2"
+uuid = { version = "1", features = ["v4"] }
+# Official MCP Rust SDK (Apache-2.0): client role, child-process stdio and
+# streamable-HTTP client transports.
+rmcp = { version = "3.8", default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest"] }
+# Same major as rmcp's HTTP client. Native TLS (SChannel on Windows) avoids a
+# C/asm build of a rustls crypto provider.
+reqwest = { version = "0.13", default-features = false, features = ["native-tls"] }
+# Job object / process group around stdio servers (also used by rmcp).
+process-wrap = { version = "10", features = ["tokio1"] }
+sa-engine = { path = "../sa-engine" }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", default-features = false, features = ["Win32_System_Threading"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+# Disposable MCP server used by the integration tests (stdio and HTTP).
+[[bin]]
+name = "sa-ext-fixture-mcp"
+path = "tests/fixture/mcp_server.rs"
+test = false
+doc = false
