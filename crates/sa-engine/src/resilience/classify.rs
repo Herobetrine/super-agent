@@ -266,7 +266,7 @@ fn norm(s: &str) -> String {
 /// at writing (`contextWindowExceeded`, `usageLimitExceeded`,
 /// `httpConnectionFailed{httpStatusCode}`, `responseStreamConnectionFailed`,
 /// `responseStreamDisconnected`, `responseTooManyFailedAttempts`,
-/// `internalServerError`, `unauthorized`, `badRequest`, `sandboxError`,
+/// `internalServerError`, `serverOverloaded` (observed live 2026-11-03), `unauthorized`, `badRequest`, `sandboxError`,
 /// `other`). **Not verified against the installed
 /// `codex app-server generate-json-schema`**; unknown names fall back to the
 /// HTTP status and then to the message text.
@@ -296,7 +296,7 @@ pub fn codex_error(error: &Value) -> AdapterError {
         "unauthorized" => Some(ErrorClass::Auth),
         "badrequest" => Some(ErrorClass::Protocol),
         "sandboxerror" => Some(ErrorClass::Permission),
-        "internalservererror" => Some(ErrorClass::Overloaded),
+        "internalservererror" | "serveroverloaded" => Some(ErrorClass::Overloaded),
         "httpconnectionfailed" | "responsestreamconnectionfailed" | "responsestreamdisconnected" => {
             Some(status.map(http_class).unwrap_or(ErrorClass::Network))
         }
@@ -390,6 +390,7 @@ pub fn match_text(text: &str) -> Option<(ErrorClass, String)> {
         (
             &[
                 "overloaded",
+                "at capacity",
                 "service unavailable",
                 "bad gateway",
                 "gateway timeout",
@@ -587,6 +588,11 @@ mod tests {
         assert_eq!(codex_error(&json!({"codexErrorInfo":"contextWindowExceeded"})).class, ErrorClass::InputTooLarge);
         assert_eq!(codex_error(&json!("usageLimitExceeded")).class, ErrorClass::Billing);
         assert_eq!(codex_error(&json!({"codexErrorInfo":"unauthorized"})).class, ErrorClass::Auth);
+        // Frame observed from codex app-server on 2026-11-03.
+        let busy = json!({"message":"Selected model is at capacity. Please try a different model.",
+            "codexErrorInfo":"serverOverloaded","additionalDetails":null,"misalignment":null});
+        assert_eq!(codex_error(&busy).class, ErrorClass::Overloaded);
+        assert_eq!(classify_text("Selected model is at capacity.").class, ErrorClass::Overloaded);
         let rpc = codex_error(&json!({"code":-32000,"message":"stream error: HTTP 502 Bad Gateway"}));
         assert_eq!(rpc.class, ErrorClass::Overloaded);
         assert!(!rpc.message.contains("Bad Gateway"));

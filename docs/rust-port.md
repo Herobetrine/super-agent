@@ -48,7 +48,14 @@ node scripts/cargo.cjs run -p sa-desktop --release -- --demo
 
 已验证：离线夹具测试（Codex JSON-RPC 审批、过期请求拒绝、信件插入与终稿逐字节一致；UTF-8 分帧；取消后子孙进程不残留；stderr 不外泄）；`SA_LIVE_CATALOG=1` 时对本机四个执行端做只读目录探测，提供方 ID、模型数和默认路由与 JS 版一致。
 
-尚未验证：真实模型轮次（会消耗额度，按 `docs/verification.md` 另行联测）；远程 HTTPS 自定义目录（Rust 版目前只取本机 HTTP 目录，远程来源只列已保存模型）；`catalogRevision` 文件指纹未移植。
+真实联测（2026-11-03，计费）：
+- `SA_LIVE_TURNS=1 node scripts/cargo.cjs test -p sa-adapters --test turns_live -- --nocapture`：四个执行端各做一次只读文件挑战，再续接同一原生会话读回改写后的文件。四个都通过：答案正确、与原生终稿逐字节一致、会话 ID 在轮次结束前上报、第二轮复用同一会话。`SA_LIVE_AGENTS=codex,claude` 可只测部分执行端。
+- `SA_LIVE_ENGINE=1 node scripts/cargo.cjs test -p sa-adapters --test engine_live -- --nocapture`：临时工单库里由 DeepSeek 主控向 Codex（写者）、Claude、Antigravity 派工。三个子任务的原生终稿、入库结果和主控收到的回报一致，Codex 写出的 handoff.txt 字节正确，197 条事件哈希全部吻合，用时约 3.5 分钟。
+- 回执在 `~/.local/share/superagent/checks/rust-*`，只存哈希。
+- 联测中 Codex 曾返回 `serverOverloaded`（所选模型容量不足），原先归为未分类；现归为 `overloaded`，可按退避重试。
+- 本机 Claude 默认来源不可用时，测试改选第一个可用来源；正式界面仍需要用户明确选择。
+
+尚未验证：远程 HTTPS 自定义目录（Rust 版目前只取本机 HTTP 目录，远程来源只列已保存模型）；`catalogRevision` 文件指纹未移植；桌面端尚未接入 Rust 引擎写路径。
 
 ## 只读观察窗口
 
