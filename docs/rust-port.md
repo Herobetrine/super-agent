@@ -9,7 +9,7 @@
 | `crates/sa-store` | 兼容现有表结构的 SQLite 访问、只读快照、进展投影 | `runtime/engine-schema.cjs`、`studio.cjs` 读路径、`progress.cjs`、`native-activity.cjs`、`harness-activity.cjs` |
 | `crates/sa-desktop` | egui 桌面工作台（可执行文件 `super-agent`） | `desktop/`（Electron 主进程与 HTML 界面） |
 | `crates/sa-engine` | 工单、任务状态机、控制指令、持续运行、断线重试与熔断 | `engine*.cjs`（`broker.cjs` 待移植） |
-| 计划：`crates/sa-adapters` | Codex app-server、Claude Code stream-json、DeepSeek Harness、Antigravity CLI | `runtime/adapters/*` |
+| `crates/sa-adapters` | Codex app-server、Claude Code stream-json、DeepSeek Harness、Antigravity CLI | `runtime/adapters/*` |
 | 计划：`crates/sa-ext` | MCP（官方 Rust SDK `rmcp`）与技能目录 | `extensions.cjs`、`skills.cjs` |
 | `native/` | 现有 Node 辅助进程，切换完成前保留 | 最终并入上述 crate |
 
@@ -41,6 +41,14 @@ node scripts/cargo.cjs run -p sa-desktop --release -- --demo
 失败处理经 `TurnRunner`：默认 `ResilientRunner` 对所有任务做分类重试（带抖动、续接原生会话）、按路由熔断（`turn.route_wait`、`turn.deferred`、`harness.health`）、可选供应商轮换（`route.rotated`），子任务首次失败会给上级发 `platform` 留言，放弃时记录 `turn.gave_up` 并在上级 `reports[].failure` 中标明；`PassThroughRunner` 保留 JS 的自动工单正则重试。见 `tests/engine_resilience.rs`。
 
 尚未完成：真实执行端适配器（第 3 阶段）；`desktop.lock` 独占锁与 broker；`SA_CANCEL` 与只读子任务自动改派（spec §9.2 F 可选项）；桌面端尚未接入引擎写路径；未对真实工单库副本做联测。
+
+## 执行端适配器现状（第 3 阶段）
+
+`sa-adapters` 移植了 `runtime/adapters/*`：共用进程管道（无控制台窗口、取消时结束整棵进程树、stderr 只留内存尾部用于分类且不入日志）、严格 UTF-8 NDJSON、CC Switch 只读读取、权限档到沙箱的映射，以及四个执行端的目录发现与单轮执行。失败一律返回分类后的 `AdapterError`，会话 ID 一出现就上报，供引擎续接。`sa_adapters::all(Sys::from_process())` 给出可传给 `Engine::open` 的四个适配器。
+
+已验证：离线夹具测试（Codex JSON-RPC 审批、过期请求拒绝、信件插入与终稿逐字节一致；UTF-8 分帧；取消后子孙进程不残留；stderr 不外泄）；`SA_LIVE_CATALOG=1` 时对本机四个执行端做只读目录探测，提供方 ID、模型数和默认路由与 JS 版一致。
+
+尚未验证：真实模型轮次（会消耗额度，按 `docs/verification.md` 另行联测）；远程 HTTPS 自定义目录（Rust 版目前只取本机 HTTP 目录，远程来源只列已保存模型）；`catalogRevision` 文件指纹未移植。
 
 ## 只读观察窗口
 
