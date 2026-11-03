@@ -150,8 +150,15 @@ const ModelSettings = (() => {
             ''
           : pick.model;
         fill(model, models, modelId);
-        for (const s of [mode, provider, model]) s.disabled = locked || follow.checked;
-        detail.textContent = [m?.detail, p?.detail].filter(Boolean).join(' · ');
+        // Keep the default-following state as the saved semantic default, while
+        // leaving the controls interactive so a direct provider click has an
+        // immediate path to an explicit selection.
+        for (const s of [mode, provider, model]) s.disabled = locked;
+        const notes = [m?.detail, p?.detail].filter(Boolean);
+        if (follow.checked) notes.push('当前仍跟随本机默认配置，选择供应商或模型后会自动切换为明确配置。');
+        else if (locked) notes.push('会话中仍有活动任务，当前配置只读。');
+        detail.textContent = notes.join(' · ');
+        for (const s of [mode, provider, model]) s.title = s.disabled ? '会话中仍有活动任务，当前配置只读。' : '';
       }
       function store() {
         if (follow.checked) delete chosen[agent];
@@ -173,14 +180,19 @@ const ModelSettings = (() => {
         store();
       };
       mode.onchange = () => {
+        follow.checked = false;
         draw({ mode: mode.value }, true, true);
         store();
       };
       provider.onchange = () => {
+        follow.checked = false;
         draw({ mode: mode.value, provider: provider.value }, false, true);
         store();
       };
-      model.onchange = store;
+      model.onchange = () => {
+        follow.checked = false;
+        store();
+      };
       validate();
       if (chosen[agent] && [mode, provider, model].some((s) => s.selectedOptions[0]?.disabled))
         warning.textContent = '已选组合在最新配置中不可用，请重新选择或跟随本机默认配置。';

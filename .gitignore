@@ -50,3 +50,6 @@ receipt.json
 desktop.lock
 Thumbs.db
 .DS_Store
+
+# Local self-improvement notes
+.learnings/
