@@ -1,11 +1,11 @@
 //! Command line: `super-agent [--data <dir>] [--ticket <id>] [--demo] [--observe] [--schedule] [--dark]
-//! [--inspector [tab]] [--screenshot <out.png> [--size WxH]]`.
+//! [--inspector [tab]] [--dialog models] [--screenshot <out.png> [--size WxH]]`.
 
 use anyhow::{Context, Result, bail};
 use std::path::PathBuf;
 
 pub const USAGE: &str = "用法: super-agent [--data <目录>] [--ticket <编号>] [--demo] [--observe] [--schedule] [--dark] \
-[--inspector [collab|native|plan|approvals]] [--at-top] [--expand-all] [--screenshot <输出.png> [--size 宽x高]]";
+[--inspector [collab|native|plan|approvals|diff]] [--dialog models] [--at-top] [--expand-all] [--screenshot <输出.png> [--size 宽x高]]";
 
 #[derive(Clone, Debug, Default)]
 pub struct Options {
@@ -25,6 +25,8 @@ pub struct Options {
     pub at_top: bool,
     /// Expand every progress group and job card (screenshot review aid).
     pub expand_all: bool,
+    /// Open a dialog at start (`models`; screenshot review aid).
+    pub dialog: Option<String>,
 }
 
 fn parse_size(s: &str) -> Result<(f32, f32)> {
@@ -60,6 +62,10 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Options> {
             "--dark" => o.dark = true,
             "--at-top" => o.at_top = true,
             "--expand-all" => o.expand_all = true,
+            "--dialog" => match value("--dialog")?.as_str() {
+                "models" => o.dialog = Some("models".into()),
+                other => bail!("未知对话框：{other}"),
+            },
             "--screenshot" => o.screenshot = Some(PathBuf::from(value("--screenshot")?)),
             "--size" => o.size = Some(parse_size(&value("--size")?)?),
             "--inspector" => {

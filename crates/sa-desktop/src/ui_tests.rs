@@ -183,6 +183,65 @@ fn composer_sends_follows_up_approves_and_edits_the_plan() {
     assert!(last["result"].as_str().unwrap().ends_with("denied"), "{last:?}");
 }
 
+fn ticket_routes(app: &App, ticket: i64) -> Value {
+    let row = app
+        .host
+        .as_ref()
+        .unwrap()
+        .engine()
+        .db()
+        .with(|q| q.one("SELECT agent_routes FROM tickets WHERE id=?", &[&ticket]))
+        .unwrap()
+        .unwrap();
+    serde_json::from_str(row["agent_routes"].as_str().unwrap()).unwrap()
+}
+
+#[test]
+fn model_dialog_saves_defaults_and_ticket_routes() {
+    let data = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let mut h = harness(data.path(), "readonly");
+    h.state_mut().composer.project = Some(sa_engine::services::realpath(project.path()).unwrap());
+    h.run_steps(4);
+
+    // Defaults: pin DeepSeek's route explicitly.
+    h.state_mut().open_models(crate::models::Scope::Defaults);
+    until(&mut h, "deepseek catalog", |a| a.models.as_ref().is_some_and(|d| !d.needs("deepseek")));
+    h.run_steps(2);
+    h.get_by_label("跟随本机适配器默认配置").click();
+    h.run_steps(2);
+    h.get_by_label("保存选择").click();
+    until(&mut h, "defaults saved", |a| a.models.is_none() && a.composer.pending == 0);
+    let route = serde_json::json!({"provider": "test-local", "model": "default", "mode": "cli"});
+    assert_eq!(h.state().host.as_ref().unwrap().defaults(), serde_json::json!({"deepseek": route}));
+
+    // A new conversation inherits the defaults.
+    let editor = h.get_by_label("输入框");
+    editor.focus();
+    editor.type_text("核对");
+    h.run_steps(2);
+    h.key_press(egui::Key::Enter);
+    until(&mut h, "done", |a| root_state(a) == "done");
+    let ticket = h.state().view.as_ref().unwrap().id;
+    assert_eq!(ticket_routes(h.state(), ticket), serde_json::json!({"deepseek": route}));
+
+    // The finished ticket's routes: also pin Codex.
+    h.state_mut().open_models(crate::models::Scope::Ticket(ticket));
+    until(&mut h, "dialog", |a| a.models.as_ref().is_some_and(|d| !d.needs("deepseek")));
+    h.get_by_label("Codex").click();
+    until(&mut h, "codex catalog", |a| a.models.as_ref().is_some_and(|d| !d.needs("codex")));
+    h.run_steps(2);
+    h.get_by_label("跟随本机适配器默认配置").click();
+    h.run_steps(2);
+    h.get_by_label("保存选择").click();
+    until(&mut h, "routes saved", |a| a.models.is_none() && a.composer.pending == 0);
+    assert_eq!(
+        ticket_routes(h.state(), ticket),
+        serde_json::json!({"deepseek": route, "codex": route})
+    );
+    assert!(kinds(h.state(), ticket).iter().any(|k| k == "routes.changed"));
+}
+
 #[test]
 fn second_window_on_an_owned_journal_is_a_read_only_observer() {
     let data = tempfile::tempdir().unwrap();

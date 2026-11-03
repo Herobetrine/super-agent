@@ -3,6 +3,7 @@
 use crate::cli::Options;
 use crate::composer::Composer;
 use crate::host::Host;
+use crate::ops::Pending;
 use crate::feed::{self, Feed};
 use crate::labels;
 use crate::theme::{self, Palette};
@@ -25,6 +26,7 @@ pub enum Tab {
     Native,
     Plan,
     Approvals,
+    Diff,
 }
 
 impl Tab {
@@ -34,6 +36,7 @@ impl Tab {
             Tab::Native => "native",
             Tab::Plan => "plan",
             Tab::Approvals => "approvals",
+            Tab::Diff => "diff",
         }
     }
     pub fn from_key(s: &str) -> Option<Self> {
@@ -42,6 +45,7 @@ impl Tab {
             "native" => Tab::Native,
             "plan" => Tab::Plan,
             "approvals" | "approval" => Tab::Approvals,
+            "diff" | "git" => Tab::Diff,
             _ => return None,
         })
     }
@@ -114,6 +118,17 @@ pub struct App {
     /// Why the window is an observer (another workbench owns the journal, …).
     pub host_error: Option<String>,
     pub composer: Composer,
+    pub models: Option<crate::models::ModelDialog>,
+    pub diff: DiffState,
+    pub export: Option<Pending<PathBuf>>,
+}
+
+/// Git changes of one project (inspector "变更" tab).
+#[derive(Default)]
+pub struct DiffState {
+    pub cwd: Option<String>,
+    pub text: Option<Result<String, String>>,
+    pub pending: Option<Pending<String>>,
 }
 
 impl App {
@@ -175,6 +190,9 @@ impl App {
                 get("project").map(PathBuf::from).filter(|p| p.is_dir()),
                 get("lead"),
             ),
+            models: None,
+            diff: DiffState::default(),
+            export: None,
             host_error: host.as_ref().err().cloned(),
             host: host.ok(),
             worker,
@@ -183,6 +201,9 @@ impl App {
         if let Some(t) = app.opts.ticket.or(remembered) {
             app.select(Some(t));
             app.auto_selected = true;
+        }
+        if app.opts.dialog.as_deref() == Some("models") {
+            app.open_models(crate::models::Scope::Defaults);
         }
         app
     }
@@ -432,6 +453,7 @@ fn save_png(path: &std::path::Path, image: &egui::ColorImage) -> Result<(), Stri
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_host();
+        self.poll_ops();
         self.drain();
         if self.applied_dark != Some(self.dark) {
             self.pal = Palette::of(self.dark);
@@ -508,6 +530,7 @@ impl eframe::App for App {
             .frame(Frame::new().fill(pal.surface))
             .show(ctx, |ui| self.conversation(ui));
         self.confirm_dialog(ctx);
+        self.models_dialog(ctx);
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
@@ -558,6 +581,47 @@ impl eframe::App for App {
 }
 
 impl App {
+    fn start_export(&mut self, ctx: &egui::Context, ticket: i64) {
+        let Some(file) = rfd::FileDialog::new()
+            .set_title("导出完整工单记录（请选择新文件）")
+            .set_file_name(format!("ticket-{ticket}.jsonl"))
+            .add_filter("JSON Lines", &["jsonl"])
+            .save_file()
+        else {
+            return;
+        };
+        if file.exists() {
+            self.composer.message = Some(("请选择新文件，导出不会覆盖已有文件".into(), true));
+            return;
+        }
+        let data = self.opts.data.clone().unwrap_or_else(sa_store::default_data_dir);
+        self.export = Some(Pending::spawn(ctx, move || crate::ops::export(&data, ticket, &file)));
+    }
+
+    /// Load the Git changes of `cwd` (inspector tab).
+    pub fn load_diff(&mut self, ctx: &egui::Context, cwd: String) {
+        if self.diff.pending.is_some() {
+            return;
+        }
+        let root = PathBuf::from(&cwd);
+        self.diff.cwd = Some(cwd);
+        self.diff.pending = Some(Pending::spawn(ctx, move || crate::ops::diff(&root)));
+    }
+
+    fn poll_ops(&mut self) {
+        if let Some(r) = self.export.as_ref().and_then(Pending::poll) {
+            self.export = None;
+            self.composer.message = Some(match r {
+                Ok(f) => (format!("完整记录已导出至 {}", f.display()), false),
+                Err(e) => (e, true),
+            });
+        }
+        if let Some(r) = self.diff.pending.as_ref().and_then(Pending::poll) {
+            self.diff.pending = None;
+            self.diff.text = Some(r);
+        }
+    }
+
     fn rail(&mut self, ui: &mut egui::Ui) {
         let pal = self.pal.clone();
         ui.vertical_centered(|ui| {
@@ -621,6 +685,13 @@ impl App {
             if r.clicked() {
                 self.inspector_open = true;
                 self.tab = Tab::Approvals;
+            }
+            if self.writable()
+                && widgets::icon_button(ui, icon::SLIDERS_HORIZONTAL, 38.0, pal.rail_ink, hover, false)
+                    .on_hover_text("模型与执行端 · 新会话默认")
+                    .clicked()
+            {
+                self.open_models(crate::models::Scope::Defaults);
             }
         });
         ui.with_layout(egui::Layout::bottom_up(egui::Align::Center), |ui| {
@@ -694,6 +765,19 @@ impl App {
                 .clicked()
                 {
                     self.inspector_open = !self.inspector_open;
+                }
+                if let Some(id) = self.view.as_ref().map(|v| v.id) {
+                    let busy = self.export.is_some();
+                    let r = ui
+                        .add_enabled_ui(!busy, |ui| {
+                            widgets::icon_button(ui, icon::EXPORT, 32.0, pal.mute, pal.hover, false)
+                        })
+                        .inner
+                        .on_hover_text("导出完整记录（JSON Lines，逐条校验摘要）");
+                    r.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, !busy, "导出完整记录"));
+                    if r.clicked() {
+                        self.start_export(ui.ctx(), id);
+                    }
                 }
                 if approvals > 0
                     && widgets::badge(

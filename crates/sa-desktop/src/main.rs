@@ -13,6 +13,8 @@ mod host;
 mod inspector;
 mod labels;
 mod markdown;
+mod models;
+mod ops;
 mod sidebar;
 mod theme;
 #[cfg(test)]

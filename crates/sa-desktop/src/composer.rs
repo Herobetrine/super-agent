@@ -49,6 +49,9 @@ pub struct Composer {
     pub message: Option<(String, bool)>,
     pub confirm: Option<Confirm>,
     pub plan_draft: String,
+    /// Explicit routes for the next new conversation; `None` follows
+    /// `route_defaults`.
+    pub routes: Option<serde_json::Value>,
     /// Body of the last submitted create/follow/note (cleared on success).
     last_body: Option<String>,
     last_plan: Option<String>,
@@ -68,6 +71,7 @@ impl Composer {
             message: None,
             confirm: None,
             plan_draft: String::new(),
+            routes: None,
             last_body: None,
             last_plan: None,
             focus: false,
@@ -192,6 +196,12 @@ impl App {
     pub fn poll_host(&mut self) {
         let Some(host) = &self.host else { return };
         let outcomes: Vec<_> = host.rx.try_iter().collect();
+        let catalogs: Vec<_> = host.catalogs.try_iter().collect();
+        if let Some(d) = self.models.as_mut() {
+            for c in catalogs {
+                d.answer(&c.agent, c.result);
+            }
+        }
         if outcomes.is_empty() {
             return;
         }
@@ -229,6 +239,7 @@ impl App {
                     }
                 }
                 (ActionKind::Follow, Ok(_)) => {}
+                (ActionKind::Routes, r) => self.routes_saved(r.map(|_| ())),
                 (_, Err(e)) => self.composer.message = Some((e, true)),
             }
         }
@@ -247,6 +258,7 @@ impl App {
                 lead: self.composer.lead.clone(),
                 profile: self.composer.profile.clone(),
                 files: self.composer.attachments.clone(),
+                selections: self.composer.routes.clone(),
             },
             Some(ticket) => match &self.composer.target {
                 Some(_) if !cur.target_active => return,
@@ -347,6 +359,7 @@ impl App {
         let mut stop = false;
         let mut pick_project = false;
         let mut pick_files = false;
+        let mut models = None;
         Frame::new()
             .fill(pal.surface_alt)
             .stroke(Stroke::new(1.0_f32, pal.line))
@@ -435,6 +448,13 @@ impl App {
                             let folder = format!("{} {}", icon::FOLDER_SIMPLE, labels::basename(&cur.cwd));
                             ui.label(RichText::new(folder).font(theme::body(theme::TINY + 0.5)).color(pal.mute))
                                 .on_hover_text(&cur.cwd);
+                            if let Some(t) = cur.ticket
+                                && widgets::icon_button(ui, icon::SLIDERS_HORIZONTAL, 26.0, pal.mute, pal.hover, false)
+                                    .on_hover_text("本次会话的模型与执行端")
+                                    .clicked()
+                            {
+                                models = Some(crate::models::Scope::Ticket(t));
+                            }
                         }
                     } else {
                         let folder = self
@@ -484,6 +504,14 @@ impl App {
                                     ui.selectable_value(&mut next, p.to_string(), labels::profile(p));
                                 }
                             });
+                        let tip = App::routes_summary(self.composer.routes.as_ref());
+                        if widgets::icon_button(ui, icon::SLIDERS_HORIZONTAL, 30.0, pal.mute, pal.hover, self.composer.routes.is_some())
+                            .on_hover_text(format!("模型与执行端
+{tip}"))
+                            .clicked()
+                        {
+                            models = Some(crate::models::Scope::Draft);
+                        }
                         if next != self.composer.profile {
                             if matches!(next.as_str(), "full" | "auto") {
                                 self.composer.confirm = Some(Confirm::Profile(next));
@@ -544,6 +572,9 @@ impl App {
         }
         if pick_files {
             self.pick_attachments();
+        }
+        if let Some(scope) = models {
+            self.open_models(scope);
         }
         if stop && let Some(ticket) = cur.ticket {
             self.submit(Action::Cancel { ticket });

@@ -18,6 +18,8 @@ sa-engine = { path = "../sa-engine" }
 sa-adapters = { path = "../sa-adapters" }
 tokio.workspace = true
 tempfile.workspace = true
+rusqlite.workspace = true
+sha2.workspace = true
 rfd = { version = "0.17.2", default-features = false }
 eframe = { version = "0.33.3", default-features = false, features = ["default_fonts", "glow", "persistence", "accesskit"] }
 egui = "0.33.3"
