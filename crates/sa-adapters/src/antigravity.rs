@@ -26,7 +26,7 @@ use tokio_util::sync::CancellationToken;
 
 static MODEL_ID: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[\w./-]{1,150}$").expect("valid regex"));
 
-const SETTINGS_REL: &str = ".gemini/antigravity-cli/settings.json";
+pub(crate) const SETTINGS_REL: &str = ".gemini/antigravity-cli/settings.json";
 const FAILED: &str = "Antigravity 未返回匹配会话的成功终态";
 
 pub struct Antigravity {

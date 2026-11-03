@@ -21,3 +21,7 @@ toml = { version = "0.9", default-features = false, features = ["parse", "serde"
 serde_yaml = "0.9"
 url = "2"
 sa-engine = { path = "../sa-engine" }
+sa-store = { path = "../sa-store" }
+# Catalog and model-list requests to remote HTTPS endpoints. Blocking client
+# run on the blocking pool; rustls (ring) with the OS trust store.
+ureq = { version = "3.5", default-features = false, features = ["rustls", "platform-verifier"] }

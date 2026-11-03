@@ -9,6 +9,7 @@
 use crate::common::{
     Emit, cc_rows, endpoint, is_file, modes, probe_failed, read_json, route_gone, scope, select, session_mismatch,
 };
+use crate::custom::{self, CustomProvider, Registry};
 use crate::proc::{capture, start, stream};
 use crate::sys::Sys;
 use anyhow::{Result, anyhow};
@@ -42,11 +43,16 @@ console.log(JSON.stringify({protocols:supportedProtocols(),url:a.baseURL,ref:a.a
 
 pub struct DeepSeek {
     sys: Sys,
+    registry: Registry,
 }
 
 impl DeepSeek {
     pub fn new(sys: Sys) -> Self {
-        Self { sys }
+        Self::with_registry(sys, custom::registry(vec![]))
+    }
+
+    pub fn with_registry(sys: Sys, registry: Registry) -> Self {
+        Self { sys, registry }
     }
 }
 
@@ -434,6 +440,37 @@ async fn discover(sys: &Sys, cancel: &CancellationToken) -> Result<Discovery> {
     Ok(Discovery { node: node_exe, catalog, routes })
 }
 
+/// A DSH `llm-pi-ai` route for an operator provider (OpenAI chat
+/// completions). The key comes from `sys` only; a keyless loopback endpoint
+/// gets the non-secret placeholder so DSH never consults its credential
+/// store.
+fn custom_route(p: &CustomProvider, sys: &Sys) -> DsRoute {
+    let key = custom::key(p, sys).ok().map(|k| k.unwrap_or_else(|| custom::LOCAL_PLACEHOLDER.to_string()));
+    DsRoute {
+        official: false,
+        label: p.name.clone(),
+        url: p.base_url.clone(),
+        api: Some(json!(custom::DSH_PROTOCOL)),
+        env_ref: p.key_env.clone(),
+        key,
+        store: dsh_home(sys).join(".credentials.yaml"),
+        models: p.models.iter().map(|m| (m.clone(), json!({"id": m, "name": m}))).collect(),
+        reasoning: None,
+    }
+}
+
+/// Merge operator providers into a discovery: catalog rows plus runnable
+/// routes for the rows that were not shadowed by a native provider.
+fn merge_custom(d: &mut Discovery, customs: &[CustomProvider], sys: &Sys) {
+    custom::merge(&mut d.catalog, customs, sys);
+    for p in customs {
+        let id = p.route_id();
+        if custom::lookup(&d.catalog, customs, &id).is_some() && d.route(&id).is_none() {
+            d.routes.push((id, custom_route(p, sys)));
+        }
+    }
+}
+
 fn yaml_list(items: Value) -> String {
     serde_yaml::to_string(&items).unwrap_or_default()
 }
@@ -467,55 +504,18 @@ fn policy(provider: &str, model: &str, boundary: &str, r: &DsRoute, spec: Value)
 
 const ALLOWED_MODEL_FIELDS: [&str; 7] = ["id", "name", "contextWindow", "input", "reasoningEfforts", "maxTokens", "compat"];
 
-impl Adapter for DeepSeek {
-    fn agent(&self) -> &'static str {
-        "deepseek"
-    }
+/// Variable the per-turn patch names when the adapter supplies the key.
+const CALL_KEY: &str = "SUPERAGENT_DSH_CALL_KEY";
 
-    fn catalog(&self) -> BoxFuture<'static, anyhow::Result<Catalog>> {
-        let sys = self.sys.clone();
-        Box::pin(async move {
-            Ok(Catalog {
-                value: discover(&sys, &CancellationToken::new()).await?.catalog,
-            })
-        })
-    }
-
-    fn run(
-        &self,
-        request: RunRequest,
-        host: Arc<dyn TurnHost>,
-        events: EventSink,
-        cancel: CancellationToken,
-    ) -> BoxFuture<'static, Result<RunOutcome, AdapterError>> {
-        let sys = self.sys.clone();
-        Box::pin(async move { run(sys, request, host, Emit(events), cancel).await })
-    }
-}
-
-/// `run(o)` (DS:211-293).
-async fn run(
-    sys: Sys,
-    req: RunRequest,
-    host: Arc<dyn TurnHost>,
-    emit: Emit,
-    cancel: CancellationToken,
-) -> Result<RunOutcome, AdapterError> {
-    let boundary = scope("deepseek", &req, &host, &cancel, true).await?;
-    let d = discover(&sys, &cancel).await.map_err(|e| probe_failed(&e.to_string()))?;
-    let s = select(&d.catalog, &req.route)?;
-    let r = d.route(&s.provider).cloned().ok_or_else(|| route_gone("已选供应商或模型失效，请刷新配置"))?;
-    let node_exe = d.node.clone().ok_or_else(|| route_gone("本机未安装所选原生执行端"))?;
-    let mut env = sys.clone();
-    env.set("DSH_HOME", sys.platform_dir().join("dsh-state").join(boundary).to_string_lossy().into_owned());
-    env.set("DSH_PERMISSION_MODE", boundary);
-    let mut env_ref = r.env_ref.clone();
-    if let Some(key) = &r.key {
-        env_ref = "SUPERAGENT_DSH_CALL_KEY".into();
-        env.set(&env_ref, key.clone());
-    }
-    let selected: Map<String, Value> = r.models[&s.model]
-        .as_object()
+/// The provider spec for the policy patch and, when the adapter holds the
+/// key, the `(variable, key)` pair to put in the child environment. The key
+/// itself never enters the patch file.
+fn call_spec(r: &DsRoute, model: &str) -> (Value, Option<(&'static str, String)>) {
+    let env_ref = if r.key.is_some() { CALL_KEY.to_string() } else { r.env_ref.clone() };
+    let selected: Map<String, Value> = r
+        .models
+        .get(model)
+        .and_then(Value::as_object)
         .into_iter()
         .flatten()
         .filter(|(k, _)| ALLOWED_MODEL_FIELDS.contains(&k.as_str()))
@@ -534,7 +534,60 @@ async fn run(
             spec.insert("reasoning".into(), reasoning.clone());
         }
     }
-    let policy_text = policy(&s.provider, &s.model, boundary, &r, Value::Object(spec));
+    (Value::Object(spec), r.key.clone().map(|k| (CALL_KEY, k)))
+}
+
+impl Adapter for DeepSeek {
+    fn agent(&self) -> &'static str {
+        "deepseek"
+    }
+
+    fn catalog(&self) -> BoxFuture<'static, anyhow::Result<Catalog>> {
+        let sys = self.sys.clone();
+        let customs = custom::snapshot(&self.registry, "deepseek");
+        Box::pin(async move {
+            let mut d = discover(&sys, &CancellationToken::new()).await?;
+            merge_custom(&mut d, &customs, &sys);
+            Ok(Catalog { value: d.catalog })
+        })
+    }
+
+    fn run(
+        &self,
+        request: RunRequest,
+        host: Arc<dyn TurnHost>,
+        events: EventSink,
+        cancel: CancellationToken,
+    ) -> BoxFuture<'static, Result<RunOutcome, AdapterError>> {
+        let sys = self.sys.clone();
+        let customs = custom::snapshot(&self.registry, "deepseek");
+        Box::pin(async move { run(sys, customs, request, host, Emit(events), cancel).await })
+    }
+}
+
+/// `run(o)` (DS:211-293).
+async fn run(
+    sys: Sys,
+    customs: Vec<CustomProvider>,
+    req: RunRequest,
+    host: Arc<dyn TurnHost>,
+    emit: Emit,
+    cancel: CancellationToken,
+) -> Result<RunOutcome, AdapterError> {
+    let boundary = scope("deepseek", &req, &host, &cancel, true).await?;
+    let mut d = discover(&sys, &cancel).await.map_err(|e| probe_failed(&e.to_string()))?;
+    merge_custom(&mut d, &customs, &sys);
+    let s = select(&d.catalog, &req.route)?;
+    let r = d.route(&s.provider).cloned().ok_or_else(|| route_gone("已选供应商或模型失效，请刷新配置"))?;
+    let node_exe = d.node.clone().ok_or_else(|| route_gone("本机未安装所选原生执行端"))?;
+    let mut env = sys.clone();
+    env.set("DSH_HOME", sys.platform_dir().join("dsh-state").join(boundary).to_string_lossy().into_owned());
+    env.set("DSH_PERMISSION_MODE", boundary);
+    let (spec, call_key) = call_spec(&r, &s.model);
+    if let Some((name, key)) = call_key {
+        env.set(name, key);
+    }
+    let policy_text = policy(&s.provider, &s.model, boundary, &r, spec);
     let temp = tempfile::Builder::new()
         .prefix("superagent-dsh-")
         .tempdir_in(&sys.temp)
@@ -697,6 +750,51 @@ mod tests {
         assert_eq!(a.keys().collect::<Vec<_>>(), vec!["x"]);
         let b = models(&json!({"y": {"id": "y"}, "z": {"id": "other"}}));
         assert_eq!(b.keys().collect::<Vec<_>>(), vec!["y"]);
+    }
+
+    fn custom_provider(base: &str, key_env: &str) -> CustomProvider {
+        CustomProvider {
+            id: "gw".into(),
+            agent: "deepseek".into(),
+            name: "网关".into(),
+            base_url: base.into(),
+            key_env: key_env.into(),
+            models: vec!["m-1".into(), "m-2".into()],
+            enabled: true,
+        }
+    }
+
+    #[test]
+    fn custom_providers_become_pi_ai_routes_with_the_key_in_env_only() {
+        let sys = Sys::new(
+            vec![("GW_KEY".into(), "sk-secret".into())],
+            PathBuf::from("/nonexistent-home"),
+            std::env::temp_dir(),
+        );
+        let mut d = Discovery {
+            node: None,
+            catalog: json!({"providers": [], "modes": modes("DSH", true), "default": {}}),
+            routes: vec![],
+        };
+        let customs = vec![custom_provider("https://gw.example/v1", "GW_KEY")];
+        merge_custom(&mut d, &customs, &sys);
+        assert_eq!(d.catalog["providers"][0]["id"], "sa-gw");
+        let r = d.route("sa-gw").expect("route").clone();
+        let (spec, key) = call_spec(&r, "m-2");
+        assert_eq!(key, Some((CALL_KEY, "sk-secret".to_string())));
+        assert_eq!(spec["api"], "openai-completions");
+        assert_eq!(spec["apiKeyEnv"], CALL_KEY);
+        assert_eq!(spec["baseURL"], "https://gw.example/v1");
+        assert_eq!(spec["models"], json!([{"id": "m-2", "name": "m-2"}]));
+        let text = policy("sa-gw", "m-2", "read-only", &r, spec);
+        assert!(!text.contains("sk-secret"));
+        assert!(!text.contains("credentials"));
+        assert!(text.contains("llm-pi-ai"));
+
+        let keyless = custom_route(&custom_provider("http://127.0.0.1:9/v1", ""), &sys);
+        assert_eq!(keyless.key.as_deref(), Some(custom::LOCAL_PLACEHOLDER));
+        let missing = custom_route(&custom_provider("https://gw.example/v1", "NOPE"), &sys);
+        assert_eq!(missing.key, None);
     }
 
     #[test]
