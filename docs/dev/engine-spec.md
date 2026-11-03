@@ -62,6 +62,7 @@ Constants (PR:4-14):
 | `continuous_runs` | ticket PK, phase('work'), milestone, learning, boundary_job, boundary_seq, probe, success, stalls, last_signal | INSERT on create when profile=auto (S:126). Updated in §5. |
 | `studio_plan` | id, ticket, body, done | Studio only (ST:118-120, 359-375). The engine reads it if the table exists (E:170-174). |
 | `studio_ticket_extensions`, `studio_tool_receipts`, `studio_servers` | — | Extensions (X:248-250, 328-330, 372-384) |
+| `project_knowledge` (Rust port) | id, cwd, kind, body, ticket, job, agent, created, sha256, archived(0) | §4.4. Not in the JS schema; created by the Rust journal opener. |
 
 ### 1.3 Event kinds (payload shape · when · where)
 Event row `job`/`turn` are the job the event is logged against.
@@ -113,6 +114,7 @@ Event row `job`/`turn` are the job the event is logged against.
 | `mcp.result` | `{id, server, tool, state: done\|error\|uncertain, result}` | X:376 |
 | `routes.changed` | `{old, new, new_native_session:[agents]}` | ST:271-283 |
 | `plan.add` / `plan.done` / `plan.reopen` | `{id}` | ST:365, 373 |
+| `knowledge.add` / `knowledge.rejected` / `knowledge.archived` | `{id, kind}` / `{reason}` / `{id, archived}` | Rust port, §4.4 |
 
 Studio's UI-visible subset is listed in ST:15-40.
 
@@ -296,6 +298,7 @@ T1 asserts recovery runs only on `start()`, not in the constructor.
 | delegate_models | added in executionRoute (§6.4), always present (possibly `{}`) |
 | project_extensions | `{skills, mcp}`, only if the extensions service exists. `mcp` is `[]` unless the job is a root and the profile is not legacy or readonly (E:342-346). |
 | mcp_results | for roots: `X.results(job)`, i.e. receipts of the latest logical turn plus the last 10, as `{id, state, result}`; for children: `[]` |
+| project_knowledge | Rust port, after `recovery` (before `plan`/`delegate_models`), only when non-empty; see §4.4 |
 
 ---
 
@@ -307,7 +310,7 @@ T1 asserts recovery runs only on `start()`, not in the constructor.
   - A `message.boundary` flushes the remainder as one streaming line.
   - This happens only **after** the batch has been durably logged (E:323), and only if the job is still live and not aborted.
 - **Final reply**: after the adapter returns, `result.text.split('\n')` and every line is submitted with `streaming=false`.
-- `submit` accepts only lines matching `/^SA_(SEND|NOTE|ROLE|TOOL|PROGRESS) /`. The tag must be at column 0, followed by one space.
+- `submit` accepts only lines matching `/^SA_(SEND|NOTE|ROLE|TOOL|PROGRESS) /` (the Rust port adds `MEMO`, final pass only, §4.4). The tag must be at column 0, followed by one space.
   - `SA_TOOL` is ignored while streaming. External effects run only from the authoritative final text (T2 "MCP effects are final-only").
   - A trailing `\r` is stripped before parsing.
 - All submissions go through one serial promise queue per turn.
@@ -384,6 +387,18 @@ Lines that do not match the tag regex are ignored. `command()` also ignores line
 - EXHAUSTED: `checks` and `alternatives` must each be an array of 1-32 strings, each validText ≤4000.
 - Conflicts: FINISH with NEXT, or EXHAUSTED with any of FINISH, GOAL or NEXT, throws `'同一轮的状态指令相互冲突'`.
 - `unresolved(reports, cmd)` (PR:127-134) returns the ids of reports in failed, partial or cancelled state that are not listed in `cmd.resolved`.
+
+### 4.4 Shared project knowledge (Rust port; `crates/sa-engine/src/knowledge.rs`)
+Operator requirement: all agents of one project share memory, lessons and progress, and see them every turn. There is no JS counterpart.
+
+- **Table** `project_knowledge(id, cwd, kind ∈ memory|lesson|progress, body, ticket, job, agent, created, sha256, archived)`, index `(cwd, archived, id)`, unique `(cwd, sha256) WHERE archived=0`. DDL in `sa_store::knowledge::SCHEMA`, run by `Db::open` with `CREATE … IF NOT EXISTS`; the Node engine ignores it. A project is the ticket's canonical `tickets.cwd`; `sha256 = digest(body)`.
+- **SA_MEMO** `{"kind":"memory|lesson|progress","text":"…"}` from the final reply of any job (lead or child); streamed lines are ignored like SA_TOOL. Exactly these two keys; `text` is trimmed, validText ≤ 2000 UTF-16 units, no control characters other than tab/newline and no bidi overrides. At most 8 SA_MEMO lines per turn. Like SA_PROGRESS, failures never fail the job: they log `knowledge.rejected {reason: invalid_json | invalid_fields | too_many}` without quoting content. Skipped silently when aborted or not live.
+- **Dedupe/replay**: no insert when the project has an active row with the same digest, or the same job already recorded it (also when archived since), so retried and replayed turns are no-ops. Each insert logs `knowledge.add {id, kind}` on the writing job.
+- **Automatic progress**: commitReply of a root that ends `done` or `partial` inserts `progress` (agent = lead): `工单 #<ticket>（完成|部分完成）目标：<goal ≤300>`, `最新追加：<last user.follow ≤200>` when present, and `结果：<reply without SA_* lines, whitespace collapsed, ≤1200>`.
+- **Envelope** `project_knowledge`: appended after `recovery`, only when the project has active entries. Newest first, `{id, kind, body, agent, ticket}`. Each kind first gets its newest entries within 2000 UTF-16 units; the remaining budget (6000 in total, at most 48 entries) goes to the next newest of any kind. Archived rows are excluded. Compaction keeps it as a current (non-history) key.
+- **Guide**: `guides::KNOWLEDGE` follows the base/mode guide on every turn.
+- **Operator API**: `Engine::knowledge(cwd)` (all rows, newest first, with `archived`), `Engine::add_knowledge(cwd, kind, body, ticket)` (agent `operator`; with a ticket, it must belong to the project and `knowledge.add` is logged on its root; duplicate → error), `Engine::archive_knowledge(id, archived)` (logs `knowledge.archived` on the ticket root if any; restoring over an active duplicate → error). `cwd` is canonicalized when it resolves. Observer reads: `sa_store::knowledge::list(conn, cwd)` or `read(data_dir, cwd)` (opens read-only; a journal without the table reads as empty).
+- Tests: `crates/sa-engine/tests/knowledge.rs`.
 
 ---
 

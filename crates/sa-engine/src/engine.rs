@@ -19,6 +19,7 @@ use crate::db::{Db, Q, Who, int_of, now, str_of, who_of};
 use crate::dispatch::{self, CmdError};
 use crate::guides;
 use crate::job::{JobCtx, envelope};
+use crate::knowledge;
 use crate::protocol::{self as p, END_SQL, digest, stringify};
 use crate::resilience::{Health, HealthTransition, Recovery, TurnLedger, TurnResult, classify};
 use crate::runner::{NoRotation, ResilientRunner, RotationSource, TurnRunner};
@@ -33,7 +34,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, LazyLock, Mutex, MutexGuard, Weak,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -57,7 +58,7 @@ static TRANSIENT: LazyLock<Regex> = LazyLock::new(|| {
     .expect("valid regex")
 });
 static CONTROL_LINE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^SA_(SEND|NOTE|ROLE|TOOL|PROGRESS) ").expect("valid regex"));
+    LazyLock::new(|| Regex::new(r"^SA_(SEND|NOTE|ROLE|TOOL|PROGRESS|MEMO) ").expect("valid regex"));
 
 /// Pluggable engine services.
 pub struct EngineOptions {
@@ -161,6 +162,8 @@ pub struct Turn {
     pub(crate) cancel: CancellationToken,
     timed_out: AtomicBool,
     pub(crate) tool_follow: AtomicBool,
+    /// `SA_MEMO` lines seen in this turn's final reply.
+    pub(crate) memos: AtomicUsize,
     route: Mutex<Option<Route>>,
 }
 
@@ -229,6 +232,14 @@ fn class_name(class: ErrorClass) -> Value {
 
 fn route_json(r: &Route) -> Value {
     p::route_value(r)
+}
+
+/// Project key: the canonical directory like `tickets.cwd`, or the text as
+/// given when it does not resolve.
+fn project_key(cwd: &str) -> String {
+    realpath(Path::new(cwd))
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| cwd.to_string())
 }
 
 /// Parsed JSON column, `null` when absent or invalid.
@@ -543,6 +554,27 @@ impl Engine {
         self.inner.db.with(|q| q.root(ticket))
     }
 
+    /// Project knowledge entries of `cwd` (canonicalized when it exists),
+    /// newest first, including archived ones.
+    pub fn knowledge(&self, cwd: &str) -> Result<Vec<sa_store::knowledge::KnowledgeEntry>> {
+        let cwd = project_key(cwd);
+        self.inner.db.with(|q| sa_store::knowledge::list(q.conn(), &cwd))
+    }
+
+    /// Add an operator entry (`agent='operator'`) to the project `cwd`.
+    /// With `ticket`, the ticket must belong to the project and
+    /// `knowledge.add` is logged on its root job. Returns the entry id.
+    pub fn add_knowledge(&self, cwd: &str, kind: &str, body: &str, ticket: Option<i64>) -> Result<i64> {
+        let cwd = project_key(cwd);
+        self.inner.db.tx(|q| knowledge::operator_add(q, &cwd, kind, body, ticket))
+    }
+
+    /// Archive (`true`) or restore (`false`) a knowledge entry. Archived
+    /// entries stay listed but leave every envelope.
+    pub fn archive_knowledge(&self, id: i64, archived: bool) -> Result<()> {
+        self.inner.db.tx(|q| knowledge::set_archived(q, id, archived))
+    }
+
     /// Unhealthy routes known to the runner.
     pub fn health(&self) -> Vec<(String, Route, Health)> {
         self.inner.opts.runner.health()
@@ -663,6 +695,7 @@ impl Inner {
                     cancel: CancellationToken::new(),
                     timed_out: AtomicBool::new(false),
                     tool_follow: AtomicBool::new(false),
+                    memos: AtomicUsize::new(0),
                     route: Mutex::new(None),
                 });
             }
@@ -817,6 +850,7 @@ impl Inner {
             guide.push('\n');
             guide.push_str(guides::LEGACY_AUTO);
         }
+        guide.push_str(guides::KNOWLEDGE);
         let mut packet = turn.packet().clone();
         if primary && packet.get("autonomy").and_then(|a| a.get("phase")).and_then(Value::as_str) == Some("discover") {
             guide.push_str(guides::DISCOVERY);
@@ -1108,8 +1142,9 @@ impl Inner {
         if !CONTROL_LINE.is_match(line) {
             return;
         }
-        // External effects require the authoritative final reply.
-        if streaming && line.starts_with("SA_TOOL ") {
+        // External effects and shared knowledge require the authoritative
+        // final reply.
+        if streaming && (line.starts_with("SA_TOOL ") || line.starts_with("SA_MEMO ")) {
             return;
         }
         if st.fatal.is_some() || turn.aborted() {
@@ -1238,6 +1273,9 @@ impl Inner {
         let redirect = job.profile == "auto" && follow;
         if redirect {
             state = "queued";
+        }
+        if job.is_root() {
+            knowledge::root_progress(q, job, state, text)?;
         }
         q.run(
             "UPDATE jobs SET result=?,session=?,state=?,dispatch_turn=NULL,turn=turn+? WHERE id=?",

@@ -174,6 +174,7 @@ pub fn compact(
         "goal",
         "assignment",
         "autonomy",
+        "project_knowledge",
         "next_step",
         "reports",
         "notes",

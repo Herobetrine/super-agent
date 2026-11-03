@@ -29,6 +29,8 @@ pub struct Db {
 impl Db {
     pub fn open(dir: &Path) -> Result<Self> {
         let conn = sa_store::journal::open_journal(dir)?;
+        // Additive Rust-port table; the Node engine ignores it.
+        conn.execute_batch(sa_store::knowledge::SCHEMA)?;
         conn.set_prepared_statement_cache_capacity(256);
         Ok(Self {
             conn: Mutex::new(Some(conn)),

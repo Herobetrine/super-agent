@@ -3,6 +3,7 @@
 use crate::adapter::AGENTS;
 use crate::db::{NoteSource, Q, str_of};
 use crate::engine::Turn;
+use crate::knowledge;
 use crate::protocol::{self as p, digest, stringify, utf16_len};
 use crate::services::InvokeArgs;
 use anyhow::{Result, anyhow};
@@ -56,6 +57,9 @@ pub async fn command(turn: &Arc<Turn>, line: &str) -> Result<(), CmdError> {
     let (tag, rest) = (&line[..sep], &line[sep + 1..]);
     if tag == "SA_PROGRESS" {
         return progress(turn, rest).map_err(CmdError::Other);
+    }
+    if tag == "SA_MEMO" {
+        return memo(turn, rest).map_err(CmdError::Other);
     }
     if !matches!(tag, "SA_ROLE" | "SA_SEND" | "SA_NOTE" | "SA_TOOL") {
         return Ok(());
@@ -412,6 +416,41 @@ fn progress(turn: &Turn, text: &str) -> Result<()> {
             "INSERT INTO progress_receipts(job,source_turn,msgkey,seq) VALUES(?,?,?,?)",
             &[&job.id, &logical, &id, &seq],
         )?;
+        Ok(())
+    })
+}
+
+/// `SA_MEMO {"kind","text"}` (final reply only, spec §4.4). Like
+/// SA_PROGRESS, a malformed or excess entry is logged as
+/// `knowledge.rejected {reason}` without quoting it or failing the job.
+/// Duplicates (and replays of a retried turn) are silent no-ops.
+fn memo(turn: &Turn, text: &str) -> Result<()> {
+    let job = &turn.job;
+    let who = job.who();
+    let seen = turn.memos.fetch_add(1, Ordering::SeqCst) + 1;
+    turn.inner().db.tx(|q| {
+        if turn.aborted() || !q.live(who)? {
+            return Ok(());
+        }
+        let reject = |reason: &str| q.log(who, "knowledge.rejected", &json!({"reason": reason})).map(|_| ());
+        if seen > knowledge::MAX_PER_TURN {
+            return reject("too_many");
+        }
+        let Ok(cmd) = serde_json::from_str::<Value>(text) else {
+            return reject("invalid_json");
+        };
+        let Some((kind, body)) = knowledge::parse_memo(&cmd) else {
+            return reject("invalid_fields");
+        };
+        let entry = knowledge::NewEntry {
+            cwd: &job.cwd,
+            kind,
+            body,
+            ticket: Some(job.ticket),
+            job: Some(job.id),
+            agent: &job.agent,
+        };
+        knowledge::insert(q, &entry, Some(who))?;
         Ok(())
     })
 }
