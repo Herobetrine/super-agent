@@ -184,7 +184,8 @@ fn recovery_of(q: &Q, j: &JobCtx) -> Result<Value> {
 }
 
 /// `envelope(j)` (S:302-375) in exact key order, plus the Rust-port fields
-/// `harness_health` and `recovery` after `autonomy`.
+/// `harness_health` and `recovery` after `autonomy`, and `project_knowledge`
+/// after them when the project has active entries.
 pub fn envelope(q: &Q, j: &JobCtx, harness_health: Value) -> Result<Map<String, Value>> {
     let t = q
         .one("SELECT * FROM tickets WHERE id=?", &[&j.ticket])?
@@ -323,5 +324,9 @@ pub fn envelope(q: &Q, j: &JobCtx, harness_health: Value) -> Result<Map<String, 
     m.insert("autonomy".into(), autonomy);
     m.insert("harness_health".into(), harness_health);
     m.insert("recovery".into(), recovery_of(q, j)?);
+    let knowledge = crate::knowledge::context(q, &j.cwd)?;
+    if !knowledge.is_empty() {
+        m.insert("project_knowledge".into(), Value::Array(knowledge));
+    }
     Ok(m)
 }

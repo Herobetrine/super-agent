@@ -3,6 +3,7 @@
 mod activity;
 mod harness_activity;
 pub mod journal;
+pub mod knowledge;
 pub mod model;
 mod native_activity;
 mod progress;
