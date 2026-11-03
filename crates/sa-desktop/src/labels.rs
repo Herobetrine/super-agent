@@ -16,6 +16,37 @@ pub fn agent_name(agent: &str) -> String {
     }
 }
 
+/// Failure class of the resilient runner (`ErrorClass`, snake_case).
+pub fn error_class(class: &str) -> String {
+    match class {
+        "network" => "网络中断".into(),
+        "rate_limited" => "触发限流".into(),
+        "overloaded" => "上游过载".into(),
+        "stalled" => "长时间无输出".into(),
+        "process_crashed" => "执行端异常退出".into(),
+        "route_unavailable" => "供应商或模型不可用".into(),
+        "auth" => "认证失败".into(),
+        "billing" => "额度或计费问题".into(),
+        "permission" => "权限不足".into(),
+        "protocol" => "协议错误".into(),
+        "input_too_large" => "输入过长".into(),
+        "session_mismatch" => "会话不匹配".into(),
+        "cancelled" => "已取消".into(),
+        "" => "未知原因".into(),
+        other => other.into(),
+    }
+}
+
+/// `provider / model` of a journaled route object.
+pub fn route_label(route: &serde_json::Value) -> String {
+    let get = |k: &str| route.get(k).and_then(serde_json::Value::as_str).unwrap_or_default();
+    match (get("provider"), get("model")) {
+        ("", "") => "未知路由".into(),
+        (p, "") => p.into(),
+        (p, m) => format!("{p} / {m}"),
+    }
+}
+
 /// Two-letter monogram drawn inside the agent avatar.
 pub fn agent_monogram(agent: &str) -> &'static str {
     match agent {

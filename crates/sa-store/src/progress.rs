@@ -39,6 +39,13 @@ pub(crate) const VISIBLE: &[&str] = &[
     "approval.request",
     "approval.decision",
     "mcp.result",
+    // Rust-port resilience events (spec §9.2 G).
+    "turn.stalled",
+    "turn.retry_scheduled",
+    "turn.route_wait",
+    "turn.gave_up",
+    "route.rotated",
+    "harness.health",
 ];
 
 /// `[label, category, state = 'running']` per journal kind.

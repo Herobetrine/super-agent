@@ -644,6 +644,26 @@ pub fn build(ticket: &TicketDetail, jobs: &[JobView], events: &[EventView]) -> F
                     tone: if blocked { Tone::Error } else { Tone::Normal },
                 });
             }
+            "turn.stalled" | "turn.retry_scheduled" | "turn.route_wait" | "turn.gave_up" | "route.rotated"
+            | "harness.health" => {
+                if let Some((text, tone)) = resilience_line(&e.kind, p, &agent) {
+                    items.push(Item::Line {
+                        key,
+                        kind: LineKind::Retry,
+                        text,
+                        agent: None,
+                        to: None,
+                        ts: e.ts,
+                        tone,
+                    });
+                }
+            }
+            // `turn.retry_scheduled` right before carries the same retry with more detail.
+            "auto.retry"
+                if matches!(
+                    items.last(),
+                    Some(Item::Line { kind: LineKind::Retry, ts, .. }) if (*ts - e.ts).abs() < 0.001
+                ) => {}
             "auto.backoff" | "auto.retry" => items.push(Item::Line {
                 key,
                 kind: LineKind::Retry,
@@ -719,6 +739,85 @@ pub fn build(ticket: &TicketDetail, jobs: &[JobView], events: &[EventView]) -> F
 /// Alert title such as "Codex · 失败".
 pub fn alert_title(kind: &str, agent: &str) -> String {
     format!("{} · {}", agent_name(agent), job_state(kind))
+}
+
+/// Status line of a resilience event (spec §9.2 G); `None` hides it.
+fn resilience_line(kind: &str, p: &Value, agent: &str) -> Option<(String, Tone)> {
+    let who = agent_name(agent);
+    let num = |k: &str| p.get(k).and_then(Value::as_f64);
+    let after = |ms: Option<f64>| {
+        ms.map(|ms| format!(" · {} 后", crate::labels::duration((ms / 1000.0).round())))
+            .unwrap_or_default()
+    };
+    let class = crate::labels::error_class(&s(p, "class"));
+    Some(match kind {
+        "turn.stalled" => {
+            let phase = match s(p, "phase").as_str() {
+                "first_frame" => "启动后迟迟没有输出",
+                "model_idle" => "等待模型输出时无响应",
+                "tool_idle" => "工具执行期间无响应",
+                "hard_cap" => "超过单轮时长上限",
+                _ => "长时间无响应",
+            };
+            (
+                format!(
+                    "{who} · 疑似卡住 · {phase} {}，已中断并准备续接",
+                    crate::labels::duration((num("idle_ms").unwrap_or(0.0) / 1000.0).round())
+                ),
+                Tone::Error,
+            )
+        }
+        "turn.retry_scheduled" => {
+            let attempt = num("attempt").unwrap_or(0.0) as i64;
+            let of = num("max").map(|m| format!("/{}", m as i64)).unwrap_or_default();
+            let resume = if p.get("resume_session") == Some(&Value::Bool(true)) { " · 续接原会话" } else { "" };
+            (
+                format!("{who} · 已中断，重试中 {attempt}{of} · {class}{}{resume}", after(num("after_ms"))),
+                Tone::Normal,
+            )
+        }
+        "turn.route_wait" => (
+            format!(
+                "{who} · 等待上游恢复 · {} · {class}",
+                crate::labels::route_label(p.get("route").unwrap_or(&Value::Null))
+            ),
+            Tone::Normal,
+        ),
+        "turn.gave_up" => (
+            format!("{who} · 已放弃（{class}）· 共尝试 {} 次", num("attempts").unwrap_or(0.0) as i64),
+            Tone::Error,
+        ),
+        "route.rotated" => (
+            format!(
+                "{who} · 供应商轮换 · {} → {} · {}{}",
+                crate::labels::route_label(p.get("from").unwrap_or(&Value::Null)),
+                crate::labels::route_label(p.get("to").unwrap_or(&Value::Null)),
+                crate::labels::error_class(&s(p, "reason")),
+                after(num("after_ms"))
+            ),
+            Tone::Normal,
+        ),
+        "harness.health" => {
+            let state = s(p, "state");
+            let text = match state.as_str() {
+                "open" => "执行端熔断",
+                "half_open" => "执行端试探恢复",
+                "degraded" => "执行端降级",
+                "healthy" => "执行端已恢复",
+                _ => return None,
+            };
+            let reason = p
+                .get("reason_class")
+                .and_then(Value::as_str)
+                .map(|c| format!(" · {}", crate::labels::error_class(c)))
+                .unwrap_or_default();
+            (
+                format!("{} · {text} · {}{reason}", agent_name(&s(p, "agent")), crate::labels::route_label(p)),
+                if state == "healthy" { Tone::Normal } else { Tone::Error },
+            )
+        }
+        _ => return None,
+    })
 }
 
 #[cfg(test)]
@@ -826,6 +925,43 @@ mod tests {
             }
         ));
         assert!(matches!(&feed.items[2], Item::Reply { peer: true, .. }));
+    }
+
+    #[test]
+    fn resilience_events_become_status_lines() {
+        let jobs = vec![job(1, "codex", None)];
+        let route = json!({"provider": "openai", "model": "gpt", "mode": "cli"});
+        let mut retry = ev(2, "turn.retry_scheduled", 1, json!({"class": "overloaded", "attempt": 2, "max": 5, "after_ms": 4000, "resume_session": true, "route": route}));
+        let mut legacy = ev(3, "auto.retry", 1, json!({"after_seconds": 4, "reason": "serverOverloaded"}));
+        retry.ts = 50.0;
+        legacy.ts = 50.0;
+        let events = vec![
+            ev(1, "turn.stalled", 1, json!({"phase": "model_idle", "idle_ms": 361000})),
+            retry,
+            legacy,
+            ev(4, "route.rotated", 1, json!({"from": route, "to": {"provider": "azure", "model": "gpt", "mode": "cli"}, "reason": "auth", "after_ms": 0})),
+            ev(5, "harness.health", 1, json!({"agent": "codex", "provider": "openai", "model": "gpt", "state": "open", "reason_class": "overloaded"})),
+            ev(6, "turn.gave_up", 1, json!({"class": "auth", "attempts": 3})),
+        ];
+        let feed = build(&ticket(), &jobs, &events);
+        let lines: Vec<&str> = feed
+            .items
+            .iter()
+            .filter_map(|i| match i {
+                Item::Line { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            lines,
+            vec![
+                "Codex · 疑似卡住 · 等待模型输出时无响应 6 分 01 秒，已中断并准备续接",
+                "Codex · 已中断，重试中 2/5 · 上游过载 · 4 秒 后 · 续接原会话",
+                "Codex · 供应商轮换 · openai / gpt → azure / gpt · 认证失败 · 0 秒 后",
+                "Codex · 执行端熔断 · openai / gpt · 上游过载",
+                "Codex · 已放弃（认证失败）· 共尝试 3 次",
+            ]
+        );
     }
 
     #[test]
