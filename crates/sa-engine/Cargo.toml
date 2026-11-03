@@ -1,0 +1,25 @@
+[package]
+name = "sa-engine"
+description = "Super Agent scheduler: tickets, jobs, control protocol, autonomy and resilience"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+# preserve_order: JSON objects keep insertion order like JSON.stringify
+# (envelope key order, journaled adapter frames).
+serde_json = { workspace = true, features = ["preserve_order"] }
+sha2.workspace = true
+regex = "1"
+tempfile.workspace = true
+rusqlite.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+futures.workspace = true
+sa-store = { path = "../sa-store" }
+
+[dev-dependencies]
+tempfile.workspace = true
