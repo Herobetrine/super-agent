@@ -1,6 +1,7 @@
 //! Right inspector: collaboration tree, native tasks, plan and approvals.
 
 use crate::app::{App, Tab};
+use crate::host::Action;
 use crate::feed::split_reply;
 use crate::labels::{self, activity_state, activity_time, agent_name, job_state};
 use crate::theme::{self, Palette};
@@ -79,6 +80,8 @@ impl App {
                 ui.add_space(10.0);
                 self.tabs(ui, snap.as_ref());
             });
+        let writable = self.writable();
+        let mut action: Option<Action> = None;
         egui::ScrollArea::vertical()
             .id_salt(("inspector", self.tab.key()))
             .auto_shrink([false, false])
@@ -104,11 +107,17 @@ impl App {
                         match self.tab {
                             Tab::Collab => self.collab_tab(ui, &snap),
                             Tab::Native => native_tab(ui, &snap, &pal),
-                            Tab::Plan => plan_tab(ui, &snap, &pal),
-                            Tab::Approvals => approvals_tab(ui, &snap, &pal),
+                            Tab::Plan => {
+                                let draft = writable.then_some(&mut self.composer.plan_draft);
+                                action = plan_tab(ui, &snap, &pal, draft);
+                            }
+                            Tab::Approvals => action = approvals_tab(ui, &snap, &pal, writable),
                         }
                     });
             });
+        if let Some(a) = action {
+            self.submit(a);
+        }
     }
 
     fn tabs(&mut self, ui: &mut Ui, snap: Option<&Snapshot>) {
@@ -334,7 +343,10 @@ impl App {
             walk(r, 0, &children, &mut order);
         }
         let permission = snap.ticket.permission_profile.clone();
+        let writable = self.host.is_some();
+        let stopped = snap.ticket.state == "cancelled";
         let mut toggle = None;
+        let mut act: Option<(CardAction, i64, String)> = None;
         ui.spacing_mut().item_spacing.y = 6.0;
         for (job, depth) in order {
             let indent = (depth.min(4) as f32) * 16.0;
@@ -355,8 +367,10 @@ impl App {
                     );
                 }
                 ui.vertical(|ui| {
-                    if job_card(ui, job, open, &permission, &pal) {
-                        toggle = Some(job.id);
+                    match job_card(ui, job, open, &permission, writable, stopped, &pal) {
+                        Some(CardAction::Toggle) => toggle = Some(job.id),
+                        Some(a) => act = Some((a, job.id, job.agent.clone())),
+                        None => {}
                     }
                 });
             });
@@ -373,18 +387,34 @@ impl App {
         if let Some(c) = action {
             self.request_jobs_page(c);
         }
+        match act {
+            Some((CardAction::Note, job, agent)) => self.set_target(job, agent),
+            Some((CardAction::Retry, job, _)) => self.submit(Action::Retry { job }),
+            _ => {}
+        }
     }
 }
 
 /// Returns true when the header was clicked.
+/// What the operator did on a job card.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CardAction {
+    Toggle,
+    Note,
+    Retry,
+}
+
+/// `writable`: this window schedules the journal; `stopped`: the ticket is cancelled.
 fn job_card(
     ui: &mut Ui,
     job: &JobView,
     open: bool,
     ticket_permission: &str,
+    writable: bool,
+    stopped: bool,
     pal: &Palette,
-) -> bool {
-    let mut clicked = false;
+) -> Option<CardAction> {
+    let mut clicked = None;
     let stroke = if job.state == "running" {
         pal.run.fg.gamma_multiply(0.45)
     } else {
@@ -458,7 +488,28 @@ fn job_card(
                 .on_hover_cursor(egui::CursorIcon::PointingHand)
                 .clicked()
             {
-                clicked = true;
+                clicked = Some(CardAction::Toggle);
+            }
+            let can_note = writable && matches!(job.state.as_str(), "running" | "queued" | "waiting");
+            let can_retry = writable && !stopped && matches!(job.state.as_str(), "failed" | "interrupted");
+            if can_note || can_retry {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    if can_note
+                        && widgets::quiet_button(ui, icon::CHAT_CIRCLE_DOTS, "定向留言", pal, false)
+                            .on_hover_text("只发给这个任务")
+                            .clicked()
+                    {
+                        clicked = Some(CardAction::Note);
+                    }
+                    if can_retry
+                        && widgets::quiet_button(ui, icon::ARROW_CLOCKWISE, "重试", pal, false)
+                            .on_hover_text("重试同一逻辑轮次，保留已提交消息的回执")
+                            .clicked()
+                    {
+                        clicked = Some(CardAction::Retry);
+                    }
+                });
             }
             if open {
                 ui.add_space(6.0);
@@ -609,16 +660,36 @@ fn native_tab(ui: &mut Ui, snap: &Snapshot, pal: &Palette) {
     }
 }
 
-fn plan_tab(ui: &mut Ui, snap: &Snapshot, pal: &Palette) {
-    note(
-        ui,
-        "这份清单属于当前会话，由现有工作台维护；此处只读。",
-        pal,
-    );
+fn plan_tab(ui: &mut Ui, snap: &Snapshot, pal: &Palette, draft: Option<&mut String>) -> Option<Action> {
+    let ticket = snap.ticket.id;
+    let writable = draft.is_some();
+    let mut action = None;
+    match draft {
+        Some(draft) => {
+            note(ui, "这份清单属于当前会话，主控每轮都会收到它。", pal);
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                let edit = egui::TextEdit::singleline(draft)
+                    .hint_text(RichText::new("添加计划项").color(pal.faint))
+                    .font(theme::body(13.0))
+                    .char_limit(2000)
+                    .desired_width(ui.available_width() - 72.0);
+                let resp = ui.add(edit);
+                resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::TextEdit, true, "计划项输入"));
+                let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                let add = widgets::quiet_button(ui, icon::PLUS, "添加", pal, false).clicked();
+                if (enter || add) && !draft.trim().is_empty() {
+                    action = Some(Action::PlanAdd { ticket, body: draft.trim().to_string() });
+                }
+            });
+        }
+        None => note(ui, "这份清单属于当前会话，由持有调度的工作台维护；此处只读。", pal),
+    }
     ui.add_space(8.0);
     if snap.plan.is_empty() {
         empty(ui, icon::LIST_CHECKS, "这个会话还没有计划项。", pal);
-        return;
+        return action;
     }
     let done = snap.plan.iter().filter(|p| p.done).count();
     let total = snap.plan.len();
@@ -648,7 +719,20 @@ fn plan_tab(ui: &mut Ui, snap: &Snapshot, pal: &Palette) {
                 }
                 ui.horizontal_top(|ui| {
                     ui.spacing_mut().item_spacing.x = 8.0;
-                    let (rect, _) = ui.allocate_exact_size(vec2(26.0, 34.0), Sense::hover());
+                    let sense = if writable { Sense::click() } else { Sense::hover() };
+                    let (rect, resp) = ui.allocate_exact_size(vec2(26.0, 34.0), sense);
+                    let what = if item.done { "标记为未完成" } else { "标记为已完成" };
+                    resp.widget_info(|| {
+                        egui::WidgetInfo::labeled(egui::WidgetType::Checkbox, writable, format!("{what} {}", item.body))
+                    });
+                    if writable
+                        && resp
+                            .on_hover_cursor(egui::CursorIcon::PointingHand)
+                            .on_hover_text(if item.done { "标记为未完成" } else { "标记为已完成" })
+                            .clicked()
+                    {
+                        action = Some(Action::PlanToggle { ticket, id: item.id });
+                    }
                     let (ic, color) = if item.done {
                         (icon::CHECK_SQUARE, pal.accent)
                     } else {
@@ -675,27 +759,31 @@ fn plan_tab(ui: &mut Ui, snap: &Snapshot, pal: &Palette) {
                 });
             }
         });
+    action
 }
 
-fn approvals_tab(ui: &mut Ui, snap: &Snapshot, pal: &Palette) {
-    widgets::callout(pal.neutral).show(ui, |ui| {
-        ui.set_width(ui.available_width());
-        ui.horizontal_top(|ui| {
-            ui.label(RichText::new(icon::LOCK_SIMPLE).font(theme::body(15.0)).color(pal.mute));
-            ui.add(
-                Label::new(
-                    RichText::new("只读观察模式只展示待审批请求，不会允许或拒绝。请在现有工作台中处理这些请求。")
-                        .font(theme::body(12.5))
-                        .color(pal.mute),
-                )
-                .wrap(),
-            );
+fn approvals_tab(ui: &mut Ui, snap: &Snapshot, pal: &Palette, writable: bool) -> Option<Action> {
+    let mut action = None;
+    if !writable {
+        widgets::callout(pal.neutral).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal_top(|ui| {
+                ui.label(RichText::new(icon::LOCK_SIMPLE).font(theme::body(15.0)).color(pal.mute));
+                ui.add(
+                    Label::new(
+                        RichText::new("只读观察模式只展示待审批请求，不会允许或拒绝。请在持有调度的工作台中处理这些请求。")
+                            .font(theme::body(12.5))
+                            .color(pal.mute),
+                    )
+                    .wrap(),
+                );
+            });
         });
-    });
-    ui.add_space(10.0);
+        ui.add_space(10.0);
+    }
     if snap.approvals.is_empty() {
         empty(ui, icon::SHIELD_CHECK, "没有待审批的请求。", pal);
-        return;
+        return None;
     }
     ui.spacing_mut().item_spacing.y = 8.0;
     for a in &snap.approvals {
@@ -766,6 +854,22 @@ fn approvals_tab(ui: &mut Ui, snap: &Snapshot, pal: &Palette) {
                         let galley = ui.painter().layout_job(job);
                         ui.add(Label::new(galley));
                     });
+                if writable {
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 6.0;
+                        if widgets::quiet_button(ui, icon::CHECK, "允许本次请求", pal, false)
+                            .on_hover_text("只批准这一项请求")
+                            .clicked()
+                        {
+                            action = Some(Action::Decide { id: a.id, allow: true });
+                        }
+                        if widgets::quiet_button(ui, icon::X, "拒绝", pal, false).clicked() {
+                            action = Some(Action::Decide { id: a.id, allow: false });
+                        }
+                    });
+                }
             });
     }
+    action
 }

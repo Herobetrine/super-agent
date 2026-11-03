@@ -7,8 +7,9 @@ pub mod model;
 mod native_activity;
 mod progress;
 pub mod providers;
-mod schema;
+pub mod schema;
 pub mod store;
 
 pub use model::*;
+pub use schema::STUDIO_PLAN;
 pub use store::{DB_FILE, Store, default_data_dir};

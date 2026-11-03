@@ -80,7 +80,13 @@ impl App {
                 bottom: 14,
             }))
             .show_separator_line(false)
-            .show_inside(ui, |ui| self.footer(ui));
+            .show_inside(ui, |ui| {
+                if self.writable() {
+                    self.composer(ui);
+                } else {
+                    self.footer(ui);
+                }
+            });
 
         ui.add_space(14.0);
         if let Some(err) = self.source.error.clone() {
@@ -180,6 +186,8 @@ impl App {
             ui.add_space(18.0);
             let (title, hint) = if self.source.error.is_some() {
                 ("等待工单数据库", "连接恢复后会自动载入工单，无需重启。")
+            } else if self.writable() && self.view.is_none() {
+                ("开始新的对话", "选择项目和主控，在下方描述目标后发送。")
             } else if self.history_loaded && self.history.is_empty() {
                 ("还没有会话", "在现有工作台中创建工单后，会自动出现在这里。")
             } else {
@@ -436,6 +444,7 @@ impl App {
         let partial = view.partial_history;
         let mut open_groups = std::mem::take(&mut view.open_groups);
         let pending: Vec<i64> = snap.approvals.iter().map(|a| a.id).collect();
+        let writable = self.writable();
         let area = ui.available_rect_before_wrap();
         let out = egui::ScrollArea::vertical()
             .id_salt(("feed", ticket))
@@ -458,7 +467,7 @@ impl App {
                     let mut prev: Option<&Item> = None;
                     for item in &items {
                         ui.add_space(gap(prev, item));
-                        show_item(ui, item, snap, &pal, &mut open_groups, &pending);
+                        show_item(ui, item, snap, &pal, &mut open_groups, &pending, writable);
                         prev = Some(item);
                     }
                     ui.add_space(28.0);
@@ -545,7 +554,12 @@ impl App {
                                 ui.add_space(8.0);
                             }
                             ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-                                let text = "只读观察模式：调度仍由现有工作台负责";
+                                let text = match &self.host_error {
+                                    Some(e) if e.starts_with("只读") => e.clone(),
+                                    Some(e) => format!("只读观察模式：{e}"),
+                                    None => "只读观察模式：调度仍由现有工作台负责".to_string(),
+                                };
+                                let text = text.as_str();
                                 let g = widgets::line_galley(ui, text, theme::body(13.0), pal.mute, ui.available_width());
                                 ui.add(Label::new(g).selectable(false)).on_hover_text(
                                     "此窗口只读取工单日志：不创建工单、不发送消息、不处理审批，也不调用模型。",
@@ -576,6 +590,7 @@ fn show_item(
     pal: &Palette,
     open_groups: &mut std::collections::HashSet<i64>,
     pending: &[i64],
+    writable: bool,
 ) {
     match item {
         Item::User {
@@ -812,7 +827,11 @@ fn show_item(
                 );
                 ui.label(
                     RichText::new(if open {
-                        "只读观察模式不会处理审批，请在现有工作台中允许或拒绝。"
+                        if writable {
+                            "请在项目面板的审批页允许或拒绝。"
+                        } else {
+                            "只读观察模式不会处理审批，请在持有调度的工作台中允许或拒绝。"
+                        }
                     } else {
                         "该请求已处理或不再等待。"
                     })

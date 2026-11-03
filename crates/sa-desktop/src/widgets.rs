@@ -100,6 +100,7 @@ pub fn quiet_button(ui: &mut Ui, icon: &str, text: &str, pal: &Palette, active: 
     let galley = line_galley(ui, &label, theme::body(13.0), pal.ink, 400.0);
     let pad = vec2(10.0, 6.0);
     let (rect, resp) = ui.allocate_exact_size(galley.size() + pad * 2.0, Sense::click());
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), text));
     if ui.is_rect_visible(rect) {
         let p = ui.painter();
         if active {

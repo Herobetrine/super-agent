@@ -1,17 +1,22 @@
-//! Super Agent desktop: a read-only observer of the ticket journal.
+//! Super Agent desktop: the workbench and scheduler for the ticket journal.
+//! Falls back to a read-only observer when another workbench owns the journal.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
 mod cli;
+mod composer;
 mod conversation;
 mod data;
 mod demo;
 mod feed;
+mod host;
 mod inspector;
 mod labels;
 mod markdown;
 mod sidebar;
 mod theme;
+#[cfg(test)]
+mod ui_tests;
 mod widgets;
 mod worker;
 
@@ -48,11 +53,14 @@ fn main() {
         native.persist_window = false;
     }
 
+    let dir = opts.data.clone().unwrap_or_else(sa_store::default_data_dir);
+    // Demo data never schedules; screenshots only with `--schedule` (so a regression
+    // capture never claims the live journal); `--observe` keeps the window read-only.
+    let schedule = !opts.demo && !opts.observe && (opts.screenshot.is_none() || opts.schedule);
     let opener: data::Opener = if opts.demo {
         Box::new(|| Ok(Box::new(demo::DemoSource::new()) as Box<dyn data::DataSource>))
     } else {
-        let dir = opts.data.clone().unwrap_or_else(sa_store::default_data_dir);
-        data::StoreSource::opener(dir)
+        data::StoreSource::opener(dir.clone())
     };
     let shot_result: Arc<Mutex<Option<Result<(), String>>>> = Arc::default();
     let result = Arc::clone(&shot_result);
@@ -62,8 +70,19 @@ fn main() {
         native,
         Box::new(move |cc| {
             theme::install_fonts(&cc.egui_ctx);
+            // The scheduler creates the journal, so start it before the reader.
+            let host = if schedule {
+                let ctx = cc.egui_ctx.clone();
+                host::Host::start(dir, move || ctx.request_repaint()).map_err(|e| format!("{e:#}"))
+            } else if opts.demo {
+                Err("演示数据不调度".into())
+            } else if opts.observe {
+                Err("以 --observe 启动，不调度".into())
+            } else {
+                Err("截图模式不调度".into())
+            };
             let worker = worker::spawn(opener, cc.egui_ctx.clone());
-            Ok(Box::new(app::App::new(cc, opts, worker, result)))
+            Ok(Box::new(app::App::new(cc, opts, worker, result, host)))
         }),
     );
     if let Err(e) = run {

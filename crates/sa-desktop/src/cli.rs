@@ -1,10 +1,10 @@
-//! Command line: `super-agent [--data <dir>] [--ticket <id>] [--demo] [--dark]
+//! Command line: `super-agent [--data <dir>] [--ticket <id>] [--demo] [--observe] [--schedule] [--dark]
 //! [--inspector [tab]] [--screenshot <out.png> [--size WxH]]`.
 
 use anyhow::{Context, Result, bail};
 use std::path::PathBuf;
 
-pub const USAGE: &str = "用法: super-agent [--data <目录>] [--ticket <编号>] [--demo] [--dark] \
+pub const USAGE: &str = "用法: super-agent [--data <目录>] [--ticket <编号>] [--demo] [--observe] [--schedule] [--dark] \
 [--inspector [collab|native|plan|approvals]] [--at-top] [--expand-all] [--screenshot <输出.png> [--size 宽x高]]";
 
 #[derive(Clone, Debug, Default)]
@@ -12,6 +12,10 @@ pub struct Options {
     pub data: Option<PathBuf>,
     pub ticket: Option<i64>,
     pub demo: bool,
+    /// Never claim the journal; only observe it.
+    pub observe: bool,
+    /// Schedule even while taking a screenshot.
+    pub schedule: bool,
     pub dark: bool,
     /// `Some(None)` opens the inspector on its current tab.
     pub inspector: Option<Option<String>>,
@@ -51,6 +55,8 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Options> {
                 o.ticket = Some(id);
             }
             "--demo" => o.demo = true,
+            "--observe" => o.observe = true,
+            "--schedule" => o.schedule = true,
             "--dark" => o.dark = true,
             "--at-top" => o.at_top = true,
             "--expand-all" => o.expand_all = true,

@@ -31,7 +31,7 @@ type RunFn = dyn Fn(Arc<dyn TurnHost>, EventSink, CancellationToken) -> BoxFutur
 struct FakeAdapter(Box<RunFn>);
 
 impl FakeAdapter {
-    fn new<F, Fut>(f: F) -> Arc<dyn Adapter>
+    fn adapter<F, Fut>(f: F) -> Arc<dyn Adapter>
     where
         F: Fn(Arc<dyn TurnHost>, EventSink, CancellationToken) -> Fut + Send + Sync + 'static,
         Fut: std::future::Future<Output = Result<RunOutcome, AdapterError>> + Send + 'static,
@@ -168,7 +168,7 @@ async fn i1_stalled_stream_is_killed_at_model_idle_and_session_resumes() {
     let cfg = fast();
     let saw_cancel = Arc::new(AtomicUsize::new(0));
     let flag = saw_cancel.clone();
-    let adapter = FakeAdapter::new(move |_h, ev, cancel| {
+    let adapter = FakeAdapter::adapter(move |_h, ev, cancel| {
         let flag = flag.clone();
         async move {
             ev.send(AdapterEvent::Session("thread-1".into())).unwrap();
@@ -209,7 +209,7 @@ async fn i1_stalled_stream_is_killed_at_model_idle_and_session_resumes() {
 #[tokio::test(flavor = "multi_thread")]
 async fn first_frame_timeout() {
     let cfg = fast();
-    let adapter = FakeAdapter::new(|_h, _ev, cancel| until_cancelled(cancel));
+    let adapter = FakeAdapter::adapter(|_h, _ev, cancel| until_cancelled(cancel));
     let (res, _, took) = supervise(&cfg, adapter, CancellationToken::new()).await;
     let e = failed(res);
     assert_eq!(e.code.as_deref(), Some("stall:first_frame"));
@@ -219,7 +219,7 @@ async fn first_frame_timeout() {
 #[tokio::test(flavor = "multi_thread")]
 async fn i2_open_tool_extends_to_tool_idle() {
     let cfg = fast();
-    let adapter = FakeAdapter::new(|_h, ev, _c| async move {
+    let adapter = FakeAdapter::adapter(|_h, ev, _c| async move {
         ev.send(frame()).unwrap();
         ev.send(AdapterEvent::ToolStarted("cmd-1".into())).unwrap();
         sleep(Duration::from_millis(500)).await; // > model_idle, < tool_idle (1.5 s)
@@ -232,7 +232,7 @@ async fn i2_open_tool_extends_to_tool_idle() {
     assert_eq!(evs.len(), 4);
 
     // A tool that never finishes is cut at tool_idle.
-    let adapter = FakeAdapter::new(|_h, ev, cancel| async move {
+    let adapter = FakeAdapter::adapter(|_h, ev, cancel| async move {
         ev.send(AdapterEvent::ToolStarted("cmd-2".into())).unwrap();
         until_cancelled(cancel).await
     });
@@ -251,7 +251,7 @@ async fn i2_open_tool_extends_to_tool_idle() {
 async fn approval_pauses_idle_timer() {
     let cfg = fast();
     // In-flight TurnHost::approve (600 ms > model_idle).
-    let adapter = FakeAdapter::new(|host, ev, _c| async move {
+    let adapter = FakeAdapter::adapter(|host, ev, _c| async move {
         ev.send(frame()).unwrap();
         assert!(host.approve(json!({"kind": "exec"})).await);
         sleep(Duration::from_millis(20)).await;
@@ -262,7 +262,7 @@ async fn approval_pauses_idle_timer() {
     assert!(matches!(res, TurnResult::Done(_)), "{res:?}");
 
     // Announced AwaitingApproval pauses until the next frame.
-    let adapter = FakeAdapter::new(|_h, ev, _c| async move {
+    let adapter = FakeAdapter::adapter(|_h, ev, _c| async move {
         ev.send(AdapterEvent::AwaitingApproval).unwrap();
         sleep(Duration::from_millis(500)).await;
         ev.send(frame()).unwrap();
@@ -275,7 +275,7 @@ async fn approval_pauses_idle_timer() {
 #[tokio::test(flavor = "multi_thread")]
 async fn native_retry_extends_idle_once() {
     let cfg = fast();
-    let adapter = FakeAdapter::new(|_h, ev, _c| async move {
+    let adapter = FakeAdapter::adapter(|_h, ev, _c| async move {
         ev.send(frame()).unwrap();
         ev.send(AdapterEvent::NativeRetry {
             after: Some(Duration::from_millis(1000)),
@@ -289,7 +289,7 @@ async fn native_retry_extends_idle_once() {
     assert!(matches!(res, TurnResult::Done(_)), "{res:?}");
 
     // The extension ends at the next ordinary frame.
-    let adapter = FakeAdapter::new(|_h, ev, cancel| async move {
+    let adapter = FakeAdapter::adapter(|_h, ev, cancel| async move {
         ev.send(AdapterEvent::NativeRetry {
             after: Some(Duration::from_millis(2000)),
         })
@@ -308,7 +308,7 @@ async fn hard_cap_applies_even_with_steady_frames() {
         turn_hard_cap: Duration::from_millis(500),
         ..fast()
     };
-    let adapter = FakeAdapter::new(|_h, ev, cancel| async move {
+    let adapter = FakeAdapter::adapter(|_h, ev, cancel| async move {
         loop {
             if ev.send(frame()).is_err() || cancel.is_cancelled() {
                 return Err(AdapterError::new(ErrorClass::Cancelled, "x"));
@@ -331,7 +331,7 @@ async fn engine_cancel_maps_to_cancelled() {
         sleep(Duration::from_millis(100)).await;
         c2.cancel();
     });
-    let adapter = FakeAdapter::new(|_h, ev, cancel| async move {
+    let adapter = FakeAdapter::adapter(|_h, ev, cancel| async move {
         ev.send(AdapterEvent::Session("s9".into())).unwrap();
         until_cancelled(cancel).await
     });
@@ -350,14 +350,14 @@ async fn misbehaving_adapter_is_abandoned_after_grace() {
         ..fast()
     };
     // Ignores its token entirely.
-    let adapter = FakeAdapter::new(|_h, _ev, _c| futures::future::pending());
+    let adapter = FakeAdapter::adapter(|_h, _ev, _c| futures::future::pending());
     let (res, _, took) = supervise(&cfg, adapter, CancellationToken::new()).await;
     assert_eq!(failed(res).class, ErrorClass::Stalled);
     assert!(took < Duration::from_millis(1000), "{took:?}");
 
     let cancel = CancellationToken::new();
     cancel.cancel();
-    let adapter = FakeAdapter::new(|_h, _ev, _c| futures::future::pending());
+    let adapter = FakeAdapter::adapter(|_h, _ev, _c| futures::future::pending());
     let (res, _, took) = supervise(&cfg, adapter, cancel).await;
     assert_eq!(failed(res).class, ErrorClass::Cancelled);
     assert!(took < Duration::from_millis(1000));
@@ -366,7 +366,7 @@ async fn misbehaving_adapter_is_abandoned_after_grace() {
 #[tokio::test(flavor = "multi_thread")]
 async fn closed_forward_channel_stops_the_turn() {
     let cfg = fast();
-    let adapter = FakeAdapter::new(|_h, ev, cancel| async move {
+    let adapter = FakeAdapter::adapter(|_h, ev, cancel| async move {
         ev.send(frame()).unwrap();
         until_cancelled(cancel).await
     });
@@ -379,7 +379,7 @@ async fn closed_forward_channel_stops_the_turn() {
 #[tokio::test(flavor = "multi_thread")]
 async fn adapter_errors_pass_through_with_seen_session() {
     let cfg = fast();
-    let adapter = FakeAdapter::new(|_h, ev, _c| async move {
+    let adapter = FakeAdapter::adapter(|_h, ev, _c| async move {
         ev.send(AdapterEvent::Session("abc".into())).unwrap();
         ev.send(frame()).unwrap();
         Err(classify::classify_text("read ECONNRESET token=sk-SECRET"))
@@ -391,7 +391,7 @@ async fn adapter_errors_pass_through_with_seen_session() {
     assert_eq!(e.session_id.as_deref(), Some("abc"));
     assert!(!e.message.contains("SECRET"));
 
-    let adapter = FakeAdapter::new(|_h, _ev, _c| async move {
+    let adapter = FakeAdapter::adapter(|_h, _ev, _c| async move {
         panic!("adapter bug");
     });
     let (res, _, _) = supervise(&cfg, adapter, CancellationToken::new()).await;

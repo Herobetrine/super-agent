@@ -40,7 +40,9 @@ node scripts/cargo.cjs run -p sa-desktop --release -- --demo
 
 失败处理经 `TurnRunner`：默认 `ResilientRunner` 对所有任务做分类重试（带抖动、续接原生会话）、按路由熔断（`turn.route_wait`、`turn.deferred`、`harness.health`）、可选供应商轮换（`route.rotated`），子任务首次失败会给上级发 `platform` 留言，放弃时记录 `turn.gave_up` 并在上级 `reports[].failure` 中标明；`PassThroughRunner` 保留 JS 的自动工单正则重试。见 `tests/engine_resilience.rs`。
 
-尚未完成：真实执行端适配器（第 3 阶段）；`desktop.lock` 独占锁与 broker；`SA_CANCEL` 与只读子任务自动改派（spec §9.2 F 可选项）；桌面端尚未接入引擎写路径；未对真实工单库副本做联测。
+工单库独占：`sa_engine::owner::claim` 对 `desktop.lock` 加排他文件锁（与 Electron broker 同一个锁文件），并把进程放入 Windows 作业对象（`KILL_ON_JOB_CLOSE`），窗口退出时执行端子进程随之结束。
+
+尚未完成：`SA_CANCEL` 与只读子任务自动改派（spec §9.2 F 可选项）。
 
 ## 执行端适配器现状（第 3 阶段）
 
@@ -55,20 +57,23 @@ node scripts/cargo.cjs run -p sa-desktop --release -- --demo
 - 联测中 Codex 曾返回 `serverOverloaded`（所选模型容量不足），原先归为未分类；现归为 `overloaded`，可按退避重试。
 - 本机 Claude 默认来源不可用时，测试改选第一个可用来源；正式界面仍需要用户明确选择。
 
-尚未验证：远程 HTTPS 自定义目录（Rust 版目前只取本机 HTTP 目录，远程来源只列已保存模型）；`catalogRevision` 文件指纹未移植；桌面端尚未接入 Rust 引擎写路径。
+尚未验证：远程 HTTPS 自定义目录（Rust 版目前只取本机 HTTP 目录，远程来源只列已保存模型）；`catalogRevision` 文件指纹未移植。
 
-## 只读观察窗口
+## 桌面工作台
 
-`super-agent` 以 SQLite 只读模式打开工单库，可与正在运行的 Electron 调度器同时使用：
+`super-agent` 启动时尝试取得工单库的 `desktop.lock`：取得则在后台线程运行 Rust 调度器（`host.rs`，单线程顺序执行界面动作），窗口可新建对话、追加指令、定向留言、停止/重试、审批、编辑计划、附加文件；锁已被占用（Electron 版或另一个窗口在运行）时自动降为只读观察，顶栏显示原因。
 
 ```powershell
 node scripts/cargo.cjs build --release -p sa-desktop
-target\release\super-agent.exe                    # 默认工单库，或用 --data 指定目录
-target\release\super-agent.exe --ticket 5 --inspector
-target\release\super-agent.exe --demo --dark      # 合成数据
+targetelease\super-agent.exe                    # 默认工单库，或用 --data 指定目录
+targetelease\super-agent.exe --observe          # 强制只读，不取锁
+targetelease\super-agent.exe --ticket 5 --inspector
+targetelease\super-agent.exe --demo --dark      # 合成数据，不调度
 ```
 
-`--screenshot <png> [--size 宽x高]` 渲染后保存截图并退出，用于界面回归。
+`--screenshot <png> [--size 宽x高]` 渲染后保存截图并退出，用于界面回归；截图模式默认不调度，加 `--schedule` 才会取锁。
+
+界面测试（`crates/sa-desktop/src/ui_tests.rs`）用 egui_kittest 通过无障碍树驱动真实 `App`：在输入框输入并回车创建工单、批准/拒绝审批、添加并勾选计划项、按发送追加指令，断言事件与审批记录；另测已被占用的工单库只能只读观察。`SA_LIVE_UI=1` 时从输入框发起一次真实 DeepSeek 只读轮次（2026-11-03 通过：状态 done，答案与挑战文件一致）。
 
 ## 追加需求（运营方，2026-11-03）
 

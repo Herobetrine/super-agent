@@ -1,6 +1,8 @@
 //! Application state, message handling, persistence and the top-level layout.
 
 use crate::cli::Options;
+use crate::composer::Composer;
+use crate::host::Host;
 use crate::feed::{self, Feed};
 use crate::labels;
 use crate::theme::{self, Palette};
@@ -107,6 +109,11 @@ pub struct App {
     pub persist: bool,
     shot: Option<ShotState>,
     applied_dark: Option<bool>,
+    /// Scheduler host; `None` in observer mode.
+    pub host: Option<Host>,
+    /// Why the window is an observer (another workbench owns the journal, …).
+    pub host_error: Option<String>,
+    pub composer: Composer,
 }
 
 impl App {
@@ -115,6 +122,7 @@ impl App {
         opts: Options,
         worker: Worker,
         shot_result: Arc<Mutex<Option<Result<(), String>>>>,
+        host: Result<Host, String>,
     ) -> Self {
         let screenshot = opts.screenshot.is_some();
         let storage = if screenshot { None } else { cc.storage };
@@ -163,6 +171,12 @@ impl App {
             persist: !screenshot,
             shot,
             applied_dark: None,
+            composer: Composer::new(
+                get("project").map(PathBuf::from).filter(|p| p.is_dir()),
+                get("lead"),
+            ),
+            host_error: host.as_ref().err().cloned(),
+            host: host.ok(),
             worker,
             opts,
         };
@@ -417,6 +431,7 @@ fn save_png(path: &std::path::Path, image: &egui::ColorImage) -> Result<(), Stri
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.poll_host();
         self.drain();
         if self.applied_dark != Some(self.dark) {
             self.pal = Palette::of(self.dark);
@@ -492,6 +507,7 @@ impl eframe::App for App {
         egui::CentralPanel::default()
             .frame(Frame::new().fill(pal.surface))
             .show(ctx, |ui| self.conversation(ui));
+        self.confirm_dialog(ctx);
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
@@ -505,6 +521,10 @@ impl eframe::App for App {
             if self.inspector_open { "1" } else { "0" }.into(),
         );
         storage.set_string("tab", self.tab.key().into());
+        storage.set_string("lead", self.composer.lead.clone());
+        if let Some(p) = &self.composer.project {
+            storage.set_string("project", p.to_string_lossy().into_owned());
+        }
         if !self.opts.demo
             && let Some(v) = &self.view
         {
@@ -690,8 +710,27 @@ impl App {
                     self.inspector_open = true;
                     self.tab = Tab::Approvals;
                 }
-                widgets::badge(ui, icon::EYE, "只读观察", pal.neutral)
-                    .on_hover_text("此窗口只读取工单日志，不调度、不写入，也不调用模型。");
+                match (&self.host, &self.host_error) {
+                    (Some(h), _) => match h.fault() {
+                        Some(f) => {
+                            widgets::badge(ui, icon::WARNING_CIRCLE, "调度已停止", pal.fail)
+                                .on_hover_text(format!("调度器遇到无法恢复的错误：{f}"));
+                        }
+                        None => {
+                            let n = h.active_count();
+                            let text = if n > 0 { format!("调度中 · {n}") } else { "调度中".into() };
+                            widgets::badge(ui, icon::PULSE, &text, pal.run)
+                                .on_hover_text("此窗口持有工单库并负责调度与模型调用。");
+                        }
+                    },
+                    (None, err) => {
+                        let tip = match err {
+                            Some(e) => format!("只读观察：{e}"),
+                            None => "此窗口只读取工单日志，不调度、不写入，也不调用模型。".into(),
+                        };
+                        widgets::badge(ui, icon::EYE, "只读观察", pal.neutral).on_hover_text(tip);
+                    }
+                }
                 if let Some(st) = &state {
                     widgets::chip(ui, &labels::job_state(st), pal.state_tone(st), theme::SMALL);
                 }

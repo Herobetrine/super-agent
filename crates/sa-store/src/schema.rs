@@ -71,6 +71,6 @@ pub(crate) const ADDITIONS: &[(&str, &[(&str, &str)])] = &[
 ];
 
 /// Created by the (non read-only) `Studio` constructor.
-pub(crate) const STUDIO_PLAN: &str = "CREATE TABLE IF NOT EXISTS studio_plan(id INTEGER PRIMARY KEY,
+pub const STUDIO_PLAN: &str = "CREATE TABLE IF NOT EXISTS studio_plan(id INTEGER PRIMARY KEY,
       ticket INTEGER NOT NULL REFERENCES tickets,body TEXT NOT NULL,done INTEGER NOT NULL DEFAULT 0);
       CREATE INDEX IF NOT EXISTS studio_plan_ticket ON studio_plan(ticket,id)";

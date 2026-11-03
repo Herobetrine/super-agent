@@ -83,6 +83,10 @@ impl App {
                 ui.horizontal(|ui| {
                     let (color, text) = match (&self.source.error, &self.source.label) {
                         (Some(_), _) => (pal.fail.fg, "未连接到工单数据库".to_string()),
+                        (None, Some(l)) if self.writable() => (
+                            pal.run.fg,
+                            l.replacen("只读连接", "调度中", 1),
+                        ),
                         (None, Some(l)) => (pal.run.fg, l.clone()),
                         _ => (pal.faint, "正在连接数据源…".to_string()),
                     };
@@ -126,6 +130,16 @@ impl App {
                     });
                 });
                 ui.add_space(16.0);
+                if self.writable() {
+                    let fresh = self.view.is_none();
+                    if widgets::quiet_button(ui, icon::NOTE_PENCIL, "新建对话", &pal, fresh)
+                        .on_hover_text("开始一个新会话")
+                        .clicked()
+                    {
+                        self.new_conversation();
+                    }
+                    ui.add_space(10.0);
+                }
                 self.search_box(ui);
                 ui.add_space(16.0);
                 ui.horizontal(|ui| {

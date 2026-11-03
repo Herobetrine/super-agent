@@ -18,6 +18,8 @@ pub enum Cmd {
         epoch: u64,
     },
     Search(String),
+    /// Poll now (after a write) and resend the history.
+    Refresh,
     JobsPage {
         ticket: i64,
         before: Option<i64>,
@@ -148,6 +150,7 @@ impl Reader {
                 self.last_history = None;
                 true
             }
+            Cmd::Refresh => true,
             Cmd::JobsPage {
                 ticket,
                 before,
