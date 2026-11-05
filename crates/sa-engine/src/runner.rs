@@ -75,6 +75,12 @@ pub trait TurnRunner: Send + Sync {
     fn wall_clock(&self) -> Option<Duration> {
         Some(LEGACY_TURN_TIMEOUT)
     }
+
+    /// Stall watchdog limits used for the live activity badges
+    /// (`threshold_ms`); `None` when the runner has no idle watchdog.
+    fn stall_limits(&self) -> Option<ResilienceConfig> {
+        None
+    }
 }
 
 /// Calls `Adapter::run` directly; legacy failure handling.
@@ -189,6 +195,10 @@ impl TurnRunner for ResilientRunner {
     /// `Supervisor` enforces `turn_hard_cap` and stall timeouts instead.
     fn wall_clock(&self) -> Option<Duration> {
         None
+    }
+
+    fn stall_limits(&self) -> Option<ResilienceConfig> {
+        Some(self.config.clone())
     }
 }
 

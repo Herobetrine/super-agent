@@ -360,7 +360,8 @@ pub fn controls(text: &str, continuous: bool) -> Result<Map<String, Value>, Stri
     Ok(out)
 }
 
-/// `unresolved(reports, cmd)` (PR:127-134).
+/// `unresolved(reports, cmd)` (PR:127-134). Rust port: a child replaced by
+/// automatic failover (`replaced_by`) is resolved by its sibling's report.
 pub fn unresolved(reports: &[Value], cmd: &Value) -> Vec<i64> {
     let resolved: Vec<i64> = cmd
         .get("resolved")
@@ -373,7 +374,7 @@ pub fn unresolved(reports: &[Value], cmd: &Value) -> Vec<i64> {
             matches!(
                 r.get("state").and_then(Value::as_str),
                 Some("failed" | "partial" | "cancelled")
-            )
+            ) && r.get("replaced_by").is_none()
         })
         .filter_map(|r| r.get("id").and_then(Value::as_i64))
         .filter(|id| !resolved.contains(id))

@@ -63,6 +63,9 @@ Constants (PR:4-14):
 | `studio_plan` | id, ticket, body, done | Studio only (ST:118-120, 359-375). The engine reads it if the table exists (E:170-174). |
 | `studio_ticket_extensions`, `studio_tool_receipts`, `studio_servers` | — | Extensions (X:248-250, 328-330, 372-384) |
 | `project_knowledge` (Rust port) | id, cwd, kind, body, ticket, job, agent, created, sha256, archived(0) | §4.4. Not in the JS schema; created by the Rust journal opener. |
+| `cancel_receipts` (Rust port) | (job, source_turn, msgkey) PK, target, seq | SA_CANCEL idempotency (§4.2). `sa_engine::db::SCHEMA`, `CREATE … IF NOT EXISTS`; the Node engine ignores it. |
+| `ticket_failover` (Rust port) | ticket PK, mode(`'readers'`) | A row enables automatic failover of read-only children (§9.2 F). Written by create (`CreateParams.failover`) and `Engine::set_failover`. |
+| `job_failovers` (Rust port) | original PK, replacement | Written when the engine fails a child over (§9.2 F). |
 
 ### 1.3 Event kinds (payload shape · when · where)
 Event row `job`/`turn` are the job the event is logged against.
@@ -115,6 +118,11 @@ Event row `job`/`turn` are the job the event is logged against.
 | `routes.changed` | `{old, new, new_native_session:[agents]}` | ST:271-283 |
 | `plan.add` / `plan.done` / `plan.reopen` | `{id}` | ST:365, 373 |
 | `knowledge.add` / `knowledge.rejected` / `knowledge.archived` | `{id, kind}` / `{reason}` / `{id, archived}` | Rust port, §4.4 |
+| `child.cancelled` | `{id, job, cancelled:[job ids]}` | Rust port: accepted SA_CANCEL, on the issuing job (§4.2) |
+| `cancel.rejected` | `{id, job, reason: invalid_json \| invalid_fields \| conflicting_id \| not_child \| terminal, state?}` (`id`/`job` null for the first two) | Rust port: refused SA_CANCEL, on the issuing job (§4.2) |
+| `cancelled` (SA_CANCEL / failover) | `"上级任务 #<parent> 取消了此任务"` or `"执行端 <agent> 不可用，已自动改派给 <agent>（任务 #<id>）"` | Rust port: each job stopped by SA_CANCEL or replaced by failover |
+| `send` (failover) | the `send` shape with `selection:null`, `write:false`, plus `failover_of: <original job>`, `reason: route_unavailable \| circuit_open` | Rust port: automatic failover, on the parent (§9.2 F) |
+| `failover.changed` | `{enabled}` | Rust port: `Engine::set_failover` changed the ticket flag, on the root |
 
 Studio's UI-visible subset is listed in ST:15-40.
 
@@ -279,7 +287,7 @@ T1 asserts recovery runs only on `start()`, not in the constructor.
 | assignment | `jobs.body` |
 | objective | `tickets.objective \|\| goal` |
 | previous_reply | `jobs.result`. This may hold a previous reply, a failure reason or the interrupt text. |
-| reports | children with `parent=job AND id>floor`, ordered by id: `{id, sender(agent), role, assignment(body), state, result}`. `floor` is `continuous_runs.boundary_job` or 0. |
+| reports | children with `parent=job AND id>floor`, ordered by id: `{id, sender(agent), role, assignment(body), state, result}`. `floor` is `continuous_runs.boundary_job` or 0. Rust port: plus `failure` (§9.2 F) and, for a child replaced by automatic failover, `replaced_by: <sibling job>`. |
 | permission_profile | the effective profile |
 | allow_lead_routing | `tickets.allow_lead_routing && parent===null` |
 | allowed_child_permissions | `childProfiles(profile)` if routing is allowed and this is the root, otherwise `[]` |
@@ -310,7 +318,7 @@ T1 asserts recovery runs only on `start()`, not in the constructor.
   - A `message.boundary` flushes the remainder as one streaming line.
   - This happens only **after** the batch has been durably logged (E:323), and only if the job is still live and not aborted.
 - **Final reply**: after the adapter returns, `result.text.split('\n')` and every line is submitted with `streaming=false`.
-- `submit` accepts only lines matching `/^SA_(SEND|NOTE|ROLE|TOOL|PROGRESS) /` (the Rust port adds `MEMO`, final pass only, §4.4). The tag must be at column 0, followed by one space.
+- `submit` accepts only lines matching `/^SA_(SEND|NOTE|ROLE|TOOL|PROGRESS) /` (the Rust port adds `MEMO`, final pass only, §4.4, and `CANCEL`, streamed and final, §4.2). The tag must be at column 0, followed by one space.
   - `SA_TOOL` is ignored while streaming. External effects run only from the authoritative final text (T2 "MCP effects are final-only").
   - A trailing `\r` is stripped before parsing.
 - All submissions go through one serial promise queue per turn.
@@ -370,6 +378,16 @@ Lines that do not match the tag regex are ignored. `command()` also ignores line
 - The server and tool must be advertised in `packet.project_extensions.mcp`.
 - Calls `X.invoke` (X:289-386). Its dedupe key is `(job, logical, key)` with an exact request match. It writes a pending receipt, asks for approval unless the profile is full or auto, logs `mcp.started`, calls the tool (60 s timeout), and stores the result (over 512 KiB → object file). An abort after the call was issued gives the state `uncertain`. It logs `mcp.result` and updates the continuous probe.
 - If a new receipt was written, `ctx.toolFollow=true`, which forces `waiting` so the next turn reads `mcp_results` (T2).
+
+**SA_CANCEL** (Rust port, spec §9.2 F; `dispatch::cancel`) `{"id":"key","job":<child>}`:
+- Streamed and final lines, like SA_SEND. Skipped silently when aborted, not live, or superseded (continuous root with a `user.follow` after admission).
+- Refusals never fail the issuing job; they log `cancel.rejected` on it:
+  - bad JSON → `invalid_json`; not an object, `id` not validText ≤96, or `job` not a positive safe integer → `invalid_fields`. Both only on the final pass, so a streamed preview is not reported twice.
+  - Dedupe key `(job, logical turn, id)` in `cancel_receipts`. The same id with the same target is a silent no-op; a different target → `conflicting_id` (final pass only), the original receipt is kept.
+  - `job` is not a direct child of the issuing job in the same ticket → `not_child`; the child is already terminal → `terminal` (with `state`). Both write a receipt, so replays are silent.
+- Acceptance, in one transaction: `cancel_subtree(child)` treats the child and every non-terminal descendant like the operator's cancel treats a ticket (§2.6): expire their pending approvals, set `cancelled`, log `cancelled "上级任务 #<issuer> 取消了此任务"` on each. Then log `child.cancelled {id, job, cancelled}` on the issuer and insert the receipt. After commit, the running turns of the cancelled jobs are aborted (their late output is not live and is dropped).
+- The issuer's commit sees the changed child state and goes `waiting`, so its next turn reads the `cancelled` report. A non-auto root that ends `done` with that cancelled child becomes `partial` as usual.
+- The guide addendum `guides::REROUTE` (shown when any report has a `failure` or `harness_health` is non-empty) explains SA_CANCEL.
 
 ### 4.3 Autonomy controls (`controls(text, continuous)`, PR:91-125)
 - Each line is split at the first space. The tag must be exactly one of the fields below.
@@ -776,6 +794,16 @@ Other harnesses never consume notes mid-turn. T1 checks that host acceptance is 
 - **New optional control** `SA_CANCEL {"id","job"}`, restricted to the job's own direct children and idempotent on `(job, logical, id)`. With it the lead can stop a retrying child and SA_SEND the same body to another harness with a new id.
 - **Guide addendum.** "If a report has failure.retryable=false or harness_health shows open, re-dispatch to a different harness from delegate_models; do not resend to the failing one."
 - **Optional automatic failover**, off by default, ticket flag `failover:'readers'`. Only for `write:false` children with `RouteUnavailable` or after the breaker opens: the engine creates a sibling job with the same body on the first healthy harness in a configured order, logs `send` with `failover_of`, and marks the original `cancelled`. Writers and the root never auto-fail-over.
+
+**Implemented in the Rust port (2026-11-05)**:
+- `SA_CANCEL`: see §4.2. The REROUTE addendum is shown when any report carries a `failure` (retrying or given up) or `harness_health` is non-empty, and documents SA_CANCEL.
+- Failover: `CreateParams.failover: Option<bool>` (default off) inserts `ticket_failover(ticket,'readers')`; `Engine::set_failover(ticket, enabled)` / `Engine::failover(ticket)` change and read it on existing tickets. Triggers, only for a child (`parent≠NULL`) with `writing=0` on such a ticket whose parent is `queued`, `running` or `waiting`:
+  1. `fail` with an adapter error of class `RouteUnavailable` (including catalog probe failures and removed routes), unless the runner decided to rotate providers on the same harness (`route.rotated` goes first);
+  2. `fail` when the runner decided `WaitForRoute` or the job's route is now `open`, or a fresh route selection hit an open breaker (`TurnError::Wait`);
+  3. admission of a queued child whose bound route is circuit-open (instead of `turn.deferred`).
+- Target: the first agent in `AGENTS` order that has an adapter, is not the failing agent nor any agent earlier in this failover chain (`job_failovers`), and, when the parent's latest `input` has a non-empty `delegate_models`, is listed there as available with a route `{provider, models[0], mode}` that is not `open`/`half_open`. Without a delegate menu any configured harness without an open route qualifies. No target → the normal retry/give-up path.
+- Effect, in the failing transaction: insert the sibling (`parent`, `sender`, `depth`, `source_turn`, body, `role=assigned_role`, `permission_override` copied; `writing=0`; `route_override=NULL`, so the ticket route or catalog default of the new agent applies; `msgkey = <original msgkey>#failover:<original id>`), copy `job_files`, log `send {to, child, body, sha256, write:false, files, role, selection:null, permission_profile, failover_of, reason}` on the parent (its current turn), record `job_failovers`, then `cancel_subtree(original)` with `cancelled "执行端 <agent> 不可用，已自动改派给 <agent>（任务 #<id>）"`. Running turns of the cancelled subtree are aborted after commit.
+- A replaced child shows `replaced_by` in `reports`; it does not make a non-auto root `partial` and is not `unresolved` for SA_FINISH (its sibling's own state counts).
 - **Root.** Allow `saveRoutes` for the root's agent when the root is `failed` or `interrupted` with class `RouteUnavailable` or `Open` and every child is terminal or waiting. Today every job must be terminal (ST:246-253). The UI then offers "switch route and retry".
 
 **G. UI status.** The snapshot API exposes per running job:
@@ -794,6 +822,14 @@ Other harnesses never consume notes mid-turn. T1 checks that host acceptance is 
 | `已放弃（分类）` | gave up |
 
 Add the new kinds to the VISIBLE list: `turn.stalled`, `turn.retry_scheduled`, `turn.gave_up`, `harness.health`.
+
+**Implemented in the Rust port (2026-11-05)**: `Engine::activity(&self, ticket: i64) -> Vec<sa_engine::JobActivity>` (module `activity`), ordered by job id.
+- Running jobs, from memory: each admitted turn keeps a `Tracker` updated from every adapter event the engine receives (the same heartbeat rules as the watchdog: `ToolStarted/ToolFinished` open tools, `NativeRetry{after}` extends the model limit, `AwaitingApproval` and in-flight `TurnHost::approve` pause). Fields: `job, agent, phase, idle_ms, open_tools (≤16), last_frame_at, started_at (admission, epoch s), threshold_ms, health, retry:None`.
+- `phase`: `setup` (route selection and prompt assembly), `spawning` (native turn started, no frame; limit `first_frame`), `streaming` (limit `model_idle` + native retry extension), `tool_running` (limit `tool_idle`), `awaiting_approval` (no limit), `closing` (adapter returned, committing), `retry_wait` (queued). `threshold_ms` comes from `TurnRunner::stall_limits()` (new defaulted trait method; `ResilientRunner` returns its `ResilienceConfig`, `PassThroughRunner` none).
+- Queued jobs with `ready_after > now` and a journaled retry since their last `reply`/`user.follow`/`retry`/`turn.gave_up`: `retry: {attempt, max, class, next_at}`. `attempt` counts `turn.retry_scheduled` and `route.rotated`; `max` is the latest `turn.retry_scheduled.max` (null for continuous-root overflow, rotation and route waits); `class` is its class, the rotation reason, or `circuit_open` for `turn.deferred`; legacy `auto.retry`-only jobs report class `transient`. `next_at = ready_after`.
+- `health`: the runner's breaker state for the job's route (running: the selected route; queued: `native_routes`), `healthy` when unknown.
+- Cost: one scheduler-lock snapshot, one per-turn tracker lock, one breaker snapshot, then one indexed query for queued jobs plus one `events_ticket_kind` lookup per retrying job. Locks are never nested; a journal error yields only the running part.
+- Badge `JobActivity::badge() -> (&'static str, BadgeTone)` in precedence order: retry scheduled → `已中断，重试中` (Warning), or `执行端熔断` (Danger) when the route is open; `等待审批` (Waiting); idle over 80 % of `threshold_ms` → `疑似卡住` (Danger); route open → `执行端熔断` (Danger); degraded or half-open → `执行端降级` (Warning); tool open → `工具执行中` (Busy); idle over 30 s → `等待上游` (Waiting); otherwise `运行中` (Active). `JobActivity::badge_text(now_secs)` adds `n/max` (or `n`) and the `mm:ss` countdown to `next_at`. `已放弃（分类）` is not an activity badge: a given-up job is terminal and the UI reads `turn.gave_up`.
 
 **H. Engine robustness.**
 - A DB error in a single job's commit should mark that job `interrupted` and log it, with exponential retry of the transaction on `SQLITE_BUSY`. It should not set a global `fault`.

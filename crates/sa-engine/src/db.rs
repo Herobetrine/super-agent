@@ -20,6 +20,19 @@ pub fn now() -> f64 {
     (d.as_millis() as f64) / 1000.0
 }
 
+/// Additive Rust-port side tables (`CREATE … IF NOT EXISTS`). The Node
+/// engine never reads them, so the journal stays usable by both engines.
+/// - `cancel_receipts`: SA_CANCEL idempotency per `(job, logical turn, id)`.
+/// - `ticket_failover`: tickets with automatic failover of read-only
+///   children enabled (`mode='readers'`, spec §9.2 F).
+/// - `job_failovers`: original child → the sibling that replaced it.
+pub const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS cancel_receipts(
+  job INTEGER NOT NULL,source_turn INTEGER NOT NULL,msgkey TEXT NOT NULL,target INTEGER,
+  seq INTEGER NOT NULL,PRIMARY KEY(job,source_turn,msgkey)) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS ticket_failover(ticket INTEGER PRIMARY KEY,mode TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS job_failovers(original INTEGER PRIMARY KEY,replacement INTEGER NOT NULL);
+CREATE INDEX IF NOT EXISTS job_failovers_replacement ON job_failovers(replacement);";
+
 pub const INTERRUPT_REASON: &str = "上次执行中断，可能已经产生副作用，继续前请核对实际状态。";
 
 pub struct Db {
@@ -31,6 +44,7 @@ impl Db {
         let conn = sa_store::journal::open_journal(dir)?;
         // Additive Rust-port table; the Node engine ignores it.
         conn.execute_batch(sa_store::knowledge::SCHEMA)?;
+        conn.execute_batch(SCHEMA)?;
         conn.set_prepared_statement_cache_capacity(256);
         Ok(Self {
             conn: Mutex::new(Some(conn)),
@@ -200,6 +214,33 @@ impl Q<'_> {
             self.log(who, "interrupted", &json!(INTERRUPT_REASON))?;
         }
         Ok(())
+    }
+
+    /// Cancel `root` and every non-terminal descendant the way the
+    /// operator's cancel treats a ticket (E:63-73): expire their pending
+    /// approvals, set `cancelled` and log `cancelled` with `reason` on each.
+    /// Returns the cancelled job ids; the caller aborts their running turns
+    /// after the transaction commits.
+    pub fn cancel_subtree(&self, root: i64, reason: &str) -> Result<Vec<i64>> {
+        let rows = self.all(
+            &format!(
+                "WITH RECURSIVE sub(id) AS (SELECT ? UNION ALL SELECT j.id FROM jobs j JOIN sub ON j.parent=sub.id)
+        SELECT j.id,j.ticket,j.turn FROM jobs j JOIN sub ON j.id=sub.id WHERE j.state NOT IN {END_SQL} ORDER BY j.id"
+            ),
+            &[&root],
+        )?;
+        let mut ids = vec![];
+        for job in rows {
+            let id = int_of(&job, "id");
+            self.run(
+                "UPDATE approvals SET decision='expired' WHERE job=? AND decision='pending'",
+                &[&id],
+            )?;
+            self.run("UPDATE jobs SET state='cancelled' WHERE id=?", &[&id])?;
+            self.log(who_of(&job), "cancelled", &json!(reason))?;
+            ids.push(id);
+        }
+        Ok(ids)
     }
 
     /// `recover()` body (S:77-84); call inside a transaction.

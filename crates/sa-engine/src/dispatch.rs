@@ -46,8 +46,9 @@ static UNSAFE_SUMMARY: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"[\p{Cc}\p{Zl}\p{Zp}\x{202a}-\x{202e}\x{2066}-\x{2069}]").expect("valid regex")
 });
 
-/// `command(store, ctx, line)` (D:177-229).
-pub async fn command(turn: &Arc<Turn>, line: &str) -> Result<(), CmdError> {
+/// `command(store, ctx, line)` (D:177-229). `streaming` is true for lines
+/// projected from streamed deltas, false for the final reply.
+pub async fn command(turn: &Arc<Turn>, line: &str, streaming: bool) -> Result<(), CmdError> {
     if turn.aborted() {
         return Ok(());
     }
@@ -60,6 +61,12 @@ pub async fn command(turn: &Arc<Turn>, line: &str) -> Result<(), CmdError> {
     }
     if tag == "SA_MEMO" {
         return memo(turn, rest).map_err(CmdError::Other);
+    }
+    if tag == "SA_CANCEL" {
+        let cancelled = cancel(turn, rest, streaming).map_err(CmdError::Other)?;
+        // Abort outside the journal transaction (scheduler lock order).
+        turn.inner().abort_jobs(&cancelled);
+        return Ok(());
     }
     if !matches!(tag, "SA_ROLE" | "SA_SEND" | "SA_NOTE" | "SA_TOOL") {
         return Ok(());
@@ -452,5 +459,78 @@ fn memo(turn: &Turn, text: &str) -> Result<()> {
         };
         knowledge::insert(q, &entry, Some(who))?;
         Ok(())
+    })
+}
+
+/// `SA_CANCEL {"id","job"}` (spec §9.2 F): stop one of this job's own direct
+/// children and its subtree, the way the operator's cancel treats a ticket.
+/// Accepted from streamed and final lines like SA_SEND and idempotent on
+/// `(job, logical turn, id)` via `cancel_receipts`. Like SA_NOTE, a refused
+/// cancel never fails the issuing job: it logs
+/// `cancel.rejected {id, job, reason}` where `reason` is `invalid_json`,
+/// `invalid_fields` or `conflicting_id` (final reply only, so a streamed
+/// preview is not reported twice), or `not_child` / `terminal` (once, with a
+/// receipt). An accepted cancel logs `child.cancelled {id, job, cancelled}`
+/// on the issuing job and `cancelled` on every stopped job. Returns the
+/// cancelled job ids so the caller can abort their running turns.
+fn cancel(turn: &Turn, text: &str, streaming: bool) -> Result<Vec<i64>> {
+    let job = &turn.job;
+    let who = job.who();
+    turn.inner().db.tx(|q| {
+        if turn.aborted() || !q.live(who)? {
+            return Ok(vec![]);
+        }
+        // A redirected continuous root drops its stale turn's controls like SA_SEND.
+        if job.continuous && job.parent.is_none() && q.followed_after(job.ticket, job.admission)? {
+            return Ok(vec![]);
+        }
+        let reject = |payload: Value| q.log(who, "cancel.rejected", &payload);
+        let Ok(cmd) = serde_json::from_str::<Value>(text) else {
+            if !streaming {
+                reject(json!({"id": Value::Null, "job": Value::Null, "reason": "invalid_json"}))?;
+            }
+            return Ok(vec![]);
+        };
+        let target = p::safe_int(cmd.get("job")).filter(|t| *t > 0);
+        let (true, Some(target)) = (p::is_obj(Some(&cmd)) && p::valid_text(cmd.get("id"), 96), target) else {
+            if !streaming {
+                reject(json!({"id": Value::Null, "job": Value::Null, "reason": "invalid_fields"}))?;
+            }
+            return Ok(vec![]);
+        };
+        let id = cmd["id"].as_str().unwrap_or_default();
+        let logical = job.logical();
+        let receipt = q.one(
+            "SELECT target FROM cancel_receipts WHERE job=? AND source_turn=? AND msgkey=?",
+            &[&job.id, &logical, &id],
+        )?;
+        if let Some(receipt) = receipt {
+            if receipt.get("target").and_then(Value::as_i64) != Some(target) && !streaming {
+                reject(json!({"id": id, "job": target, "reason": "conflicting_id"}))?;
+            }
+            return Ok(vec![]);
+        }
+        let child = q.one(
+            "SELECT state FROM jobs WHERE id=? AND parent=? AND ticket=?",
+            &[&target, &job.id, &job.ticket],
+        )?;
+        let (seq, cancelled) = match child {
+            None => (reject(json!({"id": id, "job": target, "reason": "not_child"}))?, vec![]),
+            Some(c) if p::is_terminal(str_of(&c, "state")) => (
+                reject(json!({"id": id, "job": target, "reason": "terminal", "state": str_of(&c, "state")}))?,
+                vec![],
+            ),
+            Some(_) => {
+                let reason = format!("上级任务 #{} 取消了此任务", job.id);
+                let ids = q.cancel_subtree(target, &reason)?;
+                let seq = q.log(who, "child.cancelled", &json!({"id": id, "job": target, "cancelled": ids}))?;
+                (seq, ids)
+            }
+        };
+        q.run(
+            "INSERT INTO cancel_receipts(job,source_turn,msgkey,target,seq) VALUES(?,?,?,?,?)",
+            &[&job.id, &logical, &id, &target, &seq],
+        )?;
+        Ok(cancelled)
     })
 }
