@@ -34,6 +34,7 @@ pub enum Command {
     Attach,
     Tab(Tab),
     Export,
+    ExportMarkdown,
     Stop,
     Open(i64),
 }
@@ -132,7 +133,8 @@ impl App {
             rows.push(row(Command::Tab(tab), ic, name, ""));
         }
         if ticket.is_some() {
-            rows.push(row(Command::Export, icon::EXPORT, "导出完整记录", ""));
+            rows.push(row(Command::ExportMarkdown, icon::FILE_TEXT, "导出对话为 Markdown", ""));
+            rows.push(row(Command::Export, icon::EXPORT, "导出完整记录（JSON Lines）", ""));
         }
         for t in self.history.iter().take(40) {
             rows.push(Row {
@@ -182,6 +184,12 @@ impl App {
                 if let Some(t) = self.view.as_ref().map(|v| v.id) {
                     let ctx = self.ctx.clone();
                     self.start_export(&ctx, t);
+                }
+            }
+            Command::ExportMarkdown => {
+                if let Some(t) = self.view.as_ref().map(|v| v.id) {
+                    let ctx = self.ctx.clone();
+                    self.start_export_markdown(&ctx, t);
                 }
             }
             Command::Stop => {

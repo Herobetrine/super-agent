@@ -1164,6 +1164,16 @@ pub(crate) mod tests {
         assert!(outcome(&host).result.is_ok());
         until(|| root_state(&host, ticket) == "done" && kinds(&host, ticket).iter().filter(|k| *k == "reply").count() == 2);
 
+        // Markdown transcript: goal, follow-up and both replies, controls removed.
+        let md = data.path().join("t.md");
+        crate::ops::export_markdown(data.path(), ticket, &md).unwrap();
+        let text = std::fs::read_to_string(&md).unwrap();
+        assert!(text.starts_with("# fixture
+"), "{text}");
+        assert!(text.contains("## 你 · 追加指令") && text.contains("继续"), "{text}");
+        assert_eq!(text.matches("· 主控 ·").count(), 2, "{text}");
+        assert!(crate::ops::export_markdown(data.path(), ticket, &md).is_err(), "never overwrites");
+
         host.submit(Action::PlanAdd {
             ticket,
             body: "  核对附件  ".into(),

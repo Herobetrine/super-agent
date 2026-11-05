@@ -690,6 +690,7 @@ fn show_item(
             peer,
             role,
             blocks,
+            text,
             controls,
             ts,
             streaming,
@@ -742,6 +743,22 @@ fn show_item(
                         );
                         ui.ctx()
                             .request_repaint_after(std::time::Duration::from_millis(500));
+                    }
+                    if !text.is_empty() && !*streaming {
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            let id = ui.id().with(("reply-copied", *key));
+                            let now = ui.input(|i| i.time);
+                            let recent = ui
+                                .data(|d| d.get_temp::<f64>(id))
+                                .is_some_and(|t| now - t < 1.5);
+                            let (ic, tip) = if recent { (icon::CHECK, "已复制") } else { (icon::COPY, "复制回复") };
+                            let r = widgets::icon_button(ui, ic, 24.0, pal.faint, pal.hover, false).on_hover_text(tip);
+                            r.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "复制回复"));
+                            if r.clicked() {
+                                ui.ctx().copy_text(text.clone());
+                                ui.data_mut(|d| d.insert_temp(id, now));
+                            }
+                        });
                     }
                 });
             };

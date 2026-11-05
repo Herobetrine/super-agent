@@ -81,6 +81,8 @@ pub enum Item {
         peer: bool,
         role: String,
         blocks: Vec<Block>,
+        /// Markdown body without control lines (for copying).
+        text: String,
         controls: Vec<Control>,
         ts: f64,
         streaming: bool,
@@ -440,6 +442,7 @@ pub fn build(ticket: &TicketDetail, jobs: &[JobView], events: &[EventView]) -> F
                         peer: false,
                         role: String::new(),
                         blocks: Vec::new(),
+                        text: String::new(),
                         controls: Vec::new(),
                         ts: e.ts,
                         streaming: true,
@@ -466,6 +469,7 @@ pub fn build(ticket: &TicketDetail, jobs: &[JobView], events: &[EventView]) -> F
                     peer,
                     role: job.map(|j| j.role.clone()).unwrap_or_default(),
                     blocks: markdown::parse(&body),
+                    text: body.clone(),
                     controls,
                     ts: e.ts,
                     streaming: false,
@@ -684,11 +688,13 @@ pub fn build(ticket: &TicketDetail, jobs: &[JobView], events: &[EventView]) -> F
             removed.push(idx);
         } else if let Some(Item::Reply {
             blocks,
+            text,
             controls: c,
             ..
         }) = items.get_mut(idx)
         {
             *blocks = markdown::parse(&clean);
+            *text = clean;
             *c = controls;
         }
     }
@@ -726,6 +732,7 @@ pub fn build(ticket: &TicketDetail, jobs: &[JobView], events: &[EventView]) -> F
                 peer: false,
                 role: String::new(),
                 blocks: markdown::parse(&body),
+                text: body.clone(),
                 controls,
                 ts: 0.0,
                 streaming: false,

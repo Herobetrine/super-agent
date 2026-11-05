@@ -59,6 +59,8 @@ pub struct Composer {
     last_body: Option<String>,
     last_plan: Option<String>,
     pub focus: bool,
+    /// When the current message first appeared (success notices fade out).
+    shown: Option<(String, std::time::Instant)>,
 }
 
 impl Composer {
@@ -79,6 +81,7 @@ impl Composer {
             last_body: None,
             last_plan: None,
             focus: false,
+            shown: None,
         }
     }
 }
@@ -349,6 +352,24 @@ impl App {
         let busy = self.composer.pending > 0;
         let note_only = self.composer.target.is_some() && !cur.target_active;
 
+        if let Some((text, error)) = self.composer.message.clone() {
+            let since = match &self.composer.shown {
+                Some((t, at)) if *t == text => *at,
+                _ => {
+                    let now = std::time::Instant::now();
+                    self.composer.shown = Some((text.clone(), now));
+                    now
+                }
+            };
+            if !error {
+                let left = std::time::Duration::from_secs(6).saturating_sub(since.elapsed());
+                if left.is_zero() {
+                    self.composer.message = None;
+                } else {
+                    ui.ctx().request_repaint_after(left);
+                }
+            }
+        }
         if let Some((text, error)) = self.composer.message.clone() {
             ui.horizontal(|ui| {
                 ui.add_space(6.0);

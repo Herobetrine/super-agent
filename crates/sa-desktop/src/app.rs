@@ -129,6 +129,8 @@ pub struct App {
     pub palette: Option<crate::palette::PaletteState>,
     /// Focus the sidebar search on the next frame.
     pub focus_search: bool,
+    /// Last seen root state per ticket (finish notifications).
+    known_states: std::collections::HashMap<i64, String>,
     pub extensions: Option<crate::extensions::ExtDialog>,
     /// For background work started outside `update`.
     pub ctx: egui::Context,
@@ -208,6 +210,7 @@ impl App {
             providers: None,
             palette: None,
             focus_search: false,
+            known_states: Default::default(),
             extensions: None,
             ctx: cc.egui_ctx.clone(),
             host_error: host.as_ref().err().cloned(),
@@ -291,6 +294,9 @@ impl App {
                     if query != self.search {
                         continue;
                     }
+                    if query.is_empty() {
+                        self.notice_transitions(&rows);
+                    }
                     self.history = rows;
                     self.history_loaded = true;
                     if !self.auto_selected && self.view.is_none() && query.is_empty() && !self.writable() {
@@ -316,6 +322,13 @@ impl App {
                         continue;
                     }
                     let mut snap = *snap;
+                    let before = v.snap.as_ref().map(|s| s.approvals.len());
+                    if before.is_some_and(|n| snap.approvals.len() > n) {
+                        self.attention(true);
+                    }
+                    let Some(v) = self.view.as_mut().filter(|v| v.id == ticket) else {
+                        continue;
+                    };
                     let events = std::mem::take(&mut snap.events);
                     if full {
                         v.partial_history = events.len() >= 180;
@@ -631,6 +644,57 @@ impl App {
         self.export = Some(Pending::spawn(ctx, move || crate::ops::export(&data, ticket, &file)));
     }
 
+    /// Tell the operator when a ticket finishes or fails (in-app notice, and
+    /// a taskbar flash when the window is in the background).
+    fn notice_transitions(&mut self, rows: &[TicketSummary]) {
+        let mut done = None;
+        for r in rows {
+            let prev = self.known_states.insert(r.id, r.state.clone());
+            if prev.as_deref().is_some_and(labels::is_active) && !labels::is_active(&r.state) {
+                done = Some(format!(
+                    "工单 #{} {}：{}",
+                    r.id,
+                    labels::job_state(&r.state),
+                    labels::compact(&r.goal, 60)
+                ));
+            }
+        }
+        if let Some(text) = done {
+            self.composer.message = Some((text, false));
+            self.attention(false);
+        }
+    }
+
+    /// Flash the taskbar button when the window is not focused.
+    fn attention(&self, critical: bool) {
+        let focused = self.ctx.input(|i| i.viewport().focused).unwrap_or(true);
+        if !focused {
+            let kind = if critical {
+                egui::UserAttentionType::Critical
+            } else {
+                egui::UserAttentionType::Informational
+            };
+            self.ctx.send_viewport_cmd(ViewportCommand::RequestUserAttention(kind));
+        }
+    }
+
+    pub(crate) fn start_export_markdown(&mut self, ctx: &egui::Context, ticket: i64) {
+        let Some(file) = rfd::FileDialog::new()
+            .set_title("导出对话（请选择新文件）")
+            .set_file_name(format!("ticket-{ticket}.md"))
+            .add_filter("Markdown", &["md"])
+            .save_file()
+        else {
+            return;
+        };
+        if file.exists() {
+            self.composer.message = Some(("请选择新文件，导出不会覆盖已有文件".into(), true));
+            return;
+        }
+        let data = self.opts.data.clone().unwrap_or_else(sa_store::default_data_dir);
+        self.export = Some(Pending::spawn(ctx, move || crate::ops::export_markdown(&data, ticket, &file)));
+    }
+
     /// Load the Git changes of `cwd` (inspector tab).
     pub fn load_diff(&mut self, ctx: &egui::Context, cwd: String) {
         if self.diff.pending.is_some() {
@@ -645,7 +709,7 @@ impl App {
         if let Some(r) = self.export.as_ref().and_then(Pending::poll) {
             self.export = None;
             self.composer.message = Some(match r {
-                Ok(f) => (format!("完整记录已导出至 {}", f.display()), false),
+                Ok(f) => (format!("已导出至 {}", f.display()), false),
                 Err(e) => (e, true),
             });
         }
@@ -825,10 +889,22 @@ impl App {
                             widgets::icon_button(ui, icon::EXPORT, 32.0, pal.mute, pal.hover, false)
                         })
                         .inner
-                        .on_hover_text("导出完整记录（JSON Lines，逐条校验摘要）");
-                    r.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, !busy, "导出完整记录"));
-                    if r.clicked() {
-                        self.start_export(ui.ctx(), id);
+                        .on_hover_text("导出");
+                    r.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, !busy, "导出"));
+                    let mut pick = None;
+                    egui::Popup::menu(&r).show(|ui| {
+                        ui.set_min_width(230.0);
+                        if ui.button(format!("{}  导出对话为 Markdown", icon::FILE_TEXT)).clicked() {
+                            pick = Some(true);
+                        }
+                        if ui.button(format!("{}  导出完整记录（JSON Lines）", icon::DATABASE)).clicked() {
+                            pick = Some(false);
+                        }
+                    });
+                    match pick {
+                        Some(true) => self.start_export_markdown(ui.ctx(), id),
+                        Some(false) => self.start_export(ui.ctx(), id),
+                        None => {}
                     }
                 }
                 if approvals > 0

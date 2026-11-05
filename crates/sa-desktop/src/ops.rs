@@ -259,3 +259,70 @@ mod tests {
         assert!(diff(outside.path()).is_err());
     }
 }
+
+/// Conversation transcript as Markdown: goal, operator messages and every
+/// reply (control lines removed), written to a NEW file.
+pub fn export_markdown(data: &Path, ticket: i64, file: &Path) -> Result<PathBuf> {
+    let db = Connection::open_with_flags(
+        data.join(sa_store::DB_FILE),
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .context("无法打开工单数据库")?;
+    db.busy_timeout(Duration::from_secs(5))?;
+    db.execute_batch("BEGIN")?;
+    let (goal, cwd, lead, created): (String, String, String, f64) = db
+        .query_row("SELECT goal,cwd,lead,created FROM tickets WHERE id=?", [ticket], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+        })
+        .map_err(|_| anyhow!("工单不存在"))?;
+    let title = goal.lines().next().unwrap_or_default().chars().take(80).collect::<String>();
+    let mut out = format!(
+        "# {title}\n\n- 工单：#{ticket}\n- 项目：`{cwd}`\n- 主控：{}\n- 创建：{}\n\n",
+        crate::labels::agent_name(&lead),
+        crate::labels::activity_time(created)
+    );
+    let mut stmt = db.prepare(
+        "SELECT e.kind,e.ts,e.payload,j.agent,j.parent,j.id FROM events e LEFT JOIN jobs j ON j.id=e.job
+         WHERE e.ticket=? AND e.kind IN ('user','user.follow','reply','note') ORDER BY e.seq",
+    )?;
+    let mut rows = stmt.query([ticket])?;
+    while let Some(r) = rows.next()? {
+        let kind: String = r.get(0)?;
+        let ts: f64 = r.get(1)?;
+        let payload: String = r.get(2)?;
+        let agent: Option<String> = r.get(3)?;
+        let parent: Option<i64> = r.get(4)?;
+        let job: Option<i64> = r.get(5)?;
+        let v: serde_json::Value = serde_json::from_str(&payload).unwrap_or(serde_json::Value::Null);
+        let time = crate::labels::activity_time(ts);
+        match kind.as_str() {
+            "user" | "user.follow" => {
+                let text = v.as_str().map(str::to_string).unwrap_or_else(|| v["text"].as_str().unwrap_or_default().to_string());
+                let who = if kind == "user" { "目标" } else { "追加指令" };
+                out.push_str(&format!("---\n\n## 你 · {who} · {time}\n\n{text}\n\n"));
+            }
+            "note" => {
+                if v["sender"].as_str() == Some("user") {
+                    out.push_str(&format!("> 定向留言（{time}）：{}\n\n", v["body"].as_str().unwrap_or_default()));
+                }
+            }
+            _ => {
+                let (body, _) = crate::feed::split_reply(v["text"].as_str().unwrap_or_default());
+                if body.trim().is_empty() {
+                    continue;
+                }
+                let name = crate::labels::agent_name(agent.as_deref().unwrap_or_default());
+                let role = if parent.is_some() { "协作回报" } else { "主控" };
+                let id = job.map(|j| format!(" #{j}")).unwrap_or_default();
+                out.push_str(&format!("## {name}{id} · {role} · {time}\n\n{body}\n\n"));
+            }
+        }
+    }
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(file)
+        .with_context(|| format!("无法创建导出文件（请选择新文件）：{}", file.display()))?;
+    f.write_all(out.as_bytes())?;
+    Ok(file.to_path_buf())
+}
