@@ -8,22 +8,22 @@
 
 ## 安装与启动
 
-桌面端使用 Electron。Node.js 子进程独立调度 CLI、处理模型流和审批，将完整事件写入 SQLite。Rust 服务负责项目文件检索、SHA-256 快照、长上下文归档，以及 Windows 工单库的独占锁和子进程回收。
+桌面端是纯 Rust 程序（egui）：同一个进程负责界面、调度 CLI、处理模型流与审批、MCP 与技能，并把完整事件写入 SQLite 工单库；它持有工单库的独占锁，退出时回收全部执行端子进程。设计与迁移记录见 [Rust 重构路线](docs/rust-port.md)。
 
-从源码构建需要 Windows、Node.js 24 或更高版本、Rust stable（1.89 或更高版本）和至少一个已登录的 agent CLI。在 PowerShell 执行以下命令。
+从源码构建需要 Windows、Rust stable（1.89 或更高版本）、Node.js（仅用于运行构建包装脚本）和至少一个已登录的 agent CLI。GNU 工具链需要 [llvm-mingw](https://github.com/mstorsjo/llvm-mingw/releases)，解压方式见 [构建说明](docs/rust-port.md#构建)。在 PowerShell 执行以下命令。
 
 ```powershell
 git clone https://github.com/Herobetrine/super-agent.git
 cd super-agent
-npm ci
-node node_modules/electron/install.js
-npm run build:native
+node scripts/cargo.cjs build --release -p sa-desktop
 .\Install-Desktop.ps1
 ```
 
-双击桌面的 **Super Agent**，也可以运行 `npm start`。在 Windows 使用 Rust MSVC 工具链时需要 Visual Studio C++ Build Tools。GNU 工具链需要可用的 MinGW binutils，使用独立 LLVM 的 `dlltool.exe` 时可通过 `SUPERAGENT_DLLTOOL` 指定路径。重建前先关闭运行中的工作台。[Rust Windows 安装说明](https://rust-lang.github.io/rustup/installation/windows.html)
+双击桌面的 **Super Agent**，也可以直接运行 `target\release\super-agent.exe`。同一个工单库只能由一个工作台调度；再打开一个窗口，或旧版 Electron 工作台正在运行时，新窗口自动以只读观察模式打开。重建前先关闭运行中的工作台。
 
-升级已有安装时，先停止需要终止的工单并退出旧窗口。新版直接打开原工单库和附件目录，继续使用本机供应商配置。旧自动工单遵守创建时的规则。Python 和 Qt 源文件保留用于迁移对照及回归测试。
+旧版 Electron 工作台仍可构建：`npm ci`、`node node_modules/electron/install.js`、`npm run build:native`，再运行 `.\Install-Desktop.ps1 -Legacy`。两个版本读写同一个工单库，不要同时调度。
+
+升级已有安装时，先停止需要终止的工单并退出旧窗口。新版直接打开原工单库和附件目录，继续使用本机供应商配置；旧工单可以追加指令续跑。旧自动工单遵守创建时的规则。Electron、Node 和 Python/Qt 源文件暂时保留，用于迁移对照及回归测试。
 
 | Agent | 自动执行入口 | 配置和安装 |
 | --- | --- | --- |
@@ -45,7 +45,7 @@ npm run build:native
 
 在会话中可直接查看主控与协作者的阶段汇报、工具操作、审批和最近活动时间。点击聚合行展开逐项回执，点击 **进展记录** 翻看较早的操作。阶段汇报来自执行者，工具状态来自执行端的原生事件。缺少结束回执时界面保留未知状态。四个执行端暴露的事件粒度各不相同。
 
-**项目面板 → 协作** 区分平台派工和 Claude 内部子任务。内部任务显示原生身份、执行状态及最近报告的工具。可以在不打断已有调度器时单独打开某张工单的只读进展窗口，例如 `npm start -- --observe=42`；将数字替换成实际工单号。观察窗口不会启动调度器或发出模型请求。
+**项目面板 → 协作** 区分平台派工和 Claude 内部子任务。内部任务显示原生身份、执行状态及最近报告的工具。可以在不打断已有调度器时单独打开某张工单的只读进展窗口，例如 `super-agent.exe --observe --ticket 42`；将数字替换成实际工单号。观察窗口不会启动调度器或发出模型请求。
 
 ### MCP 与技能
 
@@ -96,12 +96,13 @@ npm run build:native
 
 ## 测试与设计来源
 
-运行原生层、调度器、扩展和桌面测试。真实执行器联测需使用本机模型配额。[验证方法](docs/verification.md)
+运行调度器、执行端、扩展和桌面测试（桌面测试通过无障碍树驱动真实窗口）。真实执行器联测需使用本机模型配额，开关与记录见 [Rust 重构路线](docs/rust-port.md#验证记录2026-11-05)。[验证方法](docs/verification.md)
 
 ```powershell
-npm run build:native
-npm test
+node scripts/cargo.cjs test --workspace
 ```
+
+旧版测试：`npm run build:native` 后运行 `npm test`。
 
 本地统筹、独立 worker 和持久化消息参考了 DeepSeek 的 Super-agent 原型。权限设计也参考了 OpenHands 的确认策略及 OpenCode 的请求、允许、拒绝规则。[DeepSeek 原型](https://github.com/deepseek-ai/dsh-superagent-prototype/tree/6337fc823ce20251c8de8085948165c81aaa701e) · [OpenHands 确认策略](https://github.com/OpenHands/software-agent-sdk/blob/main/openhands-sdk/openhands/sdk/security/confirmation_policy.py) · [OpenCode 权限规则](https://opencode.ai/docs/permissions/)
 
