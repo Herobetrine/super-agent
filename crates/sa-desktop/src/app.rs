@@ -130,6 +130,8 @@ pub struct App {
     /// Focus the sidebar search on the next frame.
     pub focus_search: bool,
     pub show_archived: bool,
+    /// Engine activity of the selected ticket, refreshed at most once a second.
+    live: Option<(i64, Instant, Vec<sa_engine::JobActivity>)>,
     /// Sidebar rename dialog: `(ticket, draft title)`.
     pub rename: Option<(i64, String)>,
     /// Last seen root state per ticket (finish notifications).
@@ -214,6 +216,7 @@ impl App {
             palette: None,
             focus_search: false,
             show_archived: false,
+            live: None,
             rename: None,
             known_states: Default::default(),
             extensions: None,
@@ -669,6 +672,41 @@ impl App {
             self.composer.message = Some((text, false));
             self.attention(false);
         }
+    }
+
+    /// Live badges per job of the selected ticket (writable windows only):
+    /// 运行中 / 等待上游 / 工具执行中 / 疑似卡住 / 重试中 n/max / 熔断.
+    pub fn live_badges(&mut self) -> std::collections::HashMap<i64, (String, crate::theme::Tone)> {
+        let (Some(host), Some(ticket)) = (&self.host, self.view.as_ref().map(|v| v.id)) else {
+            return Default::default();
+        };
+        let stale = self
+            .live
+            .as_ref()
+            .is_none_or(|(t, at, _)| *t != ticket || at.elapsed() >= Duration::from_secs(1));
+        if stale {
+            self.live = Some((ticket, Instant::now(), host.activity(ticket)));
+            self.ctx.request_repaint_after(Duration::from_secs(1));
+        }
+        let now = labels::now_secs();
+        let pal = &self.pal;
+        self.live
+            .as_ref()
+            .map(|(_, _, list)| {
+                list.iter()
+                    .map(|a| {
+                        let tone = match a.badge().1 {
+                            sa_engine::BadgeTone::Active => pal.run,
+                            sa_engine::BadgeTone::Waiting => pal.wait,
+                            sa_engine::BadgeTone::Busy => pal.report,
+                            sa_engine::BadgeTone::Warning => pal.warn,
+                            sa_engine::BadgeTone::Danger => pal.fail,
+                        };
+                        (a.job, (a.badge_text(now), tone))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// Flash the taskbar button when the window is not focused.

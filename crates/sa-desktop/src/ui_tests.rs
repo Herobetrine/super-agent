@@ -589,3 +589,36 @@ fn sidebar_rename_pin_and_archive() {
     h.state_mut().submit(crate::host::Action::TicketMeta { ticket, title: Some(String::new()), pinned: None, archived: None });
     until(&mut h, "title cleared", |a| row(a).is_some_and(|r| r.title.is_none()));
 }
+
+#[test]
+fn live_badge_and_failover_toggle() {
+    let data = tempfile::tempdir().unwrap();
+    let mut h = harness(data.path(), "ask");
+    h.run_steps(4);
+    let editor = h.get_by_label("输入框");
+    editor.focus();
+    editor.type_text("等待审批");
+    h.run_steps(2);
+    h.key_press(egui::Key::Enter);
+    // The `ask` fake waits on an approval: the lead's live badge says so.
+    until(&mut h, "approval badge", |a| {
+        a.view.as_ref().and_then(|v| v.snap.as_ref()).is_some_and(|s| !s.approvals.is_empty())
+    });
+    h.state_mut().inspector_open = true;
+    h.state_mut().tab = Tab::Collab;
+    let root = h.state().view.as_ref().and_then(|v| v.snap.as_ref()).unwrap().jobs[0].id;
+    let mut badge = None;
+    for _ in 0..80 {
+        h.step();
+        badge = h.state_mut().live_badges().remove(&root).map(|b| b.0);
+        if badge.as_deref() == Some("等待审批") {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    assert_eq!(badge.as_deref(), Some("等待审批"));
+    let ticket = h.state().view.as_ref().unwrap().id;
+    h.run_steps(2);
+    h.get_by_label("只读子任务的执行端不可用时自动改派").click();
+    until(&mut h, "failover on", |a| a.host.as_ref().unwrap().failover(ticket));
+}

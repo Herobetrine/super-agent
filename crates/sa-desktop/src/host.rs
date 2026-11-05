@@ -95,6 +95,11 @@ pub enum Action {
     RotationSave {
         rotation: Rotation,
     },
+    /// Automatic failover of read-only children for one ticket.
+    SetFailover {
+        ticket: i64,
+        enabled: bool,
+    },
     /// Sidebar metadata; `None` fields stay unchanged, an empty title clears it.
     TicketMeta {
         ticket: i64,
@@ -119,7 +124,7 @@ impl Action {
             Action::ProviderSave { .. } | Action::ProviderRemove { .. } | Action::RotationSave { .. } => {
                 ActionKind::Providers
             }
-            Action::TicketMeta { .. } => ActionKind::Meta,
+            Action::TicketMeta { .. } | Action::SetFailover { .. } => ActionKind::Meta,
         }
     }
 }
@@ -376,6 +381,15 @@ impl Host {
         self.runtime.clone()
     }
 
+    /// In-memory activity of the ticket's running and retrying jobs.
+    pub fn activity(&self, ticket: i64) -> Vec<sa_engine::JobActivity> {
+        self.engine.activity(ticket)
+    }
+
+    pub fn failover(&self, ticket: i64) -> bool {
+        self.engine.failover(ticket).unwrap_or(false)
+    }
+
     pub fn providers(&self) -> Vec<CustomProvider> {
         self.shared.registry.read().unwrap_or_else(|p| p.into_inner()).clone()
     }
@@ -597,6 +611,10 @@ async fn execute(engine: &Engine, shared: &Shared, action: Action) -> Result<Opt
                 }
                 Ok(())
             })?;
+            Ok(None)
+        }
+        Action::SetFailover { ticket, enabled } => {
+            engine.set_failover(ticket, enabled)?;
             Ok(None)
         }
         Action::RotationSave { rotation } => {

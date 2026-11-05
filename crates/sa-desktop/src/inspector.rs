@@ -319,6 +319,18 @@ impl App {
 
     fn collab_tab(&mut self, ui: &mut Ui, snap: &Snapshot) {
         let pal = self.pal.clone();
+        let badges = self.live_badges();
+        if let Some(host) = &self.host {
+            let ticket = snap.ticket.id;
+            let mut on = host.failover(ticket);
+            let before = on;
+            widgets::toggle(ui, &mut on, "只读子任务的执行端不可用时自动改派", &pal)
+                .on_hover_text("仅对只读子任务生效；写入任务和主控从不自动改派。");
+            if on != before {
+                self.submit(Action::SetFailover { ticket, enabled: on });
+            }
+            ui.add_space(6.0);
+        }
         let Some(view) = self.view.as_mut() else {
             return;
         };
@@ -464,7 +476,7 @@ impl App {
                     );
                 }
                 ui.vertical(|ui| {
-                    match job_card(ui, job, open, &permission, writable, stopped, &pal) {
+                    match job_card(ui, job, open, &permission, writable, stopped, &pal, badges.get(&job.id)) {
                         Some(CardAction::Toggle) => toggle = Some(job.id),
                         Some(a) => act = Some((a, job.id, job.agent.clone())),
                         None => {}
@@ -510,6 +522,7 @@ fn job_card(
     writable: bool,
     stopped: bool,
     pal: &Palette,
+    badge: Option<&(String, crate::theme::Tone)>,
 ) -> Option<CardAction> {
     let mut clicked = None;
     let stroke = if job.state == "running" {
@@ -554,12 +567,19 @@ fn job_card(
                             .font(theme::body(12.0))
                             .color(pal.faint),
                         );
-                        widgets::chip(
-                            ui,
-                            &job_state(&job.state),
-                            pal.state_tone(&job.state),
-                            theme::TINY,
-                        );
+                        match badge {
+                            Some((text, tone)) => {
+                                widgets::chip(ui, text, *tone, theme::TINY);
+                            }
+                            None => {
+                                widgets::chip(
+                                    ui,
+                                    &job_state(&job.state),
+                                    pal.state_tone(&job.state),
+                                    theme::TINY,
+                                );
+                            }
+                        }
                     });
                 })
                 .response;

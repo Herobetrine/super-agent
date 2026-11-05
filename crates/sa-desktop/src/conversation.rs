@@ -139,7 +139,9 @@ impl App {
             ui.add_space(8.0);
         }
         if labels::is_active(&snap.ticket.state) {
-            centered(ui, COLUMN, 24.0, |ui| self.live_line(ui, &snap));
+            let root = snap.jobs.iter().find(|j| j.parent.is_none()).map(|j| j.id);
+            let badge = root.and_then(|r| self.live_badges().remove(&r));
+            centered(ui, COLUMN, 24.0, |ui| self.live_line(ui, &snap, badge));
             ui.add_space(4.0);
         }
         self.feed_area(ui, &snap);
@@ -382,7 +384,7 @@ impl App {
         widgets::left_bar(ui, resp.response.rect, pal.accent);
     }
 
-    fn live_line(&self, ui: &mut Ui, snap: &Snapshot) {
+    fn live_line(&self, ui: &mut Ui, snap: &Snapshot, badge: Option<(String, theme::Tone)>) {
         let pal = &self.pal;
         let view = self.view.as_ref();
         let root = snap.jobs.iter().find(|j| j.parent.is_none());
@@ -486,7 +488,8 @@ impl App {
                     );
                     let rg =
                         widgets::line_galley(ui, &right, theme::body(theme::TINY), pal.mute, 200.0);
-                    let w = ui.available_width() - rg.size().x - 12.0;
+                    let reserve = if badge.is_some() { 130.0 } else { 0.0 };
+                    let w = ui.available_width() - rg.size().x - 12.0 - reserve;
                     let g = widgets::line_galley(ui, &head, theme::strong(12.5), pal.ink, w);
                     ui.add(Label::new(g).selectable(false)).on_hover_text(&head);
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -495,6 +498,9 @@ impl App {
                                 "创建于 {}",
                                 activity_time(snap.ticket.created)
                             ));
+                        if let Some((text, tone)) = &badge {
+                            widgets::chip(ui, text, *tone, theme::TINY).on_hover_text("主控的实时状态");
+                        }
                     });
                 });
                 ui.horizontal(|ui| {
