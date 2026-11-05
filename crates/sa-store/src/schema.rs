@@ -74,3 +74,9 @@ pub(crate) const ADDITIONS: &[(&str, &[(&str, &str)])] = &[
 pub const STUDIO_PLAN: &str = "CREATE TABLE IF NOT EXISTS studio_plan(id INTEGER PRIMARY KEY,
       ticket INTEGER NOT NULL REFERENCES tickets,body TEXT NOT NULL,done INTEGER NOT NULL DEFAULT 0);
       CREATE INDEX IF NOT EXISTS studio_plan_ticket ON studio_plan(ticket,id)";
+
+/// Operator metadata of a ticket in the sidebar: title, pin, archive
+/// (Rust-port addition; the Node engine ignores it).
+pub const TICKET_META: &str = "CREATE TABLE IF NOT EXISTS studio_ticket_meta(
+  ticket INTEGER PRIMARY KEY REFERENCES tickets, title TEXT,
+  pinned INTEGER NOT NULL DEFAULT 0, archived INTEGER NOT NULL DEFAULT 0)";

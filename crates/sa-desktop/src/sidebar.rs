@@ -1,6 +1,7 @@
 //! Left sidebar: brand, search and tickets grouped by project folder.
 
 use crate::app::App;
+use crate::host::Action;
 use crate::labels;
 use crate::theme;
 use crate::widgets;
@@ -198,9 +199,38 @@ impl App {
                             });
                             return;
                         }
-                        let all = groups(&self.history);
                         let searching = !self.search.trim().is_empty();
+                        let archived = self.history.iter().filter(|r| r.archived).count();
+                        let shown: Vec<TicketSummary> = self
+                            .history
+                            .iter()
+                            .filter(|r| self.show_archived || !r.archived)
+                            .cloned()
+                            .collect();
+                        let (pinned, rest): (Vec<TicketSummary>, Vec<TicketSummary>) =
+                            shown.into_iter().partition(|r| r.pinned && !r.archived);
+                        let all = groups(&rest);
                         let mut clicked = None;
+                        let mut action = None;
+                        if !pinned.is_empty() {
+                            ui.horizontal(|ui| {
+                                ui.add_space(8.0);
+                                ui.label(
+                                    RichText::new(format!("{}  置顶", icon::PUSH_PIN))
+                                        .font(theme::strong(13.0))
+                                        .color(pal.mute),
+                                );
+                            });
+                            ui.add_space(2.0);
+                            for r in &pinned {
+                                let (c, a) = self.ticket_row(ui, r);
+                                if c {
+                                    clicked = Some(r.id);
+                                }
+                                action = action.or(a);
+                            }
+                            ui.add_space(8.0);
+                        }
                         for g in &all {
                             let open = searching || !self.collapsed_projects.contains(&g.key);
                             if self.group_header(ui, g, &display_name(g, &all), open)
@@ -210,15 +240,33 @@ impl App {
                             }
                             if open {
                                 for r in &g.rows {
-                                    if self.ticket_row(ui, r) {
+                                    let (c, a) = self.ticket_row(ui, r);
+                                    if c {
                                         clicked = Some(r.id);
                                     }
+                                    action = action.or(a);
                                 }
                                 ui.add_space(6.0);
                             }
                         }
+                        if archived > 0 {
+                            ui.add_space(4.0);
+                            let text = if self.show_archived {
+                                format!("隐藏已归档（{archived}）")
+                            } else {
+                                format!("显示已归档（{archived}）")
+                            };
+                            if widgets::quiet_button(ui, icon::ARCHIVE, &text, &pal, false).clicked() {
+                                self.show_archived = !self.show_archived;
+                            }
+                        }
                         if let Some(id) = clicked {
                             self.select(Some(id));
+                        }
+                        match action {
+                            Some(RowAction::Rename(id, title)) => self.rename = Some((id, title)),
+                            Some(RowAction::Meta(a)) => self.submit(a),
+                            None => {}
                         }
                     });
             });
@@ -327,7 +375,7 @@ impl App {
         resp.clicked()
     }
 
-    fn ticket_row(&self, ui: &mut Ui, r: &TicketSummary) -> bool {
+    fn ticket_row(&self, ui: &mut Ui, r: &TicketSummary) -> (bool, Option<RowAction>) {
         let pal = &self.pal;
         let selected = self.view.as_ref().is_some_and(|v| v.id == r.id);
         let w = ui.available_width();
@@ -349,7 +397,11 @@ impl App {
             }
             let left = rect.left() + 18.0;
             let inner_w = rect.right() - 10.0 - left;
-            let title = labels::compact(if r.goal.is_empty() { "会话" } else { &r.goal }, 120);
+            let name = r.title.as_deref().filter(|t| !t.is_empty()).unwrap_or(&r.goal);
+            let mut title = labels::compact(if name.is_empty() { "会话" } else { name }, 120);
+            if r.archived {
+                title = format!("{} {title}", icon::ARCHIVE);
+            }
             let font = if selected {
                 theme::strong(13.5)
             } else {
@@ -392,6 +444,93 @@ impl App {
                         .color(self.pal.mute),
                 );
             });
-        resp.clicked()
+        let mut action = None;
+        if self.writable() {
+            resp.context_menu(|ui| {
+                ui.set_min_width(170.0);
+                if ui.button(format!("{}  重命名", icon::PENCIL_SIMPLE)).clicked() {
+                    let current = r.title.clone().unwrap_or_else(|| labels::compact(&r.goal, 60));
+                    action = Some(RowAction::Rename(r.id, current));
+                }
+                let pin = if r.pinned { "取消置顶" } else { "置顶" };
+                if ui.button(format!("{}  {pin}", icon::PUSH_PIN)).clicked() {
+                    action = Some(RowAction::Meta(Action::TicketMeta {
+                        ticket: r.id,
+                        title: None,
+                        pinned: Some(!r.pinned),
+                        archived: None,
+                    }));
+                }
+                let arch = if r.archived { "取消归档" } else { "归档" };
+                if ui.button(format!("{}  {arch}", icon::ARCHIVE)).clicked() {
+                    action = Some(RowAction::Meta(Action::TicketMeta {
+                        ticket: r.id,
+                        title: None,
+                        pinned: None,
+                        archived: Some(!r.archived),
+                    }));
+                }
+            });
+        }
+        (resp.clicked(), action)
     }
+
+    /// Rename dialog opened from a sidebar row's context menu.
+    pub fn rename_dialog(&mut self, ctx: &egui::Context) {
+        let Some((ticket, title)) = self.rename.as_mut() else { return };
+        let pal = self.pal.clone();
+        let mut save = false;
+        let mut close = false;
+        let modal = egui::Modal::new(egui::Id::new("sa-rename"))
+            .frame(widgets::modal_frame(&pal))
+            .show(ctx, |ui| {
+                ui.set_width(420.0);
+                if widgets::modal_header(ui, icon::PENCIL_SIMPLE, "重命名会话", &format!("工单 #{ticket}；留空恢复为目标原文。"), &pal) {
+                    close = true;
+                }
+                let r = ui.add(
+                    egui::TextEdit::singleline(title)
+                        .id_salt("rename-title")
+                        .desired_width(f32::INFINITY)
+                        .char_limit(200),
+                );
+                r.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::TextEdit, true, "会话名称"));
+                if ui.memory(|m| m.focused().is_none()) {
+                    r.request_focus();
+                }
+                if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    save = true;
+                }
+                ui.add_space(14.0);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if widgets::primary_button(ui, icon::CHECK, "保存", &pal, true).clicked() {
+                        save = true;
+                    }
+                    if widgets::quiet_button(ui, "", "取消", &pal, false).clicked() {
+                        close = true;
+                    }
+                });
+            });
+        if modal.should_close() && !save {
+            close = true;
+        }
+        if save {
+            if let Some((ticket, title)) = self.rename.take() {
+                self.submit(Action::TicketMeta {
+                    ticket,
+                    title: Some(title),
+                    pinned: None,
+                    archived: None,
+                });
+            }
+        } else if close {
+            self.rename = None;
+        }
+    }
+}
+
+/// What a sidebar row's context menu asked for.
+enum RowAction {
+    Rename(i64, String),
+    Meta(Action),
 }

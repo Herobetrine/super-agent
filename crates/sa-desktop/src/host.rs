@@ -95,6 +95,13 @@ pub enum Action {
     RotationSave {
         rotation: Rotation,
     },
+    /// Sidebar metadata; `None` fields stay unchanged, an empty title clears it.
+    TicketMeta {
+        ticket: i64,
+        title: Option<String>,
+        pinned: Option<bool>,
+        archived: Option<bool>,
+    },
 }
 
 impl Action {
@@ -112,6 +119,7 @@ impl Action {
             Action::ProviderSave { .. } | Action::ProviderRemove { .. } | Action::RotationSave { .. } => {
                 ActionKind::Providers
             }
+            Action::TicketMeta { .. } => ActionKind::Meta,
         }
     }
 }
@@ -128,6 +136,7 @@ pub enum ActionKind {
     Routes,
     Knowledge,
     Providers,
+    Meta,
 }
 
 /// Result of one action; `value` is the new ticket id for `Create`.
@@ -429,7 +438,10 @@ fn open_engine(
     let engine = Engine::open(dir, adapters, opts)?;
     engine
         .db()
-        .with(|q| Ok(q.conn().execute_batch(sa_store::STUDIO_PLAN)?))?;
+        .with(|q| {
+            q.conn().execute_batch(sa_store::STUDIO_PLAN)?;
+            Ok(q.conn().execute_batch(sa_store::TICKET_META)?)
+        })?;
     // Providers and rotation must be loaded before the first admission.
     shared.reload(&engine)?;
     engine.start()?;
@@ -559,6 +571,32 @@ async fn execute(engine: &Engine, shared: &Shared, action: Action) -> Result<Opt
         Action::ProviderRemove { id } => {
             engine.db().with(|q| providers::remove(q.conn(), &id))?;
             shared.reload(engine)?;
+            Ok(None)
+        }
+        Action::TicketMeta {
+            ticket,
+            title,
+            pinned,
+            archived,
+        } => {
+            let title = title.map(|t| t.trim().chars().take(200).collect::<String>());
+            engine.db().tx(|q| {
+                if !q.exists("SELECT 1 FROM tickets WHERE id=?", &[&ticket])? {
+                    bail!("工单不存在");
+                }
+                q.run("INSERT OR IGNORE INTO studio_ticket_meta(ticket) VALUES(?)", &[&ticket])?;
+                if let Some(t) = &title {
+                    let t: Option<&str> = (!t.is_empty()).then_some(t.as_str());
+                    q.run("UPDATE studio_ticket_meta SET title=? WHERE ticket=?", &[&t, &ticket])?;
+                }
+                if let Some(p) = pinned {
+                    q.run("UPDATE studio_ticket_meta SET pinned=? WHERE ticket=?", &[&(p as i64), &ticket])?;
+                }
+                if let Some(a) = archived {
+                    q.run("UPDATE studio_ticket_meta SET archived=? WHERE ticket=?", &[&(a as i64), &ticket])?;
+                }
+                Ok(())
+            })?;
             Ok(None)
         }
         Action::RotationSave { rotation } => {

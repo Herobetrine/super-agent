@@ -12,5 +12,5 @@ pub mod schema;
 pub mod store;
 
 pub use model::*;
-pub use schema::STUDIO_PLAN;
+pub use schema::{STUDIO_PLAN, TICKET_META};
 pub use store::{DB_FILE, Store, default_data_dir};

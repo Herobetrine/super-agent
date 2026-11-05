@@ -183,11 +183,24 @@ impl Store {
             pattern.push(c);
         }
         pattern.push('%');
-        let mut stmt = self.conn.prepare_cached(
-            "SELECT t.id,substr(t.goal,1,500) goal,t.cwd,t.lead,t.created,j.state
+        // `studio_ticket_meta` is created by the scheduler; older journals lack it.
+        let meta = self
+            .conn
+            .prepare_cached("SELECT 1 FROM sqlite_master WHERE type='table' AND name='studio_ticket_meta'")?
+            .exists([])?;
+        let sql = if meta {
+            "SELECT t.id,substr(t.goal,1,500) goal,t.cwd,t.lead,t.created,j.state,m.title,
+        coalesce(m.pinned,0),coalesce(m.archived,0)
       FROM tickets t JOIN jobs j ON j.ticket=t.id AND j.parent IS NULL
-      WHERE t.goal LIKE ?1 ESCAPE '\\' OR t.cwd LIKE ?1 ESCAPE '\\' ORDER BY t.id DESC LIMIT 150",
-        )?;
+      LEFT JOIN studio_ticket_meta m ON m.ticket=t.id
+      WHERE t.goal LIKE ?1 ESCAPE '\\' OR t.cwd LIKE ?1 ESCAPE '\\' OR m.title LIKE ?1 ESCAPE '\\'
+      ORDER BY t.id DESC LIMIT 150"
+        } else {
+            "SELECT t.id,substr(t.goal,1,500) goal,t.cwd,t.lead,t.created,j.state,NULL,0,0
+      FROM tickets t JOIN jobs j ON j.ticket=t.id AND j.parent IS NULL
+      WHERE t.goal LIKE ?1 ESCAPE '\\' OR t.cwd LIKE ?1 ESCAPE '\\' ORDER BY t.id DESC LIMIT 150"
+        };
+        let mut stmt = self.conn.prepare_cached(sql)?;
         let rows = stmt.query_map([&pattern], |r| {
             Ok(TicketSummary {
                 id: r.get(0)?,
@@ -196,6 +209,9 @@ impl Store {
                 lead: r.get(3)?,
                 created: r.get(4)?,
                 state: r.get(5)?,
+                title: r.get(6)?,
+                pinned: r.get::<_, i64>(7)? != 0,
+                archived: r.get::<_, i64>(8)? != 0,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)

@@ -129,6 +129,9 @@ pub struct App {
     pub palette: Option<crate::palette::PaletteState>,
     /// Focus the sidebar search on the next frame.
     pub focus_search: bool,
+    pub show_archived: bool,
+    /// Sidebar rename dialog: `(ticket, draft title)`.
+    pub rename: Option<(i64, String)>,
     /// Last seen root state per ticket (finish notifications).
     known_states: std::collections::HashMap<i64, String>,
     pub extensions: Option<crate::extensions::ExtDialog>,
@@ -210,6 +213,8 @@ impl App {
             providers: None,
             palette: None,
             focus_search: false,
+            show_archived: false,
+            rename: None,
             known_states: Default::default(),
             extensions: None,
             ctx: cc.egui_ctx.clone(),
@@ -577,6 +582,7 @@ impl eframe::App for App {
         self.providers_dialog(ctx);
         self.extensions_dialog(ctx);
         self.palette_ui(ctx);
+        self.rename_dialog(ctx);
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {

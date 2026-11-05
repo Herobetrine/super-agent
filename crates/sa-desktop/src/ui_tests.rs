@@ -560,3 +560,32 @@ fn live_composer_turn_with_real_deepseek() {
         eprintln!("journal kept in {}", keep.display());
     }
 }
+
+#[test]
+fn sidebar_rename_pin_and_archive() {
+    let data = tempfile::tempdir().unwrap();
+    let mut h = harness(data.path(), "readonly");
+    h.run_steps(4);
+    let editor = h.get_by_label("输入框");
+    editor.focus();
+    editor.type_text("整理笔记");
+    h.run_steps(2);
+    h.key_press(egui::Key::Enter);
+    until(&mut h, "done", |a| root_state(a) == "done");
+    let ticket = h.state().view.as_ref().unwrap().id;
+    let row = |a: &App| a.history.iter().find(|r| r.id == ticket).cloned();
+    h.state_mut().rename = Some((ticket, "周报整理".into()));
+    h.run_steps(3);
+    h.get_by_label("保存").click();
+    until(&mut h, "renamed", |a| row(a).and_then(|r| r.title).as_deref() == Some("周报整理"));
+    h.state_mut().submit(crate::host::Action::TicketMeta { ticket, title: None, pinned: Some(true), archived: None });
+    until(&mut h, "pinned", |a| row(a).is_some_and(|r| r.pinned));
+    h.state_mut().submit(crate::host::Action::TicketMeta { ticket, title: None, pinned: None, archived: Some(true) });
+    until(&mut h, "archived", |a| row(a).is_some_and(|r| r.archived));
+    h.run_steps(3);
+    // Archived rows are hidden until the toggle is used.
+    assert!(h.query_by_label("显示已归档（1）").is_some());
+    // An empty title restores the goal.
+    h.state_mut().submit(crate::host::Action::TicketMeta { ticket, title: Some(String::new()), pinned: None, archived: None });
+    until(&mut h, "title cleared", |a| row(a).is_some_and(|r| r.title.is_none()));
+}

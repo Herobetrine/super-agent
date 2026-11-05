@@ -909,6 +909,9 @@ impl DataSource for DemoSource {
                 lead: t.detail.lead.clone(),
                 created: t.detail.created,
                 state: t.detail.state.clone(),
+                title: None,
+                pinned: false,
+                archived: false,
             })
             .collect())
     }

@@ -258,6 +258,7 @@ impl App {
                 (ActionKind::Routes, r) => self.routes_saved(r.map(|_| ())),
                 (ActionKind::Knowledge, r) => self.knowledge_saved(r.map(|_| ())),
                 (ActionKind::Providers, r) => self.providers_saved(r.map(|_| ())),
+                (ActionKind::Meta, Ok(_)) => {}
                 (_, Err(e)) => self.composer.message = Some((e, true)),
             }
         }

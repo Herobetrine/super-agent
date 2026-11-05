@@ -19,6 +19,13 @@ pub struct TicketSummary {
     pub created: f64,
     /// State of the root (lead) job.
     pub state: String,
+    /// Operator-given title (`studio_ticket_meta`), shown instead of the goal.
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub pinned: bool,
+    #[serde(default)]
+    pub archived: bool,
 }
 
 /// Ticket header of a snapshot.
