@@ -65,6 +65,8 @@ pub struct Composer {
     pub index: Option<FileIndex>,
     /// Highlighted row of the `@` suggestions.
     pub mention_row: usize,
+    /// IME composition persists across frames without new IME events.
+    ime_active: bool,
 }
 
 pub struct FileIndex {
@@ -94,7 +96,34 @@ impl Composer {
             shown: None,
             index: None,
             mention_row: 0,
+            ime_active: false,
         }
+    }
+
+    /// TextEdit's IME state is private in egui 0.33. Keep the shortcut gate
+    /// across frames too, and leave the commit/cancel frame to the editor.
+    fn keyboard_ready(&mut self, ui: &Ui, editor: egui::Id) -> bool {
+        let focused = ui.is_enabled()
+            && ui.input(|i| i.focused)
+            && ui.memory(|m| m.has_focus(editor) && m.allows_interaction(ui.layer_id()));
+        if !focused {
+            self.ime_active = false;
+            return false;
+        }
+        let mut composing = self.ime_active;
+        ui.input(|i| {
+            for event in &i.events {
+                if let Event::Ime(ime) = event {
+                    composing = true;
+                    match ime {
+                        egui::ImeEvent::Enabled | egui::ImeEvent::Preedit(_) => self.ime_active = true,
+                        egui::ImeEvent::Commit(text) if text == "\n" || text == "\r" => {}
+                        egui::ImeEvent::Commit(_) | egui::ImeEvent::Disabled => self.ime_active = false,
+                    }
+                }
+            }
+        });
+        !composing
     }
 }
 
@@ -534,6 +563,8 @@ impl App {
 
                 // `@` mentions: pick project files (attached to a new
                 // conversation, or inserted as a path in a follow-up).
+                let editor_id = ui.make_persistent_id("composer");
+                let keyboard_ready = self.composer.keyboard_ready(ui, editor_id);
                 let root = if fixed {
                     (!cur.cwd.is_empty()).then(|| PathBuf::from(&cur.cwd))
                 } else {
@@ -550,18 +581,21 @@ impl App {
                     if n > 0 {
                         let row = &mut self.composer.mention_row;
                         *row = (*row).min(n - 1);
-                        ui.input_mut(|i| {
-                            if i.consume_key(Modifiers::NONE, Key::ArrowDown) {
-                                *row = (*row + 1) % n;
-                            }
-                            if i.consume_key(Modifiers::NONE, Key::ArrowUp) {
-                                *row = (*row + n - 1) % n;
-                            }
-                        });
-                        let mut pick = ui.input_mut(|i| {
-                            i.consume_key(Modifiers::NONE, Key::Enter) || i.consume_key(Modifiers::NONE, Key::Tab)
-                        })
-                        .then(|| hits[*row].clone());
+                        let mut pick = None;
+                        if keyboard_ready {
+                            ui.input_mut(|i| {
+                                if i.consume_key(Modifiers::NONE, Key::ArrowDown) {
+                                    *row = (*row + 1) % n;
+                                }
+                                if i.consume_key(Modifiers::NONE, Key::ArrowUp) {
+                                    *row = (*row + n - 1) % n;
+                                }
+                            });
+                            pick = ui.input_mut(|i| {
+                                i.consume_key(Modifiers::NONE, Key::Enter) || i.consume_key(Modifiers::NONE, Key::Tab)
+                            })
+                            .then(|| hits[*row].clone());
+                        }
                         Frame::new()
                             .fill(pal.surface_alt)
                             .stroke(Stroke::new(1.0_f32, pal.line_soft))
@@ -639,7 +673,7 @@ impl App {
                     .show(ui, |ui| {
                         ui.add(
                             egui::TextEdit::multiline(&mut self.composer.draft)
-                                .id_salt("composer")
+                                .id(editor_id)
                                 .frame(false)
                                 .hint_text(RichText::new(hint).color(pal.faint))
                                 .font(theme::body(14.0))
@@ -659,12 +693,14 @@ impl App {
                 {
                     self.paste_image(fixed, root.as_deref());
                 }
-                let composing = ui.input(|i| i.events.iter().any(|e| matches!(e, Event::Ime(_))));
                 if resp.has_focus()
-                    && !composing
+                    && keyboard_ready
                     && ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Enter))
                 {
                     send = true;
+                }
+                if !resp.has_focus() {
+                    self.composer.ime_active = false;
                 }
 
                 let has_draft = !self.composer.draft.trim().is_empty();
@@ -897,5 +933,146 @@ impl App {
                 resume: true,
             }),
         }
+    }
+}
+
+#[cfg(test)]
+mod keyboard_tests {
+    use super::*;
+    use egui_kittest::{Harness, kittest::Queryable};
+    use std::sync::{Arc, Mutex};
+
+    fn harness(data: &std::path::Path, project: &std::path::Path) -> Harness<'static, App> {
+        let data = data.to_path_buf();
+        let project = project.to_path_buf();
+        Harness::builder().with_size(egui::vec2(1280.0, 860.0)).build_eframe(move |cc| {
+            crate::theme::install_fonts(&cc.egui_ctx);
+            let ctx = cc.egui_ctx.clone();
+            let host = host::Host::start_with(data.clone(), host::tests::fakes, move || ctx.request_repaint())
+                .map_err(|e| format!("{e:#}"));
+            let worker = crate::worker::spawn(crate::data::StoreSource::opener(data.clone()), cc.egui_ctx.clone());
+            let opts = crate::cli::Options { data: Some(data), ..Default::default() };
+            let mut app = App::new(cc, opts, worker, Arc::new(Mutex::new(None)), host);
+            app.composer.project = Some(project.clone());
+            app.composer.index = Some(FileIndex {
+                root: project,
+                files: Some(Ok(vec!["zh-one.txt".into(), "zh-two.txt".into()])),
+                pending: None,
+            });
+            app.composer.draft = "@".into();
+            app
+        })
+    }
+
+    fn assert_not_selected_or_sent(h: &Harness<'_, App>) {
+        assert!(h.state().composer.attachments.is_empty());
+        assert_eq!(h.state().composer.pending, 0);
+        assert!(h.state().view.is_none());
+    }
+
+    fn ime_and_enter(h: &mut Harness<'_, App>, ime: egui::ImeEvent) {
+        // Harness::event runs each event in a separate frame. Raw input is
+        // required to reproduce a platform commit/cancel and key together.
+        h.input_mut().events.extend([
+            Event::Ime(ime),
+            Event::Key {
+                key: Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::NONE,
+            },
+        ]);
+        h.run_steps(2);
+    }
+
+    #[test]
+    fn mention_keyboard_requires_editor_focus() {
+        let data = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let mut h = harness(data.path(), project.path());
+        h.run_steps(3);
+        for key in [Key::ArrowDown, Key::ArrowUp, Key::Enter, Key::Tab] {
+            h.state().ctx.memory_mut(|m| {
+                if let Some(id) = m.focused() {
+                    m.surrender_focus(id);
+                }
+            });
+            h.key_press(key);
+            h.run_steps(2);
+            assert_not_selected_or_sent(&h);
+            assert_eq!(h.state().composer.mention_row, 0);
+            assert_eq!(h.state().composer.draft, "@");
+        }
+        h.get_by_label("输入框").focus();
+        h.run_steps(2);
+        h.input_mut().focused = false;
+        h.key_press(Key::Enter);
+        h.run_steps(2);
+        assert_not_selected_or_sent(&h);
+    }
+
+    #[test]
+    fn mention_keyboard_selects_with_arrows_enter_and_tab() {
+        let data = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let mut h = harness(data.path(), project.path());
+        h.run_steps(3);
+        h.get_by_label("输入框").focus();
+        h.run_steps(2);
+        h.key_press(Key::ArrowDown);
+        h.run_steps(2);
+        assert_eq!(h.state().composer.mention_row, 1);
+        h.key_press(Key::Enter);
+        h.run_steps(2);
+        assert_eq!(h.state().composer.attachments, ["zh-two.txt"]);
+        assert!(h.state().composer.draft.is_empty());
+        assert!(h.state().view.is_none());
+        h.state_mut().composer.draft = "@".into();
+        h.run_steps(2);
+        h.key_press(Key::Tab);
+        h.run_steps(2);
+        assert_eq!(h.state().composer.attachments, ["zh-two.txt", "zh-one.txt"]);
+        assert!(h.state().view.is_none());
+    }
+
+    #[test]
+    fn mention_and_send_leave_multiframe_ime_keys_to_the_editor() {
+        let data = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let mut h = harness(data.path(), project.path());
+        h.run_steps(3);
+        h.get_by_label("输入框").focus();
+        h.run_steps(2);
+        h.event(Event::Ime(egui::ImeEvent::Enabled));
+        h.event(Event::Ime(egui::ImeEvent::Preedit("zh".into())));
+        h.run_steps(3);
+        assert!(h.state().composer.ime_active);
+        assert_eq!(h.state().composer.draft, "@zh");
+        // These later frames have no IME event: the persisted state must
+        // protect both the file menu and normal Enter-to-send.
+        for key in [Key::ArrowDown, Key::ArrowUp, Key::Enter, Key::Tab] {
+            h.key_press(key);
+            h.run_steps(2);
+            assert_not_selected_or_sent(&h);
+            assert_eq!(h.state().composer.mention_row, 0);
+        }
+        h.state_mut().composer.draft = "普通消息".into();
+        h.key_press(Key::Enter);
+        h.run_steps(2);
+        assert_not_selected_or_sent(&h);
+        ime_and_enter(&mut h, egui::ImeEvent::Commit("中文".into()));
+        assert_not_selected_or_sent(&h);
+        assert!(!h.state().composer.ime_active);
+
+        // Cancelling a composition blocks that frame, then restores menu keys.
+        h.state_mut().composer.draft = "@".into();
+        h.event(Event::Ime(egui::ImeEvent::Enabled));
+        h.run_steps(2);
+        ime_and_enter(&mut h, egui::ImeEvent::Disabled);
+        assert_not_selected_or_sent(&h);
+        h.key_press(Key::Enter);
+        h.run_steps(2);
+        assert_eq!(h.state().composer.attachments, ["zh-one.txt"]);
     }
 }

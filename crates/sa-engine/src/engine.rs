@@ -845,10 +845,9 @@ impl Inner {
             q.wake()?;
             let queued = "SELECT j.*,t.cwd,t.claude_route,t.follow_config,t.agent_routes,t.allow_lead_routing,t.writes,
         t.permission_profile AS ticket_profile,coalesce(j.permission_override,t.permission_profile) AS profile,
-        t.auto_cycles,r.route AS bound_route,c.ticket AS continuous_ticket,coalesce(c.boundary_job,0) AS floor,
-        f.ticket IS NOT NULL AS failover
+        t.auto_cycles,r.route AS bound_route,c.ticket AS continuous_ticket,coalesce(c.boundary_job,0) AS floor
         FROM jobs j JOIN tickets t ON t.id=j.ticket LEFT JOIN native_routes r ON r.job=j.id
-        LEFT JOIN continuous_runs c ON c.ticket=j.ticket LEFT JOIN ticket_failover f ON f.ticket=j.ticket
+        LEFT JOIN continuous_runs c ON c.ticket=j.ticket
         WHERE j.state='queued' AND j.ready_after<=? AND j.writing=? ORDER BY j.id LIMIT ?";
             let time = now();
             let mut candidates = q.all(queued, &[&time, &0, &(READS_PER_SLICE as i64)])?;
@@ -1632,7 +1631,10 @@ impl Inner {
     /// Returns the cancelled job ids, or `None` when nothing was done.
     fn failover(&self, q: &Q, job: &JobCtx, reason: &str) -> Result<Option<Vec<i64>>> {
         let Some(parent) = job.parent else { return Ok(None) };
-        if !job.failover || job.writing {
+        // This setting can change while the native turn is running. Read
+        // the current authorization in the same transaction as the move,
+        // rather than taking a snapshot at admission.
+        if job.writing || !q.exists("SELECT 1 FROM ticket_failover WHERE ticket=?", &[&job.ticket])? {
             return Ok(None);
         }
         let Some(original) = q.one("SELECT * FROM jobs WHERE id=?", &[&job.id])? else {

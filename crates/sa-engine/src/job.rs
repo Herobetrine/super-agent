@@ -36,8 +36,6 @@ pub struct JobCtx {
     pub bound_route: Option<String>,
     pub continuous: bool,
     pub floor: i64,
-    /// The ticket enabled automatic failover of read-only children.
-    pub failover: bool,
     /// Seq of this turn's `turn.admitted` event.
     pub admission: i64,
 }
@@ -72,7 +70,6 @@ impl JobCtx {
             bound_route: opt_str(r, "bound_route"),
             continuous: r.get("continuous_ticket").is_some_and(|v| !v.is_null()),
             floor: int_of(r, "floor"),
-            failover: int_of(r, "failover") != 0,
             admission: 0,
         }
     }

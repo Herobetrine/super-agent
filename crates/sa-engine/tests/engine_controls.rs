@@ -283,6 +283,58 @@ async fn open_breaker_fails_over_a_reader_enabled_after_create() {
     assert!(!fx.engine.failover(ticket).unwrap());
 }
 
+async fn change_failover_during_child_turn(initial: bool) {
+    let (started, release) = (Gate::new(), Gate::new());
+    let (s, r) = (started.clone(), release.clone());
+    let fx = Fx::with(
+        script(move |c| {
+            let (s, r) = (s.clone(), r.clone());
+            async move {
+                if c.depth() == 0 {
+                    return Ok(if c.turn() == 1 { send(json!({})) } else { "merged".into() });
+                }
+                if c.name == "deepseek" {
+                    s.open();
+                    r.wait().await;
+                    return Err(not_configured());
+                }
+                assert!(!c.req.writable);
+                Ok("replacement done".into())
+            }
+        }),
+        t1_catalog(),
+        resilient(config()),
+    );
+    let ticket = fx.begin(fx.params().failover(initial)).await;
+    fx.until(|| started.is_open()).await;
+    let child = fx.int("SELECT id FROM jobs WHERE parent IS NOT NULL");
+    assert_eq!(state(&fx, child), "running");
+
+    // The same admitted turn must honor the new setting when it fails.
+    let enabled = !initial;
+    fx.engine.set_failover(ticket, enabled).unwrap();
+    assert_eq!(fx.engine.failover(ticket).unwrap(), enabled);
+    release.open();
+    fx.finish(ticket, if enabled { "done" } else { "partial" }).await;
+
+    assert_eq!(state(&fx, child), if enabled { "cancelled" } else { "failed" });
+    assert_eq!(fx.int("SELECT count(*) FROM job_failovers"), i64::from(enabled));
+    assert_eq!(fx.int("SELECT count(*) FROM jobs"), if enabled { 3 } else { 2 });
+    assert_eq!(fx.shared.count(|c| c.packet["depth"].as_i64().unwrap_or_default() > 0 && c.name == "codex"), usize::from(enabled));
+    assert_eq!(kinds(&fx, "failover.changed"), vec![json!({"enabled": enabled})]);
+    fx.engine.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn disabling_failover_during_a_child_turn_prevents_replacement() {
+    change_failover_during_child_turn(true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn enabling_failover_during_a_child_turn_allows_replacement() {
+    change_failover_during_child_turn(false).await;
+}
+
 fn find(fx: &Fx, ticket: i64, job: i64) -> Option<JobActivity> {
     fx.engine.activity(ticket).into_iter().find(|a| a.job == job)
 }
