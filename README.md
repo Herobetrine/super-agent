@@ -8,22 +8,20 @@
 
 ## 安装与启动
 
-桌面端使用 Electron。Node.js 子进程独立调度 CLI、处理模型流和审批，将完整事件写入 SQLite。Rust 服务负责项目文件检索、SHA-256 快照、长上下文归档，以及 Windows 工单库的独占锁和子进程回收。
+桌面端是纯 Rust 程序（egui）：同一个进程负责界面、调度 CLI、处理模型流与审批、MCP 与技能，并把完整事件写入 SQLite 工单库；它持有工单库的独占锁，退出时回收全部执行端子进程。设计与迁移记录见 [Rust 重构路线](docs/rust-port.md)。
 
-从源码构建需要 Windows、Node.js 24 或更高版本、Rust stable（1.89 或更高版本）和至少一个已登录的 agent CLI。在 PowerShell 执行以下命令。
+从源码构建需要 Windows、Rust stable（1.89 或更高版本）和至少一个已登录的 agent CLI。GNU 工具链需要 [llvm-mingw](https://github.com/mstorsjo/llvm-mingw/releases)，解压方式见 [构建说明](docs/rust-port.md#构建)。在 PowerShell 执行以下命令。
 
 ```powershell
 git clone https://github.com/Herobetrine/super-agent.git
 cd super-agent
-npm ci
-node node_modules/electron/install.js
-npm run build:native
+scripts\cargo.cmd build --release -p sa-desktop
 .\Install-Desktop.ps1
 ```
 
-双击桌面的 **Super Agent**，也可以运行 `npm start`。在 Windows 使用 Rust MSVC 工具链时需要 Visual Studio C++ Build Tools。GNU 工具链需要可用的 MinGW binutils，使用独立 LLVM 的 `dlltool.exe` 时可通过 `SUPERAGENT_DLLTOOL` 指定路径。重建前先关闭运行中的工作台。[Rust Windows 安装说明](https://rust-lang.github.io/rustup/installation/windows.html)
+双击桌面的 **Super Agent**，也可以直接运行 `target\release\super-agent.exe`。同一个工单库只能由一个工作台调度；再打开一个窗口时，新窗口自动以只读观察模式打开。重建前先关闭运行中的工作台。
 
-升级已有安装时，先停止需要终止的工单并退出旧窗口。新版直接打开原工单库和附件目录，继续使用本机供应商配置。旧自动工单遵守创建时的规则。Python 和 Qt 源文件保留用于迁移对照及回归测试。
+升级已有安装时，先停止需要终止的工单并退出旧窗口。新版直接打开原工单库和附件目录，继续使用本机供应商配置；旧工单可以追加指令续跑。旧自动工单遵守创建时的规则。旧版 Electron/Node 与 Python/Qt 实现已移除，需要时可从 Git 历史（提交 `ea08b8a` 及之前）取回。
 
 | Agent | 自动执行入口 | 配置和安装 |
 | --- | --- | --- |
@@ -32,20 +30,24 @@ npm run build:native
 | DeepSeek Harness | Node.js 及平台专用的上游 npm 运行时 | [版本、安装命令和配置](docs/deepseek.md) |
 | Antigravity | 本机已认证的 `agy` CLI | [供应商与认证](docs/claude-antigravity.md) · [官方安装](https://antigravity.google/docs/cli/install) |
 
-在 **模型与执行端** 中为每个 agent 选择供应商与模型。候选项来自本机配置或对应 CLI 的目录。可以跟随当前默认，也可以把当前组合固定在一张工单中。选中的供应商失效时，任务显示错误。界面只启用已打通自动投递、执行和回传的执行端。
+在 **模型与执行端** 中为每个 agent 选择供应商、模型与目录声明支持的思考强度。模型列表支持搜索和数量显示，刷新会读取当前来源的在线目录或 CLI 模型目录，并处理分页。在线获取失败时会明确标注已保存型号。侧栏 **管理自定义供应商** 和模型窗口中的 **自定义供应商** 都可添加 API 端点，保存后可返回原模型选择继续配置。
 
 ## 开始工作
 
 1. 点击 **新建对话**，选择项目。在输入区选主控和权限，将任务发给主控。使用临时项目时，工作台会创建独立目录。
-2. 输入 `@` 搜索项目内文件，或点击附件按钮。发送时 Rust 保存所选文件的字节快照和摘要，并把清单交给主控。新会话默认只读。
-3. 在 **项目面板** 查看协作任务、定向留言、计划和 Git 变更。计划保存在工单里，下一轮主控可以读取。变更页区分暂存、未暂存及未跟踪文件状态。
+2. 输入 `@` 搜索项目内文件，或点击附件按钮。新会话和后续消息都支持附件及拖入项目文件，粘贴图片会保存为 PNG。发送时 Rust 保存字节快照和摘要。Codex 与 Claude Code 可接收原生 PNG/JPEG 图片，需要选择支持视觉的模型，每轮最多 4 张、每张 5 MiB、合计 16 MiB。后续消息带新图时更新当前附加图片集。新会话默认只读。
+3. 在 **项目面板** 查看协作任务、定向留言、计划和 Git 变更。计划保存在工单里，下一轮主控可以读取。变更页可逐文件查看暂存、未暂存和未跟踪内容，标记已审阅版本，并保存检查点与后续文件比较。每项目保留最近检查点，覆盖已跟踪文件及未被忽略的未跟踪文件，包括清洁文件。上限为 10000 个路径、单文件 4 MiB、总计 64 MiB。
 4. 左侧会话按项目归组。输入框左下角的 **＋** 打开命令面板，旁边是权限。右下角点击模型名选型，圆形按钮发送。运行时该按钮显示方块，点击停止；要继续补充要求或定向留言，按 `Enter`，`Shift+Enter` 换行。
 
 ### 查看实时进展
 
 在会话中可直接查看主控与协作者的阶段汇报、工具操作、审批和最近活动时间。点击聚合行展开逐项回执，点击 **进展记录** 翻看较早的操作。阶段汇报来自执行者，工具状态来自执行端的原生事件。缺少结束回执时界面保留未知状态。四个执行端暴露的事件粒度各不相同。
 
-**项目面板 → 协作** 区分平台派工和 Claude 内部子任务。内部任务显示原生身份、执行状态及最近报告的工具。可以在不打断已有调度器时单独打开某张工单的只读进展窗口，例如 `npm start -- --observe=42`；将数字替换成实际工单号。观察窗口不会启动调度器或发出模型请求。
+顶栏 **用量** 展示执行端已报告的令牌计数，可展开各任务查看输入、输出和缓存。缺失字段显示“未报告”，中断或缺少历史基线的计数标记为部分统计。Claude 的统计范围为主循环，内部子任务用量另有边界。
+
+窗口在后台时，工单结束或产生新审批会触发 Windows 系统通知。侧边工具栏的铃铛可开关通知，点击通知可回到运行中的工作台并选择对应工单。首次发送会登记本应用的 Windows 通知身份及专属开始菜单快捷方式，实际显示遵循 Windows 通知设置。
+
+**项目面板 → 协作** 区分平台派工和 Claude 内部子任务。内部任务显示原生身份、执行状态及最近报告的工具。可以在不打断已有调度器时单独打开某张工单的只读进展窗口，例如 `super-agent.exe --observe --ticket 42`；将数字替换成实际工单号。观察窗口不会启动调度器或发出模型请求。
 
 ### MCP 与技能
 
@@ -57,13 +59,13 @@ npm run build:native
 
 ### 会话权限与自动目标
 
-![Electron 工作台的输入区和权限选择](docs/images/composer-permissions.png)
+![Super Agent 工作台的欢迎页](docs/images/workbench.png)
 
 新对话默认只读。需要你决定的动作出现在窗口顶部的 **待审批** 中，可检查工单、执行者和请求内容后批准或拒绝。
 
-新对话默认允许主控为每个子任务选模型、分配职能并收紧权限。主控会从目标 agent 当前获准的供应商与执行端中读取可选模型，按任务从中选择。要坚持使用原先配置的模型，请在发送首条消息前点 **主控**，关闭 **允许主控为协作者选择模型和子任务权限**。
+在模型窗口打开 **交给主控选择协作者模型和思考强度** 后，主控可按任务从获准来源的目录中选择协作者模型和强度，并可收紧子任务权限。手动选定的协作者配置用于回退。关闭后，后续派工继承手动配置。主控自身始终使用你指定的模型。此策略可保存为新会话默认、仅用于当前草稿，或在已有工单中切换；已有工单的变更从后续派工生效。
 
-展开 **协作** 并选中任务，可以核对本次使用的模型和权限。主控不能替工单切换供应商，也不能给子任务授予超出工单档位的权限。子任务继续派工时仍继承自己的权限上限。已开始的工单锁定原授权，需要不同的工单级权限时请新建对话。
+展开 **协作** 并选中任务，可以核对本次使用的模型、思考强度和权限。主控的选择范围由工单授权的供应商、执行端及权限上限约束。已接受的任务沿用原路由与会话。子任务继续派工时仍继承自己的权限上限。工单级权限档位在创建后锁定，需要不同档位时请新建对话。
 
 | 模式 | 行为 |
 | --- | --- |
@@ -96,12 +98,12 @@ npm run build:native
 
 ## 测试与设计来源
 
-运行原生层、调度器、扩展和桌面测试。真实执行器联测需使用本机模型配额。[验证方法](docs/verification.md)
+运行调度器、执行端、扩展和桌面测试（桌面测试通过无障碍树驱动真实窗口）。真实执行器联测需使用本机模型配额，开关与记录见 [Rust 重构路线](docs/rust-port.md#验证记录2026-11-05)。[验证方法](docs/verification.md)
 
 ```powershell
-npm run build:native
-npm test
+scripts\cargo.cmd test --workspace
 ```
+
 
 本地统筹、独立 worker 和持久化消息参考了 DeepSeek 的 Super-agent 原型。权限设计也参考了 OpenHands 的确认策略及 OpenCode 的请求、允许、拒绝规则。[DeepSeek 原型](https://github.com/deepseek-ai/dsh-superagent-prototype/tree/6337fc823ce20251c8de8085948165c81aaa701e) · [OpenHands 确认策略](https://github.com/OpenHands/software-agent-sdk/blob/main/openhands-sdk/openhands/sdk/security/confirmation_policy.py) · [OpenCode 权限规则](https://opencode.ai/docs/permissions/)
 

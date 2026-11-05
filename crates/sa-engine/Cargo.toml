@@ -1,0 +1,29 @@
+[package]
+name = "sa-engine"
+description = "Super Agent scheduler: tickets, jobs, control protocol, autonomy and resilience"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+# preserve_order: JSON objects keep insertion order like JSON.stringify
+# (envelope key order, journaled adapter frames).
+serde_json = { workspace = true, features = ["preserve_order"] }
+sha2.workspace = true
+regex = "1"
+tempfile.workspace = true
+rusqlite.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+futures.workspace = true
+sa-store = { path = "../sa-store" }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading"] }

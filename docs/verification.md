@@ -1,57 +1,68 @@
 # 验证方法
 
-以下命令在项目根目录执行。真实请求使用对应 CLI 的认证与配额。
-
-## Electron、Node.js 和 Rust 工作台
-
-先运行 `npm ci`、`node node_modules/electron/install.js` 和 `npm run build:native`。运行 `npm test` 检查本地协议、持续工单、锁与恢复、文件快照、扩展授权、真实 stdio 和回环 HTTP 服务。默认跳过计费及吞吐专项用例。
-
-- `node scripts/live-electron.cjs` 使用隔离的 Electron 配置和临时项目，从窗口发送带附件的工单。它用真实 MCP 服务、临时技能和本机 DeepSeek 检查审批、工具调用、逐字回传、计划持久化和窗口重开。文件夹选择器由测试指定，桌面按钮通过 Playwright 操作。
-- 设 `SUPERAGENT_NODE_ENGINE_LIVE=1` 后执行 `node --test tests-node/adapters-engine-live.test.cjs`，核对四个执行器的原生终稿、协作回报和输出文件。用完清除该测试环境变量。单独的 `tests-node/adapters-live.test.cjs` 和 `tests-node/adapters-permissions-live.test.cjs` 在文件开头列出各自的真实验证开关。
-- `node tests-node/engine-live.cjs` 在临时项目授予实际完整权限，用阶段性需求检查主动发现、协作、学习、耗尽和停止。查看独立回执中的各项布尔值。
-- `node scripts/benchmark-context.cjs` 在同一合成输入上核对新旧归档及裁剪，预热后各运行五次，输出中位数。旧基线使用本机 Python。设 `SUPERAGENT_NODE_BENCHMARK=1` 后运行 `node --test tests-node/adapters-batch.test.cjs` 可比较同一原生帧在 SQLite WAL + FULL 下逐条提交及整帧提交的耗时。
-
-通过 `node --test tests-node/progress.test.cjs tests-node/native-activity.test.cjs tests-node/harness-activity.test.cjs` 验证可视进展。用独立工单操作桌面时，核对输入区从左到右的加号、权限、模型、发送位置。运行中应在原发送位置出现停止键；空草稿也能停止，有草稿时保留内容。用 `--observe=<工单号>` 验证只读窗口，确认它能跟随新事件、翻看早期回执，原工单的执行进程继续工作。
-
-## 历史版迁移基线
-
-以下项目用于对照 Python/Qt 版本。按旧版 requirements 安装其依赖后执行。
+离线测试通过只证明协议与状态契约；本机 CLI 能否登录、实际推理和遵守权限需要分别做真实验证。以下命令在仓库根目录的 PowerShell 中运行；`scripts\cargo.cmd` 会准备 Windows GNU 工具链（见 [Rust 重构路线](rust-port.md#构建)）。
 
 ## 自动化回归
 
 ```powershell
-python -X utf8 -m unittest discover -s tests -v
+scripts\cargo.cmd build --workspace           # 同时生成 MCP 测试服务 sa-ext-fixture-mcp
+scripts\cargo.cmd test --workspace
+scripts\cargo.cmd clippy --workspace --all-targets
 ```
 
-测试使用临时目录、测试数据库和受控执行器，检查状态迁移、重复派工去重、故障与恢复、收件回执、消息字节、文件快照以及 Qt 界面。离线测试通过只证明这些契约。本机 CLI 能否登录和实际推理需要分别验证。
+- `sa-engine`：工单与任务状态机、`SA_*` 控制行、信箱、审批、持续运行、断线重试与熔断、供应商轮换、工单库独占、项目知识库（假执行端）。
+- `sa-adapters`：四个执行端的目录发现、事件流、权限映射、取消后不残留子进程、stderr 不外泄、自定义供应商与 HTTPS 探测（本机夹具）。
+- `sa-ext`：技能扫描、MCP stdio 与回环 HTTP、授权与撤销、幂等回执、取消后服务进程退出。
+- `sa-desktop`：用 egui_kittest 通过无障碍树驱动真实窗口——输入、发送、审批、计划、模型选择、供应商与轮换、MCP 与技能、知识库；另测被占用的工单库只能只读观察。
+- `sa-store --test usage` 覆盖各执行端的累计去重、续接、失败、缺失字段、限批扫描及跨分页汇总。
+- 图片测试覆盖快照校验、Codex/Claude 协议块、续接替换、并发追加与改派能力过滤。桌面测试从输入区拖入图片并发起后续消息，验证快照字节和草稿保留。
+- `sa-desktop review::tests` 使用临时 Git 仓库验证逐文件预览、中文与重命名、检查点捕获/重开/对比、内容变更使审阅标记失效，以及截断后的审阅限制。
+- `sa-engine --test routing` 验证协作者模型/强度授权、主控模型固定、运行中策略变化、重开与提交前撤权；`sa-adapters --test catalog_paging` 验证完整分页、同源认证及不完整目录报错。桌面模型测试覆盖搜索、思考强度、供应商往返和目录请求编号。
 
-## 指定模型的真实调用
-
-在 **模型与执行端** 读取本机可用的供应商 ID 和模型 ID。下列命令以一个独立项目进行验证，将占位值替换成当前实际值：
+Windows 原生通知可单独做实机检查，会以临时应用身份显示合成通知并查询系统通知历史，结束时清理测试登记与快捷方式。
 
 ```powershell
-python -X utf8 tests/live_model_selection.py --agent claude --provider "<供应商 ID>" --model "<模型 ID>"
+scripts\cargo.cmd test -p sa-desktop windows_toast_reaches_notification_history -- --ignored --nocapture
 ```
 
-该脚本使用真实 Qt 流程提交只读文件挑战。检查选择值、实际原生事件、返回正文和保存的回执。原生服务没有提供独立模型标识时，调用参数只能证明客户端所请求的型号。
+通知历史通过证明 Windows 已接受该通知。点击导航和系统免打扰策略需要另外观察，真实模型视觉理解也需要独立的计费图片挑战。
 
-## 自主分工与四方交付
+## 界面截图
 
-- `python -X utf8 tests/live_lead_routing.py` 验证主控从获准来源选择非默认协作者型号、派发只读执行并收到真实回报。该检查需要 DeepSeek 与拥有至少两个可用型号的 Claude CLI 供应商。对照派工快照、原生模型回执、读取工具事件和终稿，而非依赖模型自述。
+截图模式渲染后保存 PNG 并退出，默认不调度：
 
-- `python -X utf8 tests/live_studio.py` 在独立的测试工作区运行会话，检查主控能否自行回答简单问题，并为需要独立核对的任务选择协作者。
-- `python -X utf8 tests/live_check.py` 向运行中的本机桌面调度器提交一张四方工单。先启动窗口，准备好四种 CLI、相应认证和必要的任务授权。脚本创建随机文件，让多个执行者各自读回并回报，检查写者生成的文件字节以及完整回报是否传回主控。
-- Windows 上可双击桌面快捷方式两次，确认第二次启动聚焦已有窗口。执行任务时关闭再打开，检查中断记录与已变更的工作区，再根据工单状态决定是否重试。
+```powershell
+target\debug\super-agent.exe --demo --screenshot demo.png --size 1440x900
+target\debug\super-agent.exe --data <临时目录> --schedule --dialog models --screenshot models.png
+target\debug\super-agent.exe --observe --ticket 5 --inspector knowledge --screenshot ticket.png
+```
 
-回执和原生事件默认保存在当前用户的 `.local/share/superagent/checks`。完整事件可能含提示、模型回复、项目路径、会话标识和工具结果，检查时宜使用合成数据。将工单用于真实项目时，另行验证修改文件、项目原有测试和用户验收要求。
+## 旧工单库续跑
 
+不要对正在使用的工单库直接测试。先用 SQLite 备份接口复制一份（例如 `python -c "import sqlite3;s=sqlite3.connect('file:<原库>?mode=ro',uri=True);d=sqlite3.connect('<副本>/hub.sqlite3');s.backup(d)"`），再运行：
 
-## 权限与自动模式
+```powershell
+$env:SA_LEGACY_COPY='<副本目录>'; scripts\cargo.cmd test -p sa-desktop legacy -- --nocapture
+```
 
-`python -X utf8 tests/live_codex_permissions.py` 使用合成文件和真实 Codex 调用检查原生审批。按测试脚本中的各项用例，分别核对申请、批准或拒绝的回执与文件系统变化。
+它在副本上启动调度器，检查恢复后没有遗留运行中任务，并给已完成的非持续工单追加指令续跑（假执行端，不调用模型）。
 
-`python -X utf8 tests/live_autonomy.py` 复验真实自动工单。在新建的持续工单中，阶段里程碑应引发下一步搜寻；核对新任务的依据、经验记录、退避和最终的穷尽说明。此脚本启用完整用户权限并实际请求模型，适合在隔离测试账户或测试机运行。临时项目路径限制测试输入，无法约束处于完全访问状态的模型进程。
+## 真实调用（计费）
 
-一次 Windows 实机验证观察到，DeepSeek 在批准受限写入轮次后只能写项目内的目标；Claude 的受限工具清单未开放 Write；Antigravity 的受限写入尝试也未产生目标文件。在完整权限运行中，三个执行器都曾写入测试项目外专门准备的兄弟目录。复验时应测量文件实际内容，不宜单凭模型自述判断权限。
+下列开关会实际请求模型，只在临时项目中运行；用完清除环境变量。
 
-在临时工单中点击“停止自动运行”，记录最新任务、轮次与事件。刷新或重开窗口，核对停止状态和账本；这些动作不应派发新的自动调用。输入恢复指令后先取消确认，检查工单依然停止；再次明确确认恢复，核对新指令已经入账。此测试中的真实调用可能重复计费，即使上一轮没有产生文件变更。
+| 开关 | 命令 | 检查 |
+| --- | --- | --- |
+| `SA_LIVE_CATALOG=1` | `scripts\cargo.cmd test -p sa-adapters --test catalog_live` | 只读探测四个执行端的供应商与模型目录 |
+| `SA_LIVE_TURNS=1`（可选 `SA_LIVE_AGENTS=codex,claude`） | `… -p sa-adapters --test turns_live -- --nocapture` | 每个执行端读挑战文件、续接同一原生会话 |
+| `SA_LIVE_ENGINE=1` | `… -p sa-adapters --test engine_live -- --nocapture` | DeepSeek 主控向其余三个执行端派工，核对回报与写者文件字节 |
+| `SA_LIVE_UI=1` | `… -p sa-desktop live_composer -- --nocapture` | 从窗口输入框发起一轮并核对答案 |
+| `SA_LIVE_EXT=1` | `… -p sa-desktop live_mcp -- --nocapture` | 批准后的 MCP 调用、`SA_MEMO` 写入知识库、完成后自动记进展 |
+| `SA_LIVE_PROVIDER=agent,base_url,KEY_ENV,model` | `… -p sa-desktop live_custom -- --nocapture` | 自定义供应商探测与一轮读文件 |
+| `SA_LIVE_ROTATION=agent,base_url,KEY_ENV,model` | `… -p sa-desktop live_rotation -- --nocapture` | 首选供应商认证失败后按轮换改用下一条路由 |
+
+`KEY_ENV` 只写环境变量名，不要把密钥写进命令或文件。回执默认保存在当前用户的 `.local/share/superagent/checks`，只存哈希。完整事件可能含提示、模型回复、项目路径、会话标识和工具结果，检查时宜使用合成数据。
+
+## 权限
+
+复验权限时测量文件系统的实际变化，不要只看模型自述。一次 Windows 实机验证观察到：DeepSeek 在批准受限写入轮次后只能写项目内目标；Claude 的受限工具清单未开放 Write；Antigravity 的受限写入尝试也未产生目标文件；在完整权限下三个执行器都曾写入项目外专门准备的兄弟目录。完整权限与自动模式只适合在隔离账户或测试机上验证。
