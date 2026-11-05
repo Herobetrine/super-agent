@@ -16,7 +16,7 @@
 - `agent` ∈ `claude | codex | deepseek`；轮换顺序还允许 `antigravity`（可引用原生供应商）。
 - `base_url`：HTTPS，或仅本机（`127.0.0.1`、`localhost`、`[::1]`）可用 HTTP；不得带用户名/密码、查询参数或片段；≤2048 字节；保存时去掉末尾 `/`。
 - `key_env`：`^[A-Za-z_][A-Za-z0-9_]{0,127}$`；远程端点必填，本机端点可空；拒绝 `PATH`、`USERPROFILE` 等明显不是密钥的变量。
-- 名称 ≤64 字符、无控制字符；模型 ID 与 Codex 规则相近（另允许 `@`、`[1m]` 之类后缀），去重，≤256 个；供应商 ≤64 个；每个执行端轮换路由 ≤32 条、`mode` 只能是 `cli`。
+- 名称 ≤64 字符、无控制字符；模型 ID 与 Codex 规则相近（另允许 `@`、`[1m]` 之类后缀），去重，≤16384 个，超限明确报错；供应商 ≤64 个；每个执行端轮换路由 ≤32 条、`mode` 只能是 `cli`。
 
 ## 执行端接入（`sa_adapters::custom`）
 
@@ -41,7 +41,8 @@
 
 ## 获取模型与 HTTPS 目录
 
-- `probe_models(&provider, &sys, &cancel)`：Claude 请求 `<根>/v1/models?limit=1000`（`x-api-key`、`Authorization: Bearer`、`anthropic-version: 2023-06-01`），Codex/DeepSeek 请求 `<base_url>/models`（Bearer）；解析 `data[].id` 或 Codex 目录 `models[].slug`；10 秒、4 MiB；错误信息不含密钥或响应正文。
+- `probe_models(&provider, &sys, &cancel)` 中 Claude 请求 `<根>/v1/models?limit=1000`，Codex/DeepSeek 请求 `<base_url>/models`，使用该来源的配对认证。共用目录读取器支持 Anthropic 游标、Gemini pageToken 和同源 next 链接，最多 64 页、16384 型号，每页 4 MiB/10 秒、总时限 30 秒。跨源分页、循环游标与超限明确失败。在线完整目录和已保存回退型号通过 `catalog_complete` 与界面说明区分。
+- 目录规范化保留模型声明的 `reasoningEfforts` 和 `defaultReasoningEffort`。显式空能力保留为空，自定义来源重新在线探测能力。路由可带 `reasoning_effort`，Codex 使用原生 turn effort，Claude/Antigravity 使用 CLI `--effort`，DSH 使用经过级别到 wire 映射的 policy。
 - `common::get_json` 改用 [`ureq`](https://crates.io/crates/ureq) 3.5（rustls + ring，`platform-verifier` 使用系统证书库），支持远程 HTTPS，补上 Codex `model_catalog_url` 的远程目录。保留 JS 版的安全约束：不读环境代理、不跟随重定向（3xx 视为失败）、请求头不得含换行、默认 3.5 秒 / 1 MiB。选择 ureq 的理由：同步小客户端，无需引入 hyper/reqwest 全套；rustls 避免 Linux 上依赖 OpenSSL；ring 可用现有 llvm-mingw clang 编译（aws-lc-rs 需要 CMake/NASM）。
 - Claude 原生（CC Switch）记录仍只对本机端点探测模型，远程来源列出已保存模型，与 JS 版一致。
 

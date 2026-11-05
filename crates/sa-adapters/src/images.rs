@@ -67,8 +67,7 @@ mod tests {
             route: Route {
                 provider: "fixture".into(),
                 model: "vision".into(),
-                mode: "cli".into(),
-            },
+                mode: "cli".into(), reasoning_effort: None },
             profile: "readonly".into(),
             writable: false,
             session_id: None,

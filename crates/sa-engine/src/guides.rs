@@ -26,8 +26,11 @@ pub const BASE: &str = concat!(
     "SA_SEND {\"id\":\"unique-short-key\",\"to\":\"<harness from harness_capabilities>\",\"role\":\"<chosen function>\",\"body\":\"full exact instruction\",\"write\":false}\n",
     "The role field is optional. You can also start a separate task using your own harness.\n",
     "If allow_lead_routing is true, you may add \"model\":\"<exact ID from this recipient's delegate_models.models>\"\n",
-    "and/or \"permission_profile\":\"<one of allowed_child_permissions>\" to SA_SEND. Choose a model suited to the\n",
-    "assignment and grant only the needed access. Use readonly for unrestricted-ticket checks that need no edits.\n",
+    "and \"reasoning_effort\":\"<supported value from delegate_models.reasoning_efforts[model]>\" to SA_SEND.\n",
+    "Choose collaborators' model and effort for the assignment. Your own model stays fixed. Omit effort to use the harness default.\n",
+    "If allow_lead_routing is false, dispatch without model or effort overrides to use the operator's fixed routes.\n",
+    "When authorized you may also add \"permission_profile\":\"<one of allowed_child_permissions>\" to SA_SEND.\n",
+    "Grant only needed access. Use readonly for unrestricted-ticket checks that need no edits.\n",
     "The provider and runtime are chosen by the operator. Omit overrides to inherit. Never choose a new provider,\n",
     "grant powers beyond your ticket, or use a permission preset as a role name. In autonomous projects avoid\n",
     "requesting an interactive child write profile unless the operator requires a human checkpoint.\n",
@@ -140,10 +143,10 @@ pub const KNOWLEDGE: &str = concat!(
 #[cfg(test)]
 mod tests {
     use crate::protocol::digest;
-    /// SHA-256 of the JS strings, computed with Node from the JS sources.
+    /// Pin protocol-guide bytes; BASE includes the current routing policy.
     #[test]
     fn guides_are_byte_exact() {
-        assert_eq!(digest(super::BASE), "11d1bd5d51dd805780553216ddbf439e7db0cb1a87e4c1a7d78d6dfd34ce4ec6");
+        assert_eq!(digest(super::BASE), "9476ea854e9f7e0d75b148ccdb70cd4595df3fc57f7ffc9a3df96e960067f326");
         assert_eq!(digest(super::CONTINUOUS), "fd0fa7b25db7c20413b502eb74a5aaf637a3a4fa54ccf6411ded9626181050ac");
         assert_eq!(digest(super::LEGACY_AUTO), "af975831015ac95d04194f2bb0603b54aedf64f2730c192687db56fe3ec58074");
         assert_eq!(digest(super::DISCOVERY), "bb7595c92c9dd3570e2b40426a820b01e76392745a6fcb095d41a7bdbd7e8fe2");

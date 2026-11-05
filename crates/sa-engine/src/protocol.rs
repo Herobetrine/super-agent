@@ -9,7 +9,7 @@ use crate::adapter::{AGENTS, Route};
 use regex::Regex;
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
-use std::sync::LazyLock;
+use std::{collections::HashMap, sync::LazyLock};
 
 pub const PROFILES: [&str; 5] = ["readonly", "ask", "partial", "full", "auto"];
 pub const TERMINAL: [&str; 4] = ["done", "partial", "failed", "cancelled"];
@@ -132,7 +132,11 @@ pub fn safe_int(v: Option<&Value>) -> Option<i64> {
 
 /// JSON value of a route in JS key order `{provider, model, mode}`.
 pub fn route_value(r: &Route) -> Value {
-    json!({"provider": r.provider, "model": r.model, "mode": r.mode})
+    let mut value = json!({"provider": r.provider, "model": r.model, "mode": r.mode});
+    if let Some(effort) = &r.reasoning_effort {
+        value["reasoning_effort"] = json!(effort);
+    }
+    value
 }
 
 /// `route(x)` (PR:16-24).
@@ -142,10 +146,11 @@ pub fn route(v: Option<&Value>) -> Result<Route, String> {
         return Err(bad());
     };
     let mode = o.get("mode").and_then(Value::as_str);
-    if o.len() != 3
+    if o.keys().any(|key| !matches!(key.as_str(), "provider" | "model" | "mode" | "reasoning_effort"))
         || !ident(o.get("provider"))
         || !ident(o.get("model"))
         || !matches!(mode, Some("cli" | "desktop"))
+        || (o.contains_key("reasoning_effort") && !ident(o.get("reasoning_effort")))
     {
         return Err(bad());
     }
@@ -153,6 +158,7 @@ pub fn route(v: Option<&Value>) -> Result<Route, String> {
         provider: o["provider"].as_str().unwrap_or_default().to_string(),
         model: o["model"].as_str().unwrap_or_default().to_string(),
         mode: mode.unwrap_or_default().to_string(),
+        reasoning_effort: o.get("reasoning_effort").and_then(Value::as_str).map(str::to_string),
     })
 }
 
@@ -215,6 +221,9 @@ pub fn options(cat: Option<&Value>, picked: Option<&Value>) -> Result<Option<Val
         return Ok(None);
     }
     let mut ids: Vec<(String, bool)> = vec![];
+    let mut positions = HashMap::new();
+    let mut efforts = Map::new();
+    let mut defaults = Map::new();
     for m in source.get("models").and_then(Value::as_array).into_iter().flatten() {
         let Some(m) = m.as_object() else { continue };
         if !ident(m.get("id")) {
@@ -222,26 +231,60 @@ pub fn options(cat: Option<&Value>, picked: Option<&Value>) -> Result<Option<Val
         }
         let id = m["id"].as_str().unwrap_or_default().to_string();
         let ok = not_unavailable(m);
-        match ids.iter_mut().find(|(k, _)| *k == id) {
-            Some(entry) => entry.1 = entry.1 && ok,
-            None => ids.push((id, ok)),
+        match positions.get(&id).copied() {
+            Some(index) => {
+                // Conflicting duplicate entries cannot grant an effort.
+                let entry: &mut (String, bool) = &mut ids[index];
+                entry.1 = entry.1 && ok;
+                efforts.remove(&id);
+                defaults.remove(&id);
+            }
+            None => {
+                positions.insert(id.clone(), ids.len());
+                ids.push((id.clone(), ok));
+                if let Some(values) = m.get("reasoningEfforts").and_then(Value::as_array)
+                    && values.iter().all(|value| ident(Some(value)))
+                {
+                    efforts.insert(id.clone(), json!(values));
+                    if let Some(default) = m.get("defaultReasoningEffort")
+                        && values.contains(default)
+                    {
+                        defaults.insert(id, default.clone());
+                    }
+                }
+            }
         }
     }
     if !ids.iter().any(|(k, ok)| *k == selected.model && *ok) {
         return Ok(None);
     }
+    if let Some(effort) = &selected.reasoning_effort
+        && !efforts.get(&selected.model).and_then(Value::as_array)
+            .is_some_and(|values| values.iter().any(|value| value.as_str() == Some(effort)))
+    {
+        return Err("所选模型未声明支持该思考强度，请刷新模型目录或重新选择".into());
+    }
+    efforts.retain(|id, _| ids[positions[id]].1);
+    defaults.retain(|id, _| ids[positions[id]].1);
     let mut models = vec![Value::String(selected.model.clone())];
     models.extend(
         ids.into_iter()
             .filter(|(id, ok)| *ok && *id != selected.model)
             .map(|(id, _)| Value::String(id)),
     );
-    Ok(Some(json!({
+    let mut menu = json!({
         "provider": selected.provider,
         "mode": selected.mode,
         "default_model": selected.model,
         "models": models,
-    })))
+    });
+    if !efforts.is_empty() {
+        menu["reasoning_efforts"] = json!(efforts);
+    }
+    if !defaults.is_empty() {
+        menu["default_reasoning_efforts"] = json!(defaults);
+    }
+    Ok(Some(menu))
 }
 
 /// `toolsProof(e)` (PR:68-89): `Some("ok" | "attempt")` for tool evidence.
@@ -441,6 +484,42 @@ mod tests {
         let gone = json!({"provider": "p", "model": "c", "mode": "cli"});
         assert!(options(Some(&cat), Some(&gone)).unwrap().is_none());
         assert!(options(Some(&cat), None).is_err());
+    }
+
+    #[test]
+    fn route_effort_roundtrip_and_model_specific_capabilities() {
+        let legacy = json!({"provider":"p", "model":"a", "mode":"cli"});
+        let old: Route = serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(old.reasoning_effort, None);
+        assert_eq!(serde_json::to_value(&old).unwrap(), legacy);
+        let selected = json!({"provider":"p", "model":"b", "mode":"cli", "reasoning_effort":"high"});
+        assert_eq!(route_value(&route(Some(&selected)).unwrap()), selected);
+        let cat = json!({"modes":[{"id":"cli", "available":true}], "providers":[{"id":"p", "models":[
+            {"id":"a"}, {"id":"b", "reasoningEfforts":["low","high"], "defaultReasoningEffort":"low"}
+        ]}]});
+        let menu = options(Some(&cat), Some(&selected)).unwrap().unwrap();
+        assert_eq!(menu["reasoning_efforts"]["b"], json!(["low", "high"]));
+        assert_eq!(menu["default_reasoning_efforts"]["b"], json!("low"));
+        for (model, effort) in [("a", "high"), ("b", "max")] {
+            let bad = json!({"provider":"p", "model":model, "mode":"cli", "reasoning_effort":effort});
+            assert!(options(Some(&cat), Some(&bad)).unwrap_err().contains("思考强度"));
+        }
+        for value in [Value::Null, json!(42), json!(""), json!("bad\nvalue")] {
+            let mut bad = selected.clone();
+            bad["reasoning_effort"] = value;
+            assert!(route(Some(&bad)).is_err());
+        }
+    }
+
+    #[test]
+    fn full_catalog_menu_keeps_late_models_and_efforts() {
+        let models: Vec<Value> = (0..16_384).map(|n| json!({"id":format!("m-{n}"), "reasoningEfforts":["low","high"]})).collect();
+        let cat = json!({"modes":[{"id":"cli", "available":true}], "providers":[{"id":"p", "models":models}]});
+        let picked = json!({"provider":"p", "model":"m-16383", "mode":"cli", "reasoning_effort":"high"});
+        let menu = options(Some(&cat), Some(&picked)).unwrap().unwrap();
+        assert_eq!(menu["models"].as_array().unwrap().len(), 16_384);
+        assert_eq!(menu["models"][0], json!("m-16383"));
+        assert_eq!(menu["reasoning_efforts"]["m-16383"], json!(["low", "high"]));
     }
 
     #[test]

@@ -415,6 +415,13 @@ impl Engine {
         })
     }
 
+    /// Change whether the root may override collaborator model/effort and
+    /// narrow permissions on subsequent dispatches. Accepted assignments
+    /// retain their route and native session.
+    pub fn set_lead_routing(&self, ticket: i64, enabled: bool) -> Result<()> {
+        self.inner.db.tx(|q| q.set_lead_routing(ticket, enabled))
+    }
+
     /// `create(params)` (S:85-143); returns the ticket id.
     pub async fn create(&self, params: CreateParams) -> Result<i64> {
         let inner = &self.inner;
@@ -1286,8 +1293,7 @@ impl Inner {
             }
         };
         let mut memo: HashMap<String, Result<Value, String>> = HashMap::new();
-        let routing = turn.packet().get("allow_lead_routing") == Some(&Value::Bool(true));
-        if routing {
+        if job.is_root() {
             let probes = AGENTS.iter().map(|name| {
                 let f = self.catalog(name);
                 async move { (*name, f.await) }
@@ -1339,8 +1345,10 @@ impl Inner {
         let selected = p::route(picked.as_ref()).map_err(|e| TurnError::Engine(anyhow!(e)))?;
         // Existing native conversations stay on their bound route. A missing
         // model requires an explicit choice; never substitute an upstream.
-        if !matches!(p::options(Some(&cat), Some(&route_json(&selected))), Ok(Some(_))) {
-            return Err(route_error(crate::resilience::CODE_ROUTE_NOT_CONFIGURED, UNAVAILABLE.into()));
+        match p::options(Some(&cat), Some(&route_json(&selected))) {
+            Ok(Some(_)) => {}
+            Ok(None) => return Err(route_error(crate::resilience::CODE_ROUTE_NOT_CONFIGURED, UNAVAILABLE.into())),
+            Err(message) => return Err(route_error(crate::resilience::CODE_ROUTE_NOT_CONFIGURED, message)),
         }
         turn.ensure_current()?;
         self.db.tx(|q| {
@@ -1622,6 +1630,7 @@ impl Inner {
                 provider: "catalog".into(),
                 model: "*".into(),
                 mode: "cli".into(),
+                reasoning_effort: None,
             });
             let mut ledger = ledger(q, job.id)?;
             let rotation = self.opts.rotation.candidates(&job.agent);
@@ -1638,7 +1647,8 @@ impl Inner {
                     .runner
                     .health()
                     .iter()
-                    .any(|(a, r, h)| *a == job.agent && *r == route && *h == Health::Open);
+                    .any(|(a, r, h)| *a == job.agent && r.provider == route.provider
+                        && r.model == route.model && r.mode == route.mode && *h == Health::Open);
             let reason = if rotating {
                 None
             } else if e.class == ErrorClass::RouteUnavailable {
@@ -1739,7 +1749,8 @@ impl Inner {
         });
         let blocked = |agent: &str, route: Option<&Route>| {
             health.iter().any(|(a, r, h)| {
-                a == agent && matches!(h, Health::Open | Health::HalfOpen) && route.is_none_or(|x| x == r)
+                a == agent && matches!(h, Health::Open | Health::HalfOpen)
+                    && route.is_none_or(|x| x.provider == r.provider && x.model == r.model && x.mode == r.mode)
             })
         };
         let target = AGENTS.into_iter().find(|agent| {

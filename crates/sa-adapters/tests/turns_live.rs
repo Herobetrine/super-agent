@@ -70,7 +70,7 @@ fn live_route(catalog: &Value) -> Option<Route> {
         .as_str()
         .filter(|d| models.iter().any(|m| m["id"] == json!(d)))
         .or_else(|| models.iter().find(|m| m["available"] != json!(false)).and_then(|m| m["id"].as_str()))?;
-    Some(Route { provider: p["id"].as_str()?.into(), model: model.into(), mode: "cli".into() })
+    Some(Route { provider: p["id"].as_str()?.into(), model: model.into(), mode: "cli".into(), reasoning_effort: None })
 }
 
 struct Turn {

@@ -140,6 +140,15 @@ impl App {
                     }
                     ui.add_space(10.0);
                 }
+                let writable = self.writable();
+                let providers = ui.add_enabled_ui(writable, |ui| {
+                    widgets::wide_button(ui, icon::PLUGS, "管理自定义供应商", "", &pal)
+                }).inner.on_hover_text("添加兼容接口并获取在线模型")
+                    .on_disabled_hover_text("此窗口为只读观察模式，请在正在运行的主窗口管理供应商");
+                if providers.clicked() {
+                    self.open_providers();
+                }
+                ui.add_space(10.0);
                 self.search_box(ui);
                 ui.add_space(16.0);
                 ui.horizontal(|ui| {

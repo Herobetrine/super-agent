@@ -19,6 +19,8 @@ pub struct Route {
     pub provider: String,
     pub model: String,
     pub mode: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
 }
 
 /// Inputs of one native turn (spec §7.1 run options).

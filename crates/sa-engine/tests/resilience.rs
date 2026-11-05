@@ -88,6 +88,7 @@ fn route(p: &str, m: &str) -> Route {
         provider: p.into(),
         model: m.into(),
         mode: "cli".into(),
+        reasoning_effort: None,
     }
 }
 

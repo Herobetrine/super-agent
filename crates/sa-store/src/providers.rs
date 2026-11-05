@@ -31,7 +31,7 @@ pub const ROTATION_AGENTS: [&str; 4] = ["codex", "claude", "deepseek", "antigrav
 pub const ROUTE_PREFIX: &str = "sa-";
 
 pub const MAX_PROVIDERS: usize = 64;
-pub const MAX_MODELS: usize = 256;
+pub const MAX_MODELS: usize = 16_384;
 pub const MAX_ROTATION: usize = 32;
 const MAX_NAME: usize = 64;
 const MAX_URL: usize = 2048;
@@ -170,7 +170,7 @@ pub fn validate(p: &CustomProvider) -> Result<CustomProvider> {
         }
     }
     if models.len() > MAX_MODELS {
-        bail!("模型数量超过 {MAX_MODELS}");
+        bail!("模型数量超过 {MAX_MODELS}，本次模型目录未保存，请缩小目录后重试");
     }
     Ok(CustomProvider {
         id,
@@ -379,6 +379,21 @@ mod tests {
         ] {
             assert!(validate_base_url(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn complete_model_catalog_saves_up_to_the_limit_without_truncation() {
+        let conn = Connection::open_in_memory().unwrap();
+        let mut config = provider("codex", "http://127.0.0.1:8080/v1", "");
+        config.models = (0..MAX_MODELS).map(|n| format!("model-{n}")).collect();
+        let saved = save(&conn, &config).unwrap();
+        let before = list(&conn).unwrap();
+        assert_eq!(before[0].models, config.models);
+        config.id = saved;
+        config.models.push("one-over-limit".into());
+        let error = save(&conn, &config).unwrap_err();
+        assert!(error.to_string().contains("本次模型目录未保存"));
+        assert_eq!(list(&conn).unwrap(), before);
     }
 
     #[test]

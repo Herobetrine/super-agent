@@ -21,7 +21,7 @@ fn route_text(route: &Option<Value>) -> Option<String> {
         Value::String(s) => serde_json::from_str::<Value>(s).ok()?,
         other => other.clone(),
     };
-    let parts: Vec<String> = ["provider", "model", "mode"]
+    let mut parts: Vec<String> = ["provider", "model", "mode"]
         .iter()
         .filter_map(|k| {
             r.get(*k)
@@ -30,6 +30,9 @@ fn route_text(route: &Option<Value>) -> Option<String> {
                 .map(str::to_string)
         })
         .collect();
+    if let Some(effort) = r.get("reasoning_effort").and_then(Value::as_str) {
+        parts.push(format!("思考强度 {effort}"));
+    }
     (!parts.is_empty()).then(|| parts.join(" / "))
 }
 

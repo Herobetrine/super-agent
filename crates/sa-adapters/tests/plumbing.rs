@@ -49,12 +49,18 @@ fn explicit_routes_fail_closed_for_stale_providers_models_and_desktops() {
         "providers": [{"id": "p", "models": [{"id": "m"}, {"id": "hidden", "available": false}]}],
         "modes": [{"id": "cli", "available": true}, {"id": "desktop", "available": false}]
     });
-    let route = |p: &str, m: &str, mode: &str| Route { provider: p.into(), model: m.into(), mode: mode.into() };
+    let route = |p: &str, m: &str, mode: &str| Route { provider: p.into(), model: m.into(), mode: mode.into(), reasoning_effort: None };
     assert_eq!(select(&cat, &route("p", "m", "cli")).unwrap(), route("p", "m", "cli"));
     for r in [route("p", "hidden", "cli"), route("other", "m", "cli"), route("p", "m", "desktop")] {
         let e = select(&cat, &r).unwrap_err();
         assert_eq!(e.class, ErrorClass::RouteUnavailable);
     }
+    let mut effort = route("p", "m", "cli");
+    effort.reasoning_effort = Some("high".into());
+    assert!(select(&cat, &effort).is_err());
+    let mut capable = cat;
+    capable["providers"][0]["models"][0]["reasoningEfforts"] = json!(["low", "high"]);
+    assert_eq!(select(&capable, &effort).unwrap(), effort);
 }
 
 struct Approver(bool);
@@ -79,7 +85,7 @@ fn request(profile: &str, writable: bool) -> RunRequest {
         prompt: "p".into(),
         images: vec![],
         cwd: std::env::current_dir().unwrap(),
-        route: Route { provider: "p".into(), model: "m".into(), mode: "cli".into() },
+        route: Route { provider: "p".into(), model: "m".into(), mode: "cli".into(), reasoning_effort: None },
         profile: profile.into(),
         writable,
         session_id: None,

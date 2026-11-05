@@ -70,11 +70,13 @@ pub struct ProvidersDialog {
     pub form: Option<Form>,
     pub rotation: Rotation,
     catalogs: HashMap<String, Option<Result<Value, String>>>,
+    pending_requests: HashMap<String, u64>,
     /// Pending rotation pick per agent: `(provider, model)`.
     picks: HashMap<String, (String, String)>,
     pub probing: bool,
     pub saving: bool,
     pub message: Option<(String, bool)>,
+    preferred_agent: String,
 }
 
 impl ProvidersDialog {
@@ -85,6 +87,13 @@ impl ProvidersDialog {
     pub fn answer(&mut self, agent: &str, result: Result<Value, String>) {
         if self.needs(agent) {
             self.catalogs.insert(agent.to_string(), Some(result));
+            self.pending_requests.remove(agent);
+        }
+    }
+
+    pub fn answer_for(&mut self, agent: &str, request_id: u64, result: Result<Value, String>) {
+        if self.pending_requests.get(agent) == Some(&request_id) && self.needs(agent) {
+            self.answer(agent, result);
         }
     }
 
@@ -132,20 +141,41 @@ impl App {
             form: None,
             rotation: host.rotation(),
             catalogs: HashMap::new(),
+            pending_requests: HashMap::new(),
             picks: HashMap::new(),
             probing: false,
             saving: false,
             message: None,
+            preferred_agent: "claude".into(),
         });
     }
 
+    /// Enter from the model picker without discarding its unsaved routes.
+    pub(crate) fn open_providers_for(&mut self, agent: &str) {
+        self.open_providers();
+        if let Some(dialog) = self.providers.as_mut() {
+            if CUSTOM_AGENTS.contains(&agent) {
+                dialog.preferred_agent = agent.into();
+            } else {
+                dialog.message = Some((
+                    "这个执行端没有自定义供应商入口，可在这里管理 Codex、Claude Code 和 DeepSeek。"
+                        .into(),
+                    false,
+                ));
+            }
+        }
+    }
+
     fn rotation_catalog(&mut self, agent: &str) {
-        let (Some(host), Some(d)) = (&self.host, self.providers.as_mut()) else { return };
+        let (Some(host), Some(d)) = (&self.host, self.providers.as_mut()) else {
+            return;
+        };
         if d.catalogs.contains_key(agent) {
             return;
         }
         d.catalogs.insert(agent.to_string(), None);
-        host.request_catalog(agent);
+        let request_id = host.request_catalog(agent);
+        d.pending_requests.insert(agent.to_string(), request_id);
     }
 
     /// `ActionKind::Providers` outcome.
@@ -153,6 +183,8 @@ impl App {
         let Some(d) = self.providers.as_mut() else {
             if let Err(e) = result {
                 self.composer.message = Some((e, true));
+            } else {
+                self.resume_models_after_providers();
             }
             return;
         };
@@ -163,6 +195,7 @@ impl App {
                 d.message = Some(("已保存。新的设置从下一轮开始生效。".into(), false));
                 // Catalogs change with the registry.
                 d.catalogs.clear();
+                d.pending_requests.clear();
                 if let Some(h) = &self.host {
                     d.rotation = h.rotation();
                 }
@@ -176,36 +209,66 @@ impl App {
             return;
         }
         let pal = self.pal.clone();
-        let list = self.host.as_ref().map(|h| h.providers()).unwrap_or_default();
+        let list = self
+            .host
+            .as_ref()
+            .map(|h| h.providers())
+            .unwrap_or_default();
         let mut submit: Option<Action> = None;
         let mut probe: Option<CustomProvider> = None;
         let mut load: Vec<String> = Vec::new();
         let mut close = false;
         let busy = self.composer.pending > 0;
+        let return_to_models = self.models.is_some();
         let d = self.providers.as_mut().expect("checked");
         let modal = egui::Modal::new(egui::Id::new("sa-providers"))
             .frame(widgets::modal_frame(&pal))
             .show(ctx, |ui| {
                 ui.set_width(620.0);
-                if widgets::modal_header(ui, icon::PLUGS, "供应商与轮换", "添加兼容端点；某个供应商不可用时按顺序自动改用下一个。", &pal) {
+                if widgets::modal_header(
+                    ui,
+                    icon::PLUGS,
+                    "供应商与轮换",
+                    "添加兼容端点；某个供应商不可用时按顺序自动改用下一个。",
+                    &pal,
+                ) {
+                    close = true;
+                }
+                if return_to_models
+                    && widgets::quiet_button(ui, icon::ARROW_LEFT, "返回模型选择", &pal, false)
+                        .clicked()
+                {
                     close = true;
                 }
                 let pages = [Page::Providers, Page::Rotation];
                 let current = pages.iter().position(|p| *p == d.page).unwrap_or(0);
-                if let Some(i) = widgets::segmented(ui, &["自定义供应商", "轮换"], current, &pal) {
+                if let Some(i) = widgets::segmented(ui, &["自定义供应商", "轮换"], current, &pal)
+                {
                     d.page = pages[i];
                     d.message = None;
                 }
                 ui.add_space(10.0);
                 let max = (ui.ctx().content_rect().height() - 220.0).max(240.0);
-                egui::ScrollArea::vertical().max_height(max).min_scrolled_height(max).show(ui, |ui| match d.page {
-                    Page::Providers => providers_page(ui, d, &list, &pal, &mut submit, &mut probe, busy),
-                    Page::Rotation => rotation_page(ui, d, &pal, &mut submit, &mut load, busy),
-                });
+                egui::ScrollArea::vertical()
+                    .max_height(max)
+                    .min_scrolled_height(max)
+                    .show(ui, |ui| match d.page {
+                        Page::Providers => {
+                            providers_page(ui, d, &list, &pal, &mut submit, &mut probe, busy)
+                        }
+                        Page::Rotation => rotation_page(ui, d, &pal, &mut submit, &mut load, busy),
+                    });
                 if let Some((text, error)) = &d.message {
                     ui.add_space(8.0);
                     let color = if *error { pal.fail.fg } else { pal.ok.fg };
-                    ui.add(Label::new(RichText::new(text).font(theme::body(theme::SMALL)).color(color)).wrap());
+                    ui.add(
+                        Label::new(
+                            RichText::new(text)
+                                .font(theme::body(theme::SMALL))
+                                .color(color),
+                        )
+                        .wrap(),
+                    );
                 }
             });
         if modal.should_close() {
@@ -213,6 +276,9 @@ impl App {
         }
         if close {
             self.providers = None;
+            if return_to_models {
+                self.resume_models_after_providers();
+            }
             return;
         }
         if let Some(p) = probe
@@ -268,7 +334,10 @@ fn providers_page(
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ui.horizontal(|ui| {
-                    ui.add_sized([96.0, 24.0], Label::new(RichText::new("执行端").font(theme::body(13.0))));
+                    ui.add_sized(
+                        [96.0, 24.0],
+                        Label::new(RichText::new("执行端").font(theme::body(13.0))),
+                    );
                     ui.add_enabled_ui(f.id.is_empty(), |ui| {
                         widgets::combo("provider-agent")
                             .selected_text(agent_name(&f.agent))
@@ -280,25 +349,63 @@ fn providers_page(
                     });
                 });
                 field(ui, "名称", &mut f.name, "例如 公司网关");
-                field(ui, "接口地址", &mut f.base_url, "https://api.example.com/v1");
-                field(ui, "密钥环境变量", &mut f.key_env, "例如 EXAMPLE_API_KEY（本机端点可留空）");
+                field(
+                    ui,
+                    "接口地址",
+                    &mut f.base_url,
+                    "https://api.example.com/v1",
+                );
+                field(
+                    ui,
+                    "密钥环境变量",
+                    &mut f.key_env,
+                    "例如 EXAMPLE_API_KEY（本机端点可留空）",
+                );
                 ui.horizontal(|ui| {
-                    ui.add_sized([96.0, 24.0], Label::new(RichText::new("模型").font(theme::body(13.0))));
-                    let r = ui.add(
-                        egui::TextEdit::multiline(&mut f.models)
-                            .hint_text("每行一个模型 ID")
-                            .desired_rows(3)
-                            .desired_width(ui.available_width()),
+                    ui.add_sized(
+                        [96.0, 24.0],
+                        Label::new(RichText::new("模型").font(theme::body(13.0))),
                     );
-                    r.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::TextEdit, true, "模型"));
+                    egui::ScrollArea::vertical()
+                        .id_salt("provider-model-list")
+                        .max_height(160.0)
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            let r = ui.add(
+                                egui::TextEdit::multiline(&mut f.models)
+                                    .hint_text("每行一个模型 ID")
+                                    .desired_rows(3)
+                                    .desired_width(ui.available_width()),
+                            );
+                            r.widget_info(|| {
+                                egui::WidgetInfo::labeled(egui::WidgetType::TextEdit, true, "模型")
+                            });
+                        });
                 });
+                ui.label(
+                    RichText::new(format!(
+                        "{} 个模型 · 每行一个模型 ID",
+                        f.models
+                            .lines()
+                            .filter(|line| !line.trim().is_empty())
+                            .count()
+                    ))
+                    .font(theme::body(theme::TINY))
+                    .color(pal.mute),
+                );
                 widgets::toggle(ui, &mut f.enabled, "启用", pal);
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
                     let can_probe = !probing && !f.base_url.trim().is_empty();
                     if ui
                         .add_enabled_ui(can_probe, |ui| {
-                            widgets::quiet_button(ui, icon::ARROWS_CLOCKWISE, "获取模型", pal, false)
+                            widgets::quiet_button(
+                                ui,
+                                icon::ARROWS_CLOCKWISE,
+                                "获取模型",
+                                pal,
+                                false,
+                            )
                         })
                         .inner
                         .on_hover_text("从接口的 /v1/models 读取模型列表")
@@ -310,13 +417,20 @@ fn providers_page(
                         ui.spinner();
                     }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        let ok = !busy && !saving && !f.name.trim().is_empty() && !f.base_url.trim().is_empty();
+                        let ok = !busy
+                            && !saving
+                            && !f.name.trim().is_empty()
+                            && !f.base_url.trim().is_empty();
                         if ui
-                            .add_enabled_ui(ok, |ui| widgets::primary_button(ui, icon::CHECK, "保存供应商", pal, ok))
+                            .add_enabled_ui(ok, |ui| {
+                                widgets::primary_button(ui, icon::CHECK, "保存供应商", pal, ok)
+                            })
                             .inner
                             .clicked()
                         {
-                            *submit = Some(Action::ProviderSave { provider: f.provider() });
+                            *submit = Some(Action::ProviderSave {
+                                provider: f.provider(),
+                            });
                         }
                         if widgets::quiet_button(ui, "", "取消", pal, false).clicked() {
                             cancel = true;
@@ -330,7 +444,7 @@ fn providers_page(
         }
     } else if widgets::quiet_button(ui, icon::PLUS, "添加供应商", pal, true).clicked() {
         d.form = Some(Form {
-            agent: "claude".into(),
+            agent: d.preferred_agent.clone(),
             enabled: true,
             ..Default::default()
         });
@@ -349,34 +463,58 @@ fn providers_page(
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new(&p.name).font(theme::strong(13.5)).color(pal.ink));
+                    ui.label(
+                        RichText::new(&p.name)
+                            .font(theme::strong(13.5))
+                            .color(pal.ink),
+                    );
                     widgets::chip(ui, &agent_name(&p.agent), pal.neutral, theme::TINY);
                     if !p.enabled {
                         widgets::chip(ui, "已停用", pal.warn, theme::TINY);
                     }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        let del = widgets::icon_button(ui, icon::TRASH, 24.0, pal.mute, pal.hover, false)
-                            .on_hover_text("删除");
+                        let del =
+                            widgets::icon_button(ui, icon::TRASH, 24.0, pal.mute, pal.hover, false)
+                                .on_hover_text("删除");
                         let label = format!("删除供应商 {}", p.name);
-                        del.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &label));
+                        del.widget_info(|| {
+                            egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &label)
+                        });
                         if del.clicked() && !busy {
                             *submit = Some(Action::ProviderRemove { id: p.id.clone() });
                         }
-                        let edit = widgets::icon_button(ui, icon::PENCIL_SIMPLE, 24.0, pal.mute, pal.hover, false)
-                            .on_hover_text("编辑");
+                        let edit = widgets::icon_button(
+                            ui,
+                            icon::PENCIL_SIMPLE,
+                            24.0,
+                            pal.mute,
+                            pal.hover,
+                            false,
+                        )
+                        .on_hover_text("编辑");
                         let label = format!("编辑供应商 {}", p.name);
-                        edit.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &label));
+                        edit.widget_info(|| {
+                            egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &label)
+                        });
                         if edit.clicked() {
                             d.form = Some(Form::from(p));
                             d.message = None;
                         }
                     });
                 });
-                let key = if p.key_env.is_empty() { "无需密钥".to_string() } else { format!("密钥变量 {}", p.key_env) };
+                let key = if p.key_env.is_empty() {
+                    "无需密钥".to_string()
+                } else {
+                    format!("密钥变量 {}", p.key_env)
+                };
                 ui.label(
-                    RichText::new(format!("{} · {key} · {} 个模型", p.base_url, p.models.len()))
-                        .font(theme::body(theme::TINY + 0.5))
-                        .color(pal.mute),
+                    RichText::new(format!(
+                        "{} · {key} · {} 个模型",
+                        p.base_url,
+                        p.models.len()
+                    ))
+                    .font(theme::body(theme::TINY + 0.5))
+                    .color(pal.mute),
                 );
             });
         ui.add_space(6.0);
@@ -527,4 +665,32 @@ fn rotation_page(
             });
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rotation_catalog_ignores_superseded_reply() {
+        let mut dialog = ProvidersDialog {
+            page: Page::Rotation,
+            form: None,
+            rotation: Rotation::default(),
+            catalogs: HashMap::from([("codex".into(), None)]),
+            pending_requests: HashMap::from([("codex".into(), 2)]),
+            picks: HashMap::new(),
+            probing: false,
+            saving: false,
+            message: None,
+            preferred_agent: "codex".into(),
+        };
+        dialog.answer_for("codex", 1, Err("old failure".into()));
+        assert!(dialog.needs("codex"));
+        dialog.answer_for("codex", 2, Ok(serde_json::json!({"revision":"new"})));
+        assert!(!dialog.needs("codex"));
+        assert!(dialog.pending_requests.is_empty());
+        dialog.answer_for("codex", 1, Ok(serde_json::json!({"revision":"old"})));
+        assert!(matches!(dialog.catalogs.get("codex"), Some(Some(Ok(value))) if value["revision"] == "new"));
+    }
 }

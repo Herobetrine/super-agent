@@ -17,7 +17,7 @@ node --expose-internals (Join-Path $runtime 'node_modules\@deepseek-ai\dsh\lib\b
 
 先在原生 Harness 或支持的供应商配置中完成认证。在 **模型与执行端 → DeepSeek Harness** 中可以核对本机发现的供应商、模型、协议和可用状态。官方 API 的凭据使用原生环境变量或工具自身的凭据来源。外部网关的端点、模型与认证必须匹配同一条供应商记录。
 
-平台读取原生配置、兼容的 CC Switch 配置，以及隔离运行时的模型目录。显式选定的模型在调用时复查；上游的模型名与协议错误将作为任务失败返回。运行时 profile 和原生会话状态位于当前 Windows 用户目录。模型请求通常携带任务上下文，端点可自行决定保留策略。
+平台读取原生配置、兼容的 CC Switch 配置及供应商在线模型目录。官方目录再经已安装运行时的 `parseModelListing` / `resolveListedCatalog` 检查版本与协议兼容性。思考强度使用运行时声明的级别及 wire 映射，显式选择非 off 时相应启用 thinking。显式选定的模型在调用时复查，上游模型名与协议错误将作为任务失败返回。运行时 profile 和原生会话状态位于当前 Windows 用户目录。模型请求通常携带任务上下文，端点可自行决定保留策略。
 
 ## 权限档位
 

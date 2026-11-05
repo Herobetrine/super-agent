@@ -702,6 +702,7 @@ fn create_receipt_preserves_attachments_added_after_send() {
             goal: "initial request".into(), cwd: Some(project.path().to_path_buf()),
             lead: "claude".into(), profile: "readonly".into(), files: vec!["first.txt".into()],
             selections: None, extensions: None,
+            allow_lead_routing: None,
         });
         if change_project {
             h.state_mut().new_conversation();
@@ -714,4 +715,160 @@ fn create_receipt_preserves_attachments_added_after_send() {
         assert_eq!(h.state().composer.draft, "next request");
         assert_eq!(h.state().view.is_none(), change_project);
     }
+}
+
+#[test]
+fn model_picker_searches_complete_catalog_and_saves_declared_effort() {
+    let data = tempfile::tempdir().unwrap();
+    let mut h = harness(data.path(), "readonly");
+    h.run_steps(3);
+    h.state_mut().open_models(crate::models::Scope::Draft);
+    let models: Vec<Value> = (0..2500).map(|n| serde_json::json!({
+        "id":format!("model-{n:04}"), "reasoningEfforts":["low","high"], "defaultReasoningEffort":"low"
+    })).collect();
+    h.state_mut().models.as_mut().unwrap().answer("deepseek", Ok(serde_json::json!({
+        "default":{"mode":"cli","provider":"fixture","model":"model-0000"},
+        "modes":[{"id":"cli"}], "providers":[{"id":"fixture","models":models}]
+    })));
+    h.run_steps(3);
+    assert!(h.query_by_label("共 2500 个模型，可在列表中搜索").is_some());
+    h.get_by_role_and_label(Role::ComboBox, "模型").click();
+    h.run_steps(3);
+    h.get_by_label("搜索模型").focus();
+    h.get_by_label("搜索模型").type_text("model-2499");
+    h.run_steps(3);
+    assert!(h.query_by_label("匹配 1 / 共 2500 个模型").is_some());
+    h.get_by_label("model-2499").click();
+    h.run_steps(3);
+    h.get_by_role_and_label(Role::ComboBox, "思考强度").click();
+    h.run_steps(3);
+    h.get_by_label("high").click();
+    h.run_steps(3);
+    h.get_by_label("保存选择").click();
+    h.run_steps(3);
+    let route = &h.state().composer.routes.as_ref().unwrap()["deepseek"];
+    assert_eq!(route["model"], "model-2499");
+    assert_eq!(route["reasoning_effort"], "high");
+    assert_eq!(h.state().composer.allow_lead_routing, Some(true));
+}
+
+#[test]
+fn model_picker_opens_custom_providers_and_preserves_unsaved_choices() {
+    let data = tempfile::tempdir().unwrap();
+    let mut h = harness(data.path(), "readonly");
+    h.run_steps(3);
+    h.state_mut().open_models(crate::models::Scope::Draft);
+    until(&mut h, "model catalog", |a| a.models.as_ref().is_some_and(|d| !d.needs("deepseek")));
+    h.run_steps(3);
+    h.get_by_label("跟随本机适配器默认配置").click();
+    h.run_steps(3);
+    h.get_by_label("Codex").click();
+    until(&mut h, "codex catalog", |a| a.models.as_ref().is_some_and(|d| !d.needs("codex")));
+    h.run_steps(3);
+    h.get_by_label("跟随本机适配器默认配置").click();
+    h.get_by_label("交给主控选择协作者模型和思考强度").click();
+    h.run_steps(3);
+    h.get_by_role_and_label(Role::Button, "自定义供应商").click();
+    h.run_steps(3);
+    assert!(h.state().models.as_ref().is_some_and(|d| d.scope == crate::models::Scope::Draft && !d.allow_lead_routing));
+    assert!(h.state().providers.is_some());
+    h.get_by_label("添加供应商").click();
+    h.run_steps(3);
+    assert_eq!(h.state().providers.as_ref().unwrap().form.as_ref().unwrap().agent, "codex");
+    for (label, text) in [("名称", "完整目录测试"), ("接口地址", "http://127.0.0.1:34999/v1")] {
+        h.get_by_role_and_label(Role::TextInput, label).focus();
+        h.get_by_role_and_label(Role::TextInput, label).type_text(text);
+        h.run_steps(2);
+    }
+    // Exercise the form's complete probe-result entry point without a live endpoint.
+    h.state_mut().providers.as_mut().unwrap().probed(Ok((0..2500).map(|n| format!("remote-{n:04}")).collect()));
+    h.run_steps(3);
+    assert!(h.query_by_label("2500 个模型 · 每行一个模型 ID").is_some());
+    h.get_by_label("保存供应商").click();
+    until(&mut h, "custom provider saved", |a| a.providers.as_ref().is_some_and(|d| d.form.is_none()) && a.host.as_ref().unwrap().providers().len() == 1);
+    let saved = h.state().host.as_ref().unwrap().providers().remove(0);
+    assert_eq!(saved.agent, "codex");
+    assert_eq!(saved.models.len(), 2500);
+    assert_eq!(saved.models.last().unwrap(), "remote-2499");
+    h.run_steps(3);
+    h.get_by_label("返回模型选择").click();
+    until(&mut h, "returned model catalog", |a| a.providers.is_none() && a.models.as_ref().is_some_and(|d| !d.needs("codex")));
+    h.run_steps(3);
+    h.get_by_label("保存选择").click();
+    h.run_steps(3);
+    let routes = h.state().composer.routes.as_ref().unwrap();
+    assert_eq!(routes["deepseek"]["model"], "default");
+    assert_eq!(routes["codex"]["model"], "default");
+    assert_eq!(h.state().composer.allow_lead_routing, Some(false));
+}
+
+#[test]
+fn custom_provider_entry_survives_catalog_failure_and_palette_search() {
+    let data = tempfile::tempdir().unwrap();
+    let mut h = harness(data.path(), "readonly");
+    h.run_steps(3);
+    h.state_mut().open_models(crate::models::Scope::Draft);
+    h.state_mut().models.as_mut().unwrap().answer("deepseek", Err("目录暂时不可用".into()));
+    h.run_steps(3);
+    h.get_by_role_and_label(Role::Button, "自定义供应商").click();
+    h.run_steps(3);
+    assert!(h.state().providers.is_some());
+    h.get_by_label("返回模型选择").click();
+    h.run_steps(3);
+    h.get_by_label("取消").click();
+    h.run_steps(3);
+    h.state_mut().palette = Some(crate::palette::PaletteState::default());
+    h.state_mut().palette.as_mut().unwrap().query = "自定义".into();
+    h.run_steps(3);
+    h.get_by_label("自定义供应商与轮换").click();
+    h.run_steps(3);
+    assert!(h.state().providers.is_some());
+}
+
+#[test]
+fn lead_routing_policy_roundtrips_defaults_draft_and_active_ticket() {
+    const POLICY: &str = "交给主控选择协作者模型和思考强度";
+    let data = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let mut h = harness(data.path(), "ask");
+    h.run_steps(3);
+    h.state_mut().open_models(crate::models::Scope::Defaults);
+    h.run_steps(3);
+    h.get_by_label(POLICY).click();
+    h.run_steps(3);
+    h.get_by_label("保存选择").click();
+    until(&mut h, "default policy saved", |a| a.models.is_none() && !a.host.as_ref().unwrap().allow_lead_routing_default());
+    drop(h);
+    let mut h = harness(data.path(), "ask");
+    h.state_mut().composer.project = Some(project.path().to_path_buf());
+    h.run_steps(3);
+    h.state_mut().open_models(crate::models::Scope::Draft);
+    h.run_steps(3);
+    assert!(!h.state().models.as_ref().unwrap().allow_lead_routing);
+    h.get_by_label(POLICY).click();
+    h.run_steps(3);
+    h.get_by_label("保存选择").click();
+    h.run_steps(3);
+    assert_eq!(h.state().composer.allow_lead_routing, Some(true));
+    assert!(!h.state().host.as_ref().unwrap().allow_lead_routing_default());
+    h.get_by_label("输入框").focus();
+    h.get_by_label("输入框").type_text("保持审批等待以测试实时策略");
+    h.run_steps(2);
+    h.key_press(egui::Key::Enter);
+    until(&mut h, "active approval", |a| a.view.as_ref().and_then(|v| v.snap.as_ref()).is_some_and(|s| !s.approvals.is_empty()));
+    let ticket = h.state().view.as_ref().unwrap().id;
+    assert!(h.state().view.as_ref().unwrap().snap.as_ref().unwrap().ticket.allow_lead_routing);
+    let routes_before = ticket_routes(h.state(), ticket);
+    h.state_mut().open_models(crate::models::Scope::Ticket(ticket));
+    h.run_steps(3);
+    assert!(h.state().models.as_ref().unwrap().allow_lead_routing);
+    h.get_by_label(POLICY).click();
+    h.run_steps(3);
+    h.get_by_label("保存选择").click();
+    until(&mut h, "live policy saved", |a| a.models.is_none() && a.view.as_ref().and_then(|v| v.snap.as_ref()).is_some_and(|s| !s.ticket.allow_lead_routing));
+    assert_eq!(ticket_routes(h.state(), ticket), routes_before);
+    assert!(kinds(h.state(), ticket).iter().any(|kind| kind == "lead_routing.changed"));
+    h.state_mut().open_models(crate::models::Scope::Ticket(ticket));
+    h.run_steps(3);
+    assert!(!h.state().models.as_ref().unwrap().allow_lead_routing);
 }

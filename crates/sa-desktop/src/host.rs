@@ -34,6 +34,7 @@ pub enum Action {
         files: Vec<String>,
         /// Per-agent routes; `None` follows `route_defaults`.
         selections: Option<Value>,
+        allow_lead_routing: Option<bool>,
         /// `{skills, servers}` ids; `None` follows the extension defaults.
         extensions: Option<Value>,
     },
@@ -69,12 +70,15 @@ pub enum Action {
     /// `saveDefaults` (ST:234-238): routes for new conversations.
     SaveDefaults {
         selections: Value,
+        allow_lead_routing: bool,
     },
     /// `saveRoutes` (ST:239-290): routes of a stopped ticket.
     SaveRoutes {
         ticket: i64,
         selections: Value,
+        allow_lead_routing: bool,
     },
+    SetLeadRouting { ticket: i64, enabled: bool },
     /// Operator entry in the project knowledge base.
     KnowledgeAdd {
         cwd: String,
@@ -120,7 +124,7 @@ impl Action {
             Action::Retry { .. } => ActionKind::Retry,
             Action::Decide { allow, .. } => ActionKind::Decide { allow: *allow },
             Action::PlanAdd { .. } | Action::PlanToggle { .. } => ActionKind::Plan,
-            Action::SaveDefaults { .. } | Action::SaveRoutes { .. } => ActionKind::Routes,
+            Action::SaveDefaults { .. } | Action::SaveRoutes { .. } | Action::SetLeadRouting { .. } => ActionKind::Routes,
             Action::KnowledgeAdd { .. } | Action::KnowledgeArchive { .. } => ActionKind::Knowledge,
             Action::ProviderSave { .. } | Action::ProviderRemove { .. } | Action::RotationSave { .. } => {
                 ActionKind::Providers
@@ -155,6 +159,7 @@ pub struct Outcome {
 /// A harness catalog probe answered off the action queue.
 #[derive(Debug)]
 pub struct CatalogReply {
+    pub request_id: u64,
     pub agent: String,
     pub result: Result<Value, String>,
 }
@@ -179,6 +184,7 @@ impl RotationSource for DbRotation {
                 provider: x.provider.clone(),
                 model: x.model.clone(),
                 mode: x.mode.clone(),
+                reasoning_effort: None,
             })
             .collect()
     }
@@ -341,9 +347,11 @@ impl Host {
 
     /// Probe one harness catalog concurrently with the action queue (probes
     /// take seconds); the answer arrives on [`catalogs`](Self::catalogs).
-    pub fn request_catalog(&self, agent: &str) {
+    pub fn request_catalog(&self, agent: &str) -> u64 {
+        static NEXT_REQUEST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let request_id = NEXT_REQUEST.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if self.tx.is_none() {
-            return;
+            return request_id;
         }
         let adapter = self.adapters.get(agent).cloned();
         let (tx, notify, agent) = (self.catalog_tx.clone(), self.notify.clone(), agent.to_string());
@@ -352,9 +360,10 @@ impl Host {
                 Some(a) => a.catalog().await.map(|c| c.value).map_err(|e| format!("{e:#}")),
                 None => Err("未知执行器".into()),
             };
-            let _ = tx.send(CatalogReply { agent, result });
+            let _ = tx.send(CatalogReply { agent, request_id, result });
             notify();
         });
+        request_id
     }
 
     /// Fetch the model list of an unsaved provider (`/v1/models`).
@@ -410,6 +419,10 @@ impl Host {
             .unwrap_or_else(|| json!({}))
     }
 
+    pub fn allow_lead_routing_default(&self) -> bool {
+        routing_default(&self.engine).unwrap_or(true)
+    }
+
     /// Unrecoverable scheduler fault (scheduling stopped).
     pub fn fault(&self) -> Option<String> {
         self.engine.fault()
@@ -455,6 +468,7 @@ fn open_engine(
         .db()
         .with(|q| {
             q.conn().execute_batch(sa_store::STUDIO_PLAN)?;
+            q.conn().execute_batch("CREATE TABLE IF NOT EXISTS studio_model_policy(singleton INTEGER PRIMARY KEY CHECK(singleton=1),allow_lead_routing INTEGER NOT NULL CHECK(allow_lead_routing IN (0,1)))")?;
             Ok(q.conn().execute_batch(sa_store::TICKET_META)?)
         })?;
     // Providers and rotation must be loaded before the first admission.
@@ -472,6 +486,7 @@ async fn create(engine: &Engine, action: Action) -> Result<i64> {
         profile,
         files,
         selections,
+        allow_lead_routing,
         extensions,
     } = action
     else {
@@ -504,6 +519,10 @@ async fn create(engine: &Engine, action: Action) -> Result<i64> {
     let mut params = CreateParams::new(goal, cwd).lead(&lead).profile(&profile);
     params.files = files;
     params.selections = selections.map(parse_routes).transpose()?;
+    params.allow_lead_routing = Some(match allow_lead_routing {
+        Some(enabled) => enabled,
+        None => routing_default(engine)?,
+    });
     params.extensions = extensions;
     engine.create(params).await
 }
@@ -560,15 +579,21 @@ async fn execute(engine: &Engine, shared: &Shared, action: Action) -> Result<Opt
             })?;
             Ok(None)
         }
-        Action::SaveDefaults { selections } => {
+        Action::SaveDefaults { selections, allow_lead_routing } => {
             let routes = parse_routes(selections)?.to_string();
-            engine.db().with(|q| {
-                q.run("INSERT OR REPLACE INTO route_defaults(singleton,routes) VALUES(1,?)", &[&routes])
+            engine.db().tx(|q| {
+                q.run("INSERT OR REPLACE INTO route_defaults(singleton,routes) VALUES(1,?)", &[&routes])?;
+                q.run("INSERT OR REPLACE INTO studio_model_policy(singleton,allow_lead_routing) VALUES(1,?)", &[&i64::from(allow_lead_routing)])?;
+                Ok(())
             })?;
             Ok(None)
         }
-        Action::SaveRoutes { ticket, selections } => {
-            save_routes(engine, ticket, parse_routes(selections)?)?;
+        Action::SaveRoutes { ticket, selections, allow_lead_routing } => {
+            save_routes(engine, ticket, parse_routes(selections)?, allow_lead_routing)?;
+            Ok(None)
+        }
+        Action::SetLeadRouting { ticket, enabled } => {
+            engine.set_lead_routing(ticket, enabled)?;
             Ok(None)
         }
         Action::KnowledgeAdd { cwd, kind, body, ticket } => {
@@ -628,31 +653,17 @@ async fn execute(engine: &Engine, shared: &Shared, action: Action) -> Result<Opt
 
 /// `parseRoutes` (ST:57-70): `{agent: {mode, model, provider}}`.
 pub fn parse_routes(routes: Value) -> Result<Value> {
-    let Some(map) = routes.as_object() else { bail!("路由格式有误") };
-    for (agent, row) in map {
-        let keys: Option<Vec<&str>> = row.as_object().map(|r| {
-            let mut k: Vec<&str> = r.keys().map(String::as_str).collect();
-            k.sort_unstable();
-            k
-        });
-        if !AGENTS.contains(&agent.as_str()) || keys.as_deref() != Some(&["mode", "model", "provider"][..]) {
-            bail!("路由字段无效");
-        }
-        let text = |k: &str| {
-            row[k]
-                .as_str()
-                .is_some_and(|v| !v.is_empty() && v.encode_utf16().count() <= 1000)
-        };
-        if !matches!(row["mode"].as_str(), Some("cli" | "desktop")) || !text("provider") || !text("model") {
-            bail!("模型或供应商无效");
-        }
-    }
-    Ok(routes)
+    sa_engine::protocol::routes(&routes).map(Value::Object).map_err(anyhow::Error::msg)
+}
+
+fn routing_default(engine: &Engine) -> Result<bool> {
+    engine.db().with(|q| Ok(q.one("SELECT allow_lead_routing FROM studio_model_policy WHERE singleton=1", &[])?
+        .is_none_or(|row| row["allow_lead_routing"].as_i64() == Some(1))))
 }
 
 /// `saveRoutes` (ST:239-290): every job must be terminal; changed agents
 /// lose their bound route and native session.
-fn save_routes(engine: &Engine, ticket: i64, selections: Value) -> Result<()> {
+fn save_routes(engine: &Engine, ticket: i64, selections: Value, allow_lead_routing: bool) -> Result<()> {
     engine.db().tx(|q| {
         let row = q
             .one("SELECT agent_routes FROM tickets WHERE id=?", &[&ticket])?
@@ -667,7 +678,7 @@ fn save_routes(engine: &Engine, ticket: i64, selections: Value) -> Result<()> {
         let changed: Vec<&str> = AGENTS
             .into_iter()
             .filter(|a| {
-                ["provider", "model", "mode"]
+                ["provider", "model", "mode", "reasoning_effort"]
                     .iter()
                     .any(|f| old.get(*a).and_then(|r| r.get(f)) != selections.get(*a).and_then(|r| r.get(f)))
             })
@@ -683,6 +694,7 @@ fn save_routes(engine: &Engine, ticket: i64, selections: Value) -> Result<()> {
             )?;
         }
         q.run("UPDATE tickets SET agent_routes=? WHERE id=?", &[&selections.to_string(), &ticket])?;
+        q.set_lead_routing(ticket, allow_lead_routing)?;
         if !changed.is_empty() {
             let root = q.root(ticket)?;
             q.log(
@@ -737,7 +749,7 @@ pub(crate) mod tests {
                         "default": route,
                         "legacy_defaults": {"user": route},
                         "modes": [{"id": "cli", "available": true}],
-                        "providers": [{"id": "test-local", "models": [{"id": "default"}]}]
+                        "providers": [{"id": "test-local", "models": [{"id": "default", "reasoningEfforts": ["low", "high"], "defaultReasoningEffort": "low"}]}]
                     }),
                 })
             })
@@ -984,6 +996,7 @@ pub(crate) mod tests {
             profile: "ask".into(),
             files: vec![],
             selections: None,
+            allow_lead_routing: None,
             extensions: None,
         });
         let ticket = outcome(&host).result.unwrap().unwrap();
@@ -1061,6 +1074,7 @@ pub(crate) mod tests {
             profile: "readonly".into(),
             files: vec![],
             selections: Some(json!({agent: route})),
+            allow_lead_routing: None,
             extensions: None,
         });
         let ticket = outcome(&host).result.unwrap().unwrap();
@@ -1131,6 +1145,7 @@ pub(crate) mod tests {
             profile: "readonly".into(),
             files: vec![],
             selections: Some(json!({agent: {"provider": broken, "model": model, "mode": "cli"}})),
+            allow_lead_routing: None,
             extensions: None,
         });
         let ticket = outcome(&host).result.unwrap().unwrap();
@@ -1207,6 +1222,7 @@ pub(crate) mod tests {
             profile: "readonly".into(),
             files,
             selections: None,
+            allow_lead_routing: None,
             extensions: None,
         }));
         let o = outcome(&host);
@@ -1263,6 +1279,7 @@ pub(crate) mod tests {
             profile: "readonly".into(),
             files: vec![],
             selections: None,
+            allow_lead_routing: None,
             extensions: None,
         });
         assert_eq!(outcome(&host).result.unwrap_err(), "请输入目标");
@@ -1280,5 +1297,43 @@ pub(crate) mod tests {
         assert!(!owner::is_claimed(data.path()));
         let again = Host::start_with(data.path().to_path_buf(), fakes, || {}).unwrap();
         drop(again);
+    }
+
+    #[test]
+    fn model_policy_and_effort_persist_and_leave_primary_fixed() {
+        let data = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let routes = json!({"codex":{"provider":"test-local","model":"default","mode":"cli","reasoning_effort":"high"}});
+        let mut host = Host::start_with(data.path().into(), fakes, || {}).unwrap();
+        assert!(host.allow_lead_routing_default());
+        host.submit(Action::SaveDefaults { selections: routes.clone(), allow_lead_routing: false });
+        assert!(outcome(&host).result.is_ok());
+        assert!(!host.allow_lead_routing_default());
+        assert_eq!(host.defaults(), routes);
+        host.shutdown();
+
+        let host = Host::start_with(data.path().into(), fakes, || {}).unwrap();
+        assert!(!host.allow_lead_routing_default());
+        host.submit(Action::Create {
+            goal: "fixed primary".into(), cwd: Some(project.path().into()), lead: "codex".into(),
+            profile: "readonly".into(), files: Vec::new(), selections: None,
+            allow_lead_routing: None, extensions: None,
+        });
+        let ticket = outcome(&host).result.unwrap().unwrap();
+        until(|| root_state(&host, ticket) == "done");
+        let policy = || host.engine.db().with(|q| q.one("SELECT allow_lead_routing FROM tickets WHERE id=?", &[&ticket])).unwrap().unwrap()["allow_lead_routing"].as_i64().unwrap();
+        assert_eq!(policy(), 0);
+        let bound = || host.engine.db().with(|q| q.one("SELECT route FROM native_routes WHERE job=(SELECT id FROM jobs WHERE ticket=? AND parent IS NULL)", &[&ticket])).unwrap().unwrap()["route"].as_str().unwrap().to_string();
+        let fixed = bound();
+        assert_eq!(serde_json::from_str::<Value>(&fixed).unwrap()["reasoning_effort"], "high");
+        host.submit(Action::SetLeadRouting { ticket, enabled: true });
+        assert!(outcome(&host).result.is_ok());
+        assert_eq!(policy(), 1);
+        assert_eq!(bound(), fixed);
+
+        host.submit(Action::SaveDefaults { selections: json!({"unknown":{"provider":"x","model":"y","mode":"cli"}}), allow_lead_routing: true });
+        assert!(outcome(&host).result.is_err());
+        assert!(!host.allow_lead_routing_default());
+        assert_eq!(host.defaults(), routes);
     }
 }

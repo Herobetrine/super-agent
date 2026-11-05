@@ -52,6 +52,8 @@ pub struct Composer {
     /// Explicit routes for the next new conversation; `None` follows
     /// `route_defaults`.
     pub routes: Option<serde_json::Value>,
+    /// None follows the saved policy for new conversations.
+    pub allow_lead_routing: Option<bool>,
     /// MCP/skill grants for the next new conversation; `None` follows the
     /// global defaults.
     pub extensions: Option<serde_json::Value>,
@@ -91,6 +93,7 @@ impl Composer {
             confirm: None,
             plan_draft: String::new(),
             routes: None,
+            allow_lead_routing: None,
             extensions: None,
             last_body: None,
             last_attachments: None,
@@ -258,10 +261,10 @@ impl App {
         let probes: Vec<_> = host.probes.try_iter().collect();
         for c in catalogs {
             if let Some(d) = self.models.as_mut() {
-                d.answer(&c.agent, c.result.clone());
+                d.answer_for(&c.agent, c.request_id, c.result.clone());
             }
             if let Some(d) = self.providers.as_mut() {
-                d.answer(&c.agent, c.result);
+                d.answer_for(&c.agent, c.request_id, c.result);
             }
         }
         if let Some(d) = self.providers.as_mut() {
@@ -349,6 +352,7 @@ impl App {
                 profile: self.composer.profile.clone(),
                 files: self.composer.attachments.clone(),
                 selections: self.composer.routes.clone(),
+                allow_lead_routing: self.composer.allow_lead_routing,
                 extensions: self.composer.extensions.clone(),
             },
             Some(ticket) => match &self.composer.target {

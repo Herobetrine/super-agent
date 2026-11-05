@@ -7,7 +7,7 @@
 //! environment variable the provider names and are handed to the harness only
 //! through its environment, never argv, journals or catalog rows.
 
-use crate::common::{get_json_with, local_host};
+use crate::common::local_host;
 use crate::sys::Sys;
 use anyhow::{Result, anyhow, bail};
 pub use sa_store::providers::CustomProvider;
@@ -15,7 +15,6 @@ use sa_store::providers::{MAX_MODELS, ROUTE_PREFIX, valid_model_id, validate};
 use serde_json::{Map, Value, json};
 use std::collections::HashSet;
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 /// Live provider list shared by the adapters and the desktop.
@@ -38,7 +37,11 @@ pub fn registry(providers: Vec<CustomProvider>) -> Registry {
 /// Enabled providers for `agent`, in registry order.
 pub fn snapshot(registry: &Registry, agent: &str) -> Vec<CustomProvider> {
     let guard = registry.read().unwrap_or_else(|e| e.into_inner());
-    guard.iter().filter(|p| p.enabled && p.agent == agent).cloned().collect()
+    guard
+        .iter()
+        .filter(|p| p.enabled && p.agent == agent)
+        .cloned()
+        .collect()
 }
 
 /// Why a provider cannot run right now.
@@ -69,13 +72,33 @@ fn credential(p: &CustomProvider, sys: &Sys) -> Result<String, KeyError> {
 /// Catalog row (spec §7.2) for one custom provider. Contains no secret: only
 /// the variable name appears when it is missing.
 pub fn provider_row(p: &CustomProvider, sys: &Sys) -> Value {
-    let models: Vec<Value> = p.models.iter().map(|m| json!({"id": m, "label": m})).collect();
+    let models: Vec<Value> = p
+        .models
+        .iter()
+        .map(|m| json!({"id": m, "label": m}))
+        .collect();
     let (available, detail, reason) = match key(p, sys) {
-        Err(KeyError::Invalid) => (false, "自定义供应商配置无效，请重新编辑".to_string(), Some("not_configured")),
-        Err(KeyError::Missing(var)) => (false, format!("环境变量 {var} 未设置，无法读取密钥"), Some("auth")),
-        Ok(_) if p.models.is_empty() => (false, "未配置模型，请先获取或填写模型".to_string(), Some("not_configured")),
+        Err(KeyError::Invalid) => (
+            false,
+            "自定义供应商配置无效，请重新编辑".to_string(),
+            Some("not_configured"),
+        ),
+        Err(KeyError::Missing(var)) => (
+            false,
+            format!("环境变量 {var} 未设置，无法读取密钥"),
+            Some("auth"),
+        ),
+        Ok(_) if p.models.is_empty() => (
+            false,
+            "未配置模型，请先获取或填写模型".to_string(),
+            Some("not_configured"),
+        ),
         Ok(None) => (true, "自定义供应商 · 本机端点（无密钥）".to_string(), None),
-        Ok(Some(_)) => (true, format!("自定义供应商 · 密钥来自环境变量 {}", p.key_env), None),
+        Ok(Some(_)) => (
+            true,
+            format!("自定义供应商 · 密钥来自环境变量 {}", p.key_env),
+            None,
+        ),
     };
     let mut row = json!({
         "id": p.route_id(),
@@ -102,8 +125,13 @@ pub fn merge(catalog: &mut Value, customs: &[CustomProvider], sys: &Sys) {
     if !catalog["providers"].is_array() {
         catalog["providers"] = json!([]);
     }
-    let Some(list) = catalog["providers"].as_array_mut() else { return };
-    let mut taken: HashSet<String> = list.iter().filter_map(|p| p["id"].as_str().map(str::to_string)).collect();
+    let Some(list) = catalog["providers"].as_array_mut() else {
+        return;
+    };
+    let mut taken: HashSet<String> = list
+        .iter()
+        .filter_map(|p| p["id"].as_str().map(str::to_string))
+        .collect();
     for p in customs {
         let id = p.route_id();
         if taken.insert(id) {
@@ -114,7 +142,11 @@ pub fn merge(catalog: &mut Value, customs: &[CustomProvider], sys: &Sys) {
 
 /// The custom provider a selected route names, if the merged catalog row is
 /// a custom one.
-pub fn lookup<'a>(catalog: &Value, customs: &'a [CustomProvider], provider: &str) -> Option<&'a CustomProvider> {
+pub fn lookup<'a>(
+    catalog: &Value,
+    customs: &'a [CustomProvider],
+    provider: &str,
+) -> Option<&'a CustomProvider> {
     if !provider.starts_with(ROUTE_PREFIX) {
         return None;
     }
@@ -123,7 +155,9 @@ pub fn lookup<'a>(catalog: &Value, customs: &'a [CustomProvider], provider: &str
         .into_iter()
         .flatten()
         .any(|r| r["id"] == json!(provider) && r["custom"] == json!(true));
-    is_custom.then(|| customs.iter().find(|p| p.route_id() == provider)).flatten()
+    is_custom
+        .then(|| customs.iter().find(|p| p.route_id() == provider))
+        .flatten()
 }
 
 /// Anthropic API root: Claude Code appends `/v1/messages` itself.
@@ -226,20 +260,42 @@ fn auth_headers(p: &CustomProvider, key: Option<&str>) -> Vec<(String, String)> 
 /// Model ids from an OpenAI (`data[].id`), Anthropic (`data[].id`) or Codex
 /// catalog (`models[].slug`) response: valid, unique, at most `MAX_MODELS`.
 pub fn parse_models(body: &Value) -> Vec<String> {
-    let rows = body["data"].as_array().or_else(|| body["models"].as_array());
+    let rows = body["data"]
+        .as_array()
+        .or_else(|| body["models"].as_array());
     let mut seen = HashSet::new();
     rows.into_iter()
         .flatten()
-        .filter_map(|m| m["id"].as_str().or_else(|| m["slug"].as_str()).or_else(|| m.as_str()))
+        .filter_map(|m| {
+            m["id"]
+                .as_str()
+                .or_else(|| m["slug"].as_str())
+                .or_else(|| m.as_str())
+        })
         .filter(|id| valid_model_id(id) && seen.insert(id.to_string()))
-        .take(MAX_MODELS)
         .map(str::to_string)
         .collect()
 }
 
 /// "获取模型": list the endpoint's models (10 s, 4 MiB). Makes one GET with
 /// the provider's key; never follows redirects or environment proxies.
-pub async fn probe_models(provider: &CustomProvider, sys: &Sys, cancel: &CancellationToken) -> Result<Vec<String>> {
+pub async fn probe_models(
+    provider: &CustomProvider,
+    sys: &Sys,
+    cancel: &CancellationToken,
+) -> Result<Vec<String>> {
+    Ok(probe_catalog(provider, sys, cancel)
+        .await?
+        .iter()
+        .filter_map(|m| m["id"].as_str().map(str::to_string))
+        .collect())
+}
+
+async fn probe_catalog(
+    provider: &CustomProvider,
+    sys: &Sys,
+    cancel: &CancellationToken,
+) -> Result<Vec<Value>> {
     let p = validate(provider)?;
     let key = match key(&p, sys) {
         Ok(k) => k,
@@ -247,21 +303,66 @@ pub async fn probe_models(provider: &CustomProvider, sys: &Sys, cancel: &Cancell
         Err(KeyError::Invalid) => bail!("自定义供应商配置无效"),
     };
     let url = url::Url::parse(&p.base_url).map_err(|_| anyhow!("供应商端点无效"))?;
-    let key = key.or_else(|| local_host(url.host_str().unwrap_or_default()).then(|| LOCAL_PLACEHOLDER.to_string()));
-    let body = get_json_with(
-        &models_url(&p),
-        &auth_headers(&p, key.as_deref()),
-        Duration::from_secs(10),
-        4 * 1024 * 1024,
-        cancel,
-    )
-    .await
-    .map_err(|e| anyhow!("获取模型失败：{e}"))?;
-    let models = parse_models(&body);
-    if models.is_empty() {
-        bail!("端点未返回可用模型");
+    let key = key.or_else(|| {
+        local_host(url.host_str().unwrap_or_default()).then(|| LOCAL_PLACEHOLDER.to_string())
+    });
+    let models = crate::catalog::fetch(&models_url(&p), &auth_headers(&p, key.as_deref()), cancel)
+        .await
+        .map_err(|e| anyhow!("获取模型失败：{e}"))?;
+    if models.len() > MAX_MODELS {
+        bail!("模型数量超过 {MAX_MODELS}，无法保存完整目录");
     }
     Ok(models)
+}
+
+/// Refresh custom providers at the same time as native catalogs, retaining exact
+/// native capability metadata when an endpoint only returns model IDs.
+pub async fn refresh(
+    catalog: &mut Value,
+    customs: &[CustomProvider],
+    sys: &Sys,
+    cancel: &CancellationToken,
+) {
+    let metadata: Vec<Value> = catalog["providers"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|p| p["models"].as_array().into_iter().flatten().cloned())
+        .collect();
+    merge(catalog, customs, sys);
+    for p in customs {
+        let Some(row) = catalog["providers"].as_array_mut().and_then(|ps| {
+            ps.iter_mut()
+                .find(|r| r["id"] == p.route_id() && r["custom"] == true)
+        }) else {
+            continue;
+        };
+        match probe_catalog(p, sys, cancel).await {
+            Ok(mut models) => {
+                crate::catalog::supplement(&mut models, &metadata);
+                if p.agent == "claude" {
+                    crate::catalog::restrict_efforts(
+                        &mut models,
+                        &["low", "medium", "high", "xhigh", "max"],
+                    );
+                } else if p.agent == "deepseek" {
+                    crate::catalog::restrict_efforts(
+                        &mut models,
+                        &["off", "minimal", "low", "medium", "high", "xhigh", "max"],
+                    );
+                }
+                row["models"] = json!(models);
+                row["available"] = json!(true);
+                row["detail"] = json!("供应商在线完整模型目录");
+                row["catalog_complete"] = json!(true);
+            }
+            Err(error) => {
+                row["detail"] = json!(format!("在线目录获取失败：{error}；以下仅为已保存型号"));
+                row["catalogError"] = json!(true);
+                row["catalog_complete"] = json!(false);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -271,7 +372,9 @@ mod tests {
 
     pub(crate) fn sys(vars: &[(&str, &str)]) -> Sys {
         Sys::new(
-            vars.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+            vars.iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
             PathBuf::from("/nonexistent-home"),
             std::env::temp_dir(),
         )
@@ -305,7 +408,10 @@ mod tests {
 
         let mut empty = p.clone();
         empty.models.clear();
-        assert_eq!(provider_row(&empty, &sys(&[("GW_KEY", "k")]))["unavailable_reason"], "not_configured");
+        assert_eq!(
+            provider_row(&empty, &sys(&[("GW_KEY", "k")]))["unavailable_reason"],
+            "not_configured"
+        );
 
         let keyless = provider("claude", "http://127.0.0.1:9/", "");
         assert_eq!(provider_row(&keyless, &sys(&[]))["available"], true);
@@ -331,20 +437,32 @@ mod tests {
         let customs = vec![up.clone(), down.clone(), clash.clone()];
         let env = sys(&[("GW_KEY", "k")]);
         merge(&mut cat, &customs, &env);
-        let ids: Vec<&str> = cat["providers"].as_array().unwrap().iter().map(|p| p["id"].as_str().unwrap()).collect();
+        let ids: Vec<&str> = cat["providers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["id"].as_str().unwrap())
+            .collect();
         assert_eq!(ids, vec!["openai", "sa-taken", "sa-gw1", "sa-down"]);
 
         let route = |p: &str, m: &str| Route {
             provider: p.into(),
             model: m.into(),
             mode: "cli".into(),
+            reasoning_effort: None,
         };
-        assert_eq!(select(&cat, &route("sa-gw1", "m-b")).unwrap(), route("sa-gw1", "m-b"));
+        assert_eq!(
+            select(&cat, &route("sa-gw1", "m-b")).unwrap(),
+            route("sa-gw1", "m-b")
+        );
         assert_eq!(lookup(&cat, &customs, "sa-gw1"), Some(&up));
         assert_eq!(lookup(&cat, &customs, "sa-taken"), None, "native row wins");
         assert_eq!(lookup(&cat, &customs, "openai"), None);
         for r in [route("sa-down", "m-a"), route("sa-gw1", "other")] {
-            assert_eq!(select(&cat, &r).unwrap_err().class, ErrorClass::RouteUnavailable);
+            assert_eq!(
+                select(&cat, &r).unwrap_err().class,
+                ErrorClass::RouteUnavailable
+            );
         }
     }
 
@@ -369,7 +487,11 @@ mod tests {
         assert_eq!(env.get("CLAUDE_CODE_SUBAGENT_MODEL"), Some("m-a"));
         assert_eq!(env.get("CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST"), Some("1"));
         assert_eq!(env.get("PATH"), Some("/bin"));
-        let anthropic: Vec<_> = env.vars().iter().filter(|(k, _)| k.eq_ignore_ascii_case("ANTHROPIC_BASE_URL")).collect();
+        let anthropic: Vec<_> = env
+            .vars()
+            .iter()
+            .filter(|(k, _)| k.eq_ignore_ascii_case("ANTHROPIC_BASE_URL"))
+            .collect();
         assert_eq!(anthropic.len(), 1);
 
         assert_eq!(
@@ -408,21 +530,32 @@ mod tests {
         }
         let (args, settings) = codex_routing(&provider("codex", "http://127.0.0.1:1/v1", ""), true);
         assert!(!args.iter().any(|a| a.contains("env_key")));
-        assert_eq!(settings["model_providers"]["sa-gw1"]["wire_api"], "responses");
+        assert_eq!(
+            settings["model_providers"]["sa-gw1"]["wire_api"],
+            "responses"
+        );
     }
 
     #[test]
     fn model_lists_parse_all_shapes() {
         assert_eq!(
-            parse_models(&json!({"data": [{"id": "a"}, {"id": "a"}, {"id": "bad id"}, {"id": "b[1m]"}]})),
+            parse_models(
+                &json!({"data": [{"id": "a"}, {"id": "a"}, {"id": "bad id"}, {"id": "b[1m]"}]})
+            ),
             vec!["a", "b[1m]"]
         );
-        assert_eq!(parse_models(&json!({"models": [{"slug": "gpt-x"}]})), vec!["gpt-x"]);
+        assert_eq!(
+            parse_models(&json!({"models": [{"slug": "gpt-x"}]})),
+            vec!["gpt-x"]
+        );
         assert!(parse_models(&json!({"error": "x"})).is_empty());
         assert_eq!(
             models_url(&provider("claude", "https://gw.example/v1", "K")),
             "https://gw.example/v1/models?limit=1000"
         );
-        assert_eq!(models_url(&provider("codex", "https://gw.example/v1", "K")), "https://gw.example/v1/models");
+        assert_eq!(
+            models_url(&provider("codex", "https://gw.example/v1", "K")),
+            "https://gw.example/v1/models"
+        );
     }
 }

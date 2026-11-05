@@ -58,7 +58,7 @@ async fn selections(adapters: &[std::sync::Arc<dyn sa_engine::adapter::Adapter>]
                 .as_str()
                 .filter(|d| p["models"].as_array().is_some_and(|m| m.iter().any(|x| x["id"] == json!(d))))
                 .or_else(|| p["models"][0]["id"].as_str())?;
-            Some(sa_engine::adapter::Route { provider: p["id"].as_str()?.into(), model: model.into(), mode: "cli".into() })
+            Some(sa_engine::adapter::Route { provider: p["id"].as_str()?.into(), model: model.into(), mode: "cli".into(), reasoning_effort: None })
         });
         if let Some(r) = route {
             out.insert(a.agent().into(), json!({"provider": r.provider, "model": r.model, "mode": r.mode}));

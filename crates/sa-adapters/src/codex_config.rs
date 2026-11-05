@@ -1,6 +1,6 @@
 //! Codex configuration and model discovery (port of `codex-config.cjs`).
 
-use crate::common::{endpoint, get_json, local_host, modes, read_json};
+use crate::common::{endpoint, modes, read_json};
 use crate::proc::capture;
 use crate::sys::{Sys, resolve};
 use anyhow::{Result, anyhow, bail};
@@ -14,8 +14,10 @@ use tokio_util::sync::CancellationToken;
 
 static ID_OK: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^[\p{L}\p{N}_][\p{L}\p{N}_./:+-]{0,199}$").expect("valid regex"));
-static PROVIDER_ID: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[\w-]{1,96}$").expect("valid regex"));
-static PROFILE_NAME: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[A-Za-z0-9_-]+$").expect("valid regex"));
+static PROVIDER_ID: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^[\w-]{1,96}$").expect("valid regex"));
+static PROFILE_NAME: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^[A-Za-z0-9_-]+$").expect("valid regex"));
 
 pub fn id_ok(v: &Value) -> bool {
     v.as_str().is_some_and(|s| ID_OK.is_match(s))
@@ -33,7 +35,11 @@ pub fn executable(sys: &Sys) -> Option<PathBuf> {
         return sys.which("codex");
     }
     if let Some(shim) = sys.which("codex.cmd") {
-        let arch = if cfg!(target_arch = "aarch64") { "arm64" } else { "x64" };
+        let arch = if cfg!(target_arch = "aarch64") {
+            "arm64"
+        } else {
+            "x64"
+        };
         let vendor = shim
             .parent()
             .unwrap_or(Path::new("."))
@@ -55,9 +61,13 @@ pub fn executable(sys: &Sys) -> Option<PathBuf> {
 }
 
 fn toml_file(p: &Path) -> Result<Value> {
-    let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let name = p
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
     let text = std::fs::read_to_string(p).map_err(|_| anyhow!("无法读取 Codex 配置 {name}"))?;
-    let table: toml::Table = toml::from_str(&text).map_err(|_| anyhow!("无法读取 Codex 配置 {name}"))?;
+    let table: toml::Table =
+        toml::from_str(&text).map_err(|_| anyhow!("无法读取 Codex 配置 {name}"))?;
     Ok(serde_json::to_value(table)?)
 }
 
@@ -84,8 +94,15 @@ pub struct Settings {
 pub fn settings(sys: &Sys) -> Result<Settings> {
     let dir = config_home(sys);
     let f = dir.join("config.toml");
-    let base = if f.is_file() { toml_file(&f)? } else { json!({}) };
-    let profile = sys.get("SUPERAGENT_CODEX_PROFILE").map(str::trim).filter(|p| !p.is_empty());
+    let base = if f.is_file() {
+        toml_file(&f)?
+    } else {
+        json!({})
+    };
+    let profile = sys
+        .get("SUPERAGENT_CODEX_PROFILE")
+        .map(str::trim)
+        .filter(|p| !p.is_empty());
     if let Some(p) = profile
         && !PROFILE_NAME.is_match(p)
     {
@@ -100,7 +117,10 @@ pub fn settings(sys: &Sys) -> Result<Settings> {
         let mut names: Vec<PathBuf> = entries
             .flatten()
             .map(|e| e.path())
-            .filter(|p| p.file_name().is_some_and(|n| n.to_string_lossy().ends_with(".config.toml")))
+            .filter(|p| {
+                p.file_name()
+                    .is_some_and(|n| n.to_string_lossy().ends_with(".config.toml"))
+            })
             .collect();
         names.sort();
         for p in names {
@@ -123,11 +143,13 @@ fn visible(data: &Value) -> Vec<Value> {
         .as_array()
         .into_iter()
         .flatten()
-        .filter(|m| id_ok(&m["slug"]) && m.get("visibility").and_then(Value::as_str).unwrap_or("list") == "list")
-        .map(|m| {
-            let label = m["display_name"].as_str().unwrap_or(m["slug"].as_str().unwrap_or_default());
-            json!({"id": m["slug"], "label": label})
+        .filter(|m| {
+            m.get("visibility")
+                .and_then(Value::as_str)
+                .unwrap_or("list")
+                == "list"
         })
+        .filter_map(crate::catalog::model)
         .collect()
 }
 
@@ -139,12 +161,12 @@ async fn custom_models(sys: &Sys, cfg: &Value, cancel: &CancellationToken) -> Re
         .map(|u| url::Url::parse(u).map_err(|_| anyhow!("目录和认证来源不匹配")))
         .transpose()?;
     if let Some(u) = &catalog_url
-        && (u.origin() != origin.origin() || !u.username().is_empty() || u.password().is_some() || u.fragment().is_some())
+        && (u.origin() != origin.origin()
+            || !u.username().is_empty()
+            || u.password().is_some()
+            || u.fragment().is_some())
     {
         bail!("目录和认证来源不匹配");
-    }
-    if catalog_url.is_none() && !local_host(origin.host_str().unwrap_or_default()) {
-        return Ok(vec![]);
     }
     let mut headers: Vec<(String, String)> = cfg["http_headers"]
         .as_object()
@@ -158,10 +180,18 @@ async fn custom_models(sys: &Sys, cfg: &Value, cancel: &CancellationToken) -> Re
             headers.push((name.clone(), v.to_string()));
         }
     }
+    // Codex's API-key auth is valid for the explicitly selected provider. OAuth
+    // access tokens remain with the CLI and are never sent to custom origins.
+    let auth = if cfg["requires_openai_auth"] == true {
+        read_json(&config_home(sys).join("auth.json"), json!({}))?
+    } else {
+        json!({})
+    };
     let token = cfg["experimental_bearer_token"]
         .as_str()
         .filter(|t| !t.is_empty())
-        .or_else(|| cfg["env_key"].as_str().and_then(|k| sys.var(k)));
+        .or_else(|| cfg["env_key"].as_str().and_then(|k| sys.var(k)))
+        .or_else(|| auth["OPENAI_API_KEY"].as_str());
     if let Some(t) = token {
         headers.push(("Authorization".into(), format!("Bearer {t}")));
     }
@@ -169,18 +199,7 @@ async fn custom_models(sys: &Sys, cfg: &Value, cancel: &CancellationToken) -> Re
         Some(u) => u.to_string(),
         None => format!("{}/models", origin.as_str().trim_end_matches('/')),
     };
-    let data = get_json(&target, &headers, cancel).await?;
-    Ok(if data.get("models").is_some_and(|m| !m.is_null()) {
-        visible(&data)
-    } else {
-        data["data"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter(|m| id_ok(&m["id"]))
-            .map(|m| json!({"id": m["id"], "label": m["id"]}))
-            .collect()
-    })
+    crate::catalog::fetch(&target, &headers, cancel).await
 }
 
 pub struct Discovery {
@@ -194,14 +213,48 @@ pub struct Discovery {
 /// `discover()` (CXC:87-173).
 pub async fn discover(sys: &Sys, cancel: &CancellationToken) -> Result<Discovery> {
     let exe = executable(sys);
-    let Settings { config, profile, dir, saved } = settings(sys)?;
-    let custom = config["model_providers"].as_object().cloned().unwrap_or_default();
-    let def = config.get("model_provider").cloned().unwrap_or_else(|| json!("openai"));
+    let Settings {
+        config,
+        profile,
+        dir,
+        saved,
+    } = settings(sys)?;
+    let custom = config["model_providers"]
+        .as_object()
+        .cloned()
+        .unwrap_or_default();
+    let def = config
+        .get("model_provider")
+        .cloned()
+        .unwrap_or_else(|| json!("openai"));
     let def = match def.as_str() {
-        Some(d) if PROVIDER_ID.is_match(d) && (config["model"].is_null() || id_ok(&config["model"])) => d.to_string(),
+        Some(d)
+            if PROVIDER_ID.is_match(d)
+                && (config["model"].is_null() || id_ok(&config["model"])) =>
+        {
+            d.to_string()
+        }
         _ => bail!("当前 Codex 配置含有无效的模型或供应商 ID"),
     };
-    let file_catalog = config["model_catalog_json"].as_str().map(|p| resolve(&dir, p));
+    let file_catalog = config["model_catalog_json"]
+        .as_str()
+        .map(|p| resolve(&dir, p));
+    let native = match &exe {
+        Some(exe) => capture(
+            exe,
+            &["debug".into(), "models".into()],
+            &sys.home,
+            sys,
+            "",
+            Duration::from_secs(15),
+            cancel,
+        )
+        .await
+        .map_err(|e| anyhow!(e.message))
+        .and_then(|s| serde_json::from_str::<Value>(&s).map_err(Into::into))
+        .map(|v| visible(&v)),
+        None => Err(anyhow!("本机未安装 Codex CLI")),
+    };
     let mut names: Vec<String> = vec!["openai".into()];
     for n in custom.keys().cloned().chain([def.clone()]) {
         if !names.contains(&n) {
@@ -210,8 +263,8 @@ pub async fn discover(sys: &Sys, cancel: &CancellationToken) -> Result<Discovery
     }
     names.retain(|n| PROVIDER_ID.is_match(n));
     let probes = names.iter().map(|name| {
-        let (sys, config, custom, file_catalog, exe, def, saved) =
-            (sys, &config, &custom, &file_catalog, &exe, &def, &saved);
+        let (sys, config, custom, file_catalog, exe, def, saved, native) =
+            (sys, &config, &custom, &file_catalog, &exe, &def, &saved, &native);
         async move {
             let mut cfg = custom.get(name).cloned();
             if name == "openai"
@@ -222,17 +275,20 @@ pub async fn discover(sys: &Sys, cancel: &CancellationToken) -> Result<Discovery
                 cfg = Some(Value::Object(c));
             }
             let mut models: Vec<Value> = vec![];
-            let mut detail = "没有该来源的模型目录";
+            let mut detail = "没有该来源的模型目录".to_string();
             let attempt: Result<()> = async {
                 if let (Some(fc), true) = (file_catalog, name == def) {
                     if std::fs::metadata(fc)?.len() > 32 * 1024 * 1024 {
                         bail!("too large");
                     }
                     models = visible(&read_json(fc, json!({}))?);
-                    detail = "本机 model_catalog_json";
-                } else if let Some(c) = &cfg {
+                    detail = "本机 model_catalog_json".into();
+                } else if let Some(c) = cfg.as_ref().filter(|c| c["base_url"].as_str().is_some()) {
                     models = custom_models(sys, c, cancel).await?;
-                    detail = if models.is_empty() { "未发现该来源的模型目录" } else { "配置来源的模型目录" };
+                    detail = "供应商在线模型目录".into();
+                } else if name == def {
+                    models = native.as_ref().map_err(|e| anyhow!("{e}"))?.clone();
+                    detail = "Codex CLI 模型目录（遵循原生刷新与缓存策略）".into();
                 } else if let (true, Some(exe)) = (name == "openai", exe) {
                     let mut args: Vec<String> =
                         ["-c", "model_provider=\"openai\"", "debug", "models"].iter().map(|s| s.to_string()).collect();
@@ -243,14 +299,16 @@ pub async fn discover(sys: &Sys, cancel: &CancellationToken) -> Result<Discovery
                         .await
                         .map_err(|e| anyhow!(e.message))?;
                     models = visible(&serde_json::from_str(&out)?);
-                    detail = "Codex CLI 模型目录";
+                    detail = "Codex CLI 模型目录".into();
                 }
                 Ok(())
             }
             .await;
-            if attempt.is_err() {
-                detail = "模型目录暂不可读";
+            let complete = attempt.is_ok() && !models.is_empty();
+            if let Err(error) = attempt {
+                detail = format!("在线模型目录获取失败：{error}；以下仅为已保存型号");
             }
+            if let Ok(metadata) = &native { crate::catalog::supplement(&mut models, metadata); }
             let mut by_id: Vec<Value> = models;
             for c in saved.iter() {
                 let provider = c["model_provider"].as_str().unwrap_or("openai");
@@ -272,7 +330,7 @@ pub async fn discover(sys: &Sys, cancel: &CancellationToken) -> Result<Discovery
                 .unwrap_or(name)
                 .to_string();
             let available = !by_id.is_empty();
-            json!({"id": name, "label": label, "models": by_id, "detail": detail, "available": available})
+            json!({"id": name, "label": label, "models": by_id, "detail": detail, "available": available, "catalog_complete":complete})
         }
     });
     let providers: Vec<Value> = join_all(probes).await;
@@ -311,8 +369,13 @@ pub async fn discover(sys: &Sys, cancel: &CancellationToken) -> Result<Discovery
 
 /// `routing(d, s)` (CXC:174-200): CLI overrides and thread `config`.
 pub fn routing(d: &Discovery, provider: &str) -> Result<(Vec<String>, Map<String, Value>)> {
-    let cfg = d.config["model_providers"].get(provider).filter(|v| !v.is_null());
-    let mut args = vec!["-c".to_string(), format!("model_provider={}", json!(provider))];
+    let cfg = d.config["model_providers"]
+        .get(provider)
+        .filter(|v| !v.is_null());
+    let mut args = vec![
+        "-c".to_string(),
+        format!("model_provider={}", json!(provider)),
+    ];
     let mut settings = Map::new();
     let override_base = (provider == "openai")
         .then(|| d.config["openai_base_url"].as_str())
@@ -330,7 +393,10 @@ pub fn routing(d: &Discovery, provider: &str) -> Result<(Vec<String>, Map<String
         args.push(format!("{key}={}", json!(base)));
         if d.profile.is_some() && cfg.is_some() {
             args.push("-c".into());
-            args.push(format!("model_providers.{provider}.name={}", json!(provider)));
+            args.push(format!(
+                "model_providers.{provider}.name={}",
+                json!(provider)
+            ));
         }
     }
     if d.profile.is_some() {

@@ -11,7 +11,9 @@ use crate::custom::{self, CustomProvider, Registry};
 use crate::proc::{Lines, Proc, cancelled, capture, start};
 use crate::sys::Sys;
 use futures::future::BoxFuture;
-use sa_engine::adapter::{Adapter, AdapterError, Catalog, ErrorClass, EventSink, RunOutcome, RunRequest, TurnHost};
+use sa_engine::adapter::{
+    Adapter, AdapterError, Catalog, ErrorClass, EventSink, RunOutcome, RunRequest, TurnHost,
+};
 use sa_engine::resilience::classify::{classified, codex_error};
 use serde_json::{Map, Value, json};
 use std::collections::{HashMap, HashSet};
@@ -51,7 +53,10 @@ struct Policy {
 
 /// `policy(profile, writable, approve)` (CX:4-20).
 fn policy(profile: &str, writable: bool) -> Result<Policy, AdapterError> {
-    if !matches!(profile, "legacy" | "readonly" | "ask" | "partial" | "auto" | "full") {
+    if !matches!(
+        profile,
+        "legacy" | "readonly" | "ask" | "partial" | "auto" | "full"
+    ) {
         return Err(denied("未知 Codex 权限档位"));
     }
     if matches!(profile, "full" | "auto") {
@@ -69,7 +74,11 @@ fn policy(profile: &str, writable: bool) -> Result<Policy, AdapterError> {
     }
     let interactive = writable && matches!(profile, "ask" | "partial");
     Ok(Policy {
-        sandbox: if writable && profile != "ask" { "workspace-write" } else { "read-only" },
+        sandbox: if writable && profile != "ask" {
+            "workspace-write"
+        } else {
+            "read-only"
+        },
         review: if interactive { "on-request" } else { "never" },
         native: false,
     })
@@ -97,14 +106,16 @@ fn reviewable(method: &str, p: &Value, file_item: Option<&Value>) -> bool {
     match method {
         "item/commandExecution/requestApproval" => {
             p["command"].as_str().is_some_and(|c| !c.is_empty())
-                || p["networkApprovalContext"]["host"].as_str().is_some_and(|h| !h.is_empty())
+                || p["networkApprovalContext"]["host"]
+                    .as_str()
+                    .is_some_and(|h| !h.is_empty())
         }
         "item/fileChange/requestApproval" => file_item
             .and_then(|f| f["changes"].as_array())
             .is_some_and(|c| !c.is_empty()),
-        _ => p["permissions"]
-            .as_object()
-            .is_some_and(|m| !m.is_empty() && m.keys().all(|k| k == "fileSystem" || k == "network")),
+        _ => p["permissions"].as_object().is_some_and(|m| {
+            !m.is_empty() && m.keys().all(|k| k == "fileSystem" || k == "network")
+        }),
     }
 }
 
@@ -124,10 +135,14 @@ fn app_reply(method: &str, p: &Value, yes: bool) -> Value {
         let once = yes
             && p["mode"] == json!("form")
             && p["_meta"]["codex_approval_kind"] == json!("mcp_tool_call")
-            && !p["_meta"]["codex_requires_user_input"].as_bool().unwrap_or(false)
+            && !p["_meta"]["codex_requires_user_input"]
+                .as_bool()
+                .unwrap_or(false)
             && schema["type"] == json!("object")
             && schema.as_object().is_some_and(|s| s.len() == 2)
-            && schema["properties"].as_object().is_some_and(|p| p.is_empty());
+            && schema["properties"]
+                .as_object()
+                .is_some_and(|p| p.is_empty());
         return if once {
             json!({"action": "accept", "content": {}})
         } else {
@@ -173,7 +188,10 @@ fn rpc_error(error: &Value) -> AdapterError {
 }
 
 fn is_tool_item(item: &Value) -> bool {
-    matches!(item["type"].as_str(), Some("commandExecution" | "mcpToolCall" | "fileChange"))
+    matches!(
+        item["type"].as_str(),
+        Some("commandExecution" | "mcpToolCall" | "fileChange")
+    )
 }
 
 impl Adapter for Codex {
@@ -186,7 +204,7 @@ impl Adapter for Codex {
         let customs = custom::snapshot(&self.registry, "codex");
         Box::pin(async move {
             let mut d = discover(&sys, &CancellationToken::new()).await?;
-            custom::merge(&mut d.catalog, &customs, &sys);
+            custom::refresh(&mut d.catalog, &customs, &sys, &CancellationToken::new()).await;
             Ok(Catalog { value: d.catalog })
         })
     }
@@ -214,10 +232,15 @@ async fn run(
 ) -> Result<RunOutcome, AdapterError> {
     crate::images::check(&req)?;
     let perm = policy(&req.profile, req.writable)?;
-    let mut d: Discovery = discover(&sys, &cancel).await.map_err(|e| probe_failed(&e.to_string()))?;
-    custom::merge(&mut d.catalog, &customs, &sys);
+    let mut d: Discovery = discover(&sys, &cancel)
+        .await
+        .map_err(|e| probe_failed(&e.to_string()))?;
+    custom::refresh(&mut d.catalog, &customs, &sys, &cancel).await;
     let s = select(&d.catalog, &req.route)?;
-    let exe = d.exe.clone().ok_or_else(|| route_gone("本机未安装所选原生执行端"))?;
+    let exe = d
+        .exe
+        .clone()
+        .ok_or_else(|| route_gone("本机未安装所选原生执行端"))?;
     let (mut args, settings) = match custom::lookup(&d.catalog, &customs, &s.provider) {
         // `-c` overrides name the key variable; Codex reads the key itself.
         Some(p) => custom::codex_routing(p, d.profile.is_some()),
@@ -241,11 +264,25 @@ async fn run(
         }
         let mut list = args.clone();
         list.extend(["mcp", "list", "--json"].map(String::from));
-        let out = capture(&exe, &list, &req.cwd, &sys, "", Duration::from_secs(25), &cancel).await?;
-        let servers: Value = serde_json::from_str(&out).map_err(|_| protocol("Codex MCP 列表无效"))?;
+        let out = capture(
+            &exe,
+            &list,
+            &req.cwd,
+            &sys,
+            "",
+            Duration::from_secs(25),
+            &cancel,
+        )
+        .await?;
+        let servers: Value =
+            serde_json::from_str(&out).map_err(|_| protocol("Codex MCP 列表无效"))?;
         for server in servers.as_array().into_iter().flatten() {
             let name = server["name"].as_str().unwrap_or_default();
-            if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
+            if name.is_empty()
+                || !name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+            {
                 return Err(denied("MCP 名称无法安全覆盖"));
             }
             args.push("-c".into());
@@ -285,6 +322,7 @@ struct Turn {
     session_id: Option<String>,
     model: String,
     provider: String,
+    reasoning_effort: Option<String>,
     perm: Policy,
     settings: Map<String, Value>,
     host: Arc<dyn TurnHost>,
@@ -337,6 +375,7 @@ impl Turn {
             session_id: req.session_id.clone(),
             model: s.model.clone(),
             provider: s.provider.clone(),
+            reasoning_effort: s.reasoning_effort.clone(),
             perm,
             settings,
             host,
@@ -364,7 +403,10 @@ impl Turn {
     }
 
     async fn drive(&mut self, proc: &mut Proc) -> Result<RunOutcome, AdapterError> {
-        let stdout = proc.stdout.take().ok_or_else(|| protocol("Codex 输出不可读"))?;
+        let stdout = proc
+            .stdout
+            .take()
+            .ok_or_else(|| protocol("Codex 输出不可读"))?;
         let mut lines = Lines::new(stdout);
         let setup = Instant::now() + SETUP_TIMEOUT;
         let mut kill_at: Option<Instant> = None;
@@ -430,16 +472,26 @@ impl Turn {
 
     /// Steer the first pending note into the live turn (CX:141-176).
     async fn poll(&mut self) {
-        let (Some(thread), Some(turn)) = (&self.thread_id, &self.turn_id) else { return };
+        let (Some(thread), Some(turn)) = (&self.thread_id, &self.turn_id) else {
+            return;
+        };
         if !self.poll_notes || self.cancel.is_cancelled() || self.steer.is_some() {
             return;
         }
-        let Some(note) = self.host.pending_notes().into_iter().next() else { return };
+        let Some(note) = self.host.pending_notes().into_iter().next() else {
+            return;
+        };
         let seq = note["seq"].as_i64().unwrap_or_default();
-        let text = format!("Same-ticket update from the named sender:\n{}", serde_json::to_string(&note).unwrap_or_default());
+        let text = format!(
+            "Same-ticket update from the named sender:\n{}",
+            serde_json::to_string(&note).unwrap_or_default()
+        );
         if text.len() > MAX_STEER_BYTES {
             self.poll_notes = false;
-            self.emit.journal("note.deferred", json!({"seq": seq, "reason": "超过实时插入大小"}));
+            self.emit.journal(
+                "note.deferred",
+                json!({"seq": seq, "reason": "超过实时插入大小"}),
+            );
             return;
         }
         let id = format!("steer-{seq}");
@@ -468,7 +520,10 @@ impl Turn {
                 self.host.accept_notes(&[seq]);
             } else {
                 self.poll_notes = false;
-                self.emit.journal("note.deferred", json!({"seq": seq, "reason": "原生轮次未确认收件"}));
+                self.emit.journal(
+                    "note.deferred",
+                    json!({"seq": seq, "reason": "原生轮次未确认收件"}),
+                );
             }
             return Ok(None);
         }
@@ -501,7 +556,11 @@ impl Turn {
                     opts["threadId"] = json!(sid);
                     opts["excludeTurns"] = json!(true);
                 }
-                let method = if self.session_id.is_some() { "thread/resume" } else { "thread/start" };
+                let method = if self.session_id.is_some() {
+                    "thread/resume"
+                } else {
+                    "thread/start"
+                };
                 self.send(json!({"id": 2, "method": method, "params": opts}));
                 return Ok(None);
             }
@@ -513,17 +572,23 @@ impl Turn {
                     || (reviewed
                         && (r["approvalsReviewer"] != json!("user")
                             || r["sandbox"]["networkAccess"] != json!(false)
-                            || r["sandbox"]["writableRoots"].as_array().is_some_and(|w| !w.is_empty())))
+                            || r["sandbox"]["writableRoots"]
+                                .as_array()
+                                .is_some_and(|w| !w.is_empty())))
                 {
                     return Err(denied("Codex 未确认请求的原生权限"));
                 }
-                if r["model"].as_str() != Some(&self.model) || r["modelProvider"].as_str() != Some(&self.provider) {
+                if r["model"].as_str() != Some(&self.model)
+                    || r["modelProvider"].as_str() != Some(&self.provider)
+                {
                     return Err(route_gone("Codex 未采用所选供应商和模型"));
                 }
                 let thread = r["thread"]["id"].as_str().map(str::to_string);
                 match (&thread, &self.session_id) {
                     (None, _) => return Err(session_mismatch("Codex 会话不匹配")),
-                    (Some(t), Some(s)) if t != s => return Err(session_mismatch("Codex 会话不匹配")),
+                    (Some(t), Some(s)) if t != s => {
+                        return Err(session_mismatch("Codex 会话不匹配"));
+                    }
                     _ => {}
                 }
                 let thread = thread.unwrap_or_default();
@@ -545,7 +610,7 @@ impl Turn {
                 self.send(json!({
                     "id": 3,
                     "method": "turn/start",
-                    "params": {"threadId": thread, "input": self.input}
+                    "params": {"threadId": thread, "input": self.input, "effort": self.reasoning_effort}
                 }));
                 return Ok(None);
             }
@@ -557,8 +622,12 @@ impl Turn {
             }
             _ => {}
         }
-        let Some(method) = method else { return Ok(None) };
-        let Some(thread) = self.thread_id.clone() else { return Ok(None) };
+        let Some(method) = method else {
+            return Ok(None);
+        };
+        let Some(thread) = self.thread_id.clone() else {
+            return Ok(None);
+        };
         if p["threadId"].as_str() != Some(&thread) && p["thread"]["id"].as_str() != Some(&thread) {
             return Ok(None);
         }
@@ -575,7 +644,10 @@ impl Turn {
         }
         let item = &p["item"];
         let item_id = item["id"].as_str().unwrap_or_default().to_string();
-        if method == "item/completed" && item["type"] == json!("agentMessage") && self.delta_items.remove(&item_id) {
+        if method == "item/completed"
+            && item["type"] == json!("agentMessage")
+            && self.delta_items.remove(&item_id)
+        {
             self.emit.journal("message.boundary", Value::Null);
         }
         match method.as_str() {
@@ -586,7 +658,10 @@ impl Turn {
             }
             "serverRequest/resolved" => {
                 let key = request_key(&p["requestId"]);
-                self.pending.lock().unwrap_or_else(|e| e.into_inner()).remove(&key);
+                self.pending
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&key);
             }
             "item/started" => {
                 if item["type"] == json!("fileChange") {
@@ -638,7 +713,10 @@ impl Turn {
             && p["threadId"].as_str() == self.thread_id.as_deref()
             && p["turnId"].as_str() == self.turn_id.as_deref()
             && !self.cancel.is_cancelled();
-        if matches!(method, "mcpServer/elicitation/request" | "tool/requestUserInput") {
+        if matches!(
+            method,
+            "mcpServer/elicitation/request" | "tool/requestUserInput"
+        ) {
             self.send(json!({"id": id, "result": app_reply(method, p, self.perm.native && same)}));
             return;
         }
@@ -652,7 +730,11 @@ impl Turn {
         let accept_offered = p["availableDecisions"]
             .as_array()
             .is_none_or(|d| d.iter().any(|x| x == "accept"));
-        let busy = self.pending.lock().unwrap_or_else(|e| e.into_inner()).contains(&key);
+        let busy = self
+            .pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&key);
         if !same
             || item_id.is_empty()
             || busy
@@ -677,7 +759,10 @@ impl Turn {
         if let Some(item) = file_item {
             action["item"] = item;
         }
-        self.pending.lock().unwrap_or_else(|e| e.into_inner()).insert(key.clone());
+        self.pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key.clone());
         let (host, out, live, pending, cancel) = (
             self.host.clone(),
             self.out.clone(),
@@ -688,7 +773,10 @@ impl Turn {
         let (method, p) = (method.to_string(), p.clone());
         tokio::spawn(async move {
             let allow = host.approve(action).await;
-            let still = pending.lock().unwrap_or_else(|e| e.into_inner()).remove(&key);
+            let still = pending
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&key);
             if live.load(Ordering::SeqCst) && still {
                 let _ = out.send(json!({"id": id, "result": decision(&method, &p, allow && !cancel.is_cancelled())}));
             }
@@ -698,14 +786,20 @@ impl Turn {
     /// `finally` (CX:319-332): close stdin, wait briefly, then kill.
     async fn finish(&mut self, proc: &mut Proc) {
         self.live.store(false, Ordering::SeqCst);
-        self.pending.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         if let Some(w) = self.writer.take() {
             w.abort();
             let _ = w.await;
         }
         proc.wait_or_kill(Duration::from_millis(1800)).await;
         if let Some((_, seq)) = self.steer.take() {
-            self.emit.journal("note.deferred", json!({"seq": seq, "reason": "通道结束前未收到回执"}));
+            self.emit.journal(
+                "note.deferred",
+                json!({"seq": seq, "reason": "通道结束前未收到回执"}),
+            );
         }
     }
 }
@@ -731,6 +825,7 @@ const recv = async () => JSON.parse((await lines.next()).value), send = (o) => p
   send({ id: 2, result: { sandbox: { type: 'workspaceWrite', networkAccess: false, writableRoots: [] }, model: 'm', modelProvider: 'p',
     approvalPolicy: 'on-request', approvalsReviewer: 'user', thread: { id: 'thread' } } });
   const turn = await recv();
+  if (turn.params.effort !== 'high') process.exit(8);
   if (turn.params.input[0].text !== 'test' || turn.params.input[1].type !== 'image' ||
       !turn.params.input[1].url.startsWith('data:image/png;base64,') ||
       Buffer.from(turn.params.input[1].url.split(',')[1], 'base64').subarray(1,4).toString() !== 'PNG') process.exit(7);
@@ -792,7 +887,7 @@ const recv = async () => JSON.parse((await lines.next()).value), send = (o) => p
                 base64::engine::general_purpose::STANDARD.decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=").unwrap()
             }).unwrap()],
             cwd: cwd.clone(),
-            route: sa_engine::adapter::Route { provider: "p".into(), model: "m".into(), mode: "cli".into() },
+            route: sa_engine::adapter::Route { provider: "p".into(), model: "m".into(), mode: "cli".into(), reasoning_effort: Some("high".into()) },
             profile: "partial".into(),
             writable: true,
             session_id: None,
@@ -802,7 +897,16 @@ const recv = async () => JSON.parse((await lines.next()).value), send = (o) => p
         let (tx, mut rx) = mpsc::unbounded_channel();
         let out = tokio::time::timeout(
             Duration::from_secs(10),
-            converse(proc, &req, &req.route, perm, Map::new(), host.clone(), Emit(tx), CancellationToken::new()),
+            converse(
+                proc,
+                &req,
+                &req.route,
+                perm,
+                Map::new(),
+                host.clone(),
+                Emit(tx),
+                CancellationToken::new(),
+            ),
         )
         .await
         .expect("turn finished")
@@ -812,19 +916,30 @@ const recv = async () => JSON.parse((await lines.next()).value), send = (o) => p
         assert_eq!(*host.accepted.lock().unwrap(), vec![7]);
         let actions = host.actions.lock().unwrap();
         assert_eq!(actions.len(), 1);
-        assert_eq!(actions[0]["params"]["command"], json!("review this command"));
+        assert_eq!(
+            actions[0]["params"]["command"],
+            json!("review this command")
+        );
         let mut text = vec![];
         let mut session = None;
         while let Ok(ev) = rx.try_recv() {
             match ev {
-                sa_engine::adapter::AdapterEvent::Journal { kind, data } if kind == "delta" || kind == "message.boundary" => {
+                sa_engine::adapter::AdapterEvent::Journal { kind, data }
+                    if kind == "delta" || kind == "message.boundary" =>
+                {
                     text.push((kind, data))
                 }
                 sa_engine::adapter::AdapterEvent::Session(s) => session = Some(s),
                 _ => {}
             }
         }
-        assert_eq!(text, vec![("delta".to_string(), json!(out.text)), ("message.boundary".to_string(), Value::Null)]);
+        assert_eq!(
+            text,
+            vec![
+                ("delta".to_string(), json!(out.text)),
+                ("message.boundary".to_string(), Value::Null)
+            ]
+        );
         assert_eq!(session.as_deref(), Some("thread"));
     }
 
@@ -833,9 +948,15 @@ const recv = async () => JSON.parse((await lines.next()).value), send = (o) => p
         assert!(policy("readonly", true).is_err());
         assert!(policy("full", false).is_err());
         let p = policy("ask", true).unwrap();
-        assert_eq!((p.sandbox, p.review, p.native), ("read-only", "on-request", false));
+        assert_eq!(
+            (p.sandbox, p.review, p.native),
+            ("read-only", "on-request", false)
+        );
         let p = policy("auto", true).unwrap();
-        assert_eq!((p.sandbox, p.review, p.native), ("danger-full-access", "never", true));
+        assert_eq!(
+            (p.sandbox, p.review, p.native),
+            ("danger-full-access", "never", true)
+        );
         let p = policy("legacy", false).unwrap();
         assert_eq!((p.sandbox, p.review), ("read-only", "never"));
     }

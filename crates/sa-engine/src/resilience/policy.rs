@@ -212,6 +212,7 @@ impl Policy {
                     provider: route.provider.clone(),
                     model: route.model.clone(),
                     mode: b.mode.clone(),
+                    reasoning_effort: route.reasoning_effort.clone(),
                 },
                 from,
                 to,
@@ -406,6 +407,7 @@ impl Policy {
                     provider: k.1.clone(),
                     model: k.2.clone(),
                     mode: b.mode.clone(),
+                    reasoning_effort: None,
                 },
                 b.observed(now),
             ));
@@ -416,6 +418,7 @@ impl Policy {
                 provider: k.1.clone(),
                 model: k.2.clone(),
                 mode: b.mode.clone(),
+                reasoning_effort: None,
             };
             Self::record(inner, &k.0, &route, &b, Some(change), now);
         }

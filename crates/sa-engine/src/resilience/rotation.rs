@@ -45,6 +45,7 @@ mod tests {
             provider: p.into(),
             model: m.into(),
             mode: "cli".into(),
+            reasoning_effort: None,
         }
     }
 

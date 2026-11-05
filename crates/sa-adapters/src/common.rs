@@ -4,7 +4,9 @@ use crate::proc::{cancelled, protocol_error};
 use crate::sys::Sys;
 use anyhow::{Context, Result, anyhow, bail};
 use rusqlite::{Connection, OpenFlags};
-use sa_engine::adapter::{AdapterError, AdapterEvent, ErrorClass, EventSink, Route, RunRequest, TurnHost};
+use sa_engine::adapter::{
+    AdapterError, AdapterEvent, ErrorClass, EventSink, Route, RunRequest, TurnHost,
+};
 use sa_engine::resilience::classify::classified;
 use sa_engine::resilience::{CODE_ROUTE_NOT_CONFIGURED, CODE_ROUTE_PROBE_FAILED};
 use serde_json::{Map, Value, json};
@@ -22,16 +24,25 @@ fn with_message(mut e: AdapterError, message: impl Into<String>) -> AdapterError
 
 /// The selected provider/model is gone from the configuration (permanent).
 pub fn route_gone(message: &str) -> AdapterError {
-    with_message(classified(ErrorClass::RouteUnavailable, CODE_ROUTE_NOT_CONFIGURED), message)
+    with_message(
+        classified(ErrorClass::RouteUnavailable, CODE_ROUTE_NOT_CONFIGURED),
+        message,
+    )
 }
 
 /// Discovery failed transiently (retryable).
 pub fn probe_failed(message: &str) -> AdapterError {
-    with_message(classified(ErrorClass::RouteUnavailable, CODE_ROUTE_PROBE_FAILED), message)
+    with_message(
+        classified(ErrorClass::RouteUnavailable, CODE_ROUTE_PROBE_FAILED),
+        message,
+    )
 }
 
 pub fn denied(message: &str) -> AdapterError {
-    with_message(classified(ErrorClass::Permission, "permission:denied"), message)
+    with_message(
+        classified(ErrorClass::Permission, "permission:denied"),
+        message,
+    )
 }
 
 pub fn protocol(message: &str) -> AdapterError {
@@ -39,7 +50,10 @@ pub fn protocol(message: &str) -> AdapterError {
 }
 
 pub fn session_mismatch(message: &str) -> AdapterError {
-    with_message(classified(ErrorClass::SessionMismatch, "session:mismatch"), message)
+    with_message(
+        classified(ErrorClass::SessionMismatch, "session:mismatch"),
+        message,
+    )
 }
 
 /// Adapter-side event sink.
@@ -76,14 +90,20 @@ impl Emit {
 pub fn read_json(path: &Path, fallback: Value) -> Result<Value> {
     match std::fs::read(path) {
         Ok(bytes) => {
-            let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-            let text = String::from_utf8(bytes).map_err(|_| anyhow!("本地 JSON 配置无法读取：{name}"))?;
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let text =
+                String::from_utf8(bytes).map_err(|_| anyhow!("本地 JSON 配置无法读取：{name}"))?;
             serde_json::from_str(&text).map_err(|_| anyhow!("本地 JSON 配置无法读取：{name}"))
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(fallback),
         Err(_) => bail!(
             "本地 JSON 配置无法读取：{}",
-            path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
+            path.file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default()
         ),
     }
 }
@@ -121,7 +141,9 @@ pub fn cc_watch_paths(sys: &Sys) -> Vec<PathBuf> {
         .filter(|s| !s.is_empty())
         .map(PathBuf::from);
     if over.as_ref().is_none_or(|p| p.is_absolute()) {
-        let db = over.unwrap_or_else(|| sys.home.join(".cc-switch")).join("cc-switch.db");
+        let db = over
+            .unwrap_or_else(|| sys.home.join(".cc-switch"))
+            .join("cc-switch.db");
         paths.push(db.with_file_name("cc-switch.db-wal"));
         paths.insert(1, db);
     }
@@ -134,8 +156,11 @@ pub fn cc_rows(sys: &Sys, apps: &[&str]) -> Result<Vec<Map<String, Value>>> {
     if !file.is_file() {
         return Ok(vec![]);
     }
-    let db = Connection::open_with_flags(&file, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX)
-        .context("CC Switch 数据库无法打开")?;
+    let db = Connection::open_with_flags(
+        &file,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .context("CC Switch 数据库无法打开")?;
     db.busy_timeout(Duration::from_millis(2000))?;
     let cols: Vec<String> = db
         .prepare("PRAGMA table_info(providers)")?
@@ -143,7 +168,13 @@ pub fn cc_rows(sys: &Sys, apps: &[&str]) -> Result<Vec<Map<String, Value>>> {
         .collect::<rusqlite::Result<_>>()?;
     let optional: Vec<String> = ["meta", "category"]
         .iter()
-        .map(|c| if cols.iter().any(|x| x == c) { c.to_string() } else { format!("NULL AS {c}") })
+        .map(|c| {
+            if cols.iter().any(|x| x == c) {
+                c.to_string()
+            } else {
+                format!("NULL AS {c}")
+            }
+        })
         .collect();
     let marks = vec!["?"; apps.len()].join(",");
     let sql = format!(
@@ -186,7 +217,10 @@ pub fn fingerprint(prefix: &str, parts: &[Value]) -> String {
             out
         })
         .collect();
-    let digest = format!("{:x}", Sha256::digest(format!("[{}]", ascii.join(", ")).as_bytes()));
+    let digest = format!(
+        "{:x}",
+        Sha256::digest(format!("[{}]", ascii.join(", ")).as_bytes())
+    );
     format!("{prefix}{}", &digest[..24])
 }
 
@@ -235,7 +269,11 @@ static HTTP: LazyLock<ureq::Agent> = LazyLock::new(|| {
 
 /// `getJSON(url, headers)` (AC:124-151): https, or http on a loopback host;
 /// direct connection, no redirects, 3.5 s, 1 MiB.
-pub async fn get_json(url: &str, headers: &[(String, String)], cancel: &CancellationToken) -> Result<Value> {
+pub async fn get_json(
+    url: &str,
+    headers: &[(String, String)],
+    cancel: &CancellationToken,
+) -> Result<Value> {
     get_json_with(url, headers, CATALOG_TIMEOUT, CATALOG_LIMIT, cancel).await
 }
 
@@ -316,7 +354,10 @@ pub async fn scope(
     writer: bool,
 ) -> Result<&'static str, AdapterError> {
     let profile = req.profile.as_str();
-    if !matches!(profile, "legacy" | "readonly" | "ask" | "partial" | "full" | "auto") {
+    if !matches!(
+        profile,
+        "legacy" | "readonly" | "ask" | "partial" | "full" | "auto"
+    ) {
         return Err(denied("未知权限档位"));
     }
     if cancel.is_cancelled() {
@@ -355,9 +396,10 @@ pub async fn scope(
 /// `select(catalog, request)` (AC:347-361).
 pub fn select(catalog: &Value, request: &Route) -> Result<Route, AdapterError> {
     let mode_ok = request.mode == "cli"
-        && catalog["modes"]
-            .as_array()
-            .is_some_and(|m| m.iter().any(|m| m["id"] == json!(request.mode) && m["available"] == json!(true)));
+        && catalog["modes"].as_array().is_some_and(|m| {
+            m.iter()
+                .any(|m| m["id"] == json!(request.mode) && m["available"] == json!(true))
+        });
     if !mode_ok {
         return Err(route_gone("所选执行端不可自动执行"));
     }
@@ -366,12 +408,21 @@ pub fn select(catalog: &Value, request: &Route) -> Result<Route, AdapterError> {
             .find(|p| p["id"] == json!(request.provider) && p["available"] != json!(false))
     });
     let listed = provider.is_some_and(|p| {
-        p["models"]
-            .as_array()
-            .is_some_and(|ms| ms.iter().any(|m| m["id"] == json!(request.model) && m["available"] != json!(false)))
+        p["models"].as_array().is_some_and(|ms| {
+            ms.iter()
+                .any(|m| m["id"] == json!(request.model) && m["available"] != json!(false))
+        })
     });
     if !listed {
         return Err(route_gone("已选供应商或模型失效，请刷新配置"));
+    }
+    if let Some(effort) = &request.reasoning_effort {
+        let model = provider
+            .and_then(|p| p["models"].as_array())
+            .and_then(|ms| ms.iter().find(|m| m["id"] == request.model));
+        if model.is_none_or(|m| !crate::catalog::efforts(m).contains(effort)) {
+            return Err(route_gone("所选模型未声明支持该思考强度，请刷新模型目录"));
+        }
     }
     Ok(request.clone())
 }

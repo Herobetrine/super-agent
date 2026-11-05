@@ -1,10 +1,10 @@
 # Codex
 
-安装并登录本机 Codex CLI，先在终端检查 `codex --version`，再打开控制台 **连接与诊断**。Windows 适配器使用原生可执行文件，通过 stdio 与 app-server 通信。[安装 CLI](https://developers.openai.com/codex/cli/) · [app-server 协议](https://developers.openai.com/codex/app-server)
+安装并登录本机 Codex CLI，先在终端检查 `codex --version`，再打开 **模型与执行端**。Windows 适配器使用原生可执行文件，通过 stdio 与 app-server 通信。[安装 CLI](https://developers.openai.com/codex/cli/) · [app-server 协议](https://developers.openai.com/codex/app-server)
 
 ## 供应商与会话
 
-模型选项来自本机使用的配置、profiles、模型缓存和可用的原生模型清单。控制台区分跟随原生默认和显式固定组合。正在执行的任务沿用启动时的选择，选择发生变化时需在新轮次重新解析。桌面客户端的交互界面与这里使用的 app-server 执行入口分开展示。
+模型选项按当前来源读取。显式 `base_url` 使用该来源的配对认证在线获取模型并处理分页；配置缺少端点时由 Codex CLI 解析登录来源和原生目录。显式 `model_catalog_json` 继续使用指定文件。目录保留模型声明的 `supported_reasoning_levels` 并传到界面的思考强度选择，执行时通过 `turn/start.effort` 交给 app-server。目录失败时标注当前列表的范围。正在执行的任务沿用启动时的选择。
 
 输入发送到指定的原生 thread 和 turn。恢复会话需收到匹配的线程标识；派工期间可给活动任务投递信件，平台以原生 steering 回执记录轮内接受。连接中断后未确认的消息进入后续轮次。即使已经收到协议回执，模型是否实际采用消息仍应检查其输出。
 

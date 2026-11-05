@@ -183,6 +183,18 @@ impl Q<'_> {
             .ok_or_else(|| anyhow!("工单不存在"))
     }
 
+    /// Caller supplies a transaction so policy and manual routes can be
+    /// saved atomically. Applies to subsequent collaborator dispatches.
+    pub fn set_lead_routing(&self, ticket: i64, enabled: bool) -> Result<()> {
+        let root = self.root(ticket)?;
+        let current = self.int("SELECT allow_lead_routing FROM tickets WHERE id=?", &[&ticket])? != 0;
+        if current != enabled {
+            self.run("UPDATE tickets SET allow_lead_routing=? WHERE id=?", &[&(enabled as i64), &ticket])?;
+            self.log(who_of(&root), "lead_routing.changed", &json!({"enabled": enabled}))?;
+        }
+        Ok(())
+    }
+
     /// A `user.follow` exists in the ticket after `admission`.
     pub fn followed_after(&self, ticket: i64, admission: i64) -> Result<bool> {
         self.exists(

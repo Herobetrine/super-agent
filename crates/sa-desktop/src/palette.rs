@@ -111,7 +111,7 @@ impl App {
         if writable {
             rows.push(row(Command::Models, icon::SLIDERS_HORIZONTAL, "模型与执行端 · 新会话默认", "Ctrl Shift M"));
             rows.push(row(Command::Extensions, icon::PUZZLE_PIECE, "MCP 与技能 · 新会话默认", ""));
-            rows.push(row(Command::Providers, icon::PLUGS, "供应商与轮换", ""));
+            rows.push(row(Command::Providers, icon::PLUGS, "自定义供应商与轮换", "添加或管理 API 端点"));
             rows.push(row(Command::Attach, icon::PAPERCLIP, "附加项目文件", ""));
             if ticket.is_none() {
                 rows.push(row(Command::Project, icon::FOLDER_SIMPLE, "选择项目目录", ""));

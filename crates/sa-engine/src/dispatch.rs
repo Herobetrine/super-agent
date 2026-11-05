@@ -214,9 +214,11 @@ fn check(q: &Q, turn: &Turn, cmd: &Value) -> Result<Option<Child>> {
     let id = o["id"].as_str().unwrap_or_default();
     let body = o["body"].as_str().unwrap_or_default();
     let has_model = o.contains_key("model");
+    let has_effort = o.contains_key("reasoning_effort");
     let has_profile = o.contains_key("permission_profile");
-    if (has_model || has_profile) && (job.parent.is_some() || !job.allow_lead_routing) {
-        return Err(anyhow!("只有获授权的主控可指定子任务模型和权限"));
+    let routing = q.int("SELECT allow_lead_routing FROM tickets WHERE id=?", &[&job.ticket])? != 0;
+    if (has_model || has_effort || has_profile) && (job.parent.is_some() || !routing) {
+        return Err(anyhow!("只有当前获授权的主控可指定子任务模型、思考强度和权限"));
     }
     let requested = o.get("permission_profile").and_then(Value::as_str);
     if has_profile && !requested.is_some_and(|r| p::child_profiles(&job.profile).contains(&r)) {
@@ -225,7 +227,19 @@ fn check(q: &Q, turn: &Turn, cmd: &Value) -> Result<Option<Child>> {
     if has_model && !p::ident(o.get("model")) {
         return Err(anyhow!("模型标识无效"));
     }
-    let model = o.get("model").and_then(Value::as_str);
+    if has_effort && !p::ident(o.get("reasoning_effort")) {
+        return Err(anyhow!("思考强度无效"));
+    }
+    let effort = o.get("reasoning_effort").and_then(Value::as_str);
+    let default_model = if has_effort && !has_model {
+        turn.menus().get(to).and_then(|menu| menu["default_model"].as_str()).map(str::to_string)
+    } else {
+        None
+    };
+    let model = o.get("model").and_then(Value::as_str).or(default_model.as_deref());
+    if has_effort && model.is_none() {
+        return Err(anyhow!("所选执行端没有可用模型目录"));
+    }
     let override_ = if has_profile {
         requested.map(str::to_string)
     } else {
@@ -248,17 +262,19 @@ fn check(q: &Q, turn: &Turn, cmd: &Value) -> Result<Option<Child>> {
                 .collect(),
             None => vec![],
         };
-        let old_model = old
+        let old_route = old
             .get("route_override")
             .and_then(Value::as_str)
-            .and_then(|r| serde_json::from_str::<Value>(r).ok())
-            .and_then(|r| r.get("model").and_then(Value::as_str).map(str::to_string));
+            .and_then(|r| serde_json::from_str::<Value>(r).ok());
+        let old_model = old_route.as_ref().and_then(|route| route["model"].as_str());
+        let old_effort = old_route.as_ref().and_then(|route| route["reasoning_effort"].as_str());
         let old_override = old.get("permission_override").and_then(Value::as_str);
         if str_of(&old, "agent") != to
             || str_of(&old, "body") != body
             || (old["writing"].as_i64().unwrap_or(0) != 0) != write
             || str_of(&old, "assigned_role") != role
-            || old_model.as_deref() != model
+            || old_model != model
+            || old_effort != effort
             || old_override != override_.as_deref()
             || stringify(&files_value) != stringify(&Value::Array(names))
         {
@@ -278,7 +294,15 @@ fn check(q: &Q, turn: &Turn, cmd: &Value) -> Result<Option<Child>> {
             return Err(anyhow!("所选模型不在此任务的供应商和执行端目录"));
         }
         let menu = menu.cloned().unwrap_or(Value::Null);
-        let picked = json!({"provider": menu["provider"], "mode": menu["mode"], "model": model});
+        let mut picked = json!({"provider": menu["provider"], "mode": menu["mode"], "model": model});
+        if let Some(effort) = effort {
+            let supported = menu["reasoning_efforts"][model].as_array()
+                .is_some_and(|values| values.iter().any(|value| value.as_str() == Some(effort)));
+            if !supported {
+                return Err(anyhow!("所选模型未声明支持该思考强度，请从模型目录选择"));
+            }
+            picked["reasoning_effort"] = json!(effort);
+        }
         let route = p::route(Some(&picked)).map_err(|e| anyhow!(e))?;
         let pinned: Value = serde_json::from_str(&job.agent_routes).unwrap_or(Value::Null);
         if let Some(pinned) = pinned.get(to).filter(|v| p::truthy_value(v))
