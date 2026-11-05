@@ -954,6 +954,7 @@ impl DataSource for DemoSource {
             jobs,
             total_jobs,
             native_activity: t.native.clone(),
+            usage: Default::default(),
             events,
             cursor: cursor.max(after),
             approvals: t.approvals.clone(),

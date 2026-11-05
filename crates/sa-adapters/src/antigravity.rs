@@ -300,6 +300,7 @@ async fn run(
     emit: Emit,
     cancel: CancellationToken,
 ) -> Result<RunOutcome, AdapterError> {
+    crate::images::check(&req)?;
     let boundary = scope("antigravity", &req, &host, &cancel, false).await?;
     let d = discover(&sys, &cancel).await.map_err(|e| {
         if e.class == ErrorClass::Cancelled { e } else { probe_failed(&e.message) }

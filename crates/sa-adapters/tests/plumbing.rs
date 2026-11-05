@@ -77,6 +77,7 @@ fn request(profile: &str, writable: bool) -> RunRequest {
         turn: 1,
         agent: "deepseek".into(),
         prompt: "p".into(),
+        images: vec![],
         cwd: std::env::current_dir().unwrap(),
         route: Route { provider: "p".into(), model: "m".into(), mode: "cli".into() },
         profile: profile.into(),

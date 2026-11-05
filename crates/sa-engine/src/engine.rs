@@ -495,6 +495,39 @@ impl Engine {
 
     /// `follow({ticket, body, resume})` (S:175-203); returns the event seq.
     pub fn follow(&self, ticket: i64, body: &str, resume: bool) -> Result<i64> {
+        self.follow_snapshot(ticket, body, resume, &[])
+    }
+
+    /// Add immutable attachments to a root follow-up. New images replace the
+    /// current image set; text attachments replace matching names. An empty
+    /// list preserves existing attachments, like `follow`.
+    pub async fn follow_with_files(&self, ticket: i64, body: &str, resume: bool, files: &[String]) -> Result<i64> {
+        if !p::valid_str(body, usize::MAX) {
+            bail!("追加指令为空");
+        }
+        if files.is_empty() {
+            return self.follow(ticket, body, resume);
+        }
+        let cwd = self.inner.db.with(|q| {
+            let root = q.root(ticket)?;
+            if files.iter().any(|name| crate::images::is_image_name(name))
+                && !crate::images::supports_native_images(str_of(&root, "agent"))
+            {
+                bail!(crate::images::UNSUPPORTED);
+            }
+            q.one("SELECT cwd FROM tickets WHERE id=?", &[&ticket])?
+                .map(|row| str_of(&row, "cwd").to_string())
+                .ok_or_else(|| anyhow::anyhow!("工单不存在"))
+        })?;
+        let manifest = self.inner.snapshot(&cwd, files).await?;
+        let validation = Value::Array(manifest.clone());
+        let directory = self.inner.data_dir.join("objects");
+        let _ = tokio::task::spawn_blocking(move || crate::images::from_manifest(&validation, &directory))
+            .await??;
+        self.follow_snapshot(ticket, body, resume, &manifest)
+    }
+
+    fn follow_snapshot(&self, ticket: i64, body: &str, resume: bool, additions: &[Value]) -> Result<i64> {
         if !p::valid_str(body, usize::MAX) {
             bail!("追加指令为空");
         }
@@ -509,6 +542,28 @@ impl Engine {
                 bail!("停止的工单需要明确恢复");
             }
             let id = int_of(&root, "id");
+            if !additions.is_empty() {
+                let new_images = additions.iter().any(|file| file["name"].as_str().is_some_and(crate::images::is_image_name));
+                if new_images && !crate::images::supports_native_images(str_of(&root, "agent")) {
+                    bail!(crate::images::UNSUPPORTED);
+                }
+                let mut manifest = q.one("SELECT manifest FROM job_files WHERE job=?", &[&id])?
+                    .and_then(|row| parse(Some(str_of(&row, "manifest"))).as_array().cloned())
+                    .unwrap_or_default();
+                manifest.retain(|old| {
+                    !(new_images && old["name"].as_str().is_some_and(crate::images::is_image_name))
+                        && !additions.iter().any(|new| new["name"] == old["name"])
+                });
+                manifest.extend_from_slice(additions);
+                if manifest.len() > 16
+                    || manifest.iter().try_fold(0u64, |sum, file| sum.checked_add(file["bytes"].as_u64()?))
+                        .is_none_or(|bytes| bytes > 64 * 1024 * 1024)
+                {
+                    bail!("当前附件最多 16 个文件，总量不得超过 64 MiB");
+                }
+                q.run("INSERT OR REPLACE INTO job_files(job,manifest) VALUES(?,?)", &[&id, &stringify(&json!(manifest))])?;
+                q.log(who_of(&root), "files", &json!(manifest))?;
+            }
             let seq = q.log(who_of(&root), "user.follow", &json!(body))?;
             if cont {
                 q.run(
@@ -1100,6 +1155,13 @@ impl Inner {
             guide.push_str(guides::REROUTE);
         }
         *turn.packet() = packet.clone();
+        let manifest = packet.get("files").cloned().unwrap_or(Value::Null);
+        let objects = self.data_dir.join("objects");
+        let images = tokio::task::spawn_blocking(move || crate::images::from_manifest(&manifest, &objects))
+            .await.map_err(|_| anyhow!("图片校验任务异常"))??;
+        if !images.is_empty() && !crate::images::supports_native_images(&job.agent) {
+            return Err(anyhow!(crate::images::UNSUPPORTED).into());
+        }
         let mut prompt = format!("{guide}\n{}", stringify(&Value::Object(packet.clone())));
         if prompt.len() > MAX_PROMPT_BYTES {
             packet = context::compact(&packet, &guide, &self.data_dir, MAX_PROMPT_BYTES)?;
@@ -1131,6 +1193,7 @@ impl Inner {
             turn: job.turn,
             agent: job.agent.clone(),
             prompt,
+            images,
             cwd: PathBuf::from(&job.cwd),
             route: route.clone(),
             profile: if job.profile == "legacy" {
@@ -1667,13 +1730,23 @@ impl Inner {
                 _ => None,
             });
         let health = self.opts.runner.health();
+        let manifest = q
+            .one("SELECT manifest FROM job_files WHERE job=?", &[&job.id])?
+            .map(|m| parse(Some(str_of(&m, "manifest"))))
+            .unwrap_or_else(|| json!([]));
+        let needs_images = manifest.as_array().is_some_and(|files| {
+            files.iter().any(|file| file["name"].as_str().is_some_and(crate::images::is_image_name))
+        });
         let blocked = |agent: &str, route: Option<&Route>| {
             health.iter().any(|(a, r, h)| {
                 a == agent && matches!(h, Health::Open | Health::HalfOpen) && route.is_none_or(|x| x == r)
             })
         };
         let target = AGENTS.into_iter().find(|agent| {
-            if tried.iter().any(|t| t == agent) || !self.adapters.contains_key(*agent) {
+            if tried.iter().any(|t| t == agent)
+                || !self.adapters.contains_key(*agent)
+                || (needs_images && !crate::images::supports_native_images(agent))
+            {
                 return false;
             }
             let Some(menus) = &menus else { return !blocked(agent, None) };
@@ -1717,10 +1790,6 @@ impl Inner {
             "INSERT INTO job_files(job,manifest) SELECT ?,manifest FROM job_files WHERE job=?",
             &[&sibling, &job.id],
         )?;
-        let manifest = q
-            .one("SELECT manifest FROM job_files WHERE job=?", &[&job.id])?
-            .map(|m| parse(Some(str_of(&m, "manifest"))))
-            .unwrap_or_else(|| json!([]));
         q.log(
             who_of(&parent_row),
             "send",

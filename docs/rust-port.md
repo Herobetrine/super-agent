@@ -41,7 +41,7 @@ scripts\cargo.cmd run -p sa-desktop --release -- --demo
 
 工单库独占：`sa_engine::owner::claim` 对 `desktop.lock` 加排他文件锁（与 Electron broker 同一个锁文件），并把进程放入 Windows 作业对象（`KILL_ON_JOB_CLOSE`），窗口退出时执行端子进程随之结束。
 
-`SA_CANCEL`（上级取消直属子任务）、只读子任务自动改派（每张工单可开关）和按内存活动推算的实时徽标（`Engine::activity`）已实现，见 spec §9.2 F/G。尚未实现：令牌用量统计（执行端目前不记录用量字段）。
+`SA_CANCEL`（上级取消直属子任务）、只读子任务自动改派（每张工单可开关）和按内存活动推算的实时徽标（`Engine::activity`）已实现，见 spec §9.2 F/G。令牌用量通过 `sa-store::usage` 从原生事件增量投影，按执行端分别处理累计值和单次调用值。
 
 自动改派开关在实际改派事务中读取，运行中开启或关闭都会影响该任务下一次失败后的处理；已经完成的改派不撤回。回归测试分别覆盖运行中开启和关闭，不用入场时的旧开关值替代当前设置。
 
@@ -94,6 +94,10 @@ powershell -File Install-Desktop.ps1              # 桌面快捷方式指向 Rus
 | 会话重命名、置顶、归档 | 侧栏右键菜单 |
 | 复制回复、导出对话为 Markdown | 回复标题栏、顶栏导出菜单 |
 | 工单完成或新审批时任务栏闪烁提醒 | 窗口在后台时 |
+| 执行端已报告令牌用量，按任务展开 | 顶栏“用量” |
+| Windows 原生通知与点击返回工单 | 后台结束/审批提醒，侧栏铃铛开关 |
+| 逐文件差异、按内容版本审阅、最近检查点对比 | 项目面板“变更” |
+| Codex/Claude 原生图片输入及后续消息补图 | 输入区附件、拖放、粘贴 |
 
 自定义供应商只保存密钥所在环境变量的名字；各执行端如何接入见 `crates/sa-adapters/PROVIDERS.md`。轮换开启后，引擎的 `ResilientRunner` 在认证、额度、限流、过载或供应商不可用时按运营方顺序改用下一条路由（`route.rotated`），换路由后不续接原会话。
 
@@ -123,8 +127,17 @@ Rust 窗口已替代 Electron 工作台；`Install-Desktop.ps1` 把桌面快捷�
 
 ## 后续功能与验收边界
 
-Claude 于 2026-11-05 交接时列出的后续功能仍未实现：令牌用量统计、操作系统 toast 通知、逐文件 diff 审阅与检查点、把图片作为原生多模态输入交给执行端。目前通知使用任务栏闪烁，粘贴图片会保存为 PNG 附件；这不等同于原生图片输入。
+Claude 于 2026-11-05 交接的四项后续功能已接入，具体范围如下。
+
+- **令牌用量**从已保存的 native 事件只读投影，每次扫描最多 256 行，单条解析上限 256 KiB。Codex 按线程累计增量去重，缺基线与乱序值标记部分统计。Claude 按本轮主循环计数，内部子任务范围单列。DSH 按会话/轮次/步骤去重并归一化缓存桶。Antigravity 用会话终态累计值替代已计步骤。字段缺失保持未知，统计范围覆盖工单全任务，明细随当前分页显示。协议核对使用 Codex 0.166.0、Claude 2.1.317、DSH 0.2.1-rc.5、agy 1.5.0。
+- **Windows 通知**使用现有 windows-rs 0.62.2，后台线程持有 WinRT 对象，首次发送登记应用通知身份与专属开始菜单链接。审批轮询覆盖当前库的全部待审批工单，结束提醒沿会话历史检测状态变化。通知只带工单号和状态。关闭通知会取消排队项，退出工作台会收回本进程的通知。点击回执通过通道回到 UI 并选中工单。Windows 显示策略仍生效。
+- **逐文件审阅与检查点**使用 Git porcelain v2、NUL 分隔和 literal pathspecs。暂存、工作区、未跟踪及检查点比较分别显示，中文路径可读，二进制和截断有专门提示。审阅标记绑定内容摘要，仅保留在当前窗口。每项目最近检查点保存于应用数据的 `review/`，覆盖 tracked 与未忽略 untracked，包括清洁文件，上限 10000 路径、单文件 4 MiB、总量 64 MiB。两次完整扫描一致后原子发布清单，重开可继续比较。检查点用于捕获与对比，恢复文件功能留待后续实现。
+- **原生图片**经附件快照校验 SHA-256、长度、对象目录、PNG/JPEG 真实格式与解码尺寸，再传入 Codex image/data URL 或 Claude base64 image block。每轮最多 4 张、每张 5 MiB、合计 16 MiB、单边 8192 像素、总计 1600 万像素。初始消息、SA_SEND 与主控后续消息可携图，新图替换当前附加图片集，同名文本附件更新。当前原生会话保留此前对话上下文。DeepSeek/Antigravity 的未接入能力会明确反馈，自动改派只选择已支持图片的执行端。
+
+协议来源采用官方文档及已安装版本的 schema/源码。[Codex App Server](https://learn.chatgpt.com/docs/app-server) · [Claude 用量](https://code.claude.com/docs/en/agent-sdk/cost-tracking) · [Claude 流式图片](https://code.claude.com/docs/en/agent-sdk/streaming-vs-single-mode) · [Antigravity headless](https://antigravity.google/docs/cli/headless/) · [DSH](https://github.com/deepseek-ai/deepseek-harness) · [Git status](https://git-scm.com/docs/git-status) · [Windows 通知](https://learn.microsoft.com/en-us/windows/win32/shell/quickstart-sending-desktop-toast)
 
 `SA_CANCEL`、只读自动改派和实时活动徽标目前有假执行端回归，新增加的运行中开关测试也属于离线验证，尚未进行这批功能的真实模型联测。界面 IME 自动测试验证 egui 事件与焦点处理，不能代替在 Windows 输入法中的人工验收。
 
 接续验证（2026-11-05）：`build --workspace`、`test --workspace` 和 `clippy --workspace --all-targets` 全部成功，Clippy 无警告。测试器报告 201 项通过、1 项显式忽略；其中 9 项依赖环境开关的真实目录/模型、旧库或剪贴板检查在未设置开关时提前返回，本次未执行这些检查。新增 5 项回归实际执行通过：运行中开启/关闭改派、文件菜单失焦、正常键盘选择、多帧 IME 确认/取消与发送。重建后的调试程序在演示数据和独立空库上渲染截图并正常退出；已查看两张截图。未替换 release 安装或进行 Windows 输入法人工验收。本机证据保存在用户数据目录 `checks/codex-rust-handoff-20261105/`，不提交私有日志。
+
+后续功能验证（同日）：workspace build/test 和 Clippy 通过，报告 237 passed、2 ignored，Clippy 无警告。9 项环境门禁检查仍提前返回，真实模型调用另行验证。Windows 通知历史测试单独以 `--ignored` 执行通过，临时 AUMID/快捷方式随测试清理。通过真实窗口点击验证用量弹窗、检查点保存、修改后对比及已审阅标记，观察到正确的合成计数与差异。release 重建并以演示模式渲染截图后退出，桌面快捷方式已更新。通知点击导航、真实模型视觉理解及人工输入法验收仍待单独确认。证据位于用户数据目录 `checks/rust-followups-20261105/`。

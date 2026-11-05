@@ -32,7 +32,7 @@ pub enum Confirm {
     /// Switch the draft permission to `full` or `auto`.
     Profile(String),
     /// Resume a stopped continuous ticket with a new instruction.
-    Resume { ticket: i64, body: String },
+    Resume { ticket: i64, body: String, files: Vec<String> },
 }
 
 pub struct Composer {
@@ -57,6 +57,8 @@ pub struct Composer {
     pub extensions: Option<serde_json::Value>,
     /// Body of the last submitted create/follow/note (cleared on success).
     last_body: Option<String>,
+    last_attachments: Option<Vec<String>>,
+    last_create_context: Option<(u64, Option<PathBuf>)>,
     last_plan: Option<String>,
     pub focus: bool,
     /// When the current message first appeared (success notices fade out).
@@ -91,6 +93,8 @@ impl Composer {
             routes: None,
             extensions: None,
             last_body: None,
+            last_attachments: None,
+            last_create_context: None,
             last_plan: None,
             focus: false,
             shown: None,
@@ -218,6 +222,12 @@ impl App {
             Action::PlanAdd { body, .. } => self.composer.last_plan = Some(body.clone()),
             _ => {}
         }
+        if let Action::Create { files, .. } | Action::Follow { files, .. } = &action {
+            self.composer.last_attachments = Some(files.clone());
+        }
+        if let Action::Create { cwd, .. } = &action {
+            self.composer.last_create_context = Some((self.epoch, cwd.clone()));
+        }
         if host.submit(action) {
             self.composer.pending += 1;
             self.composer.message = None;
@@ -265,15 +275,24 @@ impl App {
         for o in outcomes {
             self.composer.pending = self.composer.pending.saturating_sub(1);
             let ok = o.result.is_ok();
-            let sent = ok && matches!(o.kind, ActionKind::Create | ActionKind::Follow | ActionKind::Note);
+            let same_create_context = self.composer.last_create_context.as_ref()
+                .is_some_and(|(epoch, project)| *epoch == self.epoch && project == &self.composer.project);
+            let sent = ok && matches!(o.kind, ActionKind::Create | ActionKind::Follow | ActionKind::Note)
+                && (o.kind != ActionKind::Create || same_create_context);
             if sent && self.composer.last_body.as_deref() == Some(self.composer.draft.as_str()) {
                 self.composer.draft.clear();
             }
+            if sent && matches!(o.kind, ActionKind::Create | ActionKind::Follow)
+                && self.composer.last_attachments.as_ref() == Some(&self.composer.attachments)
+            {
+                self.composer.attachments.clear();
+            }
             match (o.kind, o.result) {
                 (ActionKind::Create, Ok(id)) => {
-                    self.composer.attachments.clear();
-                    if let Some(id) = id {
+                    if let Some(id) = id && same_create_context {
+                        let unsent = std::mem::take(&mut self.composer.attachments);
                         self.select(Some(id));
+                        self.composer.attachments = unsent;
                     }
                 }
                 (ActionKind::Note, Ok(_)) => {
@@ -311,6 +330,17 @@ impl App {
         if body.trim().is_empty() || self.composer.pending > 0 || !cur.loaded {
             return;
         }
+        if self.composer.target.is_some() && !self.composer.attachments.is_empty() {
+            self.composer.message = Some(("请将附件发给主控，或先移除附件再发送定向留言".into(), true));
+            return;
+        }
+        let lead = if cur.ticket.is_some() { &cur.lead } else { &self.composer.lead };
+        if self.composer.attachments.iter().any(|path| sa_engine::images::is_image_name(path))
+            && !sa_engine::images::supports_native_images(lead)
+        {
+            self.composer.message = Some((sa_engine::images::UNSUPPORTED.into(), true));
+            return;
+        }
         let action = match cur.ticket {
             None => Action::Create {
                 goal: body,
@@ -329,13 +359,14 @@ impl App {
                     body,
                 },
                 None if cur.stopped() => {
-                    self.composer.confirm = Some(Confirm::Resume { ticket, body });
+                    self.composer.confirm = Some(Confirm::Resume { ticket, body, files: self.composer.attachments.clone() });
                     return;
                 }
                 None => Action::Follow {
                     ticket,
                     body,
                     resume: false,
+                    files: self.composer.attachments.clone(),
                 },
             },
         };
@@ -380,8 +411,8 @@ impl App {
     }
 
     /// Ctrl+V with an image on the clipboard: save it into the project and
-    /// attach it (new conversation) or insert its path (follow-up).
-    fn paste_image(&mut self, fixed: bool, root: Option<&std::path::Path>) {
+    /// attach it to the next message.
+    fn paste_image(&mut self, root: Option<&std::path::Path>) {
         let Some(root) = root else {
             if arboard::Clipboard::new().is_ok_and(|mut c| c.get_image().is_ok()) {
                 self.composer.message = Some(("粘贴图片前请先选择项目目录".into(), true));
@@ -390,14 +421,11 @@ impl App {
         };
         match crate::files::paste_image(root) {
             Ok(Some(rel)) => {
-                if fixed {
-                    if !self.composer.draft.is_empty() && !self.composer.draft.ends_with(char::is_whitespace) {
-                        self.composer.draft.push(' ');
-                    }
-                    self.composer.draft.push_str(&rel);
-                    self.composer.draft.push(' ');
-                } else if self.composer.attachments.len() < MAX_ATTACHMENTS {
+                if self.composer.attachments.len() < MAX_ATTACHMENTS {
                     self.composer.attachments.push(rel.clone());
+                } else {
+                    self.composer.message = Some((format!("图片已保存为 {rel}，单次最多附加 16 个文件"), true));
+                    return;
                 }
                 self.composer.message = Some((format!("已保存粘贴的图片：{rel}"), false));
             }
@@ -410,13 +438,14 @@ impl App {
     /// files inside the project are attached.
     pub fn take_dropped_files(&mut self, ctx: &egui::Context) {
         let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect());
-        if dropped.is_empty() || !self.writable() || self.view.is_some() {
-            if !dropped.is_empty() && self.view.is_some() {
-                self.composer.message = Some(("拖入文件只能附加到新会话".into(), true));
-            }
+        if dropped.is_empty() || !self.writable() {
             return;
         }
         if dropped.len() == 1 && dropped[0].is_dir() {
+            if self.view.is_some() {
+                self.composer.message = Some(("更换项目目录请新建对话".into(), true));
+                return;
+            }
             if let Ok(real) = sa_engine::services::realpath(&dropped[0]) {
                 if self.composer.project.as_ref() != Some(&real) {
                     self.composer.attachments.clear();
@@ -425,7 +454,7 @@ impl App {
             }
             return;
         }
-        let Some(project) = self.composer.project.clone() else {
+        let Some(project) = self.attachment_project() else {
             self.composer.message = Some(("先选择项目目录，或把项目文件夹拖进窗口".into(), true));
             return;
         };
@@ -441,8 +470,15 @@ impl App {
         }
     }
 
+    fn attachment_project(&self) -> Option<PathBuf> {
+        match &self.view {
+            Some(view) => view.snap.as_ref().map(|snapshot| PathBuf::from(&snapshot.ticket.cwd)),
+            None => self.composer.project.clone(),
+        }
+    }
+
     pub(crate) fn pick_attachments(&mut self) {
-        let Some(project) = self.composer.project.clone() else { return };
+        let Some(project) = self.attachment_project() else { return };
         let Some(files) = rfd::FileDialog::new()
             .set_title("选择要附加的项目文件")
             .set_directory(&project)
@@ -537,7 +573,7 @@ impl App {
                 ui.spacing_mut().item_spacing.y = 6.0;
 
                 let target = self.composer.target.clone();
-                let has_chips = target.is_some() || (!fixed && !self.composer.attachments.is_empty());
+                let has_chips = target.is_some() || !self.composer.attachments.is_empty();
                 if has_chips {
                     ui.horizontal_wrapped(|ui| {
                         ui.spacing_mut().item_spacing.x = 4.0;
@@ -547,7 +583,7 @@ impl App {
                                 self.composer.target = None;
                             }
                         }
-                        if !fixed {
+                        if !self.composer.attachments.is_empty() {
                             let mut remove = None;
                             for (i, f) in self.composer.attachments.iter().enumerate() {
                                 if removable_chip(ui, &labels::basename(f), &pal, &format!("移除 {f}")) {
@@ -628,21 +664,14 @@ impl App {
                                     }
                                 }
                                 ui.label(
-                                    RichText::new(if fixed {
-                                        "↑↓ 选择 · Enter 插入路径"
-                                    } else {
-                                        "↑↓ 选择 · Enter 附加到新会话"
-                                    })
+                                    RichText::new("↑↓ 选择 · Enter 附加到消息")
                                     .font(theme::body(theme::TINY))
                                     .color(pal.faint),
                                 );
                             });
                         if let Some(f) = pick {
                             self.composer.draft.truncate(*at);
-                            if fixed {
-                                self.composer.draft.push_str(&f);
-                                self.composer.draft.push(' ');
-                            } else if !self.composer.attachments.contains(&f) {
+                            if !self.composer.attachments.contains(&f) {
                                 if self.composer.attachments.len() < MAX_ATTACHMENTS {
                                     self.composer.attachments.push(f);
                                 } else {
@@ -691,7 +720,7 @@ impl App {
                 if resp.has_focus()
                     && ui.input(|i| i.events.iter().any(|e| matches!(e, Event::Key { key: Key::V, pressed: true, modifiers, .. } if modifiers.command)))
                 {
-                    self.paste_image(fixed, root.as_deref());
+                    self.paste_image(root.as_deref());
                 }
                 if resp.has_focus()
                     && keyboard_ready
@@ -708,6 +737,11 @@ impl App {
                     ui.spacing_mut().item_spacing.x = 6.0;
                     if fixed {
                         if cur.loaded {
+                            if widgets::icon_button(ui, icon::PAPERCLIP, 26.0, pal.mute, pal.hover, false)
+                                .on_hover_text("附加项目文件到本条消息").clicked()
+                            {
+                                pick_files = true;
+                            }
                             widgets::chip(ui, &labels::profile(&cur.profile), pal.neutral, theme::TINY)
                                 .on_hover_text("权限已锁定 · 新建对话可更改");
                             ui.label(
@@ -927,10 +961,11 @@ impl App {
         }
         match confirm {
             Confirm::Profile(p) => self.composer.profile = p,
-            Confirm::Resume { ticket, body } => self.submit(Action::Follow {
+            Confirm::Resume { ticket, body, files } => self.submit(Action::Follow {
                 ticket,
                 body,
                 resume: true,
+                files,
             }),
         }
     }
@@ -968,6 +1003,25 @@ mod keyboard_tests {
         assert!(h.state().composer.attachments.is_empty());
         assert_eq!(h.state().composer.pending, 0);
         assert!(h.state().view.is_none());
+    }
+
+    #[test]
+    fn unsupported_image_lead_keeps_draft_and_attachment() {
+        let data = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let mut h = harness(data.path(), project.path());
+        h.state_mut().composer.draft = "描述这张图".into();
+        h.state_mut().composer.attachments = vec!["截图.PNG".into()];
+        h.run_steps(3);
+        h.get_by_label("输入框").focus();
+        h.run_steps(2);
+        h.key_press(Key::Enter);
+        h.run_steps(2);
+        assert!(h.state().view.is_none());
+        assert_eq!(h.state().composer.pending, 0);
+        assert_eq!(h.state().composer.draft, "描述这张图");
+        assert_eq!(h.state().composer.attachments, ["截图.PNG"]);
+        assert!(h.state().composer.message.as_ref().is_some_and(|(text, error)| *error && text.contains("Codex")));
     }
 
     fn ime_and_enter(h: &mut Harness<'_, App>, ime: egui::ImeEvent) {

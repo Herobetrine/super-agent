@@ -29,6 +29,8 @@ pub struct RunRequest {
     pub turn: i64,
     pub agent: String,
     pub prompt: String,
+    /// Validated immutable PNG/JPEG snapshot bytes for this turn.
+    pub images: Vec<crate::images::ImageInput>,
     pub cwd: PathBuf,
     pub route: Route,
     /// readonly | ask | partial | full | auto | legacy

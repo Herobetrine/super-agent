@@ -88,6 +88,7 @@ async fn turn(adapter: &Arc<dyn Adapter>, project: &Path, route: Route, prompt: 
         turn: 1,
         agent: adapter.agent().into(),
         prompt: prompt.into(),
+        images: vec![],
         cwd: project.to_path_buf(),
         route,
         profile: "readonly".into(),

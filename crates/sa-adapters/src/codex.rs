@@ -212,6 +212,7 @@ async fn run(
     emit: Emit,
     cancel: CancellationToken,
 ) -> Result<RunOutcome, AdapterError> {
+    crate::images::check(&req)?;
     let perm = policy(&req.profile, req.writable)?;
     let mut d: Discovery = discover(&sys, &cancel).await.map_err(|e| probe_failed(&e.to_string()))?;
     custom::merge(&mut d.catalog, &customs, &sys);
@@ -278,7 +279,7 @@ async fn converse(
 }
 
 struct Turn {
-    prompt: String,
+    input: Value,
     cwd: String,
     profile: String,
     session_id: Option<String>,
@@ -330,7 +331,7 @@ impl Turn {
             }
         });
         Self {
-            prompt: req.prompt.clone(),
+            input: crate::images::codex(req),
             cwd: req.cwd.to_string_lossy().into_owned(),
             profile: req.profile.clone(),
             session_id: req.session_id.clone(),
@@ -544,7 +545,7 @@ impl Turn {
                 self.send(json!({
                     "id": 3,
                     "method": "turn/start",
-                    "params": {"threadId": thread, "input": [{"type": "text", "text": self.prompt}]}
+                    "params": {"threadId": thread, "input": self.input}
                 }));
                 return Ok(None);
             }
@@ -729,7 +730,11 @@ const recv = async () => JSON.parse((await lines.next()).value), send = (o) => p
   if (thread.params.sandbox !== 'workspace-write' || thread.params.approvalPolicy !== 'on-request') process.exit(3);
   send({ id: 2, result: { sandbox: { type: 'workspaceWrite', networkAccess: false, writableRoots: [] }, model: 'm', modelProvider: 'p',
     approvalPolicy: 'on-request', approvalsReviewer: 'user', thread: { id: 'thread' } } });
-  await recv(); send({ id: 3, result: { turn: { id: 'turn' } } });
+  const turn = await recv();
+  if (turn.params.input[0].text !== 'test' || turn.params.input[1].type !== 'image' ||
+      !turn.params.input[1].url.startsWith('data:image/png;base64,') ||
+      Buffer.from(turn.params.input[1].url.split(',')[1], 'base64').subarray(1,4).toString() !== 'PNG') process.exit(7);
+  send({ id: 3, result: { turn: { id: 'turn' } } });
   const steer = await recv();
   if (steer.method !== 'turn/steer' || steer.params.expectedTurnId !== 'turn' || !steer.params.input[0].text.includes('消息')) process.exit(4);
   send({ id: steer.id, result: { turnId: 'turn' } });
@@ -782,6 +787,10 @@ const recv = async () => JSON.parse((await lines.next()).value), send = (o) => p
             turn: 1,
             agent: "codex".into(),
             prompt: "test".into(),
+            images: vec![sa_engine::images::ImageInput::from_bytes("图.png".into(), {
+                use base64::Engine as _;
+                base64::engine::general_purpose::STANDARD.decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=").unwrap()
+            }).unwrap()],
             cwd: cwd.clone(),
             route: sa_engine::adapter::Route { provider: "p".into(), model: "m".into(), mode: "cli".into() },
             profile: "partial".into(),

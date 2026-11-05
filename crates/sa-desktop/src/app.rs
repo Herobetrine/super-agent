@@ -136,18 +136,16 @@ pub struct App {
     pub rename: Option<(i64, String)>,
     /// Last seen root state per ticket (finish notifications).
     known_states: std::collections::HashMap<i64, String>,
+    notifications: crate::notifications::Notifications,
+    notifications_enabled: bool,
+    approval_watch: crate::notifications::ApprovalWatch,
     pub extensions: Option<crate::extensions::ExtDialog>,
     /// For background work started outside `update`.
     pub ctx: egui::Context,
 }
 
 /// Git changes of one project (inspector "变更" tab).
-#[derive(Default)]
-pub struct DiffState {
-    pub cwd: Option<String>,
-    pub text: Option<Result<String, String>>,
-    pub pending: Option<Pending<String>>,
-}
+pub type DiffState = crate::review::ReviewState;
 
 impl App {
     pub fn new(
@@ -219,6 +217,9 @@ impl App {
             live: None,
             rename: None,
             known_states: Default::default(),
+            notifications: Default::default(),
+            notifications_enabled: cfg!(windows) && get("notifications").as_deref() != Some("0"),
+            approval_watch: Default::default(),
             extensions: None,
             ctx: cc.egui_ctx.clone(),
             host_error: host.as_ref().err().cloned(),
@@ -250,6 +251,8 @@ impl App {
         if self.view.as_ref().map(|v| v.id) == ticket && ticket.is_some() {
             return;
         }
+        self.composer.attachments.clear();
+        self.composer.target = None;
         self.epoch += 1;
         self.view = ticket.map(|id| TicketView {
             id,
@@ -330,8 +333,10 @@ impl App {
                         continue;
                     }
                     let mut snap = *snap;
-                    let before = v.snap.as_ref().map(|s| s.approvals.len());
-                    if before.is_some_and(|n| snap.approvals.len() > n) {
+                    let new_approval = v.snap.as_ref().is_some_and(|previous| {
+                        snap.approvals.iter().any(|approval| !previous.approvals.iter().any(|old| old.id == approval.id))
+                    });
+                    if new_approval {
                         self.attention(true);
                     }
                     let Some(v) = self.view.as_mut().filter(|v| v.id == ticket) else {
@@ -601,6 +606,7 @@ impl eframe::App for App {
         );
         storage.set_string("tab", self.tab.key().into());
         storage.set_string("lead", self.composer.lead.clone());
+        storage.set_string("notifications", if self.notifications_enabled { "1" } else { "0" }.into());
         if let Some(p) = &self.composer.project {
             storage.set_string("project", p.to_string_lossy().into_owned());
         }
@@ -661,6 +667,11 @@ impl App {
         for r in rows {
             let prev = self.known_states.insert(r.id, r.state.clone());
             if prev.as_deref().is_some_and(labels::is_active) && !labels::is_active(&r.state) {
+                self.post_notice(crate::notifications::Notice {
+                    ticket: r.id,
+                    approval: false,
+                    status: labels::job_state(&r.state).to_string(),
+                });
                 done = Some(format!(
                     "工单 #{} {}：{}",
                     r.id,
@@ -672,6 +683,14 @@ impl App {
         if let Some(text) = done {
             self.composer.message = Some((text, false));
             self.attention(false);
+        }
+    }
+
+    fn post_notice(&mut self, notice: crate::notifications::Notice) {
+        let focused = self.ctx.input(|input| input.viewport().focused).unwrap_or(true);
+        if self.notifications_enabled && self.writable() && !focused && self.shot.is_none() && !self.opts.demo && !cfg!(test) {
+            let data = self.opts.data.clone().unwrap_or_else(sa_store::default_data_dir);
+            self.notifications.post(&self.ctx, &data, notice);
         }
     }
 
@@ -740,17 +759,14 @@ impl App {
         self.export = Some(Pending::spawn(ctx, move || crate::ops::export_markdown(&data, ticket, &file)));
     }
 
-    /// Load the Git changes of `cwd` (inspector tab).
-    pub fn load_diff(&mut self, ctx: &egui::Context, cwd: String) {
-        if self.diff.pending.is_some() {
-            return;
-        }
-        let root = PathBuf::from(&cwd);
-        self.diff.cwd = Some(cwd);
-        self.diff.pending = Some(Pending::spawn(ctx, move || crate::ops::diff(&root)));
-    }
-
     fn poll_ops(&mut self) {
+        if self.writable() && !self.opts.demo && self.shot.is_none() {
+            let data = self.opts.data.clone().unwrap_or_else(sa_store::default_data_dir);
+            for notice in self.approval_watch.poll(&self.ctx, &data) {
+                self.attention(true);
+                self.post_notice(notice);
+            }
+        }
         if let Some(r) = self.export.as_ref().and_then(Pending::poll) {
             self.export = None;
             self.composer.message = Some(match r {
@@ -758,9 +774,16 @@ impl App {
                 Err(e) => (e, true),
             });
         }
-        if let Some(r) = self.diff.pending.as_ref().and_then(Pending::poll) {
-            self.diff.pending = None;
-            self.diff.text = Some(r);
+        self.diff.poll();
+        for feedback in self.notifications.poll() {
+            match feedback {
+                crate::notifications::Feedback::Open(ticket) => {
+                    self.select(Some(ticket));
+                    self.ctx.send_viewport_cmd(ViewportCommand::Minimized(false));
+                    self.ctx.send_viewport_cmd(ViewportCommand::Focus);
+                }
+                crate::notifications::Feedback::Failed(error) => self.composer.message = Some((error, true)),
+            }
         }
     }
 
@@ -860,6 +883,18 @@ impl App {
             let (r, resp) = ui.allocate_exact_size(Vec2::splat(14.0), egui::Sense::hover());
             ui.painter().circle_filled(r.center(), 4.0, color);
             resp.on_hover_text(tip);
+            if cfg!(windows) && self.writable() {
+                let tip = if self.notifications_enabled { "系统通知已开启 · 点击关闭" } else { "系统通知已关闭 · 点击开启" };
+                let response = widgets::icon_button(ui, icon::BELL, 34.0, pal.rail_ink, Color32::from_white_alpha(18), self.notifications_enabled)
+                    .on_hover_text(tip);
+                response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "系统通知"));
+                if response.clicked() {
+                    self.notifications_enabled = !self.notifications_enabled;
+                    if !self.notifications_enabled {
+                        self.notifications.stop();
+                    }
+                }
+            }
             let theme_icon = if self.dark { icon::SUN } else { icon::MOON };
             if widgets::icon_button(
                 ui,
@@ -966,6 +1001,9 @@ impl App {
                 {
                     self.inspector_open = true;
                     self.tab = Tab::Approvals;
+                }
+                if let Some(snapshot) = self.view.as_ref().and_then(|view| view.snap.as_ref()) {
+                    crate::usage::button(ui, &snapshot.usage, &pal);
                 }
                 match (&self.host, &self.host_error) {
                     (Some(h), _) => match h.fault() {

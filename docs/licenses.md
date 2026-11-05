@@ -15,6 +15,7 @@ Super Agent 源码和仓库自有资源采用 `GPL-3.0-only`。[许可证全文]
 | rmcp | 官方 MCP Rust SDK | Apache-2.0 |
 | reqwest、ureq、rustls | HTTP 与 TLS | MIT 或 Apache-2.0（rustls 另含 ISC） |
 | rfd | 系统文件对话框 | MIT |
+| windows-rs | Windows 原生通知、COM 与应用登记 | MIT 或 Apache-2.0 |
 | image、pulldown-cmark、serde、anyhow 等 | 图标解码、Markdown、序列化、错误处理 | MIT 或 Apache-2.0 |
 
 界面字体（Segoe UI、Microsoft YaHei、Consolas）运行时从 Windows 系统字体目录读取，不随仓库分发。重新分发二进制时应一并保留上游的许可证和第三方通知（可用 `cargo about` 或 `cargo license` 生成清单）。

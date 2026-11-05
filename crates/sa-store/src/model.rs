@@ -143,6 +143,8 @@ pub struct Snapshot {
     pub total_jobs: i64,
     pub running_peers: i64,
     pub native_activity: NativeActivity,
+    #[serde(default)]
+    pub usage: crate::usage::TicketUsage,
     /// Ascending by seq; at most 180.
     pub events: Vec<EventView>,
     /// Pass back as `after` to receive only newer events.

@@ -118,6 +118,7 @@ pub struct Store {
     conn: Connection,
     /// Per-ticket progress projection (`ProgressJournal.seen` + TEMP view).
     progress: HashMap<i64, Entry>,
+    usage: HashMap<i64, crate::usage::Entry>,
 }
 
 impl Store {
@@ -137,6 +138,7 @@ impl Store {
         Ok(Self {
             conn,
             progress: HashMap::new(),
+            usage: HashMap::new(),
         })
     }
 
@@ -169,6 +171,7 @@ impl Store {
         Ok(Self {
             conn,
             progress: HashMap::new(),
+            usage: HashMap::new(),
         })
     }
 
@@ -270,6 +273,7 @@ impl Store {
         expect((0..=MAX_SAFE).contains(&after), "事件游标无效")?;
         let end = self.max_seq(ticket, MAX_SAFE)?;
         self.ensure(ticket, end)?;
+        self.usage.entry(ticket).or_default().scan(&self.conn, ticket, end)?;
         let conn = &self.conn;
 
         let ticket_row = conn
@@ -435,7 +439,10 @@ impl Store {
             Vec::new()
         };
 
+        let visible_jobs = jobs.iter().map(|j| (j.id, j.agent.clone())).collect::<Vec<_>>();
+        let usage = self.usage[&ticket].view(end, &visible_jobs, total_jobs);
         Ok(Snapshot {
+            usage,
             ticket: detail,
             jobs,
             total_jobs,

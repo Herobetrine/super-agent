@@ -41,6 +41,7 @@ pub enum Action {
         ticket: i64,
         body: String,
         resume: bool,
+        files: Vec<String>,
     },
     Note {
         ticket: i64,
@@ -510,8 +511,8 @@ async fn create(engine: &Engine, action: Action) -> Result<i64> {
 async fn execute(engine: &Engine, shared: &Shared, action: Action) -> Result<Option<i64>> {
     match action {
         a @ Action::Create { .. } => Ok(Some(create(engine, a).await?)),
-        Action::Follow { ticket, body, resume } => {
-            engine.follow(ticket, &body, resume)?;
+        Action::Follow { ticket, body, resume, files } => {
+            engine.follow_with_files(ticket, &body, resume, &files).await?;
             Ok(None)
         }
         Action::Note { ticket, job, body } => {
@@ -881,6 +882,7 @@ pub(crate) mod tests {
                 ticket,
                 body: "核对迁移后的续跑".into(),
                 resume: false,
+                files: Vec::new(),
             });
             assert!(outcome(&host).result.is_ok());
             let end = Instant::now() + Duration::from_secs(30);
@@ -1216,6 +1218,7 @@ pub(crate) mod tests {
             ticket,
             body: "继续".into(),
             resume: false,
+            files: Vec::new(),
         });
         assert!(outcome(&host).result.is_ok());
         until(|| root_state(&host, ticket) == "done" && kinds(&host, ticket).iter().filter(|k| *k == "reply").count() == 2);

@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
+#[cfg(test)]
 const GIT_CAP: usize = 256 * 1024;
 const GIT_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -41,9 +42,33 @@ impl<T: Send + 'static> Pending<T> {
     }
 }
 
+#[cfg(test)]
 fn git(exe: &Path, cwd: &Path, args: &[&str]) -> Result<String> {
+    let output = git_run(exe, cwd, args, GIT_CAP, false)?;
+    let mut text = String::from_utf8_lossy(&output.bytes).into_owned();
+    if output.truncated {
+        text.push_str("\n…预览已截断");
+    }
+    Ok(text)
+}
+
+pub(crate) struct GitOutput {
+    pub bytes: Vec<u8>,
+    pub truncated: bool,
+}
+
+/// Bounded, literal-path Git invocation shared by the per-file review UI.
+/// `diff_exit` permits exit 1 from `git diff --no-index` (differences found).
+pub(crate) fn git_bytes(cwd: &Path, args: &[&str], cap: usize, diff_exit: bool) -> Result<GitOutput> {
+    let exe = sa_adapters::sys::Sys::from_process()
+        .which(if cfg!(windows) { "git.exe" } else { "git" })
+        .ok_or_else(|| anyhow!("未在 PATH 中找到 Git"))?;
+    git_run(&exe, cwd, args, cap, diff_exit)
+}
+
+fn git_run(exe: &Path, cwd: &Path, args: &[&str], cap: usize, diff_exit: bool) -> Result<GitOutput> {
     let mut cmd = Command::new(exe);
-    cmd.args(["--no-pager", "--no-optional-locks", "-c", "core.fsmonitor=false", "-c", "color.ui=false"])
+    cmd.args(["--no-pager", "--no-optional-locks", "--literal-pathspecs", "-c", "core.fsmonitor=false", "-c", "color.ui=false", "-c", "core.quotePath=false"])
         .args(args)
         .current_dir(cwd)
         .stdin(Stdio::null())
@@ -68,7 +93,7 @@ fn git(exe: &Path, cwd: &Path, args: &[&str]) -> Result<String> {
                 if n == 0 {
                     break;
                 }
-                let space = GIT_CAP.saturating_sub(buf.len());
+                let space = cap.saturating_sub(buf.len());
                 buf.extend_from_slice(&chunk[..n.min(space)]);
                 if n > space {
                     cut.store(true, Ordering::SeqCst);
@@ -102,17 +127,14 @@ fn git(exe: &Path, cwd: &Path, args: &[&str]) -> Result<String> {
     let buf = reader.join().map_err(|_| anyhow!("Git 检查中断"))?;
     let cut = cut.load(Ordering::SeqCst);
     let stderr = errs.join().unwrap_or_default();
-    if !cut && status.is_none_or(|s| !s.success()) {
+    if !cut && status.is_none_or(|s| !s.success() && !(diff_exit && s.code() == Some(1))) {
         bail!(if stderr.is_empty() { "Git 检查中断".to_string() } else { stderr });
     }
-    let mut text = String::from_utf8_lossy(&buf).into_owned();
-    if cut {
-        text.push_str("\n…预览已截断");
-    }
-    Ok(text)
+    Ok(GitOutput { bytes: buf, truncated: cut })
 }
 
 /// Working tree status, staged and unstaged changes (ST:345-358).
+#[cfg(test)]
 pub fn diff(root: &Path) -> Result<String> {
     let exe = sa_adapters::sys::Sys::from_process()
         .which(if cfg!(windows) { "git.exe" } else { "git" })

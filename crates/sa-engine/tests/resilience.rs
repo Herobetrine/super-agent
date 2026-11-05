@@ -98,6 +98,7 @@ fn request() -> RunRequest {
         turn: 1,
         agent: "codex".into(),
         prompt: "p".into(),
+        images: vec![],
         cwd: PathBuf::from("."),
         route: route("openai", "m"),
         profile: "full".into(),

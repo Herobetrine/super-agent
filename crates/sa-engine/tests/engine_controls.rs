@@ -251,6 +251,47 @@ async fn failover_is_off_by_default_and_never_moves_writers() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn image_reader_failover_keeps_native_images_and_stops_when_capable_harnesses_are_exhausted() {
+    for replacement_ok in [true, false] {
+        let fx = Fx::with(
+            script(move |c| async move {
+                if c.depth() == 0 {
+                    return Ok(if c.turn() == 1 {
+                        send(json!({"to":"codex", "files":["截图.PNG"]}))
+                    } else {
+                        "merged".into()
+                    });
+                }
+                assert!(matches!(c.name.as_str(), "codex" | "claude"));
+                assert_eq!(c.req.images.len(), 1);
+                assert_eq!(c.req.images[0].media_type(), "image/png");
+                assert!(!c.req.writable);
+                if c.name == "codex" || !replacement_ok {
+                    Err(not_configured())
+                } else {
+                    Ok("image reviewed".into())
+                }
+            }),
+            t1_catalog(),
+            resilient(config()),
+        );
+        image::RgbImage::new(2, 2).save_with_format(fx.project.join("截图.PNG"), image::ImageFormat::Png).unwrap();
+        let ticket = fx.begin(fx.params().failover(true)).await;
+        fx.finish(ticket, if replacement_ok { "done" } else { "partial" }).await;
+        assert_eq!(fx.int("SELECT count(*) FROM job_failovers"), 1);
+        assert_eq!(fx.int("SELECT count(*) FROM jobs WHERE agent IN ('deepseek','antigravity')"), 0);
+        let children = fx.all("SELECT id,agent,state FROM jobs WHERE parent IS NOT NULL ORDER BY id");
+        assert_eq!(children.len(), 2);
+        assert_eq!(children[0]["state"], json!("cancelled"));
+        assert_eq!(children[1]["agent"], json!("claude"));
+        assert_eq!(children[1]["state"], json!(if replacement_ok { "done" } else { "failed" }));
+        let manifests = fx.all("SELECT manifest FROM job_files ORDER BY job");
+        assert_eq!(manifests.len(), 2);
+        assert_eq!(manifests[0], manifests[1]);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn open_breaker_fails_over_a_reader_enabled_after_create() {
     let cfg = ResilienceConfig {
         breaker_threshold: 1,

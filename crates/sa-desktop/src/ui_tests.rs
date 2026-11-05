@@ -647,3 +647,71 @@ fn at_mention_attaches_project_files() {
     assert_eq!(h.state().composer.draft, "检查 ");
     assert!(h.state().view.is_none(), "Enter picked the file instead of sending");
 }
+
+#[test]
+fn existing_conversation_accepts_a_dropped_image_and_shows_usage() {
+    let data = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let picture = project.path().join("截图.PNG");
+    image::RgbImage::new(3, 2).save_with_format(&picture, image::ImageFormat::Png).unwrap();
+    let expected = std::fs::read(&picture).unwrap();
+    let mut h = harness(data.path(), "readonly");
+    h.state_mut().composer.project = Some(sa_engine::services::realpath(project.path()).unwrap());
+    h.state_mut().composer.lead = "claude".into();
+    h.run_steps(4);
+    h.get_by_label("输入框").focus();
+    h.get_by_label("输入框").type_text("先建立会话");
+    h.run_steps(2);
+    h.key_press(egui::Key::Enter);
+    until(&mut h, "initial reply", |app| root_state(app) == "done");
+    let ticket = h.state().view.as_ref().unwrap().id;
+
+    h.input_mut().dropped_files.push(egui::DroppedFile { path: Some(picture.clone()), ..Default::default() });
+    h.run_steps(3);
+    assert_eq!(h.state().composer.attachments, ["截图.PNG"]);
+    h.get_by_label("输入框").focus();
+    h.get_by_label("输入框").type_text("看看新图片");
+    h.run_steps(2);
+    h.key_press(egui::Key::Enter);
+    until(&mut h, "image follow-up", |app| root_state(app) == "done" && kinds(app, ticket).iter().filter(|kind| *kind == "reply").count() == 2);
+    assert!(h.state().composer.attachments.is_empty());
+    let row = h.state().host.as_ref().unwrap().engine().db().with(|q| {
+        q.one("SELECT manifest FROM job_files WHERE job=(SELECT id FROM jobs WHERE ticket=? AND parent IS NULL)", &[&ticket])
+    }).unwrap().unwrap();
+    let manifest: Value = serde_json::from_str(row["manifest"].as_str().unwrap()).unwrap();
+    assert_eq!(manifest[0]["name"], "截图.PNG");
+    std::fs::write(picture, "changed after delivery").unwrap();
+    assert_eq!(std::fs::read(manifest[0]["object_path"].as_str().unwrap()).unwrap(), expected);
+
+    h.get_by_label("令牌用量").click();
+    h.run_steps(3);
+    assert!(h.query_by_label("执行端已报告用量").is_some());
+}
+
+#[test]
+fn create_receipt_preserves_attachments_added_after_send() {
+    for change_project in [false, true] {
+        let data = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        std::fs::write(project.path().join("first.txt"), "first").unwrap();
+        let mut h = harness(data.path(), "readonly");
+        h.state_mut().composer.project = Some(project.path().to_path_buf());
+        h.run_steps(3);
+        h.state_mut().submit(crate::host::Action::Create {
+            goal: "initial request".into(), cwd: Some(project.path().to_path_buf()),
+            lead: "claude".into(), profile: "readonly".into(), files: vec!["first.txt".into()],
+            selections: None, extensions: None,
+        });
+        if change_project {
+            h.state_mut().new_conversation();
+            h.state_mut().composer.project = Some(other.path().to_path_buf());
+        }
+        h.state_mut().composer.draft = "next request".into();
+        h.state_mut().composer.attachments = vec!["next.png".into()];
+        until(&mut h, "create receipt", |app| app.composer.pending == 0);
+        assert_eq!(h.state().composer.attachments, ["next.png"]);
+        assert_eq!(h.state().composer.draft, "next request");
+        assert_eq!(h.state().view.is_none(), change_project);
+    }
+}

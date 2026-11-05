@@ -257,66 +257,16 @@ impl App {
         ui.add_space(6.0);
     }
 
-    /// Git status and diff of the ticket's (or draft's) project (`panels.js` diff tab).
+    /// Per-file review and persisted worktree checkpoints for this project.
     fn diff_tab(&mut self, ui: &mut Ui, cwd: Option<String>) {
         let pal = self.pal.clone();
         let Some(cwd) = cwd else {
             empty(ui, icon::GIT_DIFF, "选择工单或项目目录后查看 Git 变更。", &pal);
             return;
         };
-        let stale = self.diff.cwd.as_deref() != Some(cwd.as_str());
-        if stale && self.diff.pending.is_none() {
-            self.diff.text = None;
-            self.load_diff(ui.ctx(), cwd.clone());
-        }
-        let loading = self.diff.pending.is_some();
-        ui.horizontal(|ui| {
-            ui.label(RichText::new(format!("{} {}", icon::FOLDER_SIMPLE, labels::basename(&cwd))).color(pal.mute))
-                .on_hover_text(&cwd);
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if loading {
-                    ui.spinner();
-                } else if widgets::quiet_button(ui, icon::ARROWS_CLOCKWISE, "刷新", &pal, false).clicked() {
-                    self.load_diff(ui.ctx(), cwd.clone());
-                }
-            });
-        });
-        ui.add_space(6.0);
-        match &self.diff.text {
-            None => note(ui, "正在读取 Git 变更…", &pal),
-            Some(Err(e)) => {
-                ui.add(Label::new(RichText::new(e).color(pal.fail.fg)).wrap());
-            }
-            Some(Ok(text)) => {
-                Frame::new()
-                    .fill(pal.surface)
-                    .stroke(Stroke::new(1.0_f32, pal.line_soft))
-                    .corner_radius(CornerRadius::same(8))
-                    .inner_margin(Margin::same(10))
-                    .show(ui, |ui| {
-                        ui.set_width(ui.available_width());
-                        egui::ScrollArea::horizontal().id_salt("diff-h").show(ui, |ui| {
-                        for line in text.lines().take(4000) {
-                            let color = if line.starts_with('+') && !line.starts_with("+++") {
-                                pal.ok.fg
-                            } else if line.starts_with('-') && !line.starts_with("---") {
-                                pal.fail.fg
-                            } else if line.starts_with("@@") {
-                                pal.accent
-                            } else {
-                                pal.ink
-                            };
-                            ui.add(
-                                Label::new(RichText::new(line).monospace().size(12.0).color(color))
-                                    .wrap_mode(egui::TextWrapMode::Extend),
-                            );
-                        }
-                        });
-                    });
-            }
-        }
+        let data = self.opts.data.clone().unwrap_or_else(sa_store::default_data_dir);
+        self.diff.show(ui, &pal, cwd, data);
     }
-
     fn collab_tab(&mut self, ui: &mut Ui, snap: &Snapshot) {
         let pal = self.pal.clone();
         let badges = self.live_badges();

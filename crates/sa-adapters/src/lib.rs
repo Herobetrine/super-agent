@@ -33,6 +33,7 @@ pub mod claude;
 pub mod codex;
 pub mod codex_config;
 pub mod common;
+mod images;
 pub mod custom;
 pub mod deepseek;
 pub mod proc;

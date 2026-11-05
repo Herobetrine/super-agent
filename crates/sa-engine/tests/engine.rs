@@ -14,6 +14,169 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
+fn write_image(project: &std::path::Path, name: &str, format: image::ImageFormat, width: u32) -> Vec<u8> {
+    let mut encoded = std::io::Cursor::new(Vec::new());
+    image::RgbImage::new(width, 2).write_to(&mut encoded, format).unwrap();
+    let bytes = encoded.into_inner();
+    std::fs::write(project.join(name), &bytes).unwrap();
+    bytes
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn image_follow_replaces_images_updates_text_and_survives_reopen() {
+    let mut fx = Fx::new(script(|c| async move {
+        assert!(!c.req.writable);
+        assert_eq!(c.req.images.len(), 1);
+        if c.turn() == 1 {
+            assert_eq!(c.req.images[0].media_type(), "image/png");
+        } else {
+            assert_eq!(c.req.images[0].name(), "新图.JPEG");
+            assert_eq!(c.req.images[0].media_type(), "image/jpeg");
+            assert!(c.req.session_id.is_some());
+            let files = c.packet["files"].as_array().unwrap();
+            assert_eq!(files.len(), 2);
+            let text = files.iter().find(|file| file["name"] == "说明.txt").unwrap();
+            assert_eq!(std::fs::read(text["object_path"].as_str().unwrap()).unwrap(), b"updated");
+        }
+        Ok("seen".into())
+    }), t1_catalog());
+    write_image(&fx.project, "旧图.PNG", image::ImageFormat::Png, 2);
+    std::fs::write(fx.project.join("说明.txt"), b"original").unwrap();
+    let ticket = fx.begin(fx.params().profile("readonly").files(&["旧图.PNG", "说明.txt"])).await;
+    fx.finish(ticket, "done").await;
+    let bytes = write_image(&fx.project, "新图.JPEG", image::ImageFormat::Jpeg, 3);
+    std::fs::write(fx.project.join("说明.txt"), b"updated").unwrap();
+    fx.engine.follow_with_files(ticket, "请看新图", false, &["新图.JPEG".into(), "说明.txt".into()]).await.unwrap();
+    std::fs::write(fx.project.join("新图.JPEG"), b"source changed").unwrap();
+    std::fs::write(fx.project.join("说明.txt"), b"source changed").unwrap();
+    fx.restart(quiet()).await;
+    fx.engine.start().unwrap();
+    fx.finish(ticket, "done").await;
+    assert_eq!(fx.shared.calls(|c| (c.packet["turn"] == 2).then(|| c.req.images[0].data().to_vec())), vec![bytes.clone()]);
+    // A plain follow keeps the last explicitly attached image set.
+    fx.engine.follow(ticket, "继续说明", false).unwrap();
+    fx.finish(ticket, "done").await;
+    assert_eq!(fx.shared.calls(|c| (c.packet["turn"] == 3).then(|| c.req.images[0].data().to_vec())), vec![bytes]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn active_image_follow_supersedes_pending_images_without_mutating_the_running_request() {
+    let entered = Gate::new();
+    let release = Gate::new();
+    let (started, finish) = (entered.clone(), release.clone());
+    let fx = Fx::new(script(move |c| {
+        let (started, finish) = (started.clone(), finish.clone());
+        async move {
+            if c.turn() == 1 {
+                let original = c.req.images[0].data().to_vec();
+                started.open();
+                finish.wait().await;
+                assert_eq!(c.req.images[0].name(), "初始.png");
+                assert_eq!(c.req.images[0].data(), original);
+            } else {
+                assert_eq!(c.req.images.len(), 1);
+                assert_eq!(c.req.images[0].name(), "最新.PNG");
+                assert!(c.req.session_id.is_some());
+            }
+            Ok("seen".into())
+        }
+    }), t1_catalog());
+    write_image(&fx.project, "初始.png", image::ImageFormat::Png, 2);
+    write_image(&fx.project, "中间.jpeg", image::ImageFormat::Jpeg, 3);
+    let newest = write_image(&fx.project, "最新.PNG", image::ImageFormat::Png, 4);
+    let ticket = fx.begin(fx.params().profile("readonly").files(&["初始.png"])).await;
+    fx.until(|| fx.shared.count(|_| true) == 1).await;
+    entered.wait().await;
+    fx.engine.follow_with_files(ticket, "改看中间图", false, &["中间.jpeg".into()]).await.unwrap();
+    fx.engine.follow_with_files(ticket, "改看最新图", false, &["最新.PNG".into()]).await.unwrap();
+    release.open();
+    fx.finish(ticket, "done").await;
+    assert_eq!(fx.shared.count(|_| true), 2);
+    assert_eq!(fx.shared.calls(|c| (c.packet["turn"] == 2).then(|| c.req.images[0].data().to_vec())), vec![newest]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rejected_image_follow_leaves_state_manifest_and_journal_unchanged() {
+    let fx = Fx::new(script(|_| async { Ok("seen".into()) }), t1_catalog());
+    write_image(&fx.project, "原图.png", image::ImageFormat::Png, 2);
+    write_image(&fx.project, "伪装.jpeg", image::ImageFormat::Png, 2);
+    std::fs::write(fx.project.join("损坏.png"), b"not an image").unwrap();
+    let ticket = fx.begin(fx.params().profile("readonly").files(&["原图.png"])).await;
+    fx.finish(ticket, "done").await;
+    let before = fx.all("SELECT * FROM job_files");
+    let root = fx.engine.root(ticket).unwrap();
+    let seq = fx.int("SELECT max(seq) FROM events");
+    for files in [vec!["../outside.png".into()], vec!["伪装.jpeg".into()], vec!["损坏.png".into()], vec!["原图.png".into(); 5]] {
+        assert!(fx.engine.follow_with_files(ticket, "new", false, &files).await.is_err());
+        assert_eq!(fx.all("SELECT * FROM job_files"), before);
+        assert_eq!(fx.engine.root(ticket).unwrap(), root);
+        assert_eq!(fx.int("SELECT max(seq) FROM events"), seq);
+    }
+    let unsupported = fx.begin(fx.params().lead("deepseek")).await;
+    fx.finish(unsupported, "done").await;
+    let seq = fx.int("SELECT max(seq) FROM events");
+    let err = fx.engine.follow_with_files(unsupported, "看图", false, &["原图.png".into()]).await.unwrap_err();
+    assert!(err.to_string().contains("Codex 或 Claude Code"));
+    assert_eq!(fx.int("SELECT max(seq) FROM events"), seq);
+    assert_eq!(root_state(&fx.engine, unsupported), "done");
+    // Snapshot validation may succeed, but a disallowed state transition
+    // must still commit neither attachment metadata nor the user instruction.
+    let stopped = fx.create(fx.params().profile("auto").files(&["原图.png"])).await;
+    fx.engine.cancel(stopped).unwrap();
+    let before = fx.all("SELECT * FROM job_files");
+    let seq = fx.int("SELECT max(seq) FROM events");
+    assert!(fx.engine.follow_with_files(stopped, "resume", false, &["原图.png".into()]).await.is_err());
+    assert_eq!(fx.all("SELECT * FROM job_files"), before);
+    assert_eq!(fx.int("SELECT max(seq) FROM events"), seq);
+    assert_eq!(root_state(&fx.engine, stopped), "cancelled");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn native_images_use_snapshots_through_followup_and_context_compaction() {
+    let mut encoded = std::io::Cursor::new(Vec::new());
+    image::RgbImage::new(3, 2).write_to(&mut encoded, image::ImageFormat::Png).unwrap();
+    let bytes = encoded.into_inner();
+    let expected = bytes.clone();
+    let fx = Fx::new(script(move |c| {
+        let expected = expected.clone();
+        async move {
+            assert_eq!(c.req.images.len(), 1);
+            assert_eq!(c.req.images[0].data(), expected);
+            assert_eq!(c.req.images[0].media_type(), "image/png");
+            assert!(!c.req.writable);
+            assert!(c.packet["full_context"]["object_path"].is_string());
+            if c.turn() > 1 { assert!(c.req.session_id.is_some()); }
+            Ok("image received".into())
+        }
+    }), t1_catalog());
+    project_file(&fx.project, "图片.PNG", &bytes);
+    let mut params = fx.params().files(&["图片.PNG"]);
+    params.goal = "大".repeat(800_000);
+    let id = fx.create(params).await;
+    // A later project edit must not change native attachment bytes.
+    project_file(&fx.project, "图片.PNG", b"modified after snapshot");
+    fx.engine.start().unwrap();
+    fx.finish(id, "done").await;
+    fx.engine.follow(id, "再检查相同图片", false).unwrap();
+    fx.finish(id, "done").await;
+    assert_eq!(fx.shared.count(|c| c.req.images.len() == 1), 2);
+    fx.engine.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unsupported_image_harness_fails_before_adapter_execution() {
+    let mut encoded = std::io::Cursor::new(Vec::new());
+    image::RgbImage::new(3, 2).write_to(&mut encoded, image::ImageFormat::Png).unwrap();
+    let fx = Fx::new(script(|_| async { panic!("unsupported image turn must not reach an adapter") }), t1_catalog());
+    project_file(&fx.project, "image.png", &encoded.into_inner());
+    let id = fx.begin(fx.params().lead("deepseek").files(&["image.png"])).await;
+    fx.finish(id, "failed").await;
+    assert_eq!(fx.shared.count(|_| true), 0);
+    let result = fx.all("SELECT result FROM jobs WHERE parent IS NULL");
+    assert!(result[0]["result"].as_str().unwrap().contains("Codex 或 Claude Code"));
+    fx.engine.close().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn member_progress_arrives_during_execution_and_replay_is_scoped() {
     let release = Gate::new();

@@ -17,6 +17,7 @@ pub mod db;
 pub mod dispatch;
 pub mod engine;
 pub mod guides;
+pub mod images;
 pub mod job;
 pub mod knowledge;
 pub mod owner;

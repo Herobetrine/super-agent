@@ -20,6 +20,7 @@ tokio.workspace = true
 tokio-util.workspace = true
 futures.workspace = true
 sa-store = { path = "../sa-store" }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 
 [dev-dependencies]
 tempfile.workspace = true

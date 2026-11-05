@@ -35,5 +35,8 @@ image = { version = "0.25", default-features = false, features = ["png", "ico"] 
 pulldown-cmark = { version = "0.13", default-features = false }
 chrono = { version = "0.4.41", default-features = false, features = ["clock"] }
 
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62.2", features = ["Data_Xml_Dom", "UI_Notifications", "Foundation", "Win32_System_WinRT", "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_System_Variant", "Win32_System_Registry", "Win32_UI_Shell", "Win32_UI_Shell_PropertiesSystem", "Win32_Storage_EnhancedStorage"] }
+
 [dev-dependencies]
 egui_kittest = { version = "0.33.3", features = ["eframe"] }

@@ -247,7 +247,8 @@ pub fn envelope(q: &Q, j: &JobCtx, harness_health: Value) -> Result<Map<String, 
     for a in AGENTS {
         caps.insert(
             a.into(),
-            json!({"read_project": true, "write_project": p::can_write(a, &j.profile)}),
+            json!({"read_project": true, "write_project": p::can_write(a, &j.profile),
+                "native_images": crate::images::supports_native_images(a)}),
         );
     }
     let user_updates: Vec<Value> = q

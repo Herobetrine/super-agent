@@ -17,11 +17,14 @@ mod knowledge;
 mod labels;
 mod markdown;
 mod models;
+mod notifications;
 mod ops;
 mod palette;
 mod providers;
+mod review;
 mod sidebar;
 mod theme;
+mod usage;
 #[cfg(test)]
 mod ui_tests;
 mod widgets;

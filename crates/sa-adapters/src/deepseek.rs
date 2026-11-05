@@ -574,6 +574,7 @@ async fn run(
     emit: Emit,
     cancel: CancellationToken,
 ) -> Result<RunOutcome, AdapterError> {
+    crate::images::check(&req)?;
     let boundary = scope("deepseek", &req, &host, &cancel, true).await?;
     let mut d = discover(&sys, &cancel).await.map_err(|e| probe_failed(&e.to_string()))?;
     merge_custom(&mut d, &customs, &sys);

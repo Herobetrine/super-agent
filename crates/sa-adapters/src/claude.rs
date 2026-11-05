@@ -470,6 +470,7 @@ async fn run(
     emit: Emit,
     cancel: CancellationToken,
 ) -> Result<RunOutcome, AdapterError> {
+    crate::images::check(&req)?;
     let boundary = scope("claude", &req, &host, &cancel, false).await?;
     let high = boundary == "danger-full-access";
     let mut d = discover(&sys, &cancel).await.map_err(|e| probe_failed(&e.to_string()))?;
@@ -566,7 +567,7 @@ async fn run(
     emit.journal("adapter.permission", json!({"profile": req.profile, "scope": boundary}));
     let input = format!(
         "{}\n",
-        json!({"type": "user", "message": {"role": "user", "content": req.prompt}})
+        json!({"type": "user", "message": {"role": "user", "content": crate::images::claude(&req)}})
     );
     let mut proc = start(&exe, &args, &req.cwd, &env)?;
     let mut terminal: Option<Value> = None;
