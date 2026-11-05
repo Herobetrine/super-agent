@@ -851,6 +851,246 @@ pub(crate) mod tests {
         }
     }
 
+    /// Drive a live ticket until its root is terminal, approving every
+    /// request (live tests only run in temporary projects; DeepSeek Harness
+    /// asks for the whole turn's workspace scope on `ask` tickets).
+    fn drive_live(host: &Host, ticket: i64, limit: Duration) -> serde_json::Map<String, Value> {
+        let end = Instant::now() + limit;
+        loop {
+            let pending = host
+                .engine
+                .db()
+                .with(|q| q.all("SELECT id,action FROM approvals WHERE ticket=? AND decision='pending'", &[&ticket]))
+                .unwrap();
+            for a in pending {
+                let action = a["action"].as_str().unwrap_or_default();
+                eprintln!("approval {}: {}", a["id"], action.chars().take(160).collect::<String>());
+                let _ = host.engine.decide(a["id"].as_i64().unwrap(), true);
+            }
+            let root = host.engine.root(ticket).unwrap();
+            if matches!(
+                root["state"].as_str(),
+                Some("done" | "failed" | "partial" | "cancelled" | "interrupted")
+            ) {
+                return root;
+            }
+            if Instant::now() >= end {
+                eprintln!("live ticket timed out");
+                return root;
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    }
+
+    /// The `sa-ext` fixture MCP server built next to this test binary.
+    fn fixture_mcp() -> Option<PathBuf> {
+        let deps = std::env::current_exe().ok()?.parent()?.to_path_buf();
+        let exe = deps.parent()?.join(format!("sa-ext-fixture-mcp{}", std::env::consts::EXE_SUFFIX));
+        exe.is_file().then_some(exe)
+    }
+
+    /// Billable: `SA_LIVE_EXT=1`. A real DeepSeek lead calls a granted MCP
+    /// tool (with operator approval) and records a shared memory entry.
+    #[test]
+    fn live_mcp_tool_call_and_project_memory() {
+        if std::env::var("SA_LIVE_EXT").as_deref() != Ok("1") {
+            eprintln!("set SA_LIVE_EXT=1 to run a billable MCP + knowledge turn");
+            return;
+        }
+        let exe = fixture_mcp().expect("build the workspace first: sa-ext-fixture-mcp");
+        let data = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let secret_file = data.path().join("mcp-secret");
+        let secret = format!("mcp-{:x}", std::process::id() as u64 * 104_729 + 7);
+        std::fs::write(&secret_file, &secret).unwrap();
+        let host = Host::start(data.path().to_path_buf(), || {}).unwrap();
+        let ext = host.ext();
+        let server = ext
+            .save_server(&json!({"name": "proof", "command": exe, "args": [secret_file], "enabled": true}))
+            .unwrap();
+        let tools = host.runtime().block_on(ext.probe(&server)).unwrap();
+        eprintln!("probed tools: {tools}");
+        ext.set_defaults(&json!({"skills": [], "servers": [server]}), None).unwrap();
+
+        let memo = format!("构建口令 {secret} 已核对");
+        let goal = format!(
+            "Call the MCP tool `challenge` (no arguments) of the MCP server listed in project_extensions.mcp, \
+             using an SA_TOOL line whose server field is that entry's `server` value. \
+             After its receipt arrives, reply with only the exact secret text it returned, and on a separate line \
+             record this project memory exactly: SA_MEMO {{\"kind\":\"memory\",\"text\":\"{memo}\"}} . Do not modify files."
+        );
+        host.submit(Action::Create {
+            goal,
+            cwd: Some(project.path().to_path_buf()),
+            lead: "deepseek".into(),
+            profile: "ask".into(),
+            files: vec![],
+            selections: None,
+            extensions: None,
+        });
+        let ticket = outcome(&host).result.unwrap().unwrap();
+        let root = drive_live(&host, ticket, Duration::from_secs(420));
+        let k = kinds(&host, ticket);
+        eprintln!("state={} result={:?} kinds={k:?}", root["state"], root["result"]);
+        for e in host
+            .engine
+            .db()
+            .with(|q| {
+                q.all(
+                    "SELECT seq,turn,kind,substr(payload,1,300) p FROM events WHERE ticket=? AND kind NOT IN ('native','delta') ORDER BY seq",
+                    &[&ticket],
+                )
+            })
+            .unwrap()
+        {
+            eprintln!("  #{} t{} {} {}", e["seq"], e["turn"], e["kind"].as_str().unwrap_or_default(), e["p"].as_str().unwrap_or_default());
+        }
+        assert_eq!(root["state"], json!("done"));
+        assert!(k.iter().any(|x| x == "mcp.result"), "no MCP receipt");
+        let receipt = host
+            .engine
+            .db()
+            .with(|q| q.one("SELECT state FROM studio_tool_receipts WHERE job=(SELECT id FROM jobs WHERE ticket=? AND parent IS NULL)", &[&ticket]))
+            .unwrap();
+        eprintln!("receipt {receipt:?}");
+        assert!(root["result"].as_str().unwrap_or_default().contains(&secret), "secret not returned");
+        let entries = host
+            .engine
+            .knowledge(&sa_engine::services::realpath(project.path()).unwrap().display().to_string())
+            .unwrap();
+        eprintln!("knowledge: {entries:?}");
+        assert!(entries.iter().any(|e| e.kind == "memory" && e.body == memo), "SA_MEMO not recorded");
+        assert!(entries.iter().any(|e| e.kind == "progress"), "no automatic progress entry");
+    }
+
+    /// Billable: `SA_LIVE_PROVIDER=<agent>,<base_url>,<KEY_ENV>,<model>`. One
+    /// read-only turn through an operator-added custom provider.
+    #[test]
+    fn live_custom_provider_turn() {
+        let Ok(spec) = std::env::var("SA_LIVE_PROVIDER") else {
+            eprintln!("set SA_LIVE_PROVIDER=agent,base_url,KEY_ENV,model to run a billable custom-provider turn");
+            return;
+        };
+        let parts: Vec<&str> = spec.split(',').collect();
+        let [agent, base, key_env, model] = parts[..] else { panic!("bad SA_LIVE_PROVIDER") };
+        let data = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let nonce = format!("cp-{:x}", std::process::id() as u64 * 7_919 + 3);
+        std::fs::write(project.path().join("challenge.txt"), &nonce).unwrap();
+        let host = Host::start(data.path().to_path_buf(), || {}).unwrap();
+        let provider = CustomProvider {
+            id: String::new(),
+            agent: agent.into(),
+            name: "live-test".into(),
+            base_url: base.into(),
+            key_env: key_env.into(),
+            models: vec![model.into()],
+            enabled: true,
+        };
+        host.probe_models(provider.clone());
+        match host.probes.recv_timeout(Duration::from_secs(30)).unwrap() {
+            Ok(models) => eprintln!("probe: {} models, listed={}", models.len(), models.iter().any(|m| m == model)),
+            Err(e) => eprintln!("probe failed: {e}"),
+        }
+        host.submit(Action::ProviderSave { provider });
+        assert!(outcome(&host).result.is_ok());
+        let saved = host.providers().remove(0);
+        let route = json!({"provider": saved.route_id(), "model": model, "mode": "cli"});
+        host.submit(Action::Create {
+            goal: "Read challenge.txt in this project. Return only the exact text inside it. Do not modify any files.".into(),
+            cwd: Some(project.path().to_path_buf()),
+            lead: agent.into(),
+            profile: "readonly".into(),
+            files: vec![],
+            selections: Some(json!({agent: route})),
+            extensions: None,
+        });
+        let ticket = outcome(&host).result.unwrap().unwrap();
+        let root = drive_live(&host, ticket, Duration::from_secs(300));
+        let bound = host
+            .engine
+            .db()
+            .with(|q| q.one("SELECT route FROM native_routes WHERE job=?", &[&root["id"].as_i64().unwrap()]))
+            .unwrap();
+        eprintln!("state={} result={:?} route={bound:?}", root["state"], root["result"]);
+        assert_eq!(root["state"], json!("done"));
+        // Weaker models may wrap the answer; the file content must be there.
+        assert!(root["result"].as_str().unwrap_or_default().contains(&nonce), "challenge not read");
+        assert!(bound.unwrap()["route"].as_str().unwrap().contains(&saved.route_id()));
+    }
+
+    /// Billable: `SA_LIVE_ROTATION=<agent>,<base_url>,<KEY_ENV>,<model>`. The
+    /// first provider carries a deliberately invalid key; with rotation on,
+    /// the turn must move to the second (valid) provider and finish.
+    #[test]
+    fn live_rotation_after_auth_failure() {
+        let Ok(spec) = std::env::var("SA_LIVE_ROTATION") else {
+            eprintln!("set SA_LIVE_ROTATION=agent,base_url,KEY_ENV,model to run a billable rotation turn");
+            return;
+        };
+        let parts: Vec<&str> = spec.split(',').collect();
+        let [agent, base, key_env, model] = parts[..] else { panic!("bad SA_LIVE_ROTATION") };
+        // SAFETY: set before any adapter thread reads the environment.
+        unsafe { std::env::set_var("SA_ROTATION_INVALID_KEY", "sk-invalid-for-rotation-test") };
+        let data = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let nonce = format!("rot-{:x}", std::process::id() as u64 * 6_007 + 1);
+        std::fs::write(project.path().join("challenge.txt"), &nonce).unwrap();
+        let host = Host::start(data.path().to_path_buf(), || {}).unwrap();
+        for (name, env) in [("broken", "SA_ROTATION_INVALID_KEY"), ("backup", key_env)] {
+            host.submit(Action::ProviderSave {
+                provider: CustomProvider {
+                    id: String::new(),
+                    agent: agent.into(),
+                    name: name.into(),
+                    base_url: base.into(),
+                    key_env: env.into(),
+                    models: vec![model.into()],
+                    enabled: true,
+                },
+            });
+            assert!(outcome(&host).result.is_ok());
+        }
+        let list = host.providers();
+        let id = |n: &str| list.iter().find(|p| p.name == n).unwrap().route_id();
+        let (broken, backup) = (id("broken"), id("backup"));
+        let r = |p: &str| sa_store::providers::RouteRef {
+            provider: p.into(),
+            model: model.into(),
+            mode: "cli".into(),
+        };
+        host.submit(Action::RotationSave {
+            rotation: Rotation {
+                enabled: true,
+                order: [(agent.to_string(), vec![r(&broken), r(&backup)])].into(),
+            },
+        });
+        assert!(outcome(&host).result.is_ok());
+        host.submit(Action::Create {
+            goal: "Read challenge.txt in this project. Return only the exact text inside it. Do not modify any files.".into(),
+            cwd: Some(project.path().to_path_buf()),
+            lead: agent.into(),
+            profile: "readonly".into(),
+            files: vec![],
+            selections: Some(json!({agent: {"provider": broken, "model": model, "mode": "cli"}})),
+            extensions: None,
+        });
+        let ticket = outcome(&host).result.unwrap().unwrap();
+        let root = drive_live(&host, ticket, Duration::from_secs(300));
+        let rotated = host
+            .engine
+            .db()
+            .with(|q| q.all("SELECT payload FROM events WHERE ticket=? AND kind IN ('route.rotated','turn.gave_up','turn.retry_scheduled')", &[&ticket]))
+            .unwrap();
+        eprintln!("state={} result={:?} resilience={rotated:?}", root["state"], root["result"]);
+        assert_eq!(root["state"], json!("done"));
+        assert!(root["result"].as_str().unwrap_or_default().contains(&nonce));
+        assert!(
+            rotated.iter().any(|e| e["payload"].as_str().unwrap_or_default().contains(&backup)),
+            "no rotation to the backup provider"
+        );
+    }
+
     fn outcome(host: &Host) -> Outcome {
         host.rx.recv_timeout(Duration::from_secs(10)).expect("outcome")
     }
