@@ -7,7 +7,9 @@
 //! - `knowledge`: shared per-project knowledge base (`SA_MEMO`).
 //! - `resilience`: stall watchdog, error classification, retry policy,
 //!   circuit breaker and provider rotation.
+//! - `activity`: live per-job activity and status badges for the UI.
 
+pub mod activity;
 pub mod adapter;
 pub mod autonomy;
 pub mod context;
@@ -23,5 +25,6 @@ pub mod resilience;
 pub mod runner;
 pub mod services;
 
+pub use activity::{ActivityPhase, BadgeTone, JobActivity, RetryInfo};
 pub use engine::{CreateParams, Engine, EngineOptions};
 pub use sa_store::knowledge::KnowledgeEntry;

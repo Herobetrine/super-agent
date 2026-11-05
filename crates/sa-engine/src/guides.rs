@@ -117,12 +117,13 @@ pub const RECOVERY: &str = concat!(
     "The previous attempt of this turn was interrupted (see recovery). Inspect the actual project state and existing subtasks before repeating any effect; it may already have happened.",
 );
 
-/// Rust-port addendum when a report or harness_health shows a failing route
-/// (spec §9.2 F).
+/// Rust-port addendum when a report has a `failure` or harness_health shows a
+/// failing route (spec §9.2 F), including the SA_CANCEL control.
 pub const REROUTE: &str = concat!(
     "
 ",
-    "If a report has failure.retryable=false or harness_health lists a route as open or degraded, re-dispatch that work to a different harness from delegate_models with a new SA_SEND id; do not resend it to the failing route.",
+    "If a report has failure.retryable=false or harness_health lists a route as open or degraded, re-dispatch that work to a different harness from delegate_models with a new SA_SEND id; do not resend it to the failing route. ",
+    "To stop one of your own direct children that is still retrying before re-dispatching its work, OUTPUT a separate plain-text line: SA_CANCEL {\"id\":\"unique-cancel-key\",\"job\":<child job number>}. It cancels that child and its subtree; repeating the same id is a no-op.",
 );
 
 /// Rust-port addendum on every turn: the shared project knowledge base

@@ -36,6 +36,8 @@ pub struct JobCtx {
     pub bound_route: Option<String>,
     pub continuous: bool,
     pub floor: i64,
+    /// The ticket enabled automatic failover of read-only children.
+    pub failover: bool,
     /// Seq of this turn's `turn.admitted` event.
     pub admission: i64,
 }
@@ -70,6 +72,7 @@ impl JobCtx {
             bound_route: opt_str(r, "bound_route"),
             continuous: r.get("continuous_ticket").is_some_and(|v| !v.is_null()),
             floor: int_of(r, "floor"),
+            failover: int_of(r, "failover") != 0,
             admission: 0,
         }
     }
@@ -194,13 +197,19 @@ pub fn envelope(q: &Q, j: &JobCtx, harness_health: Value) -> Result<Map<String, 
     let floor = c.as_ref().map(|c| int_of(c, "boundary_job")).unwrap_or(0);
     let mut reports = vec![];
     for r in q.all(
-        "SELECT id,agent AS sender,role,body AS assignment,state,result FROM jobs WHERE parent=? AND id>? ORDER BY id",
+        "SELECT j.id,j.agent AS sender,j.role,j.body AS assignment,j.state,j.result,f.replacement
+      FROM jobs j LEFT JOIN job_failovers f ON f.original=j.id WHERE j.parent=? AND j.id>? ORDER BY j.id",
         &[&j.id, &floor],
     )? {
         let failure = failure_of(q, int_of(&r, "id"), str_of(&r, "state"))?;
         let mut r = r;
+        let replacement = r.remove("replacement").filter(|v| !v.is_null());
         if let Some(f) = failure {
             r.insert("failure".into(), f);
+        }
+        // Rust-port: an automatically failed-over child names its sibling.
+        if let Some(by) = replacement {
+            r.insert("replaced_by".into(), by);
         }
         reports.push(Value::Object(r));
     }

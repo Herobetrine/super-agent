@@ -12,6 +12,7 @@
 //! spawned tasks. One engine per journal (`desktop.lock`, spec §2.9) is the
 //! caller's responsibility.
 
+use crate::activity::{ActivityPhase, JobActivity, RetryInfo, Tracker};
 use crate::adapter::{AGENTS, Adapter, AdapterError, AdapterEvent, ErrorClass, Route, RunRequest, TurnHost};
 use crate::autonomy;
 use crate::context::{self, MAX_PROMPT_BYTES};
@@ -21,7 +22,7 @@ use crate::guides;
 use crate::job::{JobCtx, envelope};
 use crate::knowledge;
 use crate::protocol::{self as p, END_SQL, digest, stringify};
-use crate::resilience::{Health, HealthTransition, Recovery, TurnLedger, TurnResult, classify};
+use crate::resilience::{Health, HealthTransition, Recovery, ResilienceConfig, TurnLedger, TurnResult, classify};
 use crate::runner::{NoRotation, ResilientRunner, RotationSource, TurnRunner};
 use crate::services::{Extensions, FsSnapshotter, Snapshotter, realpath};
 use anyhow::{Result, anyhow, bail};
@@ -58,7 +59,7 @@ static TRANSIENT: LazyLock<Regex> = LazyLock::new(|| {
     .expect("valid regex")
 });
 static CONTROL_LINE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^SA_(SEND|NOTE|ROLE|TOOL|PROGRESS|MEMO) ").expect("valid regex"));
+    LazyLock::new(|| Regex::new(r"^SA_(SEND|NOTE|ROLE|TOOL|PROGRESS|MEMO|CANCEL) ").expect("valid regex"));
 
 /// Pluggable engine services.
 pub struct EngineOptions {
@@ -97,6 +98,10 @@ pub struct CreateParams {
     /// Per-agent routes; default `route_defaults`.
     pub selections: Option<Value>,
     pub extensions: Option<Value>,
+    /// Automatic failover of read-only children to another harness when
+    /// their route is unavailable or circuit-open (spec §9.2 F). Default
+    /// off; persisted in the side table `ticket_failover`.
+    pub failover: Option<bool>,
 }
 
 impl CreateParams {
@@ -119,6 +124,10 @@ impl CreateParams {
         self.files = files.iter().map(|f| f.to_string()).collect();
         self
     }
+    pub fn failover(mut self, enabled: bool) -> Self {
+        self.failover = Some(enabled);
+        self
+    }
 }
 
 type CatalogFuture = Shared<BoxFuture<'static, Result<Value, String>>>;
@@ -127,6 +136,7 @@ struct Slot {
     ticket: i64,
     cancel: CancellationToken,
     task: Option<JoinHandle<()>>,
+    turn: Arc<Turn>,
 }
 
 #[derive(Default)]
@@ -146,6 +156,12 @@ pub(crate) struct Inner {
     started: AtomicBool,
     stopping: AtomicBool,
     fault: Mutex<Option<String>>,
+    /// Runner watchdog limits for activity thresholds.
+    limits: Option<ResilienceConfig>,
+    /// Jobs cancelled inside a journal transaction whose running turns must
+    /// be aborted once it commits (the scheduler lock is taken before the
+    /// journal lock, never inside it).
+    pending_aborts: Mutex<Vec<i64>>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -165,6 +181,8 @@ pub struct Turn {
     /// `SA_MEMO` lines seen in this turn's final reply.
     pub(crate) memos: AtomicUsize,
     route: Mutex<Option<Route>>,
+    /// In-memory heartbeat for [`Engine::activity`].
+    activity: Mutex<Tracker>,
 }
 
 impl Turn {
@@ -259,11 +277,14 @@ impl Engine {
         let data_dir = std::path::absolute(dir.as_ref())?;
         let db = Db::open(&data_dir)?;
         let adapters = adapters.into_iter().map(|a| (a.agent().to_string(), a)).collect();
+        let limits = opts.runner.stall_limits();
         Ok(Self {
             inner: Arc::new(Inner {
                 db,
                 data_dir,
                 adapters,
+                limits,
+                pending_aborts: Mutex::new(vec![]),
                 opts,
                 sched: Mutex::new(Sched::default()),
                 catalogs: Mutex::new(HashMap::new()),
@@ -448,6 +469,9 @@ impl Engine {
             if profile == "auto" {
                 q.run("INSERT INTO continuous_runs(ticket) VALUES(?)", &[&ticket])?;
             }
+            if params.failover == Some(true) {
+                q.run("INSERT INTO ticket_failover(ticket,mode) VALUES(?,'readers')", &[&ticket])?;
+            }
             let writing = (writes && p::can_write(&lead, &profile)) as i64;
             let id = q.insert(
                 "INSERT INTO jobs(ticket,sender,agent,body,writing,depth,state)
@@ -579,11 +603,192 @@ impl Engine {
     pub fn health(&self) -> Vec<(String, Route, Health)> {
         self.inner.opts.runner.health()
     }
+
+    /// Whether automatic failover of read-only children is enabled for
+    /// `ticket` (spec §9.2 F).
+    pub fn failover(&self, ticket: i64) -> Result<bool> {
+        self.inner.db.with(|q| {
+            q.root(ticket)?;
+            q.exists("SELECT 1 FROM ticket_failover WHERE ticket=?", &[&ticket])
+        })
+    }
+
+    /// Enable or disable automatic failover of read-only children for an
+    /// existing ticket. Logs `failover.changed {enabled}` on the root when
+    /// the setting changes. Takes effect at the next failure of a child.
+    pub fn set_failover(&self, ticket: i64, enabled: bool) -> Result<()> {
+        self.inner.db.tx(|q| {
+            let root = q.root(ticket)?;
+            let changed = if enabled {
+                q.run(
+                    "INSERT OR IGNORE INTO ticket_failover(ticket,mode) VALUES(?,'readers')",
+                    &[&ticket],
+                )?
+            } else {
+                q.run("DELETE FROM ticket_failover WHERE ticket=?", &[&ticket])?
+            };
+            if changed > 0 {
+                q.log(who_of(&root), "failover.changed", &json!({"enabled": enabled}))?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Live activity of `ticket` for the UI (spec §9.2 G): every running job
+    /// (from memory: phase, idle time, open tools, watchdog threshold, route
+    /// health) and every queued job waiting for a scheduled retry (from the
+    /// journal: attempt, max, class, next_at), ordered by job id. Cheap
+    /// enough to call every second: one scheduler-lock snapshot, then one
+    /// indexed journal read per retrying job; locks are never nested.
+    /// A closed or failing journal yields only the running part.
+    pub fn activity(&self, ticket: i64) -> Vec<JobActivity> {
+        let inner = &self.inner;
+        let turns: Vec<Arc<Turn>> = lock(&inner.sched)
+            .active
+            .values()
+            .filter(|s| s.ticket == ticket)
+            .map(|s| s.turn.clone())
+            .collect();
+        let health = inner.opts.runner.health();
+        let health_of = |agent: &str, route: Option<&Route>| {
+            route
+                .and_then(|r| health.iter().find(|(a, hr, _)| a == agent && hr == r))
+                .map_or(Health::Healthy, |(_, _, h)| *h)
+        };
+        let at = now();
+        let mut out = Vec::with_capacity(turns.len());
+        for t in &turns {
+            let snap = lock(&t.activity).snapshot(at, inner.limits.as_ref());
+            let route = lock(&t.route)
+                .clone()
+                .or_else(|| p::route(Some(&parse(t.job.bound_route.as_deref()))).ok());
+            out.push(JobActivity {
+                job: t.job.id,
+                agent: t.job.agent.clone(),
+                phase: snap.phase,
+                idle_ms: snap.idle_ms,
+                open_tools: snap.open_tools,
+                last_frame_at: snap.last_frame_at,
+                started_at: Some(snap.started_at),
+                threshold_ms: snap.threshold_ms,
+                health: health_of(&t.job.agent, route.as_ref()),
+                retry: None,
+            });
+        }
+        let retrying = inner.db.with(|q| scheduled_retries(q, ticket, at)).unwrap_or_default();
+        for (job, agent, route, retry) in retrying {
+            if out.iter().any(|a| a.job == job) {
+                continue;
+            }
+            out.push(JobActivity {
+                job,
+                health: health_of(&agent, route.as_ref()),
+                agent,
+                phase: ActivityPhase::RetryWait,
+                idle_ms: 0,
+                open_tools: vec![],
+                last_frame_at: None,
+                started_at: None,
+                threshold_ms: None,
+                retry: Some(retry),
+            });
+        }
+        out.sort_by_key(|a| a.job);
+        out
+    }
+}
+
+/// `(job, agent, bound route, retry)` of a queued job awaiting a retry.
+type ScheduledRetry = (i64, String, Option<Route>, RetryInfo);
+
+/// Queued jobs of `ticket` with `ready_after` in the future and a journaled
+/// retry since their last reply.
+fn scheduled_retries(q: &Q, ticket: i64, at: f64) -> Result<Vec<ScheduledRetry>> {
+    let jobs = q.all(
+        "SELECT j.id,j.agent,j.ready_after,r.route AS bound_route FROM jobs j LEFT JOIN native_routes r ON r.job=j.id
+      WHERE j.ticket=? AND j.state='queued' AND j.ready_after>? ORDER BY j.id",
+        &[&ticket, &at],
+    )?;
+    let mut out = vec![];
+    for j in jobs {
+        let id = int_of(&j, "id");
+        let rows = q.all(
+            "SELECT kind,payload FROM events WHERE ticket=? AND job=? AND kind IN
+        ('turn.retry_scheduled','route.rotated','turn.route_wait','turn.deferred','auto.retry')
+        AND seq>coalesce((SELECT max(seq) FROM events WHERE ticket=? AND job=? AND kind IN
+        ('reply','user.follow','retry','turn.gave_up')),0) ORDER BY seq",
+            &[&ticket, &id, &ticket, &id],
+        )?;
+        let (mut attempts, mut legacy) = (0u32, 0u32);
+        let mut last: Option<(String, Value)> = None;
+        for r in rows {
+            let kind = str_of(&r, "kind");
+            match kind {
+                "auto.retry" => legacy += 1,
+                _ => {
+                    if matches!(kind, "turn.retry_scheduled" | "route.rotated") {
+                        attempts += 1;
+                    }
+                    last = Some((kind.to_string(), parse(Some(str_of(&r, "payload")))));
+                }
+            }
+        }
+        let (class, max, attempt) = match &last {
+            Some((kind, payload)) => {
+                let field = |k: &str| payload.get(k).and_then(Value::as_str).map(str::to_string);
+                match kind.as_str() {
+                    "turn.retry_scheduled" => (
+                        field("class"),
+                        payload.get("max").and_then(Value::as_u64).map(|m| m as u32),
+                        attempts,
+                    ),
+                    "route.rotated" => (field("reason"), None, attempts),
+                    "turn.deferred" => (Some("circuit_open".into()), None, attempts),
+                    _ => (field("class"), None, attempts),
+                }
+            }
+            None if legacy > 0 => (Some("transient".into()), None, legacy),
+            None => continue,
+        };
+        let route = p::route(Some(&parse(j.get("bound_route").and_then(Value::as_str)))).ok();
+        out.push((
+            id,
+            str_of(&j, "agent").to_string(),
+            route,
+            RetryInfo {
+                attempt,
+                max,
+                class: class.unwrap_or_else(|| "other".into()),
+                next_at: j.get("ready_after").and_then(Value::as_f64).unwrap_or(at),
+            },
+        ));
+    }
+    Ok(out)
 }
 
 impl Inner {
     pub(crate) fn extensions(&self) -> Option<Arc<dyn Extensions>> {
         self.opts.extensions.clone()
+    }
+
+    /// Abort the running turns of `ids` (already cancelled in the journal).
+    /// Never call while holding the journal lock.
+    pub(crate) fn abort_jobs(&self, ids: &[i64]) {
+        if ids.is_empty() {
+            return;
+        }
+        let sched = lock(&self.sched);
+        for id in ids {
+            if let Some(slot) = sched.active.get(id) {
+                slot.cancel.cancel();
+            }
+        }
+    }
+
+    /// Abort turns cancelled by a failover inside `fail`.
+    fn flush_aborts(&self) {
+        let ids = std::mem::take(&mut *lock(&self.pending_aborts));
+        self.abort_jobs(&ids);
     }
 
     fn step(self: &Arc<Self>) -> usize {
@@ -635,14 +840,16 @@ impl Inner {
     fn admit(self: &Arc<Self>) -> Result<usize> {
         let mut sched = lock(&self.sched);
         let health = self.health_value();
+        let mut aborts = vec![];
         let admitted = self.db.tx(|q| {
             q.wake()?;
             let queued = "SELECT j.*,t.cwd,t.claude_route,t.follow_config,t.agent_routes,t.allow_lead_routing,t.writes,
         t.permission_profile AS ticket_profile,coalesce(j.permission_override,t.permission_profile) AS profile,
-        t.auto_cycles,r.route AS bound_route,c.ticket AS continuous_ticket,coalesce(c.boundary_job,0) AS floor
+        t.auto_cycles,r.route AS bound_route,c.ticket AS continuous_ticket,coalesce(c.boundary_job,0) AS floor,
+        f.ticket IS NOT NULL AS failover
         FROM jobs j JOIN tickets t ON t.id=j.ticket LEFT JOIN native_routes r ON r.job=j.id
-        LEFT JOIN continuous_runs c ON c.ticket=j.ticket WHERE j.state='queued' AND j.ready_after<=?
-        AND j.writing=? ORDER BY j.id LIMIT ?";
+        LEFT JOIN continuous_runs c ON c.ticket=j.ticket LEFT JOIN ticket_failover f ON f.ticket=j.ticket
+        WHERE j.state='queued' AND j.ready_after<=? AND j.writing=? ORDER BY j.id LIMIT ?";
             let time = now();
             let mut candidates = q.all(queued, &[&time, &0, &(READS_PER_SLICE as i64)])?;
             if sched.writer.is_none() {
@@ -657,6 +864,10 @@ impl Inner {
                     continue;
                 }
                 if let Some(until) = self.route_blocked(&job, time) {
+                    if let Some(ids) = self.failover(q, &job, "circuit_open")? {
+                        aborts.extend(ids);
+                        continue;
+                    }
                     q.run("UPDATE jobs SET ready_after=? WHERE id=?", &[&until, &job.id])?;
                     q.log(job.who(), "turn.deferred", &json!({"until": p::seconds_json(until), "reason": "circuit_open"}))?;
                     continue;
@@ -697,10 +908,16 @@ impl Inner {
                     tool_follow: AtomicBool::new(false),
                     memos: AtomicUsize::new(0),
                     route: Mutex::new(None),
+                    activity: Mutex::new(Tracker::new(time)),
                 });
             }
             Ok(slots)
         })?;
+        for id in aborts {
+            if let Some(slot) = sched.active.get(&id) {
+                slot.cancel.cancel();
+            }
+        }
         let n = admitted.len();
         for turn in admitted {
             let turn = Arc::new(turn);
@@ -728,6 +945,7 @@ impl Inner {
                     ticket: turn.job.ticket,
                     cancel: turn.cancel.clone(),
                     task: Some(task),
+                    turn: turn.clone(),
                 },
             );
         }
@@ -810,6 +1028,7 @@ impl Inner {
             Ok(()) => Ok(()),
             Err(err) => self.db.tx(|q| self.fail(q, turn, &err)),
         };
+        self.flush_aborts();
         let expire = self.db.with(|q| {
             q.run(
                 "UPDATE approvals SET decision='expired' WHERE job=? AND turn=? AND decision='pending'",
@@ -871,9 +1090,9 @@ impl Inner {
         if packet.get("recovery").is_some_and(|r| !r.is_null()) {
             guide.push_str(guides::RECOVERY);
         }
-        let failing_report = turn.reports.iter().any(|r| {
-            r.get("failure").and_then(|f| f.get("retryable")) == Some(&Value::Bool(false))
-        });
+        // Any report with a failure (retrying or given up) gets the re-route
+        // and SA_CANCEL guidance.
+        let failing_report = turn.reports.iter().any(|r| r.get("failure").is_some_and(|f| !f.is_null()));
         let unhealthy = packet
             .get("harness_health")
             .and_then(Value::as_object)
@@ -926,6 +1145,7 @@ impl Inner {
         let host: Arc<dyn TurnHost> = Arc::new(Host(turn.clone()));
         let (tx, mut rx) = mpsc::unbounded_channel();
         let runner = self.opts.runner.clone();
+        lock(&turn.activity).set_phase(ActivityPhase::Spawning, now());
         let mut native = tokio::spawn(runner.run_turn(adapter, request, host, tx, turn.cancel.clone()));
         let wall = self.opts.runner.wall_clock();
         let deadline = tokio::time::sleep(wall.unwrap_or(Duration::MAX / 4));
@@ -939,6 +1159,13 @@ impl Inner {
                     while let Ok(ev) = rx.try_recv() {
                         batch.push(ev);
                     }
+                    {
+                        let at = now();
+                        let mut activity = lock(&turn.activity);
+                        for ev in &batch {
+                            activity.on_event(ev, at);
+                        }
+                    }
                     self.absorb(turn, batch, &route, &mut stream).await;
                 }
                 r = &mut native => break r,
@@ -948,6 +1175,7 @@ impl Inner {
                 }
             }
         };
+        lock(&turn.activity).set_phase(ActivityPhase::Closing, now());
         let mut rest = vec![];
         while let Ok(ev) = rx.try_recv() {
             rest.push(ev);
@@ -1152,7 +1380,7 @@ impl Inner {
         }
         let job = &turn.job;
         let cleaned = line.strip_suffix('\r').unwrap_or(line);
-        let Err(err) = dispatch::command(turn, cleaned).await else {
+        let Err(err) = dispatch::command(turn, cleaned, streaming).await else {
             return;
         };
         let tag = line.split(' ').next().unwrap_or_default().to_string();
@@ -1189,7 +1417,8 @@ impl Inner {
             .filter_map(|r| r.get("id").and_then(Value::as_i64).map(|id| (id, r)))
             .collect();
         let children = q.all(
-            "SELECT id,state,result FROM jobs WHERE parent=? AND id>?",
+            "SELECT j.id,j.state,j.result,f.replacement FROM jobs j LEFT JOIN job_failovers f ON f.original=j.id
+      WHERE j.parent=? AND j.id>?",
             &[&job.id, &job.floor],
         )?;
         let outstanding = children.iter().any(|c| {
@@ -1262,11 +1491,13 @@ impl Inner {
                 }
             }
         }
+        // A child replaced by automatic failover counts through its sibling.
         if state == "done"
             && !job.auto_root()
-            && children
-                .iter()
-                .any(|c| matches!(str_of(c, "state"), "partial" | "failed" | "cancelled"))
+            && children.iter().any(|c| {
+                matches!(str_of(c, "state"), "partial" | "failed" | "cancelled")
+                    && c.get("replacement").is_none_or(Value::is_null)
+            })
         {
             state = "partial";
         }
@@ -1312,6 +1543,10 @@ impl Inner {
         }
         let route = lock(&turn.route).clone();
         if let TurnError::Wait(until) = err {
+            if let Some(ids) = self.failover(q, job, "circuit_open")? {
+                lock(&self.pending_aborts).extend(ids);
+                return Ok(());
+            }
             return self.requeue(q, job, *until, None, "turn.route_wait", json!({
                 "until": p::seconds_json(*until),
                 "class": "route_unavailable",
@@ -1330,6 +1565,33 @@ impl Inner {
             let rotation = self.opts.rotation.candidates(&job.agent);
             let decision = self.opts.runner.decide(&mut ledger, &job.agent, &route, e, &rotation, now());
             self.log_transitions(q, who)?;
+            // Optional automatic failover of read-only children (spec §9.2 F):
+            // an unavailable route, or a breaker that is now open, moves the
+            // work to a sibling on another harness instead of waiting. The
+            // operator's provider rotation on the same harness goes first.
+            let rotating = matches!(decision, Some(Recovery::Rotate { .. }));
+            let open = matches!(decision, Some(Recovery::WaitForRoute { .. }))
+                || self
+                    .opts
+                    .runner
+                    .health()
+                    .iter()
+                    .any(|(a, r, h)| *a == job.agent && *r == route && *h == Health::Open);
+            let reason = if rotating {
+                None
+            } else if e.class == ErrorClass::RouteUnavailable {
+                Some("route_unavailable")
+            } else if open {
+                Some("circuit_open")
+            } else {
+                None
+            };
+            if let Some(reason) = reason
+                && let Some(ids) = self.failover(q, job, reason)?
+            {
+                lock(&self.pending_aborts).extend(ids);
+                return Ok(());
+            }
             if let Some(decision) = decision {
                 return self.recover(q, job, &route, e, decision, ledger.failures);
             }
@@ -1357,6 +1619,129 @@ impl Inner {
         q.run("UPDATE jobs SET state=?,result=? WHERE id=?", &[&state, &reason, &job.id])?;
         q.log(job.who(), state, &json!(reason))?;
         Ok(())
+    }
+
+    /// Optional automatic failover of a read-only child (spec §9.2 F), for
+    /// tickets with `ticket_failover`. Creates a sibling with the same body
+    /// on the first other harness, in `AGENTS` order, that the parent's
+    /// latest `delegate_models` lists as available (any configured harness
+    /// when the parent has no delegate menu) and whose route is not
+    /// circuit-open, skipping harnesses already tried in this failover
+    /// chain. Logs `send {…, failover_of, reason}` on the parent and cancels
+    /// the original and its subtree. Writers and roots never fail over.
+    /// Returns the cancelled job ids, or `None` when nothing was done.
+    fn failover(&self, q: &Q, job: &JobCtx, reason: &str) -> Result<Option<Vec<i64>>> {
+        let Some(parent) = job.parent else { return Ok(None) };
+        if !job.failover || job.writing {
+            return Ok(None);
+        }
+        let Some(original) = q.one("SELECT * FROM jobs WHERE id=?", &[&job.id])? else {
+            return Ok(None);
+        };
+        if p::is_terminal(str_of(&original, "state")) || int_of(&original, "writing") != 0 {
+            return Ok(None);
+        }
+        let parent_row = q
+            .one("SELECT * FROM jobs WHERE id=? AND ticket=?", &[&parent, &job.ticket])?
+            .filter(|r| matches!(str_of(r, "state"), "queued" | "running" | "waiting"));
+        let Some(parent_row) = parent_row else { return Ok(None) };
+        let mut tried = vec![job.agent.clone()];
+        let mut cursor = job.id;
+        while let Some(prev) = q.one(
+            "SELECT f.original,j.agent FROM job_failovers f JOIN jobs j ON j.id=f.original WHERE f.replacement=?",
+            &[&cursor],
+        )? {
+            tried.push(str_of(&prev, "agent").to_string());
+            cursor = int_of(&prev, "original");
+        }
+        let menus = q
+            .one(
+                "SELECT payload FROM events WHERE ticket=? AND job=? AND kind='input' ORDER BY seq DESC LIMIT 1",
+                &[&job.ticket, &parent],
+            )?
+            .and_then(|r| parse(Some(str_of(&r, "payload"))).get("delegate_models").cloned())
+            .and_then(|d| match d {
+                Value::Object(m) if !m.is_empty() => Some(m),
+                _ => None,
+            });
+        let health = self.opts.runner.health();
+        let blocked = |agent: &str, route: Option<&Route>| {
+            health.iter().any(|(a, r, h)| {
+                a == agent && matches!(h, Health::Open | Health::HalfOpen) && route.is_none_or(|x| x == r)
+            })
+        };
+        let target = AGENTS.into_iter().find(|agent| {
+            if tried.iter().any(|t| t == agent) || !self.adapters.contains_key(*agent) {
+                return false;
+            }
+            let Some(menus) = &menus else { return !blocked(agent, None) };
+            let Some(menu) = menus.get(*agent) else { return false };
+            if menu.get("available") == Some(&Value::Bool(false)) {
+                return false;
+            }
+            let model = menu
+                .get("models")
+                .and_then(|m| m.get(0))
+                .or_else(|| menu.get("default_model"))
+                .cloned()
+                .unwrap_or(Value::Null);
+            let route = json!({"provider": menu["provider"], "model": model, "mode": menu["mode"]});
+            p::route(Some(&route)).is_ok_and(|r| !blocked(agent, Some(&r)))
+        });
+        let Some(target) = target else { return Ok(None) };
+        let msgkey = format!("{}#failover:{}", str_of(&original, "msgkey"), job.id);
+        let role = str_of(&original, "assigned_role").to_string();
+        let sender = original.get("sender").and_then(Value::as_str);
+        let source_turn = original.get("source_turn").and_then(Value::as_i64);
+        let narrowed = original.get("permission_override").and_then(Value::as_str);
+        let sibling = q.insert(
+            "INSERT INTO jobs(ticket,parent,sender,agent,body,writing,depth,source_turn,
+      msgkey,state,role,assigned_role,route_override,permission_override) VALUES(?,?,?,?,?,0,?,?,?,'queued',?,?,NULL,?)",
+            &[
+                &job.ticket,
+                &parent,
+                &sender,
+                &target,
+                &job.body,
+                &job.depth,
+                &source_turn,
+                &msgkey,
+                &role,
+                &role,
+                &narrowed,
+            ],
+        )?;
+        q.run(
+            "INSERT INTO job_files(job,manifest) SELECT ?,manifest FROM job_files WHERE job=?",
+            &[&sibling, &job.id],
+        )?;
+        let manifest = q
+            .one("SELECT manifest FROM job_files WHERE job=?", &[&job.id])?
+            .map(|m| parse(Some(str_of(&m, "manifest"))))
+            .unwrap_or_else(|| json!([]));
+        q.log(
+            who_of(&parent_row),
+            "send",
+            &json!({
+                "to": target,
+                "child": sibling,
+                "body": job.body,
+                "sha256": digest(&job.body),
+                "write": false,
+                "files": manifest,
+                "role": role,
+                "selection": Value::Null,
+                "permission_profile": job.profile,
+                "failover_of": job.id,
+                "reason": reason,
+            }),
+        )?;
+        q.run(
+            "INSERT INTO job_failovers(original,replacement) VALUES(?,?)",
+            &[&job.id, &sibling],
+        )?;
+        let note = format!("执行端 {} 不可用，已自动改派给 {target}（任务 #{sibling}）", job.agent);
+        Ok(Some(q.cancel_subtree(job.id, &note)?))
     }
 
     /// Requeue the next attempt of the same logical turn. `turn+1` makes the
@@ -1580,6 +1965,15 @@ pub(crate) async fn approve(turn: Arc<Turn>, action: Value) -> bool {
         Ok(Some(id))
     });
     let Ok(Some(id)) = id else { return false };
+    // Live activity shows the wait; the guard ends it on every exit path.
+    struct Waiting<'a>(&'a Turn);
+    impl Drop for Waiting<'_> {
+        fn drop(&mut self) {
+            lock(&self.0.activity).approval(false, now());
+        }
+    }
+    lock(&turn.activity).approval(true, now());
+    let _waiting = Waiting(&turn);
     while !turn.aborted() && !inner.db.is_closed() && turn.live() {
         let row = inner
             .db
