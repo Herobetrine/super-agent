@@ -511,7 +511,7 @@ impl App {
                         {
                             pick_files = true;
                         }
-                        egui::ComboBox::from_id_salt("lead")
+                        widgets::combo("lead")
                             .width(150.0)
                             .selected_text(format!("主控 · {}", agent_name(&self.composer.lead)))
                             .show_ui(ui, |ui| {
@@ -520,7 +520,7 @@ impl App {
                                 }
                             });
                         let mut next = self.composer.profile.clone();
-                        egui::ComboBox::from_id_salt("profile")
+                        widgets::combo("profile")
                             .width(118.0)
                             .selected_text(labels::profile(&self.composer.profile))
                             .show_ui(ui, |ui| {

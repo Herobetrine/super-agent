@@ -140,7 +140,7 @@ impl App {
                     );
                     resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::TextEdit, true, "知识条目输入"));
                     ui.horizontal(|ui| {
-                        egui::ComboBox::from_id_salt("knowledge-kind")
+                        widgets::combo("knowledge-kind")
                             .width(84.0)
                             .selected_text(kind_label(&self.knowledge.kind))
                             .show_ui(ui, |ui| {

@@ -174,3 +174,156 @@ pub fn left_bar(ui: &Ui, rect: Rect, color: Color32) {
         color,
     );
 }
+
+/// Combo box with a Phosphor caret instead of egui's triangle.
+pub fn combo(id: impl std::hash::Hash) -> egui::ComboBox {
+    egui::ComboBox::from_id_salt(id).icon(|ui, rect, visuals, open| {
+        let caret = if open {
+            egui_phosphor::regular::CARET_UP
+        } else {
+            egui_phosphor::regular::CARET_DOWN
+        };
+        ui.painter().text(
+            rect.center(),
+            Align2::CENTER_CENTER,
+            caret,
+            theme::body(12.0),
+            visuals.fg_stroke.color,
+        );
+    })
+}
+
+/// Filled accent button for the primary action of a dialog or screen.
+pub fn primary_button(ui: &mut Ui, icon: &str, text: &str, pal: &Palette, enabled: bool) -> Response {
+    let label = if icon.is_empty() {
+        text.to_string()
+    } else {
+        format!("{icon}  {text}")
+    };
+    let fg = if pal.dark { pal.canvas } else { Color32::WHITE };
+    let galley = line_galley(ui, &label, theme::strong(13.0), fg, 400.0);
+    let pad = vec2(14.0, 7.0);
+    let sense = if enabled { Sense::click() } else { Sense::hover() };
+    let (rect, resp) = ui.allocate_exact_size(galley.size() + pad * 2.0, sense);
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, text));
+    if ui.is_rect_visible(rect) {
+        let hover = ui.ctx().animate_bool(resp.id.with("hover"), enabled && resp.hovered());
+        let mut fill = pal.accent;
+        if !enabled {
+            fill = fill.gamma_multiply(0.4);
+        } else if hover > 0.0 {
+            fill = fill.lerp_to_gamma(if pal.dark { Color32::WHITE } else { Color32::BLACK }, 0.12 * hover);
+        }
+        ui.painter().rect_filled(rect, CornerRadius::same(9), fill);
+        ui.painter().galley(rect.min + pad, galley, fg);
+    }
+    if enabled {
+        resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+    } else {
+        resp
+    }
+}
+
+/// iOS-style switch with a label; returns the response of the whole row.
+pub fn toggle(ui: &mut Ui, on: &mut bool, text: &str, pal: &Palette) -> Response {
+    let galley = line_galley(ui, text, theme::body(13.5), pal.ink, ui.available_width() - 48.0);
+    let track = vec2(34.0, 20.0);
+    let size = vec2(track.x + 10.0 + galley.size().x, track.y.max(galley.size().y));
+    let enabled = ui.is_enabled();
+    let (rect, mut resp) = ui.allocate_exact_size(size, Sense::click());
+    if resp.clicked() {
+        *on = !*on;
+        resp.mark_changed();
+    }
+    resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Checkbox, enabled, *on, text));
+    if ui.is_rect_visible(rect) {
+        let t = ui.ctx().animate_bool(resp.id, *on);
+        let tr = Rect::from_min_size(pos2(rect.left(), rect.center().y - track.y / 2.0), track);
+        let off = if pal.dark { pal.line } else { hex_line(pal) };
+        let fill = off.lerp_to_gamma(pal.accent, t);
+        let p = ui.painter();
+        p.rect_filled(tr, CornerRadius::same(10), if enabled { fill } else { fill.gamma_multiply(0.5) });
+        let x = egui::lerp(tr.left() + 10.0..=tr.right() - 10.0, t);
+        p.circle_filled(pos2(x, tr.center().y), 7.5, Color32::WHITE);
+        p.galley(pos2(tr.right() + 10.0, rect.center().y - galley.size().y / 2.0), galley, pal.ink);
+    }
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+fn hex_line(pal: &Palette) -> Color32 {
+    pal.line.lerp_to_gamma(pal.faint, 0.4)
+}
+
+/// Frame shared by every modal dialog.
+pub fn modal_frame(pal: &Palette) -> egui::Frame {
+    egui::Frame::new()
+        .fill(pal.surface)
+        .stroke(Stroke::new(1.0_f32, pal.line))
+        .corner_radius(CornerRadius::same(16))
+        .shadow(egui::Shadow {
+            offset: [0, 18],
+            blur: 48,
+            spread: 0,
+            color: Color32::from_black_alpha(if pal.dark { 120 } else { 40 }),
+        })
+        .inner_margin(egui::Margin::same(22))
+}
+
+/// Dialog header: icon tile, title, optional subtitle and a close button.
+/// Returns true when the close button was clicked.
+pub fn modal_header(ui: &mut Ui, icon: &str, title: &str, subtitle: &str, pal: &Palette) -> bool {
+    let mut close = false;
+    ui.horizontal(|ui| {
+        let (r, _) = ui.allocate_exact_size(Vec2::splat(36.0), Sense::hover());
+        ui.painter().rect_filled(r, CornerRadius::same(10), pal.pale);
+        ui.painter()
+            .text(r.center(), Align2::CENTER_CENTER, icon, theme::body(18.0), pal.accent);
+        ui.add_space(4.0);
+        ui.vertical(|ui| {
+            ui.spacing_mut().item_spacing.y = 1.0;
+            ui.label(egui::RichText::new(title).font(theme::strong(16.0)).color(pal.ink));
+            if !subtitle.is_empty() {
+                ui.label(egui::RichText::new(subtitle).font(theme::body(theme::SMALL)).color(pal.mute));
+            }
+        });
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+            let r = icon_button(ui, egui_phosphor::regular::X, 28.0, pal.mute, pal.hover, false).on_hover_text("关闭");
+            r.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "关闭对话框"));
+            close = r.clicked();
+        });
+    });
+    ui.add_space(12.0);
+    close
+}
+
+/// Segmented control (tabs inside a dialog); returns the newly picked index.
+pub fn segmented(ui: &mut Ui, items: &[&str], current: usize, pal: &Palette) -> Option<usize> {
+    let mut picked = None;
+    egui::Frame::new()
+        .fill(if pal.dark { pal.canvas } else { pal.hover })
+        .corner_radius(CornerRadius::same(10))
+        .inner_margin(egui::Margin::same(3))
+        .show(ui, |ui| {
+            ui.spacing_mut().item_spacing.x = 2.0;
+            ui.horizontal(|ui| {
+                for (i, name) in items.iter().enumerate() {
+                    let selected = i == current;
+                    let font = if selected { theme::strong(13.0) } else { theme::body(13.0) };
+                    let color = if selected { pal.ink } else { pal.mute };
+                    let g = line_galley(ui, name, font, color, 240.0);
+                    let (rect, resp) = ui.allocate_exact_size(g.size() + vec2(24.0, 12.0), Sense::click());
+                    resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, true, selected, *name));
+                    if selected {
+                        ui.painter().rect_filled(rect, CornerRadius::same(8), if pal.dark { pal.selected } else { pal.surface });
+                    } else if resp.hovered() {
+                        ui.painter().rect_filled(rect, CornerRadius::same(8), pal.line_soft.gamma_multiply(0.6));
+                    }
+                    ui.painter().galley(rect.min + vec2(12.0, 6.0), g, color);
+                    if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() && !selected {
+                        picked = Some(i);
+                    }
+                }
+            });
+        });
+    picked
+}

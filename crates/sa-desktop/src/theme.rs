@@ -206,7 +206,8 @@ pub fn apply(ctx: &egui::Context, pal: &Palette) {
     v.override_text_color = Some(pal.ink);
     v.panel_fill = pal.canvas;
     v.window_fill = pal.surface;
-    v.extreme_bg_color = pal.surface;
+    // Text fields read as inset wells on both white cards and the canvas.
+    v.extreme_bg_color = if pal.dark { hex(0x111714) } else { hex(0xf4f6f1) };
     v.faint_bg_color = pal.surface_alt;
     v.code_bg_color = pal.inline_code_bg;
     v.hyperlink_color = pal.link;
@@ -249,16 +250,17 @@ pub fn apply(ctx: &egui::Context, pal: &Palette) {
     w.noninteractive.fg_stroke = Stroke::new(1.0_f32, pal.ink);
     w.noninteractive.corner_radius = r;
 
+    // Checkboxes, combo boxes and text fields need a visible edge at rest.
     w.inactive.bg_fill = pal.surface;
-    w.inactive.weak_bg_fill = Color32::TRANSPARENT;
-    w.inactive.bg_stroke = Stroke::NONE;
+    w.inactive.weak_bg_fill = pal.surface_alt;
+    w.inactive.bg_stroke = Stroke::new(1.0_f32, pal.line);
     w.inactive.fg_stroke = Stroke::new(1.2_f32, pal.ink);
     w.inactive.corner_radius = r;
     w.inactive.expansion = 0.0;
 
     w.hovered.bg_fill = pal.hover;
     w.hovered.weak_bg_fill = pal.hover;
-    w.hovered.bg_stroke = Stroke::new(1.0_f32, pal.line);
+    w.hovered.bg_stroke = Stroke::new(1.0_f32, pal.faint);
     w.hovered.fg_stroke = Stroke::new(1.4_f32, pal.ink);
     w.hovered.corner_radius = r;
     w.hovered.expansion = 0.0;

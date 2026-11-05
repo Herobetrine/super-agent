@@ -10,7 +10,7 @@ use crate::host::Action;
 use crate::labels::{self, agent_name};
 use crate::theme;
 use crate::widgets;
-use egui::{Align, CornerRadius, Frame, Label, Layout, Margin, RichText, Stroke, Ui};
+use egui::{Align, Label, Layout, RichText, Ui};
 use egui_phosphor::regular as icon;
 use sa_engine::adapter::AGENTS;
 use serde_json::{Map, Value, json};
@@ -132,7 +132,7 @@ fn combo(ui: &mut Ui, label: &str, id: &str, options: &[&Value], current: &str, 
                 }
             });
         ui.add_enabled_ui(!locked, |ui| {
-            let resp = egui::ComboBox::from_id_salt(("model-combo", id))
+            let resp = widgets::combo(("model-combo", id))
                 .width(ui.available_width().min(380.0))
                 .selected_text(text)
                 .show_ui(ui, |ui| {
@@ -253,32 +253,22 @@ impl App {
         let mut close = false;
         let mut save = false;
         let modal = egui::Modal::new(egui::Id::new("sa-models"))
-            .frame(
-                Frame::new()
-                    .fill(pal.surface)
-                    .stroke(Stroke::new(1.0_f32, pal.line))
-                    .corner_radius(CornerRadius::same(14))
-                    .inner_margin(Margin::same(20)),
-            )
+            .frame(widgets::modal_frame(&pal))
             .show(ctx, |ui| {
-                ui.set_width(520.0);
-                ui.label(RichText::new(title).font(theme::strong(16.0)).color(pal.ink));
-                ui.add_space(10.0);
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 4.0;
-                    for a in AGENTS {
-                        let explicit = d.chosen.contains_key(a);
-                        let name = if explicit { format!("{} ·", agent_name(a)) } else { agent_name(a).to_string() };
-                        if widgets::quiet_button(ui, "", &name, &pal, d.agent == a)
-                            .on_hover_text(if explicit { "已指定供应商与模型" } else { "跟随本机默认配置" })
-                            .clicked()
-                            && d.agent != a
-                        {
-                            switch_to = Some(a.to_string());
-                        }
-                    }
-                });
-                ui.add_space(10.0);
+                ui.set_width(540.0);
+                if widgets::modal_header(ui, icon::SLIDERS_HORIZONTAL, title, "为每个执行端选择执行方式、供应商与模型；带 · 的已明确指定。", &pal) {
+                    close = true;
+                }
+                let names: Vec<String> = AGENTS
+                    .iter()
+                    .map(|a| if d.chosen.contains_key(*a) { format!("{} ·", agent_name(a)) } else { agent_name(a) })
+                    .collect();
+                let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+                let current = AGENTS.iter().position(|a| *a == d.agent).unwrap_or(0);
+                if let Some(i) = widgets::segmented(ui, &refs, current, &pal) {
+                    switch_to = Some(AGENTS[i].to_string());
+                }
+                ui.add_space(12.0);
                 let agent = d.agent.clone();
                 match d.catalogs.get(&agent) {
                     None | Some(Probe::Loading) => {
@@ -300,7 +290,7 @@ impl App {
                         let pick = d.chosen.get(&agent).cloned().unwrap_or_else(|| default.clone());
                         let mut follow_now = follow;
                         ui.add_enabled_ui(!d.locked, |ui| {
-                            ui.checkbox(&mut follow_now, "跟随本机适配器默认配置");
+                            widgets::toggle(ui, &mut follow_now, "跟随本机适配器默认配置", &pal);
                         });
                         if let Some(detail) = c.get("detail").and_then(Value::as_str).filter(|s| !s.is_empty()) {
                             ui.add(Label::new(RichText::new(detail).font(theme::body(theme::SMALL)).color(pal.mute)).wrap());
@@ -390,7 +380,7 @@ impl App {
                     if !d.locked {
                         let ok = d.savable();
                         if ui
-                            .add_enabled_ui(ok, |ui| widgets::quiet_button(ui, icon::CHECK, "保存选择", &pal, true))
+                            .add_enabled_ui(ok, |ui| widgets::primary_button(ui, icon::CHECK, "保存选择", &pal, ok))
                             .inner
                             .clicked()
                         {

@@ -184,36 +184,19 @@ impl App {
         let busy = self.composer.pending > 0;
         let d = self.providers.as_mut().expect("checked");
         let modal = egui::Modal::new(egui::Id::new("sa-providers"))
-            .frame(
-                Frame::new()
-                    .fill(pal.surface)
-                    .stroke(Stroke::new(1.0_f32, pal.line))
-                    .corner_radius(CornerRadius::same(14))
-                    .inner_margin(Margin::same(20)),
-            )
+            .frame(widgets::modal_frame(&pal))
             .show(ctx, |ui| {
-                ui.set_width(600.0);
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("供应商与轮换").font(theme::strong(16.0)).color(pal.ink));
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if widgets::icon_button(ui, icon::X, 26.0, pal.mute, pal.hover, false)
-                            .on_hover_text("关闭")
-                            .clicked()
-                        {
-                            close = true;
-                        }
-                    });
-                });
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    for (page, name) in [(Page::Providers, "自定义供应商"), (Page::Rotation, "轮换")] {
-                        if widgets::quiet_button(ui, "", name, &pal, d.page == page).clicked() {
-                            d.page = page;
-                            d.message = None;
-                        }
-                    }
-                });
-                ui.add_space(8.0);
+                ui.set_width(620.0);
+                if widgets::modal_header(ui, icon::PLUGS, "供应商与轮换", "添加兼容端点；某个供应商不可用时按顺序自动改用下一个。", &pal) {
+                    close = true;
+                }
+                let pages = [Page::Providers, Page::Rotation];
+                let current = pages.iter().position(|p| *p == d.page).unwrap_or(0);
+                if let Some(i) = widgets::segmented(ui, &["自定义供应商", "轮换"], current, &pal) {
+                    d.page = pages[i];
+                    d.message = None;
+                }
+                ui.add_space(10.0);
                 let max = (ui.ctx().content_rect().height() - 220.0).max(240.0);
                 egui::ScrollArea::vertical().max_height(max).min_scrolled_height(max).show(ui, |ui| match d.page {
                     Page::Providers => providers_page(ui, d, &list, &pal, &mut submit, &mut probe, busy),
@@ -287,7 +270,7 @@ fn providers_page(
                 ui.horizontal(|ui| {
                     ui.add_sized([96.0, 24.0], Label::new(RichText::new("执行端").font(theme::body(13.0))));
                     ui.add_enabled_ui(f.id.is_empty(), |ui| {
-                        egui::ComboBox::from_id_salt("provider-agent")
+                        widgets::combo("provider-agent")
                             .selected_text(agent_name(&f.agent))
                             .show_ui(ui, |ui| {
                                 for a in CUSTOM_AGENTS {
@@ -309,7 +292,7 @@ fn providers_page(
                     );
                     r.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::TextEdit, true, "模型"));
                 });
-                ui.checkbox(&mut f.enabled, "启用");
+                widgets::toggle(ui, &mut f.enabled, "启用", pal);
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
                     let can_probe = !probing && !f.base_url.trim().is_empty();
@@ -329,7 +312,7 @@ fn providers_page(
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         let ok = !busy && !saving && !f.name.trim().is_empty() && !f.base_url.trim().is_empty();
                         if ui
-                            .add_enabled_ui(ok, |ui| widgets::quiet_button(ui, icon::CHECK, "保存供应商", pal, true))
+                            .add_enabled_ui(ok, |ui| widgets::primary_button(ui, icon::CHECK, "保存供应商", pal, ok))
                             .inner
                             .clicked()
                         {
@@ -408,7 +391,7 @@ fn rotation_page(
     load: &mut Vec<String>,
     busy: bool,
 ) {
-    ui.checkbox(&mut d.rotation.enabled, "启用供应商轮换");
+    widgets::toggle(ui, &mut d.rotation.enabled, "启用供应商轮换", pal);
     ui.add(
         Label::new(
             RichText::new(
@@ -485,7 +468,7 @@ fn rotation_page(
                 let label = |v: &Value| v.get("label").and_then(Value::as_str).map(str::to_string).unwrap_or_else(|| id(v));
                 ui.horizontal(|ui| {
                     let current = providers.iter().find(|p| id(p) == pick.0);
-                    egui::ComboBox::from_id_salt(("rot-provider", agent))
+                    widgets::combo(("rot-provider", agent))
                         .width(200.0)
                         .selected_text(current.map(|p| label(p)).unwrap_or_else(|| "选择供应商".into()))
                         .show_ui(ui, |ui| {
@@ -506,7 +489,7 @@ fn rotation_page(
                                 .collect()
                         })
                         .unwrap_or_default();
-                    egui::ComboBox::from_id_salt(("rot-model", agent))
+                    widgets::combo(("rot-model", agent))
                         .width(170.0)
                         .selected_text(if pick.1.is_empty() { "选择模型".to_string() } else { pick.1.clone() })
                         .show_ui(ui, |ui| {
@@ -535,7 +518,7 @@ fn rotation_page(
     d.rotation.order.retain(|_, v| !v.is_empty());
     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
         if ui
-            .add_enabled_ui(!busy && !d.saving, |ui| widgets::quiet_button(ui, icon::CHECK, "保存轮换设置", pal, true))
+            .add_enabled_ui(!busy && !d.saving, |ui| widgets::primary_button(ui, icon::CHECK, "保存轮换设置", pal, !busy && !d.saving))
             .inner
             .clicked()
         {

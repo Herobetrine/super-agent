@@ -225,24 +225,18 @@ impl App {
             ExtScope::Draft => "本次新会话的 MCP 与技能",
             ExtScope::Ticket(_) => "本次会话的 MCP 与技能",
         };
+        let subtitle = match d.scope {
+            ExtScope::Defaults => "勾选要默认授予新会话的技能与 MCP 服务。",
+            ExtScope::Draft => "只影响下一次新建的会话。",
+            ExtScope::Ticket(_) => "此会话的授权已绑定；新建会话可重新选择。",
+        };
         let modal = egui::Modal::new(egui::Id::new("sa-extensions"))
-            .frame(
-                Frame::new()
-                    .fill(pal.surface)
-                    .stroke(Stroke::new(1.0_f32, pal.line))
-                    .corner_radius(CornerRadius::same(14))
-                    .inner_margin(Margin::same(20)),
-            )
+            .frame(widgets::modal_frame(&pal))
             .show(ctx, |ui| {
-                ui.set_width(600.0);
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new(title).font(theme::strong(16.0)).color(pal.ink));
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if busy {
-                            ui.spinner();
-                        }
-                    });
-                });
+                ui.set_width(620.0);
+                if widgets::modal_header(ui, icon::PUZZLE_PIECE, title, subtitle, &pal) {
+                    close = true;
+                }
                 ui.add_space(8.0);
                 let max = (ui.ctx().content_rect().height() - 240.0).max(240.0);
                 let kind = Kind::of(&d.view);
@@ -286,6 +280,9 @@ impl App {
                 ui.horizontal(|ui| {
                     match &kind {
                         Kind::List => {
+                            if busy {
+                                ui.spinner();
+                            }
                             ui.label(
                                 RichText::new(format!("技能 {} · MCP {}", d.skills.len(), d.servers.len()))
                                     .font(theme::body(theme::SMALL))
@@ -295,7 +292,7 @@ impl App {
                                 if !d.locked {
                                     let ok = !busy && matches!(d.data, Some(Ok(_)));
                                     if ui
-                                        .add_enabled_ui(ok, |ui| widgets::quiet_button(ui, icon::CHECK, "保存授权", &pal, true))
+                                        .add_enabled_ui(ok, |ui| widgets::primary_button(ui, icon::CHECK, "保存授权", &pal, ok))
                                         .inner
                                         .clicked()
                                     {
@@ -427,17 +424,20 @@ fn list_view(
         Some(Ok(v)) => v.clone(),
     };
     ui.horizontal(|ui| {
-        for (tab, key, name) in [(ExtTab::Skills, "skills", "技能"), (ExtTab::Servers, "servers", "MCP 服务")] {
-            let n = data[key].as_array().map_or(0, Vec::len);
-            if widgets::quiet_button(ui, "", &format!("{name} {n}"), pal, d.tab == tab).clicked() {
-                d.tab = tab;
-                d.query.clear();
-            }
+        let tabs = [ExtTab::Skills, ExtTab::Servers];
+        let names = [
+            format!("技能 {}", data["skills"].as_array().map_or(0, Vec::len)),
+            format!("MCP 服务 {}", data["servers"].as_array().map_or(0, Vec::len)),
+        ];
+        let current = tabs.iter().position(|t| *t == d.tab).unwrap_or(0);
+        if let Some(i) = widgets::segmented(ui, &[names[0].as_str(), names[1].as_str()], current, pal) {
+            d.tab = tabs[i];
+            d.query.clear();
         }
     });
     if d.scope == ExtScope::Draft {
         let before = d.follow;
-        ui.checkbox(&mut d.follow, "跟随全局默认授权");
+        widgets::toggle(ui, &mut d.follow, "跟随全局默认授权", pal);
         if d.follow && !before {
             d.skills = ids(data["defaults"].get("skills"));
             d.servers = ids(data["defaults"].get("servers"));
@@ -634,7 +634,7 @@ fn edit_view(ui: &mut Ui, d: &mut ExtDialog, pal: &theme::Palette, busy: bool, n
     ui.horizontal(|ui| {
         ui.add_sized([120.0, 24.0], Label::new(RichText::new("传输方式").font(theme::body(13.0))));
         let before = f.http;
-        egui::ComboBox::from_id_salt("mcp-transport")
+        widgets::combo("mcp-transport")
             .selected_text(if f.http { "远程服务 · Streamable HTTP" } else { "本机程序 · stdio" })
             .show_ui(ui, |ui| {
                 ui.selectable_value(&mut f.http, false, "本机程序 · stdio");
@@ -656,8 +656,8 @@ fn edit_view(ui: &mut Ui, d: &mut ExtDialog, pal: &theme::Palette, busy: bool, n
         row(ui, "可执行程序", &mut f.command, "单个程序名或路径", false);
         row(ui, "启动参数", &mut f.args, "JSON 字符串数组，例如 [\"--stdio\"]", true);
     }
-    ui.checkbox(&mut f.enabled, "启用服务，允许将它授予会话");
-    ui.checkbox(&mut f.trusted, "我信任上述程序或服务来源");
+    widgets::toggle(ui, &mut f.enabled, "启用服务，允许将它授予会话", pal);
+    widgets::toggle(ui, &mut f.trusted, "我信任上述程序或服务来源", pal);
     ui.add_space(6.0);
     let mut remove = None;
     let mut error = None;
@@ -669,7 +669,7 @@ fn edit_view(ui: &mut Ui, d: &mut ExtDialog, pal: &theme::Palette, busy: bool, n
         }
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             if ui
-                .add_enabled_ui(!busy, |ui| widgets::quiet_button(ui, icon::CHECK, "保存服务", pal, true))
+                .add_enabled_ui(!busy, |ui| widgets::primary_button(ui, icon::CHECK, "保存服务", pal, !busy))
                 .inner
                 .clicked()
             {
