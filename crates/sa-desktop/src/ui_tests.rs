@@ -622,3 +622,28 @@ fn live_badge_and_failover_toggle() {
     h.get_by_label("只读子任务的执行端不可用时自动改派").click();
     until(&mut h, "failover on", |a| a.host.as_ref().unwrap().failover(ticket));
 }
+
+#[test]
+fn at_mention_attaches_project_files() {
+    let data = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(project.path().join("src")).unwrap();
+    std::fs::write(project.path().join("src/main.rs"), "fn main() {}").unwrap();
+    std::fs::write(project.path().join("notes.md"), "x").unwrap();
+    let mut h = harness(data.path(), "readonly");
+    h.state_mut().composer.project = Some(sa_engine::services::realpath(project.path()).unwrap());
+    h.run_steps(4);
+    let editor = h.get_by_label("输入框");
+    editor.focus();
+    editor.type_text("检查 @mai");
+    until(&mut h, "suggestions", |a| {
+        a.composer.index.as_ref().and_then(|i| i.files.as_ref()).is_some_and(|f| f.is_ok())
+    });
+    h.run_steps(3);
+    assert!(h.query_by_label("src/main.rs").is_some(), "suggestion row shown");
+    h.key_press(egui::Key::Enter);
+    h.run_steps(3);
+    assert_eq!(h.state().composer.attachments, vec!["src/main.rs".to_string()]);
+    assert_eq!(h.state().composer.draft, "检查 ");
+    assert!(h.state().view.is_none(), "Enter picked the file instead of sending");
+}

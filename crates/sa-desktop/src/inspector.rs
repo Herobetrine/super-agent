@@ -476,7 +476,8 @@ impl App {
                     );
                 }
                 ui.vertical(|ui| {
-                    match job_card(ui, job, open, &permission, writable, stopped, &pal, badges.get(&job.id)) {
+                    let card = CardCtx { permission: &permission, writable, stopped, badge: badges.get(&job.id) };
+                    match job_card(ui, job, open, &card, &pal) {
                         Some(CardAction::Toggle) => toggle = Some(job.id),
                         Some(a) => act = Some((a, job.id, job.agent.clone())),
                         None => {}
@@ -513,17 +514,26 @@ enum CardAction {
     Retry,
 }
 
+/// Ticket-wide inputs of a job card.
+struct CardCtx<'a> {
+    permission: &'a str,
+    /// This window schedules the journal.
+    writable: bool,
+    /// The ticket is cancelled.
+    stopped: bool,
+    /// Live engine badge replacing the state chip.
+    badge: Option<&'a (String, crate::theme::Tone)>,
+}
+
 /// `writable`: this window schedules the journal; `stopped`: the ticket is cancelled.
 fn job_card(
     ui: &mut Ui,
     job: &JobView,
     open: bool,
-    ticket_permission: &str,
-    writable: bool,
-    stopped: bool,
+    card: &CardCtx,
     pal: &Palette,
-    badge: Option<&(String, crate::theme::Tone)>,
 ) -> Option<CardAction> {
+    let CardCtx { permission: ticket_permission, writable, stopped, badge } = *card;
     let mut clicked = None;
     let stroke = if job.state == "running" {
         pal.run.fg.gamma_multiply(0.45)

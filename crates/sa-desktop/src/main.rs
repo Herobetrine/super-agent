@@ -10,6 +10,7 @@ mod data;
 mod demo;
 mod extensions;
 mod feed;
+mod files;
 mod host;
 mod inspector;
 mod knowledge;

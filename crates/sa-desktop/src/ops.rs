@@ -195,71 +195,6 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn export_verifies_digests_and_never_overwrites() {
-        let data = tempfile::tempdir().unwrap();
-        let db = Connection::open(data.path().join(sa_store::DB_FILE)).unwrap();
-        db.execute_batch(
-            "CREATE TABLE tickets(id INTEGER PRIMARY KEY);
-             CREATE TABLE events(seq INTEGER PRIMARY KEY, ts REAL, ticket INTEGER, kind TEXT, payload TEXT, sha256 TEXT);
-             INSERT INTO tickets VALUES(1);",
-        )
-        .unwrap();
-        for (ts, p) in [(1.0, "\"你好\""), (2.5, "{\"a\":1}")] {
-            let h = hex(&Sha256::digest(p.as_bytes()));
-            db.execute(
-                "INSERT INTO events(ts,ticket,kind,payload,sha256) VALUES(?,1,'user',?,?)",
-                rusqlite::params![ts, p, h],
-            )
-            .unwrap();
-        }
-        let out = data.path().join("t.jsonl");
-        export(data.path(), 1, &out).unwrap();
-        let text = std::fs::read_to_string(&out).unwrap();
-        let lines: Vec<&str> = text.lines().collect();
-        assert_eq!(lines.len(), 2);
-        assert!(lines[0].starts_with("{\"seq\":1,\"ts\":1,\"ticket\":1,\"kind\":\"user\",\"payload\":\"\\\"你好\\\"\""));
-        assert!(lines[1].contains("\"ts\":2.5"));
-        // Existing files are never overwritten.
-        assert!(export(data.path(), 1, &out).is_err());
-        assert_eq!(std::fs::read_to_string(&out).unwrap(), text);
-        // A tampered payload fails and leaves no partial file.
-        db.execute("UPDATE events SET payload='\"x\"' WHERE seq=2", []).unwrap();
-        let bad = data.path().join("bad.jsonl");
-        let e = export(data.path(), 1, &bad).unwrap_err();
-        assert_eq!(e.to_string(), "事件摘要校验失败 #2");
-        assert!(!bad.exists());
-        assert_eq!(export(data.path(), 9, &bad).unwrap_err().to_string(), "工单不存在");
-    }
-
-    #[test]
-    fn diff_reports_status_and_changes() {
-        let Some(exe) = sa_adapters::sys::Sys::from_process().which(if cfg!(windows) { "git.exe" } else { "git" })
-        else {
-            eprintln!("git not on PATH; skipped");
-            return;
-        };
-        let repo = tempfile::tempdir().unwrap();
-        let run = |args: &[&str]| {
-            let ok = Command::new(&exe).args(args).current_dir(repo.path()).output().unwrap();
-            assert!(ok.status.success(), "{args:?}: {}", String::from_utf8_lossy(&ok.stderr));
-        };
-        run(&["init", "-q"]);
-        assert_eq!(diff(repo.path()).unwrap(), "工作区干净");
-        std::fs::write(repo.path().join("a.txt"), "one\n").unwrap();
-        run(&["add", "a.txt"]);
-        let text = diff(repo.path()).unwrap();
-        assert!(text.starts_with("工作区状态\nA  a.txt"), "{text}");
-        assert!(text.contains("已暂存\ndiff --git a/a.txt b/a.txt"), "{text}");
-        let outside = tempfile::tempdir().unwrap();
-        assert!(diff(outside.path()).is_err());
-    }
-}
-
 /// Conversation transcript as Markdown: goal, operator messages and every
 /// reply (control lines removed), written to a NEW file.
 pub fn export_markdown(data: &Path, ticket: i64, file: &Path) -> Result<PathBuf> {
@@ -325,4 +260,69 @@ pub fn export_markdown(data: &Path, ticket: i64, file: &Path) -> Result<PathBuf>
         .with_context(|| format!("无法创建导出文件（请选择新文件）：{}", file.display()))?;
     f.write_all(out.as_bytes())?;
     Ok(file.to_path_buf())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn export_verifies_digests_and_never_overwrites() {
+        let data = tempfile::tempdir().unwrap();
+        let db = Connection::open(data.path().join(sa_store::DB_FILE)).unwrap();
+        db.execute_batch(
+            "CREATE TABLE tickets(id INTEGER PRIMARY KEY);
+             CREATE TABLE events(seq INTEGER PRIMARY KEY, ts REAL, ticket INTEGER, kind TEXT, payload TEXT, sha256 TEXT);
+             INSERT INTO tickets VALUES(1);",
+        )
+        .unwrap();
+        for (ts, p) in [(1.0, "\"你好\""), (2.5, "{\"a\":1}")] {
+            let h = hex(&Sha256::digest(p.as_bytes()));
+            db.execute(
+                "INSERT INTO events(ts,ticket,kind,payload,sha256) VALUES(?,1,'user',?,?)",
+                rusqlite::params![ts, p, h],
+            )
+            .unwrap();
+        }
+        let out = data.path().join("t.jsonl");
+        export(data.path(), 1, &out).unwrap();
+        let text = std::fs::read_to_string(&out).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].starts_with("{\"seq\":1,\"ts\":1,\"ticket\":1,\"kind\":\"user\",\"payload\":\"\\\"你好\\\"\""));
+        assert!(lines[1].contains("\"ts\":2.5"));
+        // Existing files are never overwritten.
+        assert!(export(data.path(), 1, &out).is_err());
+        assert_eq!(std::fs::read_to_string(&out).unwrap(), text);
+        // A tampered payload fails and leaves no partial file.
+        db.execute("UPDATE events SET payload='\"x\"' WHERE seq=2", []).unwrap();
+        let bad = data.path().join("bad.jsonl");
+        let e = export(data.path(), 1, &bad).unwrap_err();
+        assert_eq!(e.to_string(), "事件摘要校验失败 #2");
+        assert!(!bad.exists());
+        assert_eq!(export(data.path(), 9, &bad).unwrap_err().to_string(), "工单不存在");
+    }
+
+    #[test]
+    fn diff_reports_status_and_changes() {
+        let Some(exe) = sa_adapters::sys::Sys::from_process().which(if cfg!(windows) { "git.exe" } else { "git" })
+        else {
+            eprintln!("git not on PATH; skipped");
+            return;
+        };
+        let repo = tempfile::tempdir().unwrap();
+        let run = |args: &[&str]| {
+            let ok = Command::new(&exe).args(args).current_dir(repo.path()).output().unwrap();
+            assert!(ok.status.success(), "{args:?}: {}", String::from_utf8_lossy(&ok.stderr));
+        };
+        run(&["init", "-q"]);
+        assert_eq!(diff(repo.path()).unwrap(), "工作区干净");
+        std::fs::write(repo.path().join("a.txt"), "one\n").unwrap();
+        run(&["add", "a.txt"]);
+        let text = diff(repo.path()).unwrap();
+        assert!(text.starts_with("工作区状态\nA  a.txt"), "{text}");
+        assert!(text.contains("已暂存\ndiff --git a/a.txt b/a.txt"), "{text}");
+        let outside = tempfile::tempdir().unwrap();
+        assert!(diff(outside.path()).is_err());
+    }
 }

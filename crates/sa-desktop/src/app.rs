@@ -501,6 +501,7 @@ fn save_png(path: &std::path::Path, image: &egui::ColorImage) -> Result<(), Stri
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.shortcuts(ctx);
+        self.take_dropped_files(ctx);
         self.poll_host();
         self.poll_ops();
         self.poll_knowledge();

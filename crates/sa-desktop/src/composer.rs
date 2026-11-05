@@ -61,6 +61,16 @@ pub struct Composer {
     pub focus: bool,
     /// When the current message first appeared (success notices fade out).
     shown: Option<(String, std::time::Instant)>,
+    /// File index of the project being mentioned with `@`.
+    pub index: Option<FileIndex>,
+    /// Highlighted row of the `@` suggestions.
+    pub mention_row: usize,
+}
+
+pub struct FileIndex {
+    pub root: PathBuf,
+    pub files: Option<Result<Vec<String>, String>>,
+    pending: Option<crate::ops::Pending<Vec<String>>>,
 }
 
 impl Composer {
@@ -82,6 +92,8 @@ impl Composer {
             last_plan: None,
             focus: false,
             shown: None,
+            index: None,
+            mention_row: 0,
         }
     }
 }
@@ -319,6 +331,87 @@ impl App {
         }
     }
 
+    /// Start (or reuse) the `@` file index of `root`.
+    fn ensure_index(&mut self, ctx: &egui::Context, root: &std::path::Path) {
+        let idx = self.composer.index.get_or_insert_with(|| FileIndex {
+            root: PathBuf::new(),
+            files: None,
+            pending: None,
+        });
+        if let Some(r) = idx.pending.as_ref().and_then(crate::ops::Pending::poll) {
+            idx.pending = None;
+            idx.files = Some(r);
+        }
+        if idx.root != root && idx.pending.is_none() {
+            idx.root = root.to_path_buf();
+            idx.files = None;
+            let dir = root.to_path_buf();
+            idx.pending = Some(crate::ops::Pending::spawn(ctx, move || crate::files::scan(&dir)));
+        }
+    }
+
+    /// Ctrl+V with an image on the clipboard: save it into the project and
+    /// attach it (new conversation) or insert its path (follow-up).
+    fn paste_image(&mut self, fixed: bool, root: Option<&std::path::Path>) {
+        let Some(root) = root else {
+            if arboard::Clipboard::new().is_ok_and(|mut c| c.get_image().is_ok()) {
+                self.composer.message = Some(("粘贴图片前请先选择项目目录".into(), true));
+            }
+            return;
+        };
+        match crate::files::paste_image(root) {
+            Ok(Some(rel)) => {
+                if fixed {
+                    if !self.composer.draft.is_empty() && !self.composer.draft.ends_with(char::is_whitespace) {
+                        self.composer.draft.push(' ');
+                    }
+                    self.composer.draft.push_str(&rel);
+                    self.composer.draft.push(' ');
+                } else if self.composer.attachments.len() < MAX_ATTACHMENTS {
+                    self.composer.attachments.push(rel.clone());
+                }
+                self.composer.message = Some((format!("已保存粘贴的图片：{rel}"), false));
+            }
+            Ok(None) => {}
+            Err(e) => self.composer.message = Some((format!("{e:#}"), true)),
+        }
+    }
+
+    /// Files dropped on the window: a folder becomes the draft's project,
+    /// files inside the project are attached.
+    pub fn take_dropped_files(&mut self, ctx: &egui::Context) {
+        let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect());
+        if dropped.is_empty() || !self.writable() || self.view.is_some() {
+            if !dropped.is_empty() && self.view.is_some() {
+                self.composer.message = Some(("拖入文件只能附加到新会话".into(), true));
+            }
+            return;
+        }
+        if dropped.len() == 1 && dropped[0].is_dir() {
+            if let Ok(real) = sa_engine::services::realpath(&dropped[0]) {
+                if self.composer.project.as_ref() != Some(&real) {
+                    self.composer.attachments.clear();
+                }
+                self.composer.project = Some(real);
+            }
+            return;
+        }
+        let Some(project) = self.composer.project.clone() else {
+            self.composer.message = Some(("先选择项目目录，或把项目文件夹拖进窗口".into(), true));
+            return;
+        };
+        match host::relative_files(&project, &dropped) {
+            Ok(rel) => {
+                for r in rel {
+                    if !self.composer.attachments.contains(&r) && self.composer.attachments.len() < MAX_ATTACHMENTS {
+                        self.composer.attachments.push(r);
+                    }
+                }
+            }
+            Err(e) => self.composer.message = Some((format!("{e:#}"), true)),
+        }
+    }
+
     pub(crate) fn pick_attachments(&mut self) {
         let Some(project) = self.composer.project.clone() else { return };
         let Some(files) = rfd::FileDialog::new()
@@ -439,6 +532,97 @@ impl App {
                     });
                 }
 
+                // `@` mentions: pick project files (attached to a new
+                // conversation, or inserted as a path in a follow-up).
+                let root = if fixed {
+                    (!cur.cwd.is_empty()).then(|| PathBuf::from(&cur.cwd))
+                } else {
+                    self.composer.project.clone()
+                };
+                let mention = crate::files::mention(&self.composer.draft).map(|(at, q)| (at, q.to_string()));
+                if let (Some((at, q)), Some(root)) = (&mention, &root) {
+                    self.ensure_index(ui.ctx(), root);
+                    let hits: Vec<String> = match self.composer.index.as_ref().and_then(|i| i.files.as_ref()) {
+                        Some(Ok(files)) => crate::files::search(files, q, 8).into_iter().map(str::to_string).collect(),
+                        _ => Vec::new(),
+                    };
+                    let n = hits.len();
+                    if n > 0 {
+                        let row = &mut self.composer.mention_row;
+                        *row = (*row).min(n - 1);
+                        ui.input_mut(|i| {
+                            if i.consume_key(Modifiers::NONE, Key::ArrowDown) {
+                                *row = (*row + 1) % n;
+                            }
+                            if i.consume_key(Modifiers::NONE, Key::ArrowUp) {
+                                *row = (*row + n - 1) % n;
+                            }
+                        });
+                        let mut pick = ui.input_mut(|i| {
+                            i.consume_key(Modifiers::NONE, Key::Enter) || i.consume_key(Modifiers::NONE, Key::Tab)
+                        })
+                        .then(|| hits[*row].clone());
+                        Frame::new()
+                            .fill(pal.surface_alt)
+                            .stroke(Stroke::new(1.0_f32, pal.line_soft))
+                            .corner_radius(CornerRadius::same(10))
+                            .inner_margin(Margin::same(4))
+                            .show(ui, |ui| {
+                                ui.set_width(ui.available_width());
+                                for (i, f) in hits.iter().enumerate() {
+                                    let (rect, r) =
+                                        ui.allocate_exact_size(Vec2::new(ui.available_width(), 26.0), Sense::click());
+                                    r.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, f));
+                                    if i == self.composer.mention_row || r.hovered() {
+                                        ui.painter().rect_filled(rect, CornerRadius::same(7), pal.selected);
+                                    }
+                                    ui.painter().text(
+                                        rect.left_center() + Vec2::new(10.0, 0.0),
+                                        Align2::LEFT_CENTER,
+                                        icon::FILE,
+                                        theme::body(13.0),
+                                        pal.mute,
+                                    );
+                                    let g = widgets::line_galley(ui, f, theme::body(12.5), pal.ink, rect.width() - 40.0);
+                                    ui.painter().galley(
+                                        rect.left_center() + Vec2::new(30.0, -g.size().y / 2.0),
+                                        g,
+                                        pal.ink,
+                                    );
+                                    if r.clicked() {
+                                        pick = Some(f.clone());
+                                    }
+                                }
+                                ui.label(
+                                    RichText::new(if fixed {
+                                        "↑↓ 选择 · Enter 插入路径"
+                                    } else {
+                                        "↑↓ 选择 · Enter 附加到新会话"
+                                    })
+                                    .font(theme::body(theme::TINY))
+                                    .color(pal.faint),
+                                );
+                            });
+                        if let Some(f) = pick {
+                            self.composer.draft.truncate(*at);
+                            if fixed {
+                                self.composer.draft.push_str(&f);
+                                self.composer.draft.push(' ');
+                            } else if !self.composer.attachments.contains(&f) {
+                                if self.composer.attachments.len() < MAX_ATTACHMENTS {
+                                    self.composer.attachments.push(f);
+                                } else {
+                                    self.composer.message = Some(("单次最多附加 16 个文件".into(), true));
+                                }
+                            }
+                            self.composer.mention_row = 0;
+                            self.composer.focus = true;
+                        }
+                    }
+                } else {
+                    self.composer.mention_row = 0;
+                }
+
                 let hint = if target.is_some() {
                     "给这个执行者留言…"
                 } else if cur.stopped() {
@@ -469,6 +653,11 @@ impl App {
                 resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::TextEdit, true, "输入框"));
                 if std::mem::take(&mut self.composer.focus) {
                     resp.request_focus();
+                }
+                if resp.has_focus()
+                    && ui.input(|i| i.events.iter().any(|e| matches!(e, Event::Key { key: Key::V, pressed: true, modifiers, .. } if modifiers.command)))
+                {
+                    self.paste_image(fixed, root.as_deref());
                 }
                 let composing = ui.input(|i| i.events.iter().any(|e| matches!(e, Event::Ime(_))));
                 if resp.has_focus()

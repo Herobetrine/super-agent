@@ -265,7 +265,7 @@ impl App {
                         }
                         match action {
                             Some(RowAction::Rename(id, title)) => self.rename = Some((id, title)),
-                            Some(RowAction::Meta(a)) => self.submit(a),
+                            Some(RowAction::Meta(a)) => self.submit(*a),
                             None => {}
                         }
                     });
@@ -454,21 +454,21 @@ impl App {
                 }
                 let pin = if r.pinned { "取消置顶" } else { "置顶" };
                 if ui.button(format!("{}  {pin}", icon::PUSH_PIN)).clicked() {
-                    action = Some(RowAction::Meta(Action::TicketMeta {
+                    action = Some(RowAction::Meta(Box::new(Action::TicketMeta {
                         ticket: r.id,
                         title: None,
                         pinned: Some(!r.pinned),
                         archived: None,
-                    }));
+                    })));
                 }
                 let arch = if r.archived { "取消归档" } else { "归档" };
                 if ui.button(format!("{}  {arch}", icon::ARCHIVE)).clicked() {
-                    action = Some(RowAction::Meta(Action::TicketMeta {
+                    action = Some(RowAction::Meta(Box::new(Action::TicketMeta {
                         ticket: r.id,
                         title: None,
                         pinned: None,
                         archived: Some(!r.archived),
-                    }));
+                    })));
                 }
             });
         }
@@ -532,5 +532,5 @@ impl App {
 /// What a sidebar row's context menu asked for.
 enum RowAction {
     Rename(i64, String),
-    Meta(Action),
+    Meta(Box<Action>),
 }
