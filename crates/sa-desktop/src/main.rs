@@ -17,6 +17,7 @@ mod labels;
 mod markdown;
 mod models;
 mod ops;
+mod palette;
 mod providers;
 mod sidebar;
 mod theme;

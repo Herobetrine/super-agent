@@ -458,6 +458,33 @@ fn extensions_dialog_grants_skills_and_probed_mcp_servers() {
 }
 
 #[test]
+fn command_palette_and_shortcuts() {
+    let data = tempfile::tempdir().unwrap();
+    let mut h = harness(data.path(), "readonly");
+    h.run_steps(4);
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::K);
+    h.run_steps(3);
+    assert!(h.state().palette.is_some(), "Ctrl+K opens the palette");
+    let q = h.get_by_role_and_label(Role::TextInput, "命令搜索");
+    q.type_text("供应商");
+    h.run_steps(2);
+    h.key_press(egui::Key::Enter);
+    h.run_steps(3);
+    assert!(h.state().palette.is_none());
+    assert!(h.state().providers.is_some(), "Enter runs the filtered command");
+    h.state_mut().providers = None;
+    h.run_steps(2);
+    let open = h.state().inspector_open;
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::J);
+    h.run_steps(2);
+    assert_ne!(h.state().inspector_open, open, "Ctrl+J toggles the inspector");
+    let dark = h.state().dark;
+    h.key_press_modifiers(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, egui::Key::L);
+    h.run_steps(2);
+    assert_ne!(h.state().dark, dark, "Ctrl+Shift+L toggles the theme");
+}
+
+#[test]
 fn second_window_on_an_owned_journal_is_a_read_only_observer() {
     let data = tempfile::tempdir().unwrap();
     let _owner = sa_engine::owner::claim(data.path()).unwrap();

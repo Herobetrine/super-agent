@@ -297,7 +297,7 @@ impl App {
         self.submit(action);
     }
 
-    fn pick_project(&mut self) {
+    pub(crate) fn pick_project(&mut self) {
         let mut dialog = rfd::FileDialog::new().set_title("选择项目目录");
         if let Some(p) = &self.composer.project {
             dialog = dialog.set_directory(p);
@@ -315,7 +315,7 @@ impl App {
         }
     }
 
-    fn pick_attachments(&mut self) {
+    pub(crate) fn pick_attachments(&mut self) {
         let Some(project) = self.composer.project.clone() else { return };
         let Some(files) = rfd::FileDialog::new()
             .set_title("选择要附加的项目文件")

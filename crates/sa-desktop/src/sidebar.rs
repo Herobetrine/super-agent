@@ -251,8 +251,13 @@ impl App {
                         .frame(false)
                         .font(theme::body(13.5))
                         .desired_width(ui.available_width() - clear_w)
-                        .margin(Margin::symmetric(0, 3));
-                    ui.add(edit);
+                        .margin(Margin::symmetric(0, 3))
+                        .id_salt("sidebar-search");
+                    let r = ui.add(edit);
+                    r.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::TextEdit, true, "搜索对话或项目"));
+                    if std::mem::take(&mut self.focus_search) {
+                        r.request_focus();
+                    }
                     if !q.is_empty()
                         && widgets::icon_button(ui, icon::X, 22.0, pal.mute, pal.hover, false)
                             .on_hover_text("清除搜索")

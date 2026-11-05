@@ -126,6 +126,9 @@ pub struct App {
     pub export: Option<Pending<PathBuf>>,
     pub knowledge: crate::knowledge::KnowledgeState,
     pub providers: Option<crate::providers::ProvidersDialog>,
+    pub palette: Option<crate::palette::PaletteState>,
+    /// Focus the sidebar search on the next frame.
+    pub focus_search: bool,
     pub extensions: Option<crate::extensions::ExtDialog>,
     /// For background work started outside `update`.
     pub ctx: egui::Context,
@@ -203,6 +206,8 @@ impl App {
             export: None,
             knowledge: Default::default(),
             providers: None,
+            palette: None,
+            focus_search: false,
             extensions: None,
             ctx: cc.egui_ctx.clone(),
             host_error: host.as_ref().err().cloned(),
@@ -218,6 +223,7 @@ impl App {
             Some("models") => app.open_models(crate::models::Scope::Defaults),
             Some("providers") => app.open_providers(),
             Some("extensions") => app.open_extensions(crate::extensions::ExtScope::Defaults),
+            Some("palette") => app.palette = Some(Default::default()),
             Some("rotation") => {
                 app.open_providers();
                 if let Some(d) = app.providers.as_mut() {
@@ -473,6 +479,7 @@ fn save_png(path: &std::path::Path, image: &egui::ColorImage) -> Result<(), Stri
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.shortcuts(ctx);
         self.poll_host();
         self.poll_ops();
         self.poll_knowledge();
@@ -556,6 +563,7 @@ impl eframe::App for App {
         self.models_dialog(ctx);
         self.providers_dialog(ctx);
         self.extensions_dialog(ctx);
+        self.palette_ui(ctx);
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
@@ -606,7 +614,7 @@ impl eframe::App for App {
 }
 
 impl App {
-    fn start_export(&mut self, ctx: &egui::Context, ticket: i64) {
+    pub(crate) fn start_export(&mut self, ctx: &egui::Context, ticket: i64) {
         let Some(file) = rfd::FileDialog::new()
             .set_title("导出完整工单记录（请选择新文件）")
             .set_file_name(format!("ticket-{ticket}.jsonl"))
