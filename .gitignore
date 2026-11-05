@@ -1,18 +1,5 @@
-# Python / Qt local builds
-__pycache__/
-*.py[cod]
-.venv/
-venv/
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
-.coverage
-htmlcov/
-build/
-dist/
-*.egg-info/
-node_modules/
-/native/target/
+# Rust build output
+/target/
 
 # Local IDE, authentication and gateway configuration
 .idea/
@@ -53,4 +40,3 @@ Thumbs.db
 
 # Local self-improvement notes
 .learnings/
-/target/

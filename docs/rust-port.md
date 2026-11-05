@@ -11,7 +11,6 @@
 | `crates/sa-engine` | 工单、任务状态机、控制指令、持续运行、断线重试与熔断、工单库独占、项目知识库 | `engine*.cjs`、`broker.cjs` |
 | `crates/sa-adapters` | Codex app-server、Claude Code stream-json、DeepSeek Harness、Antigravity CLI，自定义供应商（见 `crates/sa-adapters/PROVIDERS.md`） | `runtime/adapters/*` |
 | `crates/sa-ext` | MCP（官方 Rust SDK `rmcp`）与技能目录 | `extensions.cjs`、`skills.cjs` |
-| `native/` | 现有 Node 辅助进程，切换完成前保留 | 最终并入上述 crate |
 
 ## 阶段
 
@@ -25,18 +24,18 @@
 
 ## 构建
 
-Windows GNU 工具链需要一个真正的 C 编译器来编译内置 SQLite。将 [llvm-mingw](https://github.com/mstorsjo/llvm-mingw/releases) 的 `msvcrt-x86_64` 包解压到 `%LOCALAPPDATA%\SuperAgent\toolchain\`（或设置 `SUPERAGENT_LLVM_MINGW`），然后通过包装脚本调用 cargo：
+Windows GNU 工具链需要一个真正的 C 编译器来编译内置 SQLite。将 [llvm-mingw](https://github.com/mstorsjo/llvm-mingw/releases) 的 `msvcrt-x86_64` 包解压到 `%LOCALAPPDATA%\SuperAgent\toolchain\`（或设置 `SUPERAGENT_LLVM_MINGW`），然后通过包装脚本 `scripts\cargo.cmd`（调用 `scripts/cargo.ps1`）运行 cargo：
 
 ```powershell
-node scripts/cargo.cjs test --workspace
-node scripts/cargo.cjs run -p sa-desktop --release -- --demo
+scripts\cargo.cmd test --workspace
+scripts\cargo.cmd run -p sa-desktop --release -- --demo
 ```
 
 包装脚本借用 llvm-mingw 的 `clang`、`llvm-ar`、`dlltool` 和 `ld.lld`，保留 Rust 自带的 CRT 与运行库（`-C linker-flavor=ld.lld -C link-self-contained=yes`）。不要改回 Rust 自带的 GNU `ld`：它会错误链接 llvm `dlltool` 生成的 raw-dylib 导入库，程序在进入 `main` 前崩溃。MSVC 工具链无需该步骤。
 
 ## 调度引擎现状（第 2 阶段）
 
-`sa-engine::Engine` 已移植 `engine.cjs`、`engine-dispatch.cjs` 与 `engine-store.cjs` 的写路径：准入循环与写者独占、信封、流式与终稿 `SA_*` 指令、信箱、审批、取消/追加/重试、持续运行状态机、超大输入压缩、附件快照。`tests/engine.rs`、`tests/autonomy.rs` 以假执行端移植了 `docs/dev/engine-spec.md` §8 的 24 个用例（`node scripts/cargo.cjs test -p sa-engine`）。
+`sa-engine::Engine` 已移植 `engine.cjs`、`engine-dispatch.cjs` 与 `engine-store.cjs` 的写路径：准入循环与写者独占、信封、流式与终稿 `SA_*` 指令、信箱、审批、取消/追加/重试、持续运行状态机、超大输入压缩、附件快照。`tests/engine.rs`、`tests/autonomy.rs` 以假执行端移植了 `docs/dev/engine-spec.md` §8 的 24 个用例（`scripts\cargo.cmd test -p sa-engine`）。
 
 失败处理经 `TurnRunner`：默认 `ResilientRunner` 对所有任务做分类重试（带抖动、续接原生会话）、按路由熔断（`turn.route_wait`、`turn.deferred`、`harness.health`）、可选供应商轮换（`route.rotated`），子任务首次失败会给上级发 `platform` 留言，放弃时记录 `turn.gave_up` 并在上级 `reports[].failure` 中标明；`PassThroughRunner` 保留 JS 的自动工单正则重试。见 `tests/engine_resilience.rs`。
 
@@ -51,8 +50,8 @@ node scripts/cargo.cjs run -p sa-desktop --release -- --demo
 已验证：离线夹具测试（Codex JSON-RPC 审批、过期请求拒绝、信件插入与终稿逐字节一致；UTF-8 分帧；取消后子孙进程不残留；stderr 不外泄）；`SA_LIVE_CATALOG=1` 时对本机四个执行端做只读目录探测，提供方 ID、模型数和默认路由与 JS 版一致。
 
 真实联测（2026-11-03，计费）：
-- `SA_LIVE_TURNS=1 node scripts/cargo.cjs test -p sa-adapters --test turns_live -- --nocapture`：四个执行端各做一次只读文件挑战，再续接同一原生会话读回改写后的文件。四个都通过：答案正确、与原生终稿逐字节一致、会话 ID 在轮次结束前上报、第二轮复用同一会话。`SA_LIVE_AGENTS=codex,claude` 可只测部分执行端。
-- `SA_LIVE_ENGINE=1 node scripts/cargo.cjs test -p sa-adapters --test engine_live -- --nocapture`：临时工单库里由 DeepSeek 主控向 Codex（写者）、Claude、Antigravity 派工。三个子任务的原生终稿、入库结果和主控收到的回报一致，Codex 写出的 handoff.txt 字节正确，197 条事件哈希全部吻合，用时约 3.5 分钟。
+- `SA_LIVE_TURNS=1 scripts\cargo.cmd test -p sa-adapters --test turns_live -- --nocapture`：四个执行端各做一次只读文件挑战，再续接同一原生会话读回改写后的文件。四个都通过：答案正确、与原生终稿逐字节一致、会话 ID 在轮次结束前上报、第二轮复用同一会话。`SA_LIVE_AGENTS=codex,claude` 可只测部分执行端。
+- `SA_LIVE_ENGINE=1 scripts\cargo.cmd test -p sa-adapters --test engine_live -- --nocapture`：临时工单库里由 DeepSeek 主控向 Codex（写者）、Claude、Antigravity 派工。三个子任务的原生终稿、入库结果和主控收到的回报一致，Codex 写出的 handoff.txt 字节正确，197 条事件哈希全部吻合，用时约 3.5 分钟。
 - 回执在 `~/.local/share/superagent/checks/rust-*`，只存哈希。
 - 联测中 Codex 曾返回 `serverOverloaded`（所选模型容量不足），原先归为未分类；现归为 `overloaded`，可按退避重试。
 - 本机 Claude 默认来源不可用时，测试改选第一个可用来源；正式界面仍需要用户明确选择。
@@ -64,12 +63,12 @@ node scripts/cargo.cjs run -p sa-desktop --release -- --demo
 `super-agent` 启动时尝试取得工单库的 `desktop.lock`：取得则在后台线程运行 Rust 调度器（`host.rs`，单线程顺序执行界面动作）；锁已被占用（Electron 版或另一个窗口在运行）时自动降为只读观察，顶栏显示原因。
 
 ```powershell
-node scripts/cargo.cjs build --release -p sa-desktop
+scripts\cargo.cmd build --release -p sa-desktop
 target\release\super-agent.exe                    # 默认工单库，或用 --data 指定目录
 target\release\super-agent.exe --observe          # 强制只读，不取锁
 target\release\super-agent.exe --ticket 5 --inspector knowledge
 target\release\super-agent.exe --demo --dark      # 合成数据，不调度
-powershell -File Install-Desktop.ps1              # 桌面快捷方式指向 Rust 版（-Legacy 改回 Electron）
+powershell -File Install-Desktop.ps1              # 桌面快捷方式指向 Rust 版
 ```
 
 `--screenshot <png> [--size 宽x高]` 渲染后保存截图并退出，用于界面回归；截图模式默认不调度，加 `--schedule` 才会取锁；`--dialog models|providers|rotation|extensions` 启动时打开对应对话框。
@@ -93,9 +92,9 @@ powershell -File Install-Desktop.ps1              # 桌面快捷方式指向 Rus
 
 ## 验证记录（2026-11-05）
 
-自动测试：`node scripts/cargo.cjs test --workspace` 全部通过，`clippy --workspace --all-targets` 无警告。桌面端 egui_kittest 界面测试通过无障碍树驱动真实 `App`：输入并回车创建工单、批准/拒绝、计划、追加；模型对话框保存默认路由与工单路由（`routes.changed`）；知识库添加与归档；供应商新增、轮换保存、删除后轮换同步；MCP 服务添加、真实探测 fixture 服务、技能与服务授权保存；被占用的工单库只能只读观察。
+自动测试：`scripts\cargo.cmd test --workspace` 全部通过，`clippy --workspace --all-targets` 无警告。桌面端 egui_kittest 界面测试通过无障碍树驱动真实 `App`：输入并回车创建工单、批准/拒绝、计划、追加；模型对话框保存默认路由与工单路由（`routes.changed`）；知识库添加与归档；供应商新增、轮换保存、删除后轮换同步；MCP 服务添加、真实探测 fixture 服务、技能与服务授权保存；被占用的工单库只能只读观察。
 
-旧工单续跑：`SA_LEGACY_COPY=<副本目录> node scripts/cargo.cjs test -p sa-desktop legacy -- --nocapture` 在 Node 版写出的工单库副本（5 张工单）上启动 Rust 调度器，恢复后无遗留运行中任务，3 张已完成的旧工单追加指令后续跑完成，只读快照全部可读。（用假执行端，未发起模型调用。）
+旧工单续跑：`SA_LEGACY_COPY=<副本目录> scripts\cargo.cmd test -p sa-desktop legacy -- --nocapture` 在 Node 版写出的工单库副本（5 张工单）上启动 Rust 调度器，恢复后无遗留运行中任务，3 张已完成的旧工单追加指令后续跑完成，只读快照全部可读。（用假执行端，未发起模型调用。）
 
 真实联测（计费，均在临时工单库与临时项目中）：
 - `SA_LIVE_UI=1`：从窗口输入框发起 DeepSeek 只读轮次，答案与挑战文件一致。
@@ -103,11 +102,9 @@ powershell -File Install-Desktop.ps1              # 桌面快捷方式指向 Rus
 - `SA_LIVE_PROVIDER=deepseek,https://api.siliconflow.cn/v1,SILICONFLOW_API_KEY,deepseek-ai/DeepSeek-V3`：新增自定义供应商，HTTPS 探测到 99 个模型，路由绑定 `sa-<id>`，DeepSeek Harness 经该端点读出挑战文件。
 - `SA_LIVE_ROTATION=…`（同上参数）：首选供应商使用无效密钥，返回认证失败后按轮换改用第二个供应商（`route.rotated`，原因 `auth`），轮次完成。
 
-## 切换状态
+## 切换状态（2026-11-05 完成）
 
-已完成：Rust 窗口可完整替代 Electron 工作台的日常操作；`Install-Desktop.ps1` 默认把快捷方式指向 `target\release\super-agent.exe`；同库独占与旧工单续跑已验证。
-
-待运营方决定：删除 Electron（`desktop/`、`runtime/`、`package.json`）、Node 辅助进程（`native/`）与 Python/Qt 旧实现（根目录 `*.py`、`tests/`）。删除前请先用 Rust 版实际工作一段时间；`native/` 下另有未提交的改动，作者未知，一直保持原样。
+Rust 窗口已替代 Electron 工作台；`Install-Desktop.ps1` 把桌面快捷方式指向 `target\release\super-agent.exe`。旧版 Electron/Node（`desktop/`、`runtime/`、`native/`、`tests-node/`）与 Python/Qt（根目录 `*.py`、`adapters/`、`tests/`）已从仓库删除，可从提交 `ea08b8a` 取回。代码注释里形如 `(E:252)`、`(ST:239-290)` 的出处指向这些已删除的 JS 源文件；`docs/dev/engine-spec.md` 同样以它们为准。
 
 ## 追加需求（运营方，2026-11-03）
 

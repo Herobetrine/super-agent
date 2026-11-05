@@ -1,9 +1,6 @@
-//! Real MCP servers through `ProjectExtensions` (port of
-//! `tests-node/extensions.test.cjs`) and one full engine turn that emits
-//! `SA_TOOL`. The server is the `sa-ext-fixture-mcp` binary of this crate;
-//! `SA_NODE_MCP=1` adds the official TypeScript SDK fixture
-//! (`tests-node/fixtures/challenge-mcp.cjs`, needs `node` and the repo's
-//! `node_modules`).
+//! Real MCP servers through `ProjectExtensions` (port of the removed Node
+//! extension tests) and one full engine turn that emits `SA_TOOL`. The
+//! server is the `sa-ext-fixture-mcp` binary of this crate.
 
 use futures::FutureExt;
 use futures::future::BoxFuture;
@@ -527,39 +524,6 @@ async fn cancelling_an_issued_call_is_uncertain_and_stops_the_server() {
         json!({"id": "late", "server": server, "tool": "challenge", "arguments": {}}),
     );
     assert_eq!(f.ext.invoke(stale).await.unwrap_err().to_string(), "旧轮次已停止");
-    f.engine.close().await;
-    f.ext.close();
-}
-
-/// Interop with the official TypeScript SDK server (opt-in).
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn typescript_sdk_stdio_server() {
-    if std::env::var("SA_NODE_MCP").as_deref() != Ok("1") {
-        eprintln!("skipped: set SA_NODE_MCP=1 to run against tests-node/fixtures/challenge-mcp.cjs");
-        return;
-    }
-    let f = fx(Arc::new(|_| "unused".into()));
-    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests-node/fixtures/challenge-mcp.cjs");
-    let script = sa_engine::services::realpath(&script).unwrap();
-    let server = f
-        .ext
-        .save_server(&json!({"name": "node", "command": "node", "args": [script, f.secret], "enabled": true}))
-        .unwrap();
-    assert_eq!(names(&f.ext.probe(&server).await.unwrap()), ["challenge"]);
-    let (ticket, job) = f.ticket("full", json!({"skills": [], "servers": [server]})).await;
-    f.run_job(job);
-    let a = args(
-        ticket,
-        job,
-        "full",
-        false,
-        json!({"id": "ts", "server": server, "tool": "challenge", "arguments": {}}),
-    );
-    assert!(f.ext.invoke(a).await.unwrap().new_receipt);
-    let r = &f.ext.results(job)[0];
-    assert_eq!(r["state"], json!("done"), "{r}");
-    assert_eq!(r["result"]["content"][0]["text"], json!(SECRET));
-    assert_eq!(f.calls(".calls").as_deref(), Some("1\n"));
     f.engine.close().await;
     f.ext.close();
 }

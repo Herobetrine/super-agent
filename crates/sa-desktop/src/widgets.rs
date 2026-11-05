@@ -113,7 +113,7 @@ pub fn quiet_button(ui: &mut Ui, icon: &str, text: &str, pal: &Palette, active: 
     resp.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
-/// The Super Agent mark (`desktop/ui/mark.svg`) painted at `rect`.
+/// The Super Agent mark (`assets/mark.svg`) painted at `rect`.
 pub fn brand_mark(ui: &Ui, rect: Rect, pal: &Palette) {
     let p = ui.painter();
     let s = rect.width() / 64.0;

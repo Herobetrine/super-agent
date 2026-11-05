@@ -10,20 +10,18 @@
 
 桌面端是纯 Rust 程序（egui）：同一个进程负责界面、调度 CLI、处理模型流与审批、MCP 与技能，并把完整事件写入 SQLite 工单库；它持有工单库的独占锁，退出时回收全部执行端子进程。设计与迁移记录见 [Rust 重构路线](docs/rust-port.md)。
 
-从源码构建需要 Windows、Rust stable（1.89 或更高版本）、Node.js（仅用于运行构建包装脚本）和至少一个已登录的 agent CLI。GNU 工具链需要 [llvm-mingw](https://github.com/mstorsjo/llvm-mingw/releases)，解压方式见 [构建说明](docs/rust-port.md#构建)。在 PowerShell 执行以下命令。
+从源码构建需要 Windows、Rust stable（1.89 或更高版本）和至少一个已登录的 agent CLI。GNU 工具链需要 [llvm-mingw](https://github.com/mstorsjo/llvm-mingw/releases)，解压方式见 [构建说明](docs/rust-port.md#构建)。在 PowerShell 执行以下命令。
 
 ```powershell
 git clone https://github.com/Herobetrine/super-agent.git
 cd super-agent
-node scripts/cargo.cjs build --release -p sa-desktop
+scripts\cargo.cmd build --release -p sa-desktop
 .\Install-Desktop.ps1
 ```
 
-双击桌面的 **Super Agent**，也可以直接运行 `target\release\super-agent.exe`。同一个工单库只能由一个工作台调度；再打开一个窗口，或旧版 Electron 工作台正在运行时，新窗口自动以只读观察模式打开。重建前先关闭运行中的工作台。
+双击桌面的 **Super Agent**，也可以直接运行 `target\release\super-agent.exe`。同一个工单库只能由一个工作台调度；再打开一个窗口时，新窗口自动以只读观察模式打开。重建前先关闭运行中的工作台。
 
-旧版 Electron 工作台仍可构建：`npm ci`、`node node_modules/electron/install.js`、`npm run build:native`，再运行 `.\Install-Desktop.ps1 -Legacy`。两个版本读写同一个工单库，不要同时调度。
-
-升级已有安装时，先停止需要终止的工单并退出旧窗口。新版直接打开原工单库和附件目录，继续使用本机供应商配置；旧工单可以追加指令续跑。旧自动工单遵守创建时的规则。Electron、Node 和 Python/Qt 源文件暂时保留，用于迁移对照及回归测试。
+升级已有安装时，先停止需要终止的工单并退出旧窗口。新版直接打开原工单库和附件目录，继续使用本机供应商配置；旧工单可以追加指令续跑。旧自动工单遵守创建时的规则。旧版 Electron/Node 与 Python/Qt 实现已移除，需要时可从 Git 历史（提交 `ea08b8a` 及之前）取回。
 
 | Agent | 自动执行入口 | 配置和安装 |
 | --- | --- | --- |
@@ -99,10 +97,9 @@ node scripts/cargo.cjs build --release -p sa-desktop
 运行调度器、执行端、扩展和桌面测试（桌面测试通过无障碍树驱动真实窗口）。真实执行器联测需使用本机模型配额，开关与记录见 [Rust 重构路线](docs/rust-port.md#验证记录2026-11-05)。[验证方法](docs/verification.md)
 
 ```powershell
-node scripts/cargo.cjs test --workspace
+scripts\cargo.cmd test --workspace
 ```
 
-旧版测试：`npm run build:native` 后运行 `npm test`。
 
 本地统筹、独立 worker 和持久化消息参考了 DeepSeek 的 Super-agent 原型。权限设计也参考了 OpenHands 的确认策略及 OpenCode 的请求、允许、拒绝规则。[DeepSeek 原型](https://github.com/deepseek-ai/dsh-superagent-prototype/tree/6337fc823ce20251c8de8085948165c81aaa701e) · [OpenHands 确认策略](https://github.com/OpenHands/software-agent-sdk/blob/main/openhands-sdk/openhands/sdk/security/confirmation_policy.py) · [OpenCode 权限规则](https://opencode.ai/docs/permissions/)
 
