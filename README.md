@@ -55,7 +55,7 @@ scripts\cargo.cmd build --release -p sa-desktop
 
 ### 会话权限与自动目标
 
-![Electron 工作台的输入区和权限选择](docs/images/composer-permissions.png)
+![Super Agent 工作台的欢迎页](docs/images/workbench.png)
 
 新对话默认只读。需要你决定的动作出现在窗口顶部的 **待审批** 中，可检查工单、执行者和请求内容后批准或拒绝。
 

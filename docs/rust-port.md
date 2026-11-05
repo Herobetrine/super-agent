@@ -41,7 +41,7 @@ scripts\cargo.cmd run -p sa-desktop --release -- --demo
 
 工单库独占：`sa_engine::owner::claim` 对 `desktop.lock` 加排他文件锁（与 Electron broker 同一个锁文件），并把进程放入 Windows 作业对象（`KILL_ON_JOB_CLOSE`），窗口退出时执行端子进程随之结束。
 
-尚未实现：`SA_CANCEL` 与只读子任务自动改派（spec §9.2 F 可选项）；运行中“等待上游/工具执行中”这类按内存活动推算的实时徽标（目前以日志事件显示卡顿与重试）。
+`SA_CANCEL`（上级取消直属子任务）、只读子任务自动改派（每张工单可开关）和按内存活动推算的实时徽标（`Engine::activity`）已实现，见 spec §9.2 F/G。尚未实现：令牌用量统计（执行端目前不记录用量字段）。
 
 ## 执行端适配器现状（第 3 阶段）
 
@@ -85,6 +85,13 @@ powershell -File Install-Desktop.ps1              # 桌面快捷方式指向 Rus
 | Git 变更 | 项目面板“变更”（`diff`，观察窗口可用） |
 | 导出完整记录（JSON Lines，逐条校验摘要，只写新文件） | 顶栏导出图标（`exportTo`，观察窗口可用） |
 | 卡顿、重试 n/max、供应商轮换、熔断、放弃 | 对话流状态行（`turn.stalled` 等事件） |
+| 实时徽标：运行中、等待上游、工具执行中、疑似卡住、等待审批、重试中 n/max、熔断 | 实时状态条、协作卡片 |
+| 只读子任务自动改派开关 | 项目面板“协作” |
+| 欢迎页（起步提示、最近项目）、命令面板 Ctrl+K、快捷键 Ctrl+N/B/J、Ctrl+Shift+F/L/M | 全局 |
+| `@` 提及项目文件、粘贴图片（存入 `.superagent/pasted/`）、拖入文件或项目文件夹 | 输入区 |
+| 会话重命名、置顶、归档 | 侧栏右键菜单 |
+| 复制回复、导出对话为 Markdown | 回复标题栏、顶栏导出菜单 |
+| 工单完成或新审批时任务栏闪烁提醒 | 窗口在后台时 |
 
 自定义供应商只保存密钥所在环境变量的名字；各执行端如何接入见 `crates/sa-adapters/PROVIDERS.md`。轮换开启后，引擎的 `ResilientRunner` 在认证、额度、限流、过载或供应商不可用时按运营方顺序改用下一条路由（`route.rotated`），换路由后不续接原会话。
 
