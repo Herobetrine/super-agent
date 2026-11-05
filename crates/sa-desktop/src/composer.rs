@@ -378,10 +378,16 @@ impl App {
         let mut models = None;
         let mut exts = None;
         Frame::new()
-            .fill(pal.surface_alt)
+            .fill(pal.surface)
             .stroke(Stroke::new(1.0_f32, pal.line))
-            .corner_radius(CornerRadius::same(14))
-            .inner_margin(Margin { left: 14, right: 12, top: 10, bottom: 10 })
+            .corner_radius(CornerRadius::same(18))
+            .shadow(egui::Shadow {
+                offset: [0, 6],
+                blur: 24,
+                spread: 0,
+                color: Color32::from_black_alpha(if pal.dark { 70 } else { 18 }),
+            })
+            .inner_margin(Margin { left: 16, right: 12, top: 12, bottom: 10 })
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ui.spacing_mut().item_spacing.y = 6.0;

@@ -131,8 +131,7 @@ impl App {
                 });
                 ui.add_space(16.0);
                 if self.writable() {
-                    let fresh = self.view.is_none();
-                    if widgets::quiet_button(ui, icon::NOTE_PENCIL, "新建对话", &pal, fresh)
+                    if widgets::wide_button(ui, icon::NOTE_PENCIL, "新建对话", "Ctrl N", &pal)
                         .on_hover_text("开始一个新会话")
                         .clicked()
                     {

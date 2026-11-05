@@ -327,3 +327,27 @@ pub fn segmented(ui: &mut Ui, items: &[&str], current: usize, pal: &Palette) -> 
         });
     picked
 }
+
+/// Full-width outlined button with an icon and an optional shortcut hint.
+pub fn wide_button(ui: &mut Ui, icon: &str, text: &str, hint: &str, pal: &Palette) -> Response {
+    let w = ui.available_width();
+    let (rect, resp) = ui.allocate_exact_size(vec2(w, 38.0), Sense::click());
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, text));
+    if ui.is_rect_visible(rect) {
+        let t = ui.ctx().animate_bool(resp.id.with("hover"), resp.hovered());
+        let p = ui.painter();
+        p.rect(
+            rect,
+            CornerRadius::same(10),
+            pal.surface.lerp_to_gamma(pal.hover, t),
+            Stroke::new(1.0_f32, pal.line),
+            egui::StrokeKind::Inside,
+        );
+        p.text(rect.left_center() + vec2(14.0, 0.0), Align2::LEFT_CENTER, icon, theme::body(16.0), pal.accent);
+        p.text(rect.left_center() + vec2(38.0, 0.0), Align2::LEFT_CENTER, text, theme::strong(13.5), pal.ink);
+        if !hint.is_empty() {
+            p.text(rect.right_center() - vec2(12.0, 0.0), Align2::RIGHT_CENTER, hint, theme::body(theme::TINY), pal.faint);
+        }
+    }
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+}

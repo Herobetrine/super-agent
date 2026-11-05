@@ -81,11 +81,13 @@ impl App {
             }))
             .show_separator_line(false)
             .show_inside(ui, |ui| {
-                if self.writable() {
-                    self.composer(ui);
-                } else {
-                    self.footer(ui);
-                }
+                centered(ui, COLUMN, 0.0, |ui| {
+                    if self.writable() {
+                        self.composer(ui);
+                    } else {
+                        self.footer(ui);
+                    }
+                });
             });
 
         ui.add_space(14.0);
@@ -94,7 +96,11 @@ impl App {
             ui.add_space(10.0);
         }
         let Some(view) = self.view.as_ref() else {
-            self.empty_state(ui);
+            if self.writable() && self.source.error.is_none() {
+                self.welcome(ui);
+            } else {
+                self.empty_state(ui);
+            }
             return;
         };
         if let Some(err) = view.error.clone() {
@@ -174,6 +180,87 @@ impl App {
                     .color(pal.mute),
             );
         });
+    }
+
+    /// New-conversation home: greeting, starter prompts and recent projects.
+    fn welcome(&mut self, ui: &mut Ui) {
+        let pal = self.pal.clone();
+        let h = ui.available_height();
+        ui.add_space((h * 0.14).clamp(16.0, 120.0));
+        let mut pick_draft: Option<String> = None;
+        let mut pick_project: Option<std::path::PathBuf> = None;
+        centered(ui, 760.0, 24.0, |ui| {
+            ui.vertical_centered(|ui| {
+                let (r, _) = ui.allocate_exact_size(vec2(52.0, 52.0), Sense::hover());
+                widgets::brand_mark(ui, r, &pal);
+                ui.add_space(16.0);
+                ui.label(RichText::new(greeting()).font(theme::strong(26.0)).color(pal.ink));
+                ui.add_space(6.0);
+                let project = self
+                    .composer
+                    .project
+                    .as_ref()
+                    .map(|p| format!("项目 · {}", labels::basename(&p.to_string_lossy())))
+                    .unwrap_or_else(|| "未选择项目时使用新的临时目录".into());
+                ui.label(
+                    RichText::new(format!("{project}　·　主控 {}", labels::agent_name(&self.composer.lead)))
+                        .font(theme::body(13.5))
+                        .color(pal.mute),
+                );
+            });
+            ui.add_space(26.0);
+            let gap = 12.0;
+            let w = ((ui.available_width() - gap) / 2.0).floor();
+            for row in STARTERS.chunks(2) {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = gap;
+                    for (ic, title, text, prompt) in row {
+                        if starter_card(ui, w, ic, title, text, &pal).clicked() {
+                            pick_draft = Some(prompt.to_string());
+                        }
+                    }
+                });
+                ui.add_space(gap);
+            }
+            let mut recent: Vec<&str> = Vec::new();
+            for t in &self.history {
+                if !t.cwd.is_empty() && !t.cwd.contains("super-agent-project-") && !recent.contains(&t.cwd.as_str()) {
+                    recent.push(&t.cwd);
+                }
+                if recent.len() == 5 {
+                    break;
+                }
+            }
+            if !recent.is_empty() {
+                ui.add_space(10.0);
+                ui.label(RichText::new("最近的项目").font(theme::body(theme::SMALL)).color(pal.mute));
+                ui.add_space(4.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing = vec2(6.0, 6.0);
+                    for cwd in recent {
+                        let active = self.composer.project.as_ref().is_some_and(|p| p.to_string_lossy() == cwd);
+                        if widgets::quiet_button(ui, icon::FOLDER_SIMPLE, &labels::basename(cwd), &pal, active)
+                            .on_hover_text(cwd)
+                            .clicked()
+                        {
+                            pick_project = Some(std::path::PathBuf::from(cwd));
+                        }
+                    }
+                });
+            }
+        });
+        if let Some(d) = pick_draft {
+            self.composer.draft = d;
+            self.composer.focus = true;
+        }
+        if let Some(p) = pick_project
+            && p.is_dir()
+        {
+            if self.composer.project.as_ref() != Some(&p) {
+                self.composer.attachments.clear();
+            }
+            self.composer.project = Some(p);
+        }
     }
 
     fn empty_state(&self, ui: &mut Ui) {
@@ -1228,4 +1315,72 @@ fn progress_row(ui: &mut Ui, r: &ProgressRow, snap: &Snapshot, pal: &Palette) {
     ui.painter()
         .galley(pos2(mrect.left() + 94.0, mrect.top()), mg, pal.faint);
     ui.add_space(4.0);
+}
+
+/// Starter prompts on the welcome screen: (icon, title, hint, draft).
+const STARTERS: [(&str, &str, &str, &str); 4] = [
+    (
+        icon::BUG,
+        "修复问题",
+        "复现、定位并修复，再运行相关测试",
+        "修复下面的问题。先写出复现步骤，修改后运行相关测试，再请另一个 agent 审查：
+",
+    ),
+    (
+        icon::MAGNIFYING_GLASS,
+        "审查改动",
+        "多个 agent 交叉检查当前 Git 变更",
+        "审查当前工作区的 Git 变更，指出正确性问题、风险和可简化之处，并给出修改建议。",
+    ),
+    (
+        icon::BOOK_OPEN_TEXT,
+        "理解项目",
+        "梳理结构、入口和关键流程",
+        "阅读这个项目，说明目录结构、构建与测试方法、主要入口和关键数据流，并记录到项目知识库。",
+    ),
+    (
+        icon::FLASK,
+        "补充测试",
+        "为薄弱模块编写并运行测试",
+        "找出测试覆盖薄弱的模块，补充有意义的测试并运行，报告结果。",
+    ),
+];
+
+fn greeting() -> &'static str {
+    use chrono::Timelike;
+    match chrono::Local::now().hour() {
+        5..=10 => "早上好，今天要完成什么？",
+        11..=13 => "中午好，今天要完成什么？",
+        14..=18 => "下午好，今天要完成什么？",
+        _ => "晚上好，今天要完成什么？",
+    }
+}
+
+/// Clickable starter card.
+fn starter_card(ui: &mut Ui, w: f32, ic: &str, title: &str, text: &str, pal: &Palette) -> egui::Response {
+    let h = 74.0;
+    let (rect, resp) = ui.allocate_exact_size(vec2(w, h), Sense::click());
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, title));
+    if ui.is_rect_visible(rect) {
+        let t = ui.ctx().animate_bool(resp.id.with("hover"), resp.hovered());
+        let p = ui.painter();
+        let fill = pal.surface.lerp_to_gamma(pal.hover, t);
+        p.rect(
+            rect,
+            CornerRadius::same(14),
+            fill,
+            Stroke::new(1.0_f32, pal.line_soft.lerp_to_gamma(pal.line, t)),
+            egui::StrokeKind::Inside,
+        );
+        let tile = egui::Rect::from_min_size(rect.min + vec2(14.0, 17.0), vec2(40.0, 40.0));
+        p.rect_filled(tile, CornerRadius::same(11), pal.pale);
+        p.text(tile.center(), egui::Align2::CENTER_CENTER, ic, theme::body(20.0), pal.accent);
+        let x = tile.right() + 12.0;
+        let tw = rect.right() - x - 12.0;
+        let tg = widgets::line_galley(ui, title, theme::strong(14.0), pal.ink, tw);
+        let sg = widgets::line_galley(ui, text, theme::body(12.5), pal.mute, tw);
+        p.galley(egui::pos2(x, rect.top() + 18.0), tg, pal.ink);
+        p.galley(egui::pos2(x, rect.top() + 41.0), sg, pal.mute);
+    }
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
 }

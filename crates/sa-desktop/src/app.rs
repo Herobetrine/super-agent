@@ -287,7 +287,7 @@ impl App {
                     }
                     self.history = rows;
                     self.history_loaded = true;
-                    if !self.auto_selected && self.view.is_none() && query.is_empty() {
+                    if !self.auto_selected && self.view.is_none() && query.is_empty() && !self.writable() {
                         self.auto_selected = true;
                         if let Some(first) = self.history.first().map(|r| r.id) {
                             self.select(Some(first));
@@ -780,8 +780,13 @@ impl App {
             })
             .unwrap_or_else(|| match self.view.as_ref() {
                 Some(v) => format!("工单 #{}", v.id),
+                None if self.host.is_some() => "新对话".into(),
                 None => "未选择工单".into(),
             });
+        let crumb = snap
+            .map(|s| labels::basename(&s.ticket.cwd))
+            .filter(|c| !c.is_empty() && !c.contains("super-agent-project-"))
+            .unwrap_or_else(|| "工作台".into());
         let title_line = labels::compact(&title, 200);
         ui.horizontal_centered(|ui| {
             if widgets::icon_button(ui, icon::SIDEBAR_SIMPLE, 32.0, pal.mute, pal.hover, false)
@@ -861,7 +866,7 @@ impl App {
                 ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                     ui.spacing_mut().item_spacing.x = 6.0;
                     ui.label(
-                        egui::RichText::new("工作台")
+                        egui::RichText::new(&crumb)
                             .font(theme::body(14.0))
                             .color(pal.mute),
                     );
