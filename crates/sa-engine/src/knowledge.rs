@@ -8,8 +8,8 @@
 //!   ([`root_progress`]);
 //! - operator edits through [`crate::Engine`].
 //!
-//! The newest active entries are added to each turn's envelope as
-//! `project_knowledge` ([`context`]).
+//! Task-relevant active entries are added to each turn's envelope as
+//! `project_knowledge` ([`context_for`]), with recent context as fallback.
 
 use crate::db::{Q, Who, now, str_of, who_of};
 use crate::job::JobCtx;
@@ -18,6 +18,7 @@ use anyhow::{Result, anyhow, bail};
 use regex::Regex;
 use sa_store::knowledge::{self as store, KINDS, KnowledgeEntry, MAX_BODY};
 use serde_json::{Value, json};
+use std::collections::HashSet;
 use std::sync::LazyLock;
 
 /// Accepted `SA_MEMO` lines per turn; later ones are rejected.
@@ -73,17 +74,28 @@ pub fn parse_memo(cmd: &Value) -> Option<(&str, &str)> {
 /// operator archived it). Logs `knowledge.add {id, kind}` on `log_on`.
 /// Returns the new id, or `None` for a duplicate.
 pub fn insert(q: &Q, e: &NewEntry, log_on: Option<Who>) -> Result<Option<i64>> {
+    // A worker may execute in an isolated worktree. Its shared knowledge still
+    // belongs to the originating ticket's project, not that disposable path.
+    let project = match e.ticket {
+        Some(ticket) => {
+            let row = q
+                .one("SELECT cwd FROM tickets WHERE id=?", &[&ticket])?
+                .ok_or_else(|| anyhow!("知识来源工单不存在"))?;
+            str_of(&row, "cwd").to_string()
+        }
+        None => e.cwd.to_string(),
+    };
     let sha = digest(e.body);
     let duplicate = q.exists(
         "SELECT 1 FROM project_knowledge WHERE cwd=? AND sha256=? AND (archived=0 OR (job IS NOT NULL AND job=?)) LIMIT 1",
-        &[&e.cwd, &sha, &e.job],
+        &[&project, &sha, &e.job],
     )?;
     if duplicate {
         return Ok(None);
     }
     let id = q.insert(
         "INSERT INTO project_knowledge(cwd,kind,body,ticket,job,agent,created,sha256) VALUES(?,?,?,?,?,?,?,?)",
-        &[&e.cwd, &e.kind, &e.body, &e.ticket, &e.job, &e.agent, &now(), &sha],
+        &[&project, &e.kind, &e.body, &e.ticket, &e.job, &e.agent, &now(), &sha],
     )?;
     if let Some(who) = log_on {
         q.log(who, "knowledge.add", &json!({"id": id, "kind": e.kind}))?;
@@ -111,7 +123,10 @@ fn excerpt(s: &str, max: usize) -> String {
 
 /// One line: whitespace runs collapsed.
 fn one_line(s: &str) -> String {
-    s.split(p::js_whitespace).filter(|w| !w.is_empty()).collect::<Vec<_>>().join(" ")
+    s.split(p::js_whitespace)
+        .filter(|w| !w.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Automatic `progress` entry when a root job ends `done` or `partial`:
@@ -133,16 +148,24 @@ pub fn root_progress(q: &Q, job: &JobCtx, state: &str, text: &str) -> Result<()>
         )?
         .and_then(|r| serde_json::from_str::<Value>(str_of(&r, "payload")).ok())
         .and_then(|v| v.as_str().map(str::to_string));
-    let reply: Vec<&str> = text
-        .split('\n')
-        .filter(|l| !l.starts_with("SA_"))
-        .collect();
+    let reply: Vec<&str> = text.split('\n').filter(|l| !l.starts_with("SA_")).collect();
     let reply = one_line(&reply.join("\n"));
-    let mut body = format!("工单 #{}（{label}）目标：{}", job.ticket, excerpt(&one_line(&goal), GOAL_EXCERPT));
+    let mut body = format!(
+        "工单 #{}（{label}）目标：{}",
+        job.ticket,
+        excerpt(&one_line(&goal), GOAL_EXCERPT)
+    );
     if let Some(f) = follow {
-        body.push_str(&format!("\n最新追加：{}", excerpt(&one_line(&f), FOLLOW_EXCERPT)));
+        body.push_str(&format!(
+            "\n最新追加：{}",
+            excerpt(&one_line(&f), FOLLOW_EXCERPT)
+        ));
     }
-    let reply = if reply.is_empty() { "（无正文）".to_string() } else { excerpt(&reply, RESULT_EXCERPT) };
+    let reply = if reply.is_empty() {
+        "（无正文）".to_string()
+    } else {
+        excerpt(&reply, RESULT_EXCERPT)
+    };
     body.push_str(&format!("\n结果：{reply}"));
     insert(
         q,
@@ -196,6 +219,46 @@ pub fn context(q: &Q, cwd: &str) -> Result<Vec<Value>> {
         .collect())
 }
 
+/// Task-aware context. Search all active project history before applying a
+/// candidate limit, so older relevant lessons are not hidden by recent progress.
+/// Relevant entries are first; remaining budget uses the existing kind-balanced
+/// recent selection. No match preserves the legacy order and selection.
+/// `created` records source time, never independently verified time.
+pub fn context_for(q: &Q, cwd: &str, query: &str) -> Result<Vec<Value>> {
+    let matched = store::relevant(q.conn(), cwd, query, CONTEXT_SCAN as usize)?;
+    let recent = store::active(q.conn(), cwd, CONTEXT_SCAN)?;
+    let fallback = context(q, cwd)?;
+    let mut result = vec![];
+    let mut bodies = HashSet::new();
+    let mut total = 0;
+    let mut push = |e: &KnowledgeEntry, relevance: i64| {
+        let size = utf16_len(&e.body);
+        if result.len() >= CONTEXT_ENTRIES
+            || total + size > CONTEXT_CHARS
+            || !bodies.insert(e.body.clone())
+        {
+            return;
+        }
+        total += size;
+        result.push(json!({
+            "id": e.id, "kind": e.kind, "body": e.body, "agent": e.agent, "ticket": e.ticket,
+            "job": e.job, "created": e.created, "relevance": relevance,
+        }));
+    };
+    for entry in &matched {
+        push(&entry.entry, entry.score);
+    }
+    for value in &fallback {
+        if let Some(entry) = recent
+            .iter()
+            .find(|entry| value["id"].as_i64() == Some(entry.id))
+        {
+            push(entry, 0);
+        }
+    }
+    Ok(result)
+}
+
 /// Operator entry (`agent='operator'`). With a ticket, the ticket must belong
 /// to the project and `knowledge.add` is logged on its root job.
 pub fn operator_add(q: &Q, cwd: &str, kind: &str, body: &str, ticket: Option<i64>) -> Result<i64> {
@@ -232,7 +295,10 @@ pub fn operator_add(q: &Q, cwd: &str, kind: &str, body: &str, ticket: Option<i64
 /// the root job of the entry's ticket when it has one.
 pub fn set_archived(q: &Q, id: i64, archived: bool) -> Result<()> {
     let row = q
-        .one("SELECT cwd,sha256,ticket,archived FROM project_knowledge WHERE id=?", &[&id])?
+        .one(
+            "SELECT cwd,sha256,ticket,archived FROM project_knowledge WHERE id=?",
+            &[&id],
+        )?
         .ok_or_else(|| anyhow!("知识条目不存在"))?;
     if (row["archived"].as_i64().unwrap_or(0) != 0) == archived {
         return Ok(());
@@ -245,11 +311,21 @@ pub fn set_archived(q: &Q, id: i64, archived: bool) -> Result<()> {
     {
         bail!("项目知识库已有相同内容的有效条目");
     }
-    q.run("UPDATE project_knowledge SET archived=? WHERE id=?", &[&(archived as i64), &id])?;
+    q.run(
+        "UPDATE project_knowledge SET archived=? WHERE id=?",
+        &[&(archived as i64), &id],
+    )?;
     if let Some(ticket) = row["ticket"].as_i64()
-        && let Some(root) = q.one("SELECT * FROM jobs WHERE ticket=? AND parent IS NULL", &[&ticket])?
+        && let Some(root) = q.one(
+            "SELECT * FROM jobs WHERE ticket=? AND parent IS NULL",
+            &[&ticket],
+        )?
     {
-        q.log(who_of(&root), "knowledge.archived", &json!({"id": id, "archived": archived}))?;
+        q.log(
+            who_of(&root),
+            "knowledge.archived",
+            &json!({"id": id, "archived": archived}),
+        )?;
     }
     Ok(())
 }
@@ -261,14 +337,19 @@ mod tests {
     #[test]
     fn memo_fields() {
         let ok = json!({"kind": "lesson", "text": "  用 cargo.cjs 构建\n不要直接 cargo  "});
-        assert_eq!(parse_memo(&ok), Some(("lesson", "用 cargo.cjs 构建\n不要直接 cargo")));
+        assert_eq!(
+            parse_memo(&ok),
+            Some(("lesson", "用 cargo.cjs 构建\n不要直接 cargo"))
+        );
         assert!(parse_memo(&json!({"kind": "secret", "text": "x"})).is_none());
         assert!(parse_memo(&json!({"kind": "memory", "text": " \u{3000} "})).is_none());
         assert!(parse_memo(&json!({"kind": "memory", "text": "x", "id": "k"})).is_none());
         assert!(parse_memo(&json!({"kind": "memory", "text": "a\u{0}b"})).is_none());
         assert!(parse_memo(&json!({"kind": "memory", "text": "a\u{202e}b"})).is_none());
         assert!(parse_memo(&json!({"kind": "memory", "text": "字".repeat(MAX_BODY)})).is_some());
-        assert!(parse_memo(&json!({"kind": "memory", "text": "😀".repeat(MAX_BODY / 2 + 1)})).is_none());
+        assert!(
+            parse_memo(&json!({"kind": "memory", "text": "😀".repeat(MAX_BODY / 2 + 1)})).is_none()
+        );
         assert!(parse_memo(&json!(["memory", "x"])).is_none());
     }
 

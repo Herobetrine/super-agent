@@ -11,11 +11,18 @@ struct Fx {
 }
 
 fn fx() -> Fx {
-    let dir = tempfile::Builder::new().prefix("sa-ext-unit-").tempdir().unwrap();
+    let dir = tempfile::Builder::new()
+        .prefix("sa-ext-unit-")
+        .tempdir()
+        .unwrap();
     let root = dir.path().to_path_buf();
     let bin = root.join("bin");
     fs::create_dir_all(&bin).unwrap();
-    let exe = bin.join(if cfg!(windows) { "server.exe" } else { "server" });
+    let exe = bin.join(if cfg!(windows) {
+        "server.exe"
+    } else {
+        "server"
+    });
     fs::write(&exe, b"").unwrap();
     let opts = ExtOptions {
         homes: SkillHomes {
@@ -73,12 +80,30 @@ fn save_server_validates_like_the_js() {
     let bad = "MCP 服务参数无效";
     assert_eq!(err(json!({"command": "server"})), bad);
     assert_eq!(err(json!({"name": " ", "command": "server"})), bad);
-    assert_eq!(err(json!({"name": "x".repeat(101), "command": "server"})), bad);
-    assert_eq!(err(json!({"name": "a", "command": "server", "enabled": 1})), bad);
-    assert_eq!(err(json!({"name": "a", "command": "server", "enabled": null})), bad);
-    assert_eq!(err(json!({"name": "a", "command": "server", "args": null})), bad);
-    assert_eq!(err(json!({"name": "a", "command": "server", "args": [1]})), bad);
-    assert_eq!(err(json!({"name": "a", "command": "server", "args": ["\0"]})), bad);
+    assert_eq!(
+        err(json!({"name": "x".repeat(101), "command": "server"})),
+        bad
+    );
+    assert_eq!(
+        err(json!({"name": "a", "command": "server", "enabled": 1})),
+        bad
+    );
+    assert_eq!(
+        err(json!({"name": "a", "command": "server", "enabled": null})),
+        bad
+    );
+    assert_eq!(
+        err(json!({"name": "a", "command": "server", "args": null})),
+        bad
+    );
+    assert_eq!(
+        err(json!({"name": "a", "command": "server", "args": [1]})),
+        bad
+    );
+    assert_eq!(
+        err(json!({"name": "a", "command": "server", "args": ["\0"]})),
+        bad
+    );
     assert_eq!(
         err(json!({"name": "a", "command": "server", "args": vec!["a"; 65]})),
         bad
@@ -87,7 +112,10 @@ fn save_server_validates_like_the_js() {
         err(json!({"name": "a", "command": "server", "args": ["x".repeat(8193)]})),
         bad
     );
-    assert_eq!(err(json!({"name": "a", "transport": "ws"})), "不支持的 MCP 传输");
+    assert_eq!(
+        err(json!({"name": "a", "transport": "ws"})),
+        "不支持的 MCP 传输"
+    );
     assert_eq!(
         err(json!({"name": "a", "command": "missing"})),
         "未找到可执行程序，请填写已安装程序的绝对路径"
@@ -97,7 +125,9 @@ fn save_server_validates_like_the_js() {
         validate::BAD_ENDPOINT
     );
     assert_eq!(
-        err(json!({"name": "a", "transport": "http", "url": "https://x.test/mcp", "tokenEnv": "GITHUB_TOKEN"})),
+        err(
+            json!({"name": "a", "transport": "http", "url": "https://x.test/mcp", "tokenEnv": "GITHUB_TOKEN"})
+        ),
         "请使用 MCP_ 开头的服务专用环境变量名"
     );
     assert_eq!(
@@ -121,7 +151,11 @@ fn save_server_validates_like_the_js() {
         .unwrap();
     let r = row(&f.ext, &web);
     assert_eq!(
-        (r["command"].as_str(), r["url"].as_str(), r["token_env"].as_str()),
+        (
+            r["command"].as_str(),
+            r["url"].as_str(),
+            r["token_env"].as_str()
+        ),
         (Some(""), Some("https://x.test/mcp"), Some("MCP_X"))
     );
 }
@@ -140,7 +174,10 @@ fn revisions_tools_and_defaults_follow_launch_parameters() {
     f.ext
         .set_defaults(&json!({"skills": [], "servers": [id, id]}), None)
         .unwrap();
-    assert_eq!(f.ext.defaults().unwrap(), json!({"skills": [], "servers": [id]}));
+    assert_eq!(
+        f.ext.defaults().unwrap(),
+        json!({"skills": [], "servers": [id]})
+    );
 
     // Renaming keeps revision, tools and defaults.
     let mut renamed = base.clone();
@@ -179,13 +216,19 @@ fn revisions_tools_and_defaults_follow_launch_parameters() {
             "transport": "stdio", "url": "", "tokenEnv": ""})
     );
     set_tools(&f.ext, &id, json!([{"name": "t1"}, {"name": "t2"}]));
-    assert_eq!(f.ext.list(None).unwrap()["servers"][0]["tools"], json!(["t1", "t2"]));
+    assert_eq!(
+        f.ext.list(None).unwrap()["servers"][0]["tools"],
+        json!(["t1", "t2"])
+    );
     f.ext
         .set_defaults(&json!({"skills": [], "servers": [id]}), None)
         .unwrap();
     f.ext.remove(&id).unwrap();
     assert_eq!(f.ext.list(None).unwrap()["servers"], json!([]));
-    assert_eq!(f.ext.defaults().unwrap(), json!({"skills": [], "servers": []}));
+    assert_eq!(
+        f.ext.defaults().unwrap(),
+        json!({"skills": [], "servers": []})
+    );
 }
 
 #[test]
@@ -216,7 +259,10 @@ fn skills_import_preview_prepare_and_forget() {
         f.ext.preview(&imported, None).unwrap(),
         json!({"name": "outside", "body": "---\nname: outside\ndescription: about outside\n---\nbody of outside\n", "source": "已导入"})
     );
-    assert_eq!(f.ext.preview(&local, None).unwrap_err().to_string(), "技能不存在");
+    assert_eq!(
+        f.ext.preview(&local, None).unwrap_err().to_string(),
+        "技能不存在"
+    );
     assert_eq!(
         f.ext.preview(&local, Some(&project)).unwrap()["source"],
         json!("项目 Claude")
@@ -254,7 +300,13 @@ fn skills_import_preview_prepare_and_forget() {
         .unwrap();
     f.ext.forget_skill(&imported).unwrap();
     assert_eq!(f.ext.defaults().unwrap()["skills"], json!([]));
-    assert_eq!(f.ext.list(None).unwrap()["skills"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        f.ext.list(None).unwrap()["skills"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
 }
 
 #[test]
@@ -282,9 +334,15 @@ fn opening_is_idempotent_and_keeps_the_js_layout() {
             "token_env"
         ]
     );
-    assert_eq!(again.summary(1).unwrap(), json!({"skills": [], "servers": []}));
+    assert_eq!(
+        again.summary(1).unwrap(),
+        json!({"skills": [], "servers": []})
+    );
     assert_eq!(again.results_of(1).unwrap(), Vec::<Value>::new());
     // A journal that never had the extension tables (read-only observers).
     let bare = Connection::open_in_memory().unwrap();
-    assert_eq!(summary_in(&bare, 1).unwrap(), json!({"skills": [], "servers": []}));
+    assert_eq!(
+        summary_in(&bare, 1).unwrap(),
+        json!({"skills": [], "servers": []})
+    );
 }

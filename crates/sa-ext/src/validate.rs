@@ -158,10 +158,22 @@ mod tests {
         assert_eq!(err(json!({"skills": []})), "扩展授权格式无效");
         assert_eq!(err(json!(null)), "扩展授权格式无效");
         let many: Vec<String> = (0..17).map(|i| i.to_string()).collect();
-        assert_eq!(err(json!({"skills": many, "servers": []})), "每类最多启用 16 项");
-        assert_eq!(err(json!({"skills": [" "], "servers": []})), "每类最多启用 16 项");
-        assert_eq!(err(json!({"skills": [], "servers": [1]})), "每类最多启用 16 项");
-        assert_eq!(err(json!({"skills": ["a\0"], "servers": []})), "每类最多启用 16 项");
+        assert_eq!(
+            err(json!({"skills": many, "servers": []})),
+            "每类最多启用 16 项"
+        );
+        assert_eq!(
+            err(json!({"skills": [" "], "servers": []})),
+            "每类最多启用 16 项"
+        );
+        assert_eq!(
+            err(json!({"skills": [], "servers": [1]})),
+            "每类最多启用 16 项"
+        );
+        assert_eq!(
+            err(json!({"skills": ["a\0"], "servers": []})),
+            "每类最多启用 16 项"
+        );
         assert_eq!(
             err(json!({"skills": ["x".repeat(101)], "servers": []})),
             "每类最多启用 16 项"
@@ -171,8 +183,14 @@ mod tests {
     #[test]
     fn endpoints() {
         let ok = |s: &str| endpoint(Some(&json!(s))).map(|u| u.to_string());
-        assert_eq!(ok("https://example.com/mcp").unwrap(), "https://example.com/mcp");
-        assert_eq!(ok("http://127.0.0.1:8080/mcp").unwrap(), "http://127.0.0.1:8080/mcp");
+        assert_eq!(
+            ok("https://example.com/mcp").unwrap(),
+            "https://example.com/mcp"
+        );
+        assert_eq!(
+            ok("http://127.0.0.1:8080/mcp").unwrap(),
+            "http://127.0.0.1:8080/mcp"
+        );
         assert!(ok("http://localhost/mcp").is_ok());
         assert!(ok("http://[::1]:9/mcp").is_ok());
         for bad in [
@@ -215,13 +233,22 @@ mod tests {
             .to_string_lossy()
             .into_owned();
         assert_eq!(executable(Some(&json!("tool")), Some(&path)).unwrap(), real);
-        assert_eq!(executable(Some(&json!(exe.to_str().unwrap())), None).unwrap(), real);
+        assert_eq!(
+            executable(Some(&json!(exe.to_str().unwrap())), None).unwrap(),
+            real
+        );
         let err = |v: Value| executable(Some(&v), Some(&path)).unwrap_err().to_string();
         assert_eq!(err(json!("")), "请提供可执行程序");
         assert_eq!(err(json!(1)), "请提供可执行程序");
-        assert_eq!(err(json!("bin/tool")), "命令必须是绝对路径或 PATH 中的程序名");
+        assert_eq!(
+            err(json!("bin/tool")),
+            "命令必须是绝对路径或 PATH 中的程序名"
+        );
         assert_eq!(err(json!("c:tool")), "命令必须是绝对路径或 PATH 中的程序名");
-        assert_eq!(err(json!("missing")), "未找到可执行程序，请填写已安装程序的绝对路径");
+        assert_eq!(
+            err(json!("missing")),
+            "未找到可执行程序，请填写已安装程序的绝对路径"
+        );
         if cfg!(windows) {
             let script = dir.path().join("server.cmd");
             std::fs::write(&script, b"").unwrap();

@@ -11,6 +11,7 @@ pub mod providers;
 pub mod schema;
 pub mod store;
 pub mod usage;
+pub mod evaluation;
 
 pub use model::*;
 pub use schema::{STUDIO_PLAN, TICKET_META};

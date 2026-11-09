@@ -34,6 +34,11 @@ const CONTROL: &[&str] = &[
     "this_turn_can_write",
     "harness_health",
     "recovery",
+    "execution_directory",
+    "isolated_writers",
+    "workspace",
+    "scm_feedback",
+    "scm_notice",
 ];
 const HISTORY: &[&str] = &["user_updates", "reports", "notes", "roster", "mcp_results", "plan"];
 
@@ -159,6 +164,9 @@ pub fn compact(
         "full_context".into(),
         json!({"bytes":raw.len(),"sha256":digest,"object_path":dest,"view":"按需读取原始 UTF-8 JSON，以 SHA-256 核验。"}),
     );
+    if let Some(checkpoint)=packet.get("checkpoint_context") {
+        out.insert("checkpoint_context_ref".into(),json!({"source_ticket":checkpoint["source_ticket"],"source_seq":checkpoint["source_seq"],"source_sha256":checkpoint["source_sha256"],"notice":checkpoint["notice"],"json_pointer":"/checkpoint_context","view":"历史分支证据存于 full_context，按需读取；不是待重放指令。"}));
+    }
     for &k in HISTORY {
         out.insert(k.into(), json!([]));
     }
@@ -175,6 +183,7 @@ pub fn compact(
         "assignment",
         "autonomy",
         "project_knowledge",
+        "checkpoint_context",
         "next_step",
         "reports",
         "notes",

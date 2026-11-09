@@ -25,7 +25,7 @@ use crate::protocol::{self as p, END_SQL, digest, stringify};
 use crate::resilience::{Health, HealthTransition, Recovery, ResilienceConfig, TurnLedger, TurnResult, classify};
 use crate::runner::{NoRotation, ResilientRunner, RotationSource, TurnRunner};
 use crate::services::{Extensions, FsSnapshotter, Snapshotter, realpath};
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Result, anyhow, bail, ensure};
 use futures::FutureExt;
 use futures::future::{BoxFuture, Shared, join_all};
 use regex::Regex;
@@ -86,6 +86,8 @@ impl Default for EngineOptions {
 /// `create(params)` input (S:85-143, ST:299-317).
 #[derive(Clone, Debug, Default)]
 pub struct CreateParams {
+    /// Operator-selected historical root reply. No native session is copied.
+    pub checkpoint: Option<(i64,i64)>,
     pub goal: String,
     pub cwd: PathBuf,
     /// Default `deepseek`.
@@ -142,13 +144,14 @@ struct Slot {
 #[derive(Default)]
 struct Sched {
     active: HashMap<i64, Slot>,
-    writer: Option<i64>,
+    /// Maintenance leases also prevent admission while validating/integrating.
+    maintenance: Vec<String>,
     timer: Option<JoinHandle<()>>,
 }
 
 pub(crate) struct Inner {
     pub(crate) db: Db,
-    data_dir: PathBuf,
+    pub(crate) data_dir: PathBuf,
     adapters: HashMap<String, Arc<dyn Adapter>>,
     opts: EngineOptions,
     sched: Mutex<Sched>,
@@ -177,6 +180,7 @@ pub struct Turn {
     menus: Mutex<Map<String, Value>>,
     pub(crate) cancel: CancellationToken,
     timed_out: AtomicBool,
+    loop_detected: AtomicBool,
     pub(crate) tool_follow: AtomicBool,
     /// `SA_MEMO` lines seen in this turn's final reply.
     pub(crate) memos: AtomicUsize,
@@ -351,6 +355,13 @@ impl Engine {
 
     /// `close()` (E:40-54): abort running turns, wait for them, close the DB.
     pub async fn close(&self) {
+        self.quiesce().await;
+        self.inner.db.close();
+    }
+
+    /// Stop admissions and model execution while retaining the journal for
+    /// tracked maintenance tasks to persist their final receipts.
+    pub async fn quiesce(&self) {
         let inner = &self.inner;
         inner.stopping.store(true, Ordering::SeqCst);
         let tasks: Vec<JoinHandle<()>> = {
@@ -369,7 +380,6 @@ impl Engine {
         for t in tasks {
             let _ = t.await;
         }
-        inner.db.close();
     }
 
     /// `cancel({ticket})` (E:63-73).
@@ -422,6 +432,108 @@ impl Engine {
         self.inner.db.tx(|q| q.set_lead_routing(ticket, enabled))
     }
 
+    pub fn isolated_writers(&self, ticket: i64) -> Result<bool> {
+        self.inner.db.with(|q| q.exists("SELECT 1 FROM workspace_policy WHERE ticket=? AND isolated=1", &[&ticket]))
+    }
+    pub fn checkpoints(&self,ticket:i64)->Result<Vec<Value>> {
+        self.inner.db.with(|q|crate::checkpoints::list(q,ticket))
+    }
+    pub fn bind_scm(&self,job:i64,url:&str)->Result<()> {
+        self.inner.db.tx(|q|crate::scm::bind(q,job,url))
+    }
+    pub fn scm_bindings(&self,ticket:i64)->Result<Vec<Value>> {
+        self.inner.db.with(|q|crate::scm::bindings(q,ticket))
+    }
+    pub async fn refresh_scm(&self,job:i64)->Result<bool> {
+        let (url,cwd)=self.inner.db.with(|q| {
+            let r=q.one("SELECT b.url,t.cwd FROM scm_bindings b JOIN jobs j ON j.id=b.job JOIN tickets t ON t.id=j.ticket WHERE b.job=?",&[&job])?.ok_or_else(||anyhow!("任务尚未绑定 PR"))?;
+            Ok((str_of(&r,"url").to_string(),PathBuf::from(str_of(&r,"cwd"))))
+        })?;
+        let observation=crate::scm::fetch(&url,&cwd).await?;
+        self.inner.db.tx(|q|crate::scm::apply(q,job,&observation))
+    }
+    pub async fn fork_checkpoint(&self,ticket:i64,seq:i64,goal:String)->Result<i64> {
+        let source=self.inner.db.with(|q|q.one("SELECT * FROM tickets WHERE id=?",&[&ticket]))?.ok_or_else(||anyhow!("工单不存在"))?;
+        let mut params=CreateParams::new(goal,str_of(&source,"cwd")).lead(str_of(&source,"lead")).profile(str_of(&source,"permission_profile"));
+        params.selections=Some(parse(Some(str_of(&source,"agent_routes"))));
+        params.allow_lead_routing=Some(int_of(&source,"allow_lead_routing")!=0);
+        params.checkpoint=Some((ticket,seq));
+        // Do not accidentally apply changed global extension defaults.
+        if self.inner.opts.extensions.is_some(){params.extensions=Some(json!({"skills":[],"servers":[]}));}
+        self.create(params).await
+    }
+
+    pub fn set_isolated_writers(&self, ticket: i64, enabled: bool) -> Result<()> {
+        self.inner.db.tx(|q| {
+            let root = q.root(ticket)?;
+            q.run("INSERT INTO workspace_policy(ticket,isolated) VALUES(?,?) ON CONFLICT(ticket) DO UPDATE SET isolated=excluded.isolated", &[&ticket,&i64::from(enabled)])?;
+            q.log(who_of(&root), "workspace.policy", &json!({"isolated_writers":enabled}))?;
+            Ok(())
+        })
+    }
+
+    pub fn workspaces(&self, ticket: i64) -> Result<Vec<crate::workspaces::Workspace>> {
+        self.inner.db.with(|q| {
+            q.all("SELECT job FROM job_workspaces WHERE ticket=? ORDER BY job", &[&ticket])?.iter()
+                .map(|r| crate::workspaces::get(q, int_of(r,"job"))?.ok_or_else(|| anyhow!("工作区不存在"))).collect()
+        })
+    }
+
+    /// Operator-only operation. Hold scheduler leases through all blocking Git
+    /// work, including if the caller stops awaiting the result.
+    pub async fn validate_workspace(&self, job: i64, command: Vec<String>) -> Result<()> {
+        self.workspace_operation(job, Some(command)).await
+    }
+    pub async fn integrate_workspace(&self, job: i64) -> Result<()> {
+        self.workspace_operation(job, None).await
+    }
+    async fn workspace_operation(&self, job: i64, command: Option<Vec<String>>) -> Result<()> {
+        let inner = self.inner.clone();
+        tokio::task::spawn_blocking(move || {
+            let (workspace, keys) = {
+                let mut sched = lock(&inner.sched);
+                let w = inner.db.with(|q| crate::workspaces::get(q, job))?.ok_or_else(|| anyhow!("工作区不存在"))?;
+                let keys = vec![crate::workspaces::scope(&w.path), crate::workspaces::scope(&w.source)];
+                let busy = sched.active.values().any(|s| keys.iter().any(|k| crate::workspaces::overlaps(k, &crate::workspaces::scope(&s.turn.job.cwd))))
+                    || sched.maintenance.iter().any(|s| keys.iter().any(|k| crate::workspaces::overlaps(k,s)));
+                if busy { bail!("相关工作区仍有任务运行，请停止或等待后再验证/合入"); }
+                sched.maintenance.extend(keys.clone());
+                (w,keys)
+            };
+            struct Lease(Arc<Inner>, Vec<String>);
+            impl Drop for Lease { fn drop(&mut self) { lock(&self.0.sched).maintenance.retain(|k| !self.1.contains(k)); } }
+            let _lease = Lease(inner.clone(), keys);
+            // Invalidate the previous receipt before a new attempt, including
+            // spawn failures/timeouts and process crashes during validation.
+            inner.db.tx(|q| {
+                let mut pending=workspace.clone();
+                pending.state=if command.is_some(){"validating"}else{"integrating"}.into();
+                pending.validation["passed"]=json!(false);
+                pending.detail="操作进行中；中断后需重新验证".into();
+                crate::workspaces::save(q,&pending)
+            })?;
+            let result = match &command {
+                Some(argv) => crate::workspaces::validate(&workspace, argv),
+                None => crate::workspaces::integrate(&workspace, &inner.data_dir),
+            };
+            inner.db.tx(|q| {
+                let root = q.root(workspace.ticket)?;
+                match &result {
+                    Ok(w) => {
+                        crate::workspaces::save(q,w)?;
+                        q.log(who_of(&root), "workspace.result", &json!({"job":job,"state":w.state,"detail":w.detail,"validation":w.validation}))?;
+                    }
+                    Err(e) => {
+                        q.run("UPDATE job_workspaces SET state='failed',detail=? WHERE job=?",&[&e.to_string(),&job])?;
+                        q.log(who_of(&root), "workspace.error", &json!({"job":job,"reason":e.to_string()}))?;
+                    }
+                }
+                Ok(())
+            })?;
+            result.map(|_| ())
+        }).await.map_err(|_| anyhow!("工作区操作异常"))?
+    }
+
     /// `create(params)` (S:85-143); returns the ticket id.
     pub async fn create(&self, params: CreateParams) -> Result<i64> {
         let inner = &self.inner;
@@ -449,6 +561,7 @@ impl Engine {
         };
         let manifest = inner.snapshot(&dir_text, &params.files).await?;
         inner.db.tx(|q| {
+            let checkpoint=params.checkpoint.map(|(ticket,seq)|crate::checkpoints::capture(q,ticket,seq)).transpose()?;
             let defaults = q.one("SELECT routes FROM route_defaults WHERE singleton=1", &[])?;
             let raw = match &params.selections {
                 Some(s) => s.clone(),
@@ -472,6 +585,10 @@ impl Engine {
             )?;
             if let (Some(x), Some(prepared)) = (&inner.opts.extensions, &extensions) {
                 x.bind(q.conn(), ticket, prepared)?;
+            }
+            if let (Some((source,seq)),Some(context))=(params.checkpoint,&checkpoint) {
+                let context=stringify(context);
+                q.run("INSERT INTO ticket_branches VALUES(?,?,?,?,?)",&[&ticket,&source,&seq,&context,&digest(&context)])?;
             }
             if profile == "auto" {
                 q.run("INSERT INTO continuous_runs(ticket) VALUES(?)", &[&ticket])?;
@@ -601,6 +718,7 @@ impl Engine {
     /// `retry({job})` (S:204-219): same logical turn, receipts kept.
     pub fn retry(&self, id: i64) -> Result<()> {
         self.inner.db.tx(|q| {
+            ensure!(!q.exists("SELECT 1 FROM job_workspaces WHERE job=? AND state='merged'", &[&id])?,"该工作区已合入，请创建新任务继续修改");
             let job = q.one("SELECT * FROM jobs WHERE id=?", &[&id])?;
             let Some(job) = job.filter(|j| matches!(str_of(j, "state"), "failed" | "interrupted")) else {
                 bail!("只能重试失败或中断的任务");
@@ -913,17 +1031,26 @@ impl Inner {
         WHERE j.state='queued' AND j.ready_after<=? AND j.writing=? ORDER BY j.id LIMIT ?";
             let time = now();
             let mut candidates = q.all(queued, &[&time, &0, &(READS_PER_SLICE as i64)])?;
-            if sched.writer.is_none() {
-                candidates.extend(q.all(queued, &[&time, &1, &1])?);
-            }
+            candidates.extend(q.all(queued, &[&time, &1, &256])?);
             candidates.sort_by_key(|r| int_of(r, "id"));
             let plan = q.exists("SELECT 1 FROM sqlite_master WHERE type='table' AND name='studio_plan'", &[])?;
             let mut slots = vec![];
+            let mut occupied: Vec<String> = sched.active.values().filter(|s| s.turn.job.writing)
+                .map(|s| crate::workspaces::scope(&s.turn.job.cwd)).chain(sched.maintenance.iter().cloned()).collect();
             for row in candidates {
                 let mut job = JobCtx::from_row(&row);
+                if let Some(w) = crate::workspaces::get(q,job.id)? {
+                    if w.state == "merged" { continue; }
+                    job.cwd = w.path;
+                } else if let Some(row)=q.one("SELECT cwd FROM job_directories WHERE job=?",&[&job.id])? {
+                    job.cwd=str_of(&row,"cwd").into();
+                }
                 if sched.active.contains_key(&job.id) {
                     continue;
                 }
+                let key = crate::workspaces::scope(&job.cwd);
+                if sched.maintenance.iter().any(|s| crate::workspaces::overlaps(s,&key))
+                    || (job.writing && occupied.iter().any(|s| crate::workspaces::overlaps(s,&key))) { continue; }
                 if let Some(until) = self.route_blocked(&job, time) {
                     if let Some(ids) = self.failover(q, &job, "circuit_open")? {
                         aborts.extend(ids);
@@ -943,6 +1070,9 @@ impl Inner {
                     q.run("UPDATE tickets SET auto_cycles=auto_cycles+1 WHERE id=?", &[&job.ticket])?;
                 }
                 let mut packet = envelope(q, &job, health.clone())?;
+                packet.insert("execution_directory".into(),json!(job.cwd));
+                packet.insert("isolated_writers".into(),json!(q.exists("SELECT 1 FROM workspace_policy WHERE ticket=? AND isolated=1", &[&job.ticket])?));
+                if let Some(w) = crate::workspaces::get(q,job.id)? { packet.insert("workspace".into(),serde_json::to_value(w)?); }
                 if plan {
                     let rows = q.all("SELECT id,body,done FROM studio_plan WHERE ticket=? ORDER BY id", &[&job.ticket])?;
                     packet.insert("plan".into(), Value::Array(rows.into_iter().map(Value::Object).collect()));
@@ -958,6 +1088,7 @@ impl Inner {
                     .and_then(Value::as_array)
                     .cloned()
                     .unwrap_or_default();
+                if job.writing { occupied.push(key); }
                 slots.push(Turn {
                     inner: Arc::downgrade(self),
                     job,
@@ -966,6 +1097,7 @@ impl Inner {
                     menus: Mutex::new(Map::new()),
                     cancel: CancellationToken::new(),
                     timed_out: AtomicBool::new(false),
+                    loop_detected: AtomicBool::new(false),
                     tool_follow: AtomicBool::new(false),
                     memos: AtomicUsize::new(0),
                     route: Mutex::new(None),
@@ -983,9 +1115,6 @@ impl Inner {
         for turn in admitted {
             let turn = Arc::new(turn);
             let id = turn.job.id;
-            if turn.job.writing {
-                sched.writer = Some(id);
-            }
             let inner = self.clone();
             let t = turn.clone();
             // The task's cleanup waits for the scheduler lock held here, so
@@ -996,9 +1125,6 @@ impl Inner {
                 }
                 let mut s = lock(&inner.sched);
                 s.active.remove(&t.job.id);
-                if s.writer == Some(t.job.id) {
-                    s.writer = None;
-                }
             });
             sched.active.insert(
                 id,
@@ -1118,6 +1244,15 @@ impl Inner {
         let job = &turn.job;
         let primary = job.primary();
         turn.ensure_current()?;
+        if let Some(w) = self.db.with(|q| crate::workspaces::get(q,job.id))? {
+            let w=crate::workspaces::identity(&w)?;
+            self.db.tx(|q|crate::workspaces::save(q,&w))?;
+            let data = self.data_dir.clone();
+            let ready = tokio::task::spawn_blocking(move || crate::workspaces::provision(&w,&data)).await
+                .map_err(|_| anyhow!("工作区准备异常"))??;
+            self.db.tx(|q| crate::workspaces::save(q,&ready))?;
+            turn.packet().insert("workspace".into(),json!(ready));
+        }
         let (route, fresh) = self.execution_route(turn).await?;
         if fresh && let Some(until) = self.opts.runner.admission_blocked_until(&job.agent, &route, now()) {
             return Err(TurnError::Wait(until));
@@ -1416,6 +1551,16 @@ impl Inner {
             }
         }
         for (kind, data) in journal {
+            if kind == "native" && let Some(signal)=st.detector.observe(&job.agent,&data) {
+                let stop=signal==crate::stuck::Signal::Stop;
+                let message=if stop {"工具操作与结果持续重复，已停止本轮以避免空转；请调整策略后重试。"} else {"检测到重复操作与相同结果，请改变方法或说明等待的外部条件。"};
+                let _=self.db.tx(|q| {
+                    q.log(job.who(),if stop {"turn.loop_stopped"} else {"turn.loop_warning"},&json!({"reason":message}))?;
+                    if !stop { platform_note(q,job,job.id,message)?; }
+                    Ok(())
+                });
+                if stop {turn.loop_detected.store(true,Ordering::SeqCst);turn.cancel.cancel();}
+            }
             if kind == "message.boundary" {
                 let line = std::mem::take(&mut st.pending);
                 if !line.is_empty() {
@@ -1587,6 +1732,8 @@ impl Inner {
             "reply",
             &json!({"text": text, "sha256": digest(text), "session": session, "state": state}),
         )?;
+        let ids:Vec<i64>=turn.packet().get("scm_feedback").and_then(Value::as_array).into_iter().flatten().filter_map(|v|v["id"].as_i64()).collect();
+        crate::scm::acknowledge(q,job.id,&ids,job.turn)?;
         Ok(())
     }
 
@@ -1601,6 +1748,9 @@ impl Inner {
         let reason = if timed_out { TIMEOUT_REASON.to_string() } else { err.message() };
         if self.stopping.load(Ordering::SeqCst) {
             return q.interrupt(who, &job.ticket_profile);
+        }
+        if turn.loop_detected.load(Ordering::SeqCst) {
+            return self.give_up(q,job,"工具操作与结果持续重复，已停止空转；请调整方法后重试。");
         }
         let auto_root = job.auto_root();
         if auto_root && job.continuous && q.followed_after(job.ticket, job.admission)? {
@@ -1966,6 +2116,12 @@ fn ledger(q: &Q, job: i64) -> Result<TurnLedger> {
 
 /// Early wake of the parent after a child's first failed attempt (spec §9.2
 /// F). `source=NULL` keeps it outside the 128-note budget.
+fn platform_note(q: &Q, job: &JobCtx, target: i64, body: &str) -> Result<()> {
+    let seq=q.log(job.who(),"note",&json!({"job":target,"sender":"platform","body":body,"sha256":digest(body)}))?;
+    q.run("INSERT INTO mailbox(seq,target,source,source_turn,msgkey) VALUES(?,?,NULL,NULL,NULL)",&[&seq,&target])?;
+    Ok(())
+}
+
 fn notify_parent(q: &Q, job: &JobCtx, class: ErrorClass, attempt: u32, until: f64) -> Result<()> {
     let Some(parent) = job.parent else { return Ok(()) };
     let open = q.exists(
@@ -2018,6 +2174,7 @@ struct Stream {
     pending: String,
     invalid: Vec<(String, String)>,
     fatal: Option<anyhow::Error>,
+    detector: crate::stuck::Detector,
 }
 
 /// `approve(ctx, action)` (E:88-125).

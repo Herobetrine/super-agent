@@ -123,6 +123,7 @@ pub struct App {
     pub composer: Composer,
     pub models: Option<crate::models::ModelDialog>,
     pub diff: DiffState,
+    pub workflow: crate::workflow::WorkflowState,
     pub export: Option<Pending<PathBuf>>,
     pub knowledge: crate::knowledge::KnowledgeState,
     pub providers: Option<crate::providers::ProvidersDialog>,
@@ -208,6 +209,7 @@ impl App {
             ),
             models: None,
             diff: DiffState::default(),
+            workflow: Default::default(),
             export: None,
             knowledge: Default::default(),
             providers: None,
@@ -1001,9 +1003,6 @@ impl App {
                 {
                     self.inspector_open = true;
                     self.tab = Tab::Approvals;
-                }
-                if let Some(snapshot) = self.view.as_ref().and_then(|view| view.snap.as_ref()) {
-                    crate::usage::button(ui, &snapshot.usage, &pal);
                 }
                 match (&self.host, &self.host_error) {
                     (Some(h), _) => match h.fault() {

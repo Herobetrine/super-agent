@@ -381,6 +381,13 @@ async fn dispatch(turn: &Arc<Turn>, cmd: &Value) -> Result<()> {
                 &c.override_,
             ],
         )?;
+        if c.write && q.exists("SELECT 1 FROM workspace_policy WHERE ticket=? AND isolated=1", &[&job.ticket])? {
+            // Nested children branch from their parent's committed workspace.
+            crate::workspaces::plan(q,&inner.data_dir,child,job.ticket,&job.cwd)?;
+        } else {
+            // A reviewer of an isolated writer must see that writer's files.
+            q.run("INSERT INTO job_directories(job,cwd) VALUES(?,?)",&[&child,&job.cwd])?;
+        }
         if !manifest.is_empty() {
             q.run(
                 "INSERT INTO job_files VALUES(?,?)",

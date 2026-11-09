@@ -7,22 +7,24 @@
 //! - streamable HTTP: the validated endpoint, an optional bearer token read
 //!   from the configured `MCP_*` variable, no redirects, no proxy.
 //!
-//! Every connection serves one operation and is closed afterwards (session
-//! `DELETE` for HTTP; stdin close, then kill after 3 s, for stdio). Dropping
-//! a connection (cancellation) also tears the process tree down.
+//! Probes use one connection. Invocations use ticket-private leases in
+//! `pool`; no connection crosses a ticket, credential or working directory.
 
 use crate::validate::endpoint;
 use anyhow::{Context, Result, anyhow, bail};
 use rmcp::model::{
-    CallToolRequestParams, ClientCapabilities, ClientConfig, Implementation, PaginatedRequestParams, ProtocolVersion,
+    CallToolRequestParams, ClientCapabilities, ClientConfig, Implementation,
+    PaginatedRequestParams, ProtocolVersion,
 };
 use rmcp::service::RunningService;
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 use rmcp::transport::{StreamableHttpClientTransport, TokioChildProcess};
 use rmcp::{RoleClient, ServiceExt};
 use serde_json::{Map, Value, json};
+use std::ffi::OsString;
 use std::future::Future;
 use std::path::Path;
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
@@ -67,7 +69,12 @@ pub struct ServerConfig {
 impl ServerConfig {
     /// From a `SELECT * FROM studio_servers` row.
     pub fn from_row(row: &Map<String, Value>) -> Result<Self> {
-        let s = |k: &str| row.get(k).and_then(Value::as_str).unwrap_or_default().to_string();
+        let s = |k: &str| {
+            row.get(k)
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string()
+        };
         Ok(Self {
             transport: s("transport"),
             command: s("command"),
@@ -101,18 +108,60 @@ pub async fn bounded<T>(
     }
 }
 
-fn stdio(config: &ServerConfig) -> Result<TokioChildProcess> {
+/// Resolve credentials and environment once, before choosing a pool slot.
+/// The same values are used to launch it, preventing identity/connection races.
+pub(crate) struct Prepared {
+    pub fingerprint: String,
+    cwd: PathBuf,
+    env: Vec<(String, OsString)>,
+    token: Option<String>,
+}
+
+pub(crate) fn prepare(config: &ServerConfig, cwd: &str) -> Result<Prepared> {
+    let cwd = if cwd.is_empty() {
+        Path::new(&config.command)
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf()
+    } else {
+        PathBuf::from(cwd)
+    };
+    let cwd = std::fs::canonicalize(cwd).context("MCP 工作目录不可用")?;
+    let env: Vec<_> = INHERITED_ENV
+        .iter()
+        .filter_map(|key| {
+            std::env::var_os(key)
+                .filter(|v| !v.to_string_lossy().starts_with("()"))
+                .map(|v| ((*key).to_string(), v))
+        })
+        .collect();
+    let token = if config.transport == "http" && !config.token_env.is_empty() {
+        Some(
+            std::env::var(&config.token_env)
+                .ok()
+                .filter(|t| !t.is_empty())
+                .ok_or_else(|| anyhow!("未设置此 MCP 服务的令牌环境变量"))?,
+        )
+    } else {
+        None
+    };
+    // Only the hash enters the pool key. Neither secrets nor this input are logged.
+    let fingerprint = sa_engine::protocol::digest(&format!("{config:?}|{cwd:?}|{env:?}|{token:?}"));
+    Ok(Prepared {
+        fingerprint,
+        cwd,
+        env,
+        token,
+    })
+}
+
+fn stdio(config: &ServerConfig, prepared: &Prepared) -> Result<TokioChildProcess> {
     let exe = Path::new(&config.command);
     let mut cmd = tokio::process::Command::new(exe);
     cmd.args(&config.args).env_clear().kill_on_drop(true);
-    if let Some(dir) = exe.parent() {
-        cmd.current_dir(dir);
-    }
-    for key in INHERITED_ENV {
-        if let Some(v) = std::env::var_os(key).filter(|v| !v.to_string_lossy().starts_with("()")) {
-            cmd.env(key, v);
-        }
-    }
+    cmd.current_dir(&prepared.cwd)
+        .envs(prepared.env.iter().cloned());
     let mut wrap = process_wrap::tokio::CommandWrap::from(cmd);
     #[cfg(windows)]
     {
@@ -130,14 +179,11 @@ fn stdio(config: &ServerConfig) -> Result<TokioChildProcess> {
     Ok(proc)
 }
 
-fn http(config: &ServerConfig) -> Result<StreamableHttpClientTransport<reqwest::Client>> {
+fn http(
+    config: &ServerConfig,
+    prepared: &Prepared,
+) -> Result<StreamableHttpClientTransport<reqwest::Client>> {
     let url = endpoint(Some(&json!(config.url)))?;
-    let token = if config.token_env.is_empty() {
-        None
-    } else {
-        let token = std::env::var(&config.token_env).ok().filter(|t| !t.is_empty());
-        Some(token.ok_or_else(|| anyhow!("未设置此 MCP 服务的令牌环境变量"))?)
-    };
     // `redirect: 'error'` keeps every request on the configured origin.
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::custom(|a| {
@@ -148,22 +194,30 @@ fn http(config: &ServerConfig) -> Result<StreamableHttpClientTransport<reqwest::
         .build()
         .context("无法创建 HTTP 客户端")?;
     let mut cfg = StreamableHttpClientTransportConfig::with_uri(url.as_str());
-    if let Some(token) = token {
-        cfg = cfg.auth_header(token);
+    if let Some(token) = &prepared.token {
+        cfg = cfg.auth_header(token.clone());
     }
     Ok(StreamableHttpClientTransport::with_client(client, cfg))
 }
 
 /// `client.connect(transport, {timeout: 12000, signal})`.
 pub async fn connect(config: &ServerConfig, cancel: &CancellationToken) -> Result<Client> {
+    connect_prepared(config, &prepare(config, "")?, cancel).await
+}
+
+pub(crate) async fn connect_prepared(
+    config: &ServerConfig,
+    prepared: &Prepared,
+    cancel: &CancellationToken,
+) -> Result<Client> {
     if cancel.is_cancelled() {
         bail!(CANCELLED);
     }
     let fut = async {
         let client = if config.transport == "http" {
-            client_info().serve(http(config)?).await
+            client_info().serve(http(config, prepared)?).await
         } else {
-            client_info().serve(stdio(config)?).await
+            client_info().serve(stdio(config, prepared)?).await
         };
         client.map_err(|e| anyhow!("MCP 服务连接失败：{e}"))
     };
@@ -176,20 +230,42 @@ pub async fn close(mut client: Client) {
 }
 
 /// One `tools/list` page: `(tools, nextCursor)` as wire JSON.
-pub async fn list_page(client: &Client, cursor: Option<String>) -> Result<(Vec<Value>, Option<String>)> {
+pub async fn list_page(
+    client: &Client,
+    cursor: Option<String>,
+) -> Result<(Vec<Value>, Option<String>)> {
     let params = cursor.map(|c| PaginatedRequestParams::default().with_cursor(Some(c)));
     let fut = async { client.list_tools(params).await.map_err(|e| anyhow!("{e}")) };
-    let page = bounded(fut, LIST_TIMEOUT, &CancellationToken::new(), "读取 MCP 工具目录超时").await?;
+    let page = bounded(
+        fut,
+        LIST_TIMEOUT,
+        &CancellationToken::new(),
+        "读取 MCP 工具目录超时",
+    )
+    .await?;
     let page = serde_json::to_value(page)?;
-    let tools = page.get("tools").and_then(Value::as_array).cloned().unwrap_or_default();
-    let next = page.get("nextCursor").and_then(Value::as_str).map(str::to_string);
+    let tools = page
+        .get("tools")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let next = page
+        .get("nextCursor")
+        .and_then(Value::as_str)
+        .map(str::to_string);
     Ok((tools, next))
 }
 
 /// `client.callTool({name, arguments}, undefined, {signal, timeout: 60000})`;
 /// the result is the wire `CallToolResult` JSON.
-pub async fn call_tool(client: &Client, tool: &str, args: &Value, cancel: &CancellationToken) -> Result<Value> {
-    let params: CallToolRequestParams = serde_json::from_value(json!({"name": tool, "arguments": args}))?;
+pub async fn call_tool(
+    client: &Client,
+    tool: &str,
+    args: &Value,
+    cancel: &CancellationToken,
+) -> Result<Value> {
+    let params: CallToolRequestParams =
+        serde_json::from_value(json!({"name": tool, "arguments": args}))?;
     let fut = async { client.call_tool(params).await.map_err(|e| anyhow!("{e}")) };
     let result = bounded(fut, CALL_TIMEOUT, cancel, "MCP 调用超时").await?;
     Ok(serde_json::to_value(result)?)

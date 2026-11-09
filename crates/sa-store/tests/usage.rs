@@ -391,3 +391,406 @@ fn ticket_totals_include_jobs_outside_the_visible_page_and_unknown_jobs() {
     assert_eq!(result.usage.unreported_jobs, 1);
     assert!(result.usage.partial);
 }
+
+fn at(conn: &Connection, job: Job, kind: &str, value: Value, seconds: f64) {
+    let seq = log(conn, job, kind, &value);
+    conn.execute(
+        "UPDATE events SET ts=? WHERE seq=?",
+        rusqlite::params![seconds, seq],
+    )
+    .unwrap();
+}
+
+fn start_at(conn: &Connection, job: Job, seconds: f64) {
+    conn.execute(
+        "UPDATE events SET ts=? WHERE job=? AND turn=? AND kind='turn.admitted'",
+        rusqlite::params![seconds, job.id, job.turn],
+    )
+    .unwrap();
+}
+
+#[test]
+fn cache_rate_uses_inclusive_input_and_preserves_unknown_buckets() {
+    use sa_store::TokenCounts;
+    let count = |input, read| TokenCounts {
+        input_tokens: input,
+        cache_read_input_tokens: read,
+        ..Default::default()
+    };
+    assert_eq!(count(Some(100), Some(40)).cache_hit_rate(), Some(0.4));
+    assert_eq!(count(Some(100), Some(0)).cache_hit_rate(), Some(0.0));
+    for (input, read) in [
+        (None, Some(4)),
+        (Some(10), None),
+        (Some(0), Some(0)),
+        (Some(10), Some(11)),
+    ] {
+        assert_eq!(count(input, read).cache_hit_rate(), None);
+    }
+    let (_dir, mut store, writer, job) = fixture("claude");
+    native(
+        &writer,
+        job,
+        json!({"type":"result","usage":cl_counts(70, 10)}),
+    );
+    let usage = snapshot(&mut store, job).usage;
+    assert_eq!(
+        usage.totals.cache_hit_rate(),
+        Some(0.2),
+        "70 new + 20 read + 10 write input"
+    );
+}
+
+#[test]
+fn rates_exclude_between_turn_idle_and_replays_and_rebuild_identically() {
+    let (dir, mut store, writer, job) = fixture("codex");
+    start_at(&writer, job, 100.0);
+    let first = cx("timed", cx_counts(100, 20, 40), cx_counts(100, 20, 40));
+    at(&writer, job, "native", first.clone(), 102.0);
+    let running = snapshot(&mut store, job).usage;
+    assert_eq!(running.performance.output_tokens_per_second(), Some(10.0));
+    assert!(running.performance.partial);
+    at(&writer, job, "reply", json!({}), 104.0);
+    at(&writer, job, "native", first.clone(), 150.0);
+    let next = Job { turn: 2, ..job };
+    at(&writer, next, "turn.admitted", json!({}), 1000.0);
+    at(&writer, next, "native", first, 1001.0);
+    at(
+        &writer,
+        next,
+        "native",
+        cx("timed", cx_counts(200, 60, 100), cx_counts(100, 40, 60)),
+        1003.0,
+    );
+    at(&writer, next, "reply", json!({}), 1006.0);
+    let usage = snapshot(&mut store, job).usage;
+    assert_eq!(usage.performance.output_tokens, 60);
+    assert_eq!(usage.performance.elapsed_ms, 10_000);
+    assert_eq!(usage.performance.samples, 2);
+    assert_eq!(usage.performance.output_tokens_per_second(), Some(6.0));
+    assert!(!usage.performance.partial);
+    assert_eq!(snapshot(&mut store, job).usage, usage);
+    drop(store);
+    let mut reopened = Store::open_read_only(dir.path()).unwrap();
+    assert_eq!(snapshot(&mut reopened, job).usage, usage);
+}
+
+#[test]
+fn rates_do_not_infer_missing_or_invalid_times_or_history() {
+    for case in [
+        "missing",
+        "zero",
+        "backwards",
+        "negative",
+        "infinite",
+        "history",
+        "failed",
+    ] {
+        let (_dir, mut store, writer, job) = fixture("codex");
+        start_at(&writer, job, 100.0);
+        if case == "missing" {
+            writer
+                .execute("DELETE FROM events WHERE kind='turn.admitted'", [])
+                .unwrap();
+        }
+        let timestamp = match case {
+            "zero" => 100.0,
+            "backwards" => 99.0,
+            "negative" => -5.0,
+            "infinite" => f64::INFINITY,
+            _ => 105.0,
+        };
+        let total = if case == "history" {
+            cx_counts(1000, 1000, 0)
+        } else {
+            cx_counts(20, 10, 0)
+        };
+        at(
+            &writer,
+            job,
+            "native",
+            cx("a", total, cx_counts(20, 10, 0)),
+            timestamp,
+        );
+        at(
+            &writer,
+            job,
+            if case == "failed" { "failed" } else { "reply" },
+            json!({}),
+            timestamp,
+        );
+        let usage = snapshot(&mut store, job).usage;
+        assert_eq!(usage.performance.output_tokens_per_second(), None, "{case}");
+        assert!(usage.performance.partial, "{case}");
+    }
+}
+
+#[test]
+fn rates_weight_concurrent_jobs_by_their_own_execution_duration() {
+    let (_dir, mut store, writer, root) = fixture("codex");
+    start_at(&writer, root, 100.0);
+    at(
+        &writer,
+        root,
+        "native",
+        cx("root", cx_counts(50, 20, 10), cx_counts(50, 20, 10)),
+        102.0,
+    );
+    at(&writer, root, "reply", json!({}), 102.0);
+    writer.execute(
+        "INSERT INTO jobs(ticket,parent,agent,body,writing,depth,state) VALUES(?1,?2,'deepseek','child',0,1,'done')",
+        rusqlite::params![root.ticket, root.id],
+    ).unwrap();
+    let child = Job {
+        id: writer.last_insert_rowid(),
+        ..root
+    };
+    at(&writer, child, "turn.admitted", json!({}), 100.0);
+    at(
+        &writer,
+        child,
+        "native",
+        ds(
+            0,
+            0,
+            json!({"inputTokens":10,"outputTokens":40,"totalTokens":50}),
+        ),
+        108.0,
+    );
+    at(&writer, child, "reply", json!({}), 108.0);
+    let usage = snapshot(&mut store, root).usage;
+    assert_eq!(usage.performance.output_tokens_per_second(), Some(6.0));
+    assert_eq!(usage.performance.elapsed_ms, 10_000);
+    assert_eq!(
+        usage.jobs[0].performance.output_tokens_per_second(),
+        Some(10.0)
+    );
+    assert_eq!(
+        usage.jobs[1].performance.output_tokens_per_second(),
+        Some(5.0)
+    );
+    assert_eq!(
+        usage.totals.cache_hit_rate(),
+        None,
+        "do not average known cache rates over unknown input"
+    );
+    let mut legacy = serde_json::to_value(&usage).unwrap();
+    legacy.as_object_mut().unwrap().remove("performance");
+    for job in legacy["jobs"].as_array_mut().unwrap() {
+        job.as_object_mut().unwrap().remove("performance");
+    }
+    let decoded: sa_store::TicketUsage = serde_json::from_value(legacy).unwrap();
+    assert_eq!(decoded.performance.output_tokens_per_second(), None);
+    assert!(
+        decoded
+            .jobs
+            .iter()
+            .all(|job| job.performance.output_tokens_per_second().is_none())
+    );
+}
+
+#[test]
+fn claude_and_deepseek_replays_do_not_inflate_rate() {
+    for agent in ["claude", "deepseek"] {
+        let (_dir, mut store, writer, job) = fixture(agent);
+        start_at(&writer, job, 100.0);
+        let sample = if agent == "claude" {
+            json!({"type":"result","usage":cl_counts(70, 20)})
+        } else {
+            ds(
+                0,
+                0,
+                json!({"inputTokens":10,"outputTokens":20,"totalTokens":30}),
+            )
+        };
+        at(&writer, job, "native", sample.clone(), 102.0);
+        at(&writer, job, "reply", json!({}), 102.0);
+        at(&writer, job, "native", sample, 110.0);
+        let usage = snapshot(&mut store, job).usage;
+        assert_eq!(
+            usage.performance.output_tokens_per_second(),
+            Some(10.0),
+            "{agent}"
+        );
+        assert_eq!(usage.performance.samples, 1);
+    }
+}
+
+#[test]
+fn antigravity_rates_refuse_unattributed_history_and_cumulative_corrections() {
+    for output in [10, 20, 1020] {
+        let (_dir, mut store, writer, job) = fixture("antigravity");
+        start_at(&writer, job, 100.0);
+        at(
+            &writer,
+            job,
+            "native",
+            ag_step(1, ag_counts(100, 20, 30)),
+            101.0,
+        );
+        at(
+            &writer,
+            job,
+            "native",
+            ag_result(ag_counts(100, output, 30)),
+            102.0,
+        );
+        at(&writer, job, "reply", json!({}), 102.0);
+        let usage = snapshot(&mut store, job).usage;
+        assert_eq!(
+            usage.performance.output_tokens_per_second(),
+            (output == 20).then_some(10.0)
+        );
+        assert_eq!(usage.totals.cache_hit_rate(), None);
+    }
+
+    let (_dir, mut store, writer, job) = fixture("antigravity");
+    start_at(&writer, job, 100.0);
+    at(
+        &writer,
+        job,
+        "native",
+        ag_step(1, ag_counts(100, 20, 30)),
+        101.0,
+    );
+    at(&writer, job, "reply", json!({}), 102.0);
+    let next = Job { turn: 2, ..job };
+    at(&writer, next, "turn.admitted", json!({}), 200.0);
+    at(
+        &writer,
+        next,
+        "native",
+        ag_step(1, ag_counts(100, 30, 30)),
+        201.0,
+    );
+    at(
+        &writer,
+        next,
+        "native",
+        ag_result(ag_counts(100, 30, 30)),
+        202.0,
+    );
+    let usage = snapshot(&mut store, job).usage;
+    assert_eq!(
+        usage.performance.output_tokens_per_second(),
+        None,
+        "late step correction has unknown time attribution"
+    );
+    assert!(usage.performance.partial);
+}
+
+#[test]
+fn resumed_deepseek_deduplicates_steps_and_does_not_count_retry_backoff() {
+    let (_dir, mut store, writer, job) = fixture("deepseek");
+    start_at(&writer, job, 100.0);
+    at(
+        &writer,
+        job,
+        "native",
+        json!({"type":"session","sessionId":"ds-rate"}),
+        100.0,
+    );
+    let first = ds(
+        0,
+        0,
+        json!({"inputTokens":10,"outputTokens":20,"totalTokens":30}),
+    );
+    at(&writer, job, "native", first.clone(), 101.0);
+    at(&writer, job, "route.rotated", json!({}), 102.0);
+    let next = Job { turn: 2, ..job };
+    at(&writer, next, "turn.admitted", json!({}), 1000.0);
+    at(&writer, next, "native", first, 1001.0);
+    at(
+        &writer,
+        next,
+        "native",
+        ds(
+            1,
+            0,
+            json!({"inputTokens":10,"outputTokens":30,"totalTokens":40}),
+        ),
+        1003.0,
+    );
+    at(&writer, next, "reply", json!({}), 1003.0);
+    let usage = snapshot(&mut store, job).usage;
+    assert_eq!(usage.totals.output_tokens, Some(50));
+    assert_eq!(
+        usage.performance.output_tokens, 30,
+        "failed attempts are outside the measured subset"
+    );
+    assert_eq!(usage.performance.output_tokens_per_second(), Some(10.0));
+    assert!(usage.performance.partial);
+}
+
+#[test]
+fn missing_usage_inside_a_timed_attempt_excludes_its_incomplete_numerator() {
+    let (_dir, mut store, writer, job) = fixture("deepseek");
+    start_at(&writer, job, 100.0);
+    at(
+        &writer,
+        job,
+        "native",
+        ds(
+            0,
+            0,
+            json!({"inputTokens":10,"outputTokens":20,"totalTokens":30}),
+        ),
+        101.0,
+    );
+    at(&writer, job, "native", ds(0, 1, Value::Null), 102.0);
+    at(&writer, job, "reply", json!({}), 103.0);
+    assert_eq!(
+        snapshot(&mut store, job)
+            .usage
+            .performance
+            .output_tokens_per_second(),
+        None
+    );
+    let next = Job { turn: 2, ..job };
+    at(&writer, next, "turn.admitted", json!({}), 200.0);
+    at(
+        &writer,
+        next,
+        "native",
+        ds(
+            1,
+            0,
+            json!({"inputTokens":10,"outputTokens":30,"totalTokens":40}),
+        ),
+        203.0,
+    );
+    at(&writer, next, "reply", json!({}), 203.0);
+    let usage = snapshot(&mut store, job).usage;
+    assert_eq!(usage.performance.output_tokens_per_second(), Some(10.0));
+    assert_eq!(usage.performance.samples, 1);
+    assert!(usage.performance.partial);
+}
+
+#[test]
+fn unidentified_step_does_not_leave_a_partial_numerator_in_rate() {
+    let (_dir, mut store, writer, job) = fixture("deepseek");
+    start_at(&writer, job, 100.0);
+    at(
+        &writer,
+        job,
+        "native",
+        ds(
+            0,
+            0,
+            json!({"inputTokens":10,"outputTokens":20,"totalTokens":30}),
+        ),
+        101.0,
+    );
+    at(
+        &writer,
+        job,
+        "native",
+        json!({"type":"status","phase":"step_end","usage":{"outputTokens":10}}),
+        102.0,
+    );
+    at(&writer, job, "reply", json!({}), 103.0);
+    let usage = snapshot(&mut store, job).usage;
+    assert_eq!(usage.totals.output_tokens, Some(20));
+    assert_eq!(usage.performance.output_tokens_per_second(), None);
+    assert!(usage.performance.partial);
+}

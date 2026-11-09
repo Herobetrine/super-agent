@@ -42,9 +42,13 @@ pub const BASE: &str = concat!(
     "In continuous tickets the 128-note limit counts pending agent notes to active jobs. Other tickets count delivered\n",
     "agent notes over their lifetime. Exact replays and operator notes do not use the budget.\n",
     "Do authorized edits yourself when this_turn_can_write is true, or select a write-capable peer with write:true.\n",
-    "The platform serializes tasks declared as writers. In full and auto mode all participants have full OS-user access;\n",
+    "The platform serializes writers whose working directories overlap. In full and auto mode participants have full OS-user access;\n",
     "declare write:true for meaningful changes so other writers can be scheduled. If a delegated writer needs your slot, end this turn\n",
     "after dispatch so it can start. Read-only collaborators may run concurrently.\n",
+    "When isolated_writers is true, each new writing child receives a separate Git worktree from your committed HEAD.\n",
+    "The source must be a clean Git repository root. Use execution_directory for all work; project names the original project.\n",
+    "Isolated child completion does not mean merged: report its workspace and tests. The operator validates and integrates it in the workbench.\n",
+    "Never merge or remove another task's worktree behind the platform, and never treat worktrees as an OS sandbox.\n",
     "Keep read-only work read-only. No publishing, external messaging or changing credentials unless explicitly requested by the human.\n",
     "You can continue independent work during this turn. Return when you need a peer's result; the platform delivers terminal reports automatically.\n",
     "Do not redispatch already completed work.\n",
@@ -146,7 +150,7 @@ mod tests {
     /// Pin protocol-guide bytes; BASE includes the current routing policy.
     #[test]
     fn guides_are_byte_exact() {
-        assert_eq!(digest(super::BASE), "9476ea854e9f7e0d75b148ccdb70cd4595df3fc57f7ffc9a3df96e960067f326");
+        assert_eq!(digest(super::BASE), "e09f2ec5e30c533ed4b716dd905e96d143e73d2d0ec084c9cb53781639682555");
         assert_eq!(digest(super::CONTINUOUS), "fd0fa7b25db7c20413b502eb74a5aaf637a3a4fa54ccf6411ded9626181050ac");
         assert_eq!(digest(super::LEGACY_AUTO), "af975831015ac95d04194f2bb0603b54aedf64f2730c192687db56fe3ec58074");
         assert_eq!(digest(super::DISCOVERY), "bb7595c92c9dd3570e2b40426a820b01e76392745a6fcb095d41a7bdbd7e8fe2");

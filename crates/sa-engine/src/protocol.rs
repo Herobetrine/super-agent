@@ -21,7 +21,8 @@ pub fn is_full(profile: &str) -> bool {
 }
 
 pub fn can_write(agent: &str, profile: &str) -> bool {
-    is_full(profile) || agent == "codex" || agent == "deepseek"
+    // ACP performs capability/mode and trusted-sandbox checks before execution.
+    is_full(profile) || matches!(agent,"codex"|"deepseek"|"acp")
 }
 
 pub fn is_terminal(state: &str) -> bool {

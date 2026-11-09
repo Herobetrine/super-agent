@@ -16,6 +16,8 @@ use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant};
 
+mod restore;
+
 const FILE_CAP: usize = 4 * 1024 * 1024;
 const TOTAL_CAP: usize = 64 * 1024 * 1024;
 const LIST_CAP: usize = 4 * 1024 * 1024;
@@ -612,12 +614,14 @@ struct Overview {
     changes: Vec<Change>,
     checkpoint: Option<Checkpoint>,
     checkpoint_changes: Result<Vec<Change>, String>,
+    restore_warnings: Vec<PathBuf>,
 }
 
 fn overview(cwd: &Path, data: &Path) -> Result<Overview> {
     let root = repository(cwd)?;
     let changes = status(&root)?;
     let checkpoint = load_checkpoint(data, &root)?;
+    let restore_warnings = restore::unfinished(&store_dir(data, &root)?)?;
     let checkpoint_changes = match &checkpoint {
         Some(point) => checkpoint_changes(&root, point).map_err(|e| format!("{e:#}")),
         None => Ok(Vec::new()),
@@ -627,6 +631,7 @@ fn overview(cwd: &Path, data: &Path) -> Result<Overview> {
         changes,
         checkpoint,
         checkpoint_changes,
+        restore_warnings,
     })
 }
 
@@ -774,6 +779,9 @@ pub struct ReviewState {
     detail: Option<Result<Detail, String>>,
     detail_pending: Option<Pending<Detail>>,
     saving: Option<Pending<Checkpoint>>,
+    restore_preview: Option<Pending<restore::Plan>>,
+    restore_plan: Option<restore::Plan>,
+    restoring: Option<Pending<restore::Receipt>>,
     selected: Option<String>,
     reviewed: HashMap<String, String>,
     compare: bool,
@@ -787,7 +795,7 @@ impl ReviewState {
             // Dropping receivers discards results from the previous project.
             *self = Self::default();
         }
-        if self.pending.is_some() || self.saving.is_some() {
+        if self.pending.is_some() || self.saving.is_some() || self.restoring.is_some() {
             return;
         }
         self.cwd = Some(cwd.clone());
@@ -799,6 +807,28 @@ impl ReviewState {
     }
 
     pub fn poll(&mut self) {
+        if let Some(result) = self.restore_preview.as_ref().and_then(Pending::poll) {
+            self.restore_preview = None;
+            match result {
+                Ok(plan) => self.restore_plan = Some(plan),
+                Err(error) => self.notice = Some(error),
+            }
+        }
+        if let Some(result) = self.restoring.as_ref().and_then(Pending::poll) {
+            self.restoring = None;
+            self.notice = Some(match result {
+                Ok(receipt) => format!(
+                    "已恢复所选文件。原内容备份与回执：{}",
+                    receipt.path.display()
+                ),
+                Err(error) => error,
+            });
+            self.result = None;
+            self.detail = None;
+            self.detail_pending = None;
+            self.reviewed.clear();
+            self.refreshed = None;
+        }
         if let Some(result) = self.pending.as_ref().and_then(Pending::poll) {
             self.pending = None;
             if let Ok(view) = &result {
@@ -849,7 +879,47 @@ impl ReviewState {
         }
     }
 
-    pub fn show(&mut self, ui: &mut Ui, pal: &Palette, cwd: String, data: PathBuf) {
+    fn restore_dialog(&mut self, ctx: &egui::Context, can_write: bool) {
+        let Some(plan) = &self.restore_plan else {
+            return;
+        };
+        let mut accept = false;
+        let mut cancel = false;
+        let modal = egui::Modal::new(egui::Id::new("checkpoint-restore"))
+            .show(ctx, |ui| {
+                ui.set_width(620.0);
+                ui.heading("确认恢复所选文件");
+                ui.label(format!("{} · {}", display_path(&plan.path), plan.action));
+                ui.label("仅更改此文件；Git 暂存区保持不变。恢复前保存当前内容备份；预览后如有新编辑会取消恢复。");
+                if !plan.complete {
+                    ui.colored_label(egui::Color32::YELLOW, "差异预览已截断，请先核对完整文件。此次仍只恢复所选文件。");
+                }
+                egui::ScrollArea::both().max_height(300.0).show(ui, |ui| {
+                    ui.monospace(&plan.preview);
+                });
+                ui.horizontal(|ui| {
+                    cancel = ui.button("取消恢复").clicked();
+                    accept = ui.add_enabled(can_write, egui::Button::new("确认恢复此文件")).clicked();
+                });
+                if !can_write { ui.label("观察窗口不能恢复文件。"); }
+            });
+        if accept {
+            if let Some(plan) = self.restore_plan.take() {
+                self.restoring = Some(Pending::spawn(ctx, move || restore::apply(plan)));
+            }
+        } else if cancel || modal.should_close() {
+            self.restore_plan = None;
+        }
+    }
+
+    pub fn show(
+        &mut self,
+        ui: &mut Ui,
+        pal: &Palette,
+        cwd: String,
+        data: PathBuf,
+        can_write: bool,
+    ) {
         self.poll();
         if self.cwd.as_ref() != Some(&cwd)
             || self
@@ -858,6 +928,7 @@ impl ReviewState {
         {
             self.refresh(ui.ctx(), cwd.clone(), data.clone());
         }
+        self.restore_dialog(ui.ctx(), can_write);
         ui.ctx().request_repaint_after(Duration::from_secs(1));
         ui.horizontal(|ui| {
             if widgets::quiet_button(ui, icon::ARROWS_CLOCKWISE, "刷新变更", pal, false).clicked()
@@ -866,9 +937,12 @@ impl ReviewState {
             }
             let ready = self.pending.is_none()
                 && self.saving.is_none()
+                && self.restoring.is_none()
+                && self.restore_preview.is_none()
+                && self.restore_plan.is_none()
                 && matches!(self.result, Some(Ok(_)));
             if ui
-                .add_enabled(ready, egui::Button::new("保存检查点"))
+                .add_enabled(can_write && ready, egui::Button::new("保存检查点"))
                 .clicked()
             {
                 let root = PathBuf::from(&cwd);
@@ -876,7 +950,11 @@ impl ReviewState {
                     save_checkpoint(&data, &root)
                 }));
             }
-            if self.pending.is_some() || self.saving.is_some() {
+            if self.pending.is_some()
+                || self.saving.is_some()
+                || self.restoring.is_some()
+                || self.restore_preview.is_some()
+            {
                 ui.spinner();
             }
         });
@@ -895,6 +973,9 @@ impl ReviewState {
             }
         };
         let before_compare = self.compare;
+        for path in &view.restore_warnings {
+            ui.add(Label::new(RichText::new(format!("发现未完成或需人工核对的恢复；原内容和操作记录保留于 {}。请先核对再继续恢复。", path.display())).color(pal.warn.fg)).wrap());
+        }
         ui.horizontal(|ui| {
             ui.selectable_value(&mut self.compare, false, "Git 变更");
             ui.add_enabled_ui(view.checkpoint.is_some(), |ui| {
@@ -974,6 +1055,28 @@ impl ReviewState {
         let Some(change) = changes.iter().find(|c| Some(c.key()) == self.selected) else {
             return;
         };
+        if self.compare {
+            let ready = can_write
+                && cfg!(windows)
+                && self.restore_preview.is_none()
+                && self.restore_plan.is_none()
+                && self.restoring.is_none()
+                && self.saving.is_none();
+            if ui
+                .add_enabled(ready, egui::Button::new("预览恢复所选文件"))
+                .clicked()
+                && let Some(point) = view.checkpoint.clone()
+            {
+                let root = view.root.clone();
+                let change = change.clone();
+                self.restore_preview = Some(Pending::spawn(ui.ctx(), move || {
+                    restore::prepare(&root, &point, &change)
+                }));
+            }
+            if !can_write {
+                ui.label("观察窗口不能保存或恢复检查点。");
+            }
+        }
         if self.detail.is_none() && self.detail_pending.is_none() {
             let root = view.root.clone();
             let selected = change.clone();
@@ -1337,6 +1440,45 @@ mod tests {
                 .unwrap()
                 .text
                 .contains("-first edit")
+        );
+        h.run_steps(3);
+        h.get_by_label("预览恢复所选文件").click();
+        wait(&mut h, |s| s.restore_plan.is_some());
+        h.run_steps(3);
+        assert_eq!(
+            fs::read(root.join("tracked.txt")).unwrap(),
+            b"after checkpoint\n"
+        );
+        h.get_by_label("取消恢复").click();
+        h.run_steps(3);
+        assert!(h.state().diff.restore_plan.is_none());
+        assert_eq!(
+            fs::read(root.join("tracked.txt")).unwrap(),
+            b"after checkpoint\n"
+        );
+        h.get_by_label("预览恢复所选文件").click();
+        wait(&mut h, |s| s.restore_plan.is_some());
+        h.run_steps(3);
+        h.get_by_label("确认恢复此文件").click();
+        wait(&mut h, |s| {
+            s.restoring.is_none() && s.notice.as_ref().is_some_and(|n| n.starts_with("已恢复"))
+        });
+        assert_eq!(fs::read(root.join("tracked.txt")).unwrap(), b"first edit\n");
+        // The same real App switched into observer mode cannot launch a write.
+        h.state_mut().host = None;
+        fs::write(root.join("tracked.txt"), b"observer must preserve\n").unwrap();
+        h.state_mut().diff.refreshed = None;
+        wait(
+            &mut h,
+            |s| matches!(&s.detail, Some(Ok(d)) if d.text.contains("+observer must preserve")),
+        );
+        h.run_steps(3);
+        h.get_by_label("预览恢复所选文件").click();
+        h.run_steps(3);
+        assert!(h.state().diff.restore_plan.is_none() && h.state().diff.restore_preview.is_none());
+        assert_eq!(
+            fs::read(root.join("tracked.txt")).unwrap(),
+            b"observer must preserve\n"
         );
     }
 

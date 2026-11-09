@@ -649,7 +649,7 @@ pub fn build(ticket: &TicketDetail, jobs: &[JobView], events: &[EventView]) -> F
                 });
             }
             "turn.stalled" | "turn.retry_scheduled" | "turn.route_wait" | "turn.gave_up" | "route.rotated"
-            | "harness.health" => {
+            | "harness.health" | "turn.loop_warning" | "turn.loop_stopped" | "workspace.result" | "workspace.error" => {
                 if let Some((text, tone)) = resilience_line(&e.kind, p, &agent) {
                     items.push(Item::Line {
                         key,
@@ -758,6 +758,8 @@ fn resilience_line(kind: &str, p: &Value, agent: &str) -> Option<(String, Tone)>
     };
     let class = crate::labels::error_class(&s(p, "class"));
     Some(match kind {
+        "turn.loop_warning" | "turn.loop_stopped" | "workspace.error" => (format!("{who} · {}",compact(&s(p,"reason"),240)),Tone::Error),
+        "workspace.result" => (format!("任务 #{} · {}",p["job"],compact(&s(p,"detail"),240)),if p["state"]=="failed"||p["state"]=="conflict"{Tone::Error}else{Tone::Normal}),
         "turn.stalled" => {
             let phase = match s(p, "phase").as_str() {
                 "first_frame" => "启动后迟迟没有输出",

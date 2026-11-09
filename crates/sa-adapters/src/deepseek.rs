@@ -21,6 +21,7 @@ use sa_engine::adapter::{
 };
 use sa_engine::resilience::classify::classified;
 use serde_json::{Map, Value, json};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
@@ -29,6 +30,9 @@ use tokio_util::sync::CancellationToken;
 
 /// Pinned DSH runtime version (DS:21).
 pub const VERSION: &str = "0.2.1-rc.5";
+/// Current supported candidate; the legacy runtime remains usable.
+pub const CURRENT_VERSION: &str = "0.2.2-rc.1";
+pub const SUPPORTED_VERSIONS: [&str; 2] = [VERSION, CURRENT_VERSION];
 const FAILED: &str = "DeepSeek 未返回匹配会话的完整终稿";
 
 static ENV_REF: LazyLock<Regex> =
@@ -65,7 +69,120 @@ impl DeepSeek {
 fn runtime(sys: &Sys) -> PathBuf {
     sys.var("SUPERAGENT_DSH_RUNTIME")
         .map(PathBuf::from)
-        .unwrap_or_else(|| sys.platform_dir().join("dsh-runtime"))
+        .unwrap_or_else(|| {
+            let candidate = sys
+                .platform_dir()
+                .join(format!("dsh-runtime-{CURRENT_VERSION}"));
+            let verification = read_json(&candidate.join("verified-runtime.json"), Value::Null)
+                .unwrap_or(Value::Null);
+            if verification["version"] == CURRENT_VERSION
+                && verification["readonly_resume"] == true
+                && verification["workspace_boundary_resume"] == true
+            {
+                candidate
+            } else {
+                sys.platform_dir().join("dsh-runtime")
+            }
+        })
+}
+
+fn session_route_file(sys: &Sys, provider: &str, session: &str) -> PathBuf {
+    let digest = format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&(provider, session)).unwrap())
+    );
+    sys.platform_dir()
+        .join("dsh-session-runtimes")
+        .join(format!("{digest}.json"))
+}
+
+fn bind_session_runtime(sys: &Sys, provider: &str, session: &str) -> Result<(), AdapterError> {
+    let path = session_route_file(sys, provider, session);
+    let value = json!({"runtime":runtime(sys),"version":runtime_version(sys)});
+    if path.exists() {
+        if read_json(&path, Value::Null).ok().as_ref() != Some(&value) {
+            return Err(session_mismatch("DeepSeek 会话运行时绑定不匹配"));
+        }
+        return Ok(());
+    }
+    std::fs::create_dir_all(path.parent().unwrap())
+        .map_err(|_| classified(ErrorClass::Other, "dsh:session_binding"))?;
+    write_private(&path, &value.to_string())
+        .map_err(|_| classified(ErrorClass::Other, "dsh:session_binding"))
+}
+
+fn resume_runtime(
+    sys: &mut Sys,
+    provider: &str,
+    session: Option<&str>,
+) -> Result<(), AdapterError> {
+    let Some(session) = session else {
+        return Ok(());
+    };
+    if sys.var("SUPERAGENT_DSH_RUNTIME").is_some() {
+        return Ok(());
+    }
+    let path = session_route_file(sys, provider, session);
+    let saved = read_json(&path, Value::Null)
+        .map_err(|_| session_mismatch("DeepSeek 会话运行时记录不可读"))?;
+    let selected = if saved.is_null() {
+        sys.platform_dir().join("dsh-runtime")
+    } else {
+        PathBuf::from(
+            saved["runtime"]
+                .as_str()
+                .ok_or_else(|| session_mismatch("DeepSeek 会话运行时记录无效"))?,
+        )
+    };
+    sys.set("SUPERAGENT_DSH_RUNTIME", selected.to_string_lossy());
+    if !saved.is_null() && saved["version"].as_str() != runtime_version(sys).as_deref() {
+        return Err(session_mismatch("DeepSeek 会话绑定的运行时版本已改变"));
+    }
+    Ok(())
+}
+
+fn runtime_version(sys: &Sys) -> Option<String> {
+    read_json(
+        &runtime(sys).join("node_modules/@deepseek-ai/dsh/package.json"),
+        json!({}),
+    )
+    .ok()?["version"]
+        .as_str()
+        .map(str::to_string)
+}
+
+fn node_supported(version: &str, runtime_version: &str) -> bool {
+    let numbers: Vec<u32> = version
+        .trim()
+        .trim_start_matches('v')
+        .split('.')
+        .take(3)
+        .filter_map(|part| part.parse().ok())
+        .collect();
+    let (Some(major), Some(minor)) = (numbers.first(), numbers.get(1)) else {
+        return false;
+    };
+    if runtime_version == CURRENT_VERSION {
+        *major > 24 || (*major == 24 && *minor >= 9)
+    } else {
+        *major >= 24 || (*major == 22 && *minor >= 19)
+    }
+}
+
+fn validate_final(
+    strict: bool,
+    session: Option<&str>,
+    final_session: Option<&str>,
+    completed: bool,
+    turn_error: bool,
+) -> Result<(), AdapterError> {
+    if strict && (final_session != session || session.is_none()) {
+        return Err(session_mismatch(FAILED));
+    }
+    if (strict && !completed) || turn_error {
+        return Err(classified(ErrorClass::Protocol, "dsh:incomplete_final"));
+    }
+    Ok(())
 }
 
 fn dsh_home(sys: &Sys) -> PathBuf {
@@ -257,15 +374,25 @@ async fn discover(sys: &Sys, cancel: &CancellationToken) -> Result<Discovery> {
     let mut builtin: Option<String> = None;
     let node_exe = node(sys);
     let cli_path = cli(sys);
-    let pkg = cli_path
-        .parent()
-        .and_then(Path::parent)
-        .map(|d| d.join("package.json"));
-    let ok = node_exe.is_some()
+    let version = runtime_version(sys);
+    let mut ok = node_exe.is_some()
         && is_file(&cli_path)
-        && pkg.is_some_and(|p| {
-            read_json(&p, json!({})).is_ok_and(|v| v["version"] == json!(VERSION))
-        });
+        && version
+            .as_deref()
+            .is_some_and(|v| SUPPORTED_VERSIONS.contains(&v));
+    if ok && let Some(node) = &node_exe {
+        let output = capture(
+            node,
+            &["--version".into()],
+            &sys.home,
+            sys,
+            "",
+            Duration::from_secs(10),
+            cancel,
+        )
+        .await;
+        ok = output.is_ok_and(|v| node_supported(&v, version.as_deref().unwrap_or_default()));
+    }
     let routes_file = sys.platform_dir().join("deepseek-default.json");
     let base_file = runtime(sys).join("node_modules/@deepseek-ai/dsh-base/cordis.patch.yml");
     let mut files = vec![base_file.clone()];
@@ -553,6 +680,8 @@ async fn discover(sys: &Sys, cancel: &CancellationToken) -> Result<Discovery> {
         })
         .collect();
     let catalog = json!({
+        "runtime_version": version,
+        "runtime_path": runtime(sys),
         "default": default,
         "providers": providers,
         "modes": modes("DeepSeek Harness CLI", ok),
@@ -911,13 +1040,14 @@ impl Adapter for DeepSeek {
 
 /// `run(o)` (DS:211-293).
 async fn run(
-    sys: Sys,
+    mut sys: Sys,
     customs: Vec<CustomProvider>,
     req: RunRequest,
     host: Arc<dyn TurnHost>,
     emit: Emit,
     cancel: CancellationToken,
 ) -> Result<RunOutcome, AdapterError> {
+    resume_runtime(&mut sys, &req.route.provider, req.session_id.as_deref())?;
     crate::images::check(&req)?;
     let boundary = scope("deepseek", &req, &host, &cancel, true).await?;
     let mut d = discover(&sys, &cancel)
@@ -935,13 +1065,15 @@ async fn run(
         .clone()
         .ok_or_else(|| route_gone("本机未安装所选原生执行端"))?;
     let mut env = sys.clone();
+    let state_root = sys.platform_dir().join("dsh-state");
+    let state_root = if runtime_version(&sys).as_deref() == Some(CURRENT_VERSION) {
+        state_root.join(CURRENT_VERSION)
+    } else {
+        state_root
+    };
     env.set(
         "DSH_HOME",
-        sys.platform_dir()
-            .join("dsh-state")
-            .join(boundary)
-            .to_string_lossy()
-            .into_owned(),
+        state_root.join(boundary).to_string_lossy().into_owned(),
     );
     env.set("DSH_PERMISSION_MODE", boundary);
     let (spec, call_key) = call_spec(&r, &s.model, s.reasoning_effort.as_deref());
@@ -980,6 +1112,8 @@ async fn run(
     let mut proc = start(&node_exe, &args, &req.cwd, &env)?;
     let mut text: Option<String> = None;
     let mut session: Option<String> = None;
+    let mut final_session: Option<String> = None;
+    let mut final_completed = false;
     let mut turn_error = false;
     let mut open_tools: HashSet<String> = HashSet::new();
     let streamed = stream(&mut proc, &req.prompt, &cancel, |e| {
@@ -990,6 +1124,7 @@ async fn run(
         match e["type"].as_str() {
             Some("session") => {
                 if let Some(id) = e["sessionId"].as_str() {
+                    bind_session_runtime(&sys, &s.provider, id)?;
                     emit.session(id);
                     session = Some(id.to_string());
                 }
@@ -1000,7 +1135,11 @@ async fn run(
                     emit.journal("message.boundary", Value::Null);
                 }
             }
-            Some("final") => text = e["text"].as_str().map(str::to_string),
+            Some("final") => {
+                text = e["text"].as_str().map(str::to_string);
+                final_session = e["sessionId"].as_str().map(str::to_string);
+                final_completed = e["reason"]["kind"] == "completed";
+            }
             // Tool events are not a verified DSH schema (spec §9.2); tracking
             // them only lengthens the stall timeout while a tool is open.
             Some("tool_call") => {
@@ -1036,6 +1175,17 @@ async fn run(
         && want != got
     {
         return Err(session_mismatch(FAILED));
+    }
+    let strict_final = runtime_version(&sys).as_deref() == Some(CURRENT_VERSION);
+    if let Err(mut err) = validate_final(
+        strict_final,
+        session.as_deref(),
+        final_session.as_deref(),
+        final_completed,
+        turn_error,
+    ) {
+        err.session_id = session;
+        return Err(err);
     }
     match (text.filter(|t| !t.is_empty()), session) {
         (Some(text), Some(sid)) => Ok(RunOutcome {
@@ -1077,7 +1227,14 @@ fn write_private(path: &Path, content: &str) -> std::io::Result<()> {
 pub fn watch_paths(sys: &Sys) -> Vec<PathBuf> {
     let h = dsh_home(sys);
     let pkg = runtime(sys).join("node_modules/@deepseek-ai");
-    let mut out = vec![sys.platform_dir().join("deepseek-default.json")];
+    let candidate = sys
+        .platform_dir()
+        .join(format!("dsh-runtime-{CURRENT_VERSION}"));
+    let mut out = vec![
+        sys.platform_dir().join("deepseek-default.json"),
+        candidate.join("verified-runtime.json"),
+        candidate.join("node_modules/@deepseek-ai/dsh/package.json"),
+    ];
     for n in [
         ".credentials.yaml",
         ".env",
@@ -1106,6 +1263,55 @@ pub fn watch_paths(sys: &Sys) -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runtime_versions_keep_legacy_and_require_current_node_and_terminal_identity() {
+        assert!(node_supported("v22.19.0", VERSION));
+        assert!(!node_supported("v22.19.0", CURRENT_VERSION));
+        assert!(!node_supported("v24.8.9", CURRENT_VERSION));
+        assert!(node_supported("v24.9.0", CURRENT_VERSION));
+        assert!(node_supported("v26.0.0", CURRENT_VERSION));
+        assert!(!node_supported("invalid", CURRENT_VERSION));
+        assert!(validate_final(false, Some("legacy"), None, false, false).is_ok());
+        assert!(validate_final(true, Some("current"), Some("current"), true, false).is_ok());
+        assert_eq!(
+            validate_final(true, Some("current"), Some("other"), true, false)
+                .unwrap_err()
+                .class,
+            ErrorClass::SessionMismatch
+        );
+        assert!(validate_final(true, Some("current"), Some("current"), false, false).is_err());
+        assert!(validate_final(false, Some("legacy"), None, false, true).is_err());
+    }
+
+    #[test]
+    fn current_install_does_not_take_over_unverified_or_legacy_sessions() {
+        let home = tempfile::tempdir().unwrap();
+        let sys = Sys::new(vec![], home.path().to_owned(), home.path().to_owned());
+        let legacy = sys.platform_dir().join("dsh-runtime");
+        let current = sys
+            .platform_dir()
+            .join(format!("dsh-runtime-{CURRENT_VERSION}"));
+        for (dir, version) in [(&legacy, VERSION), (&current, CURRENT_VERSION)] {
+            let pkg = dir.join("node_modules/@deepseek-ai/dsh/package.json");
+            std::fs::create_dir_all(pkg.parent().unwrap()).unwrap();
+            std::fs::write(pkg, json!({"version":version}).to_string()).unwrap();
+        }
+        assert_eq!(runtime(&sys), legacy);
+        std::fs::write(current.join("verified-runtime.json"),json!({"version":CURRENT_VERSION,"readonly_resume":true,"workspace_boundary_resume":true}).to_string()).unwrap();
+        assert_eq!(runtime(&sys), current);
+        bind_session_runtime(&sys, "provider-a", "new-session").unwrap();
+        let mut old = sys.clone();
+        resume_runtime(&mut old, "provider-a", Some("old-session")).unwrap();
+        assert_eq!(runtime(&old), legacy);
+        let mut restored = sys.clone();
+        resume_runtime(&mut restored, "provider-a", Some("new-session")).unwrap();
+        assert_eq!(runtime(&restored), current);
+        let mut other_provider = sys.clone();
+        resume_runtime(&mut other_provider, "provider-b", Some("new-session")).unwrap();
+        assert_eq!(runtime(&other_provider), legacy);
+        assert!(bind_session_runtime(&old, "provider-a", "new-session").is_err());
+    }
 
     #[test]
     fn dotenv_subset_matches_node_parse_env() {

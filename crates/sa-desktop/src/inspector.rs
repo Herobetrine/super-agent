@@ -268,10 +268,14 @@ impl App {
             return;
         };
         let data = self.opts.data.clone().unwrap_or_else(sa_store::default_data_dir);
-        self.diff.show(ui, &pal, cwd, data);
+        self.diff.show(ui, &pal, cwd, data, self.host.is_some());
     }
     fn collab_tab(&mut self, ui: &mut Ui, snap: &Snapshot) {
         let pal = self.pal.clone();
+        if let Some(host)=&self.host {
+            let action=self.workflow.show(ui,&pal,host,snap.ticket.id);
+            if let Some(action)=action {self.submit(action);}
+        }
         let badges = self.live_badges();
         if let Some(host) = &self.host {
             let ticket = snap.ticket.id;

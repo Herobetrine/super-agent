@@ -6,7 +6,8 @@
 use futures::FutureExt;
 use futures::future::BoxFuture;
 use sa_engine::adapter::{
-    AGENTS, Adapter, AdapterError, AdapterEvent, Catalog, EventSink, RunOutcome, RunRequest, TurnHost,
+    AGENTS, Adapter, AdapterError, AdapterEvent, Catalog, EventSink, RunOutcome, RunRequest,
+    TurnHost,
 };
 use sa_engine::{CreateParams, Engine, EngineOptions};
 use serde_json::{Map, Value, json};
@@ -58,7 +59,8 @@ impl Ctx {
     }
 }
 
-pub type Script = Arc<dyn Fn(Ctx) -> BoxFuture<'static, Result<String, AdapterError>> + Send + Sync>;
+pub type Script =
+    Arc<dyn Fn(Ctx) -> BoxFuture<'static, Result<String, AdapterError>> + Send + Sync>;
 pub type CatalogFn = Arc<dyn Fn() -> BoxFuture<'static, anyhow::Result<Value>> + Send + Sync>;
 
 pub fn script<F, Fut>(f: F) -> Script
@@ -147,7 +149,8 @@ impl Adapter for Fake {
         events: EventSink,
         cancel: CancellationToken,
     ) -> BoxFuture<'static, Result<RunOutcome, AdapterError>> {
-        let packet: Value = serde_json::from_str(req.prompt.rsplit('\n').next().unwrap_or("null")).expect("packet JSON");
+        let packet: Value = serde_json::from_str(req.prompt.rsplit('\n').next().unwrap_or("null"))
+            .expect("packet JSON");
         let job = packet["job"].clone();
         self.shared.calls.lock().unwrap().push(Call {
             name: self.name.into(),
@@ -178,7 +181,10 @@ impl Adapter for Fake {
                         .or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string()))
                         .unwrap_or_else(|| "panic".into());
                     shared.panics.lock().unwrap().push(msg.clone());
-                    Err(AdapterError::new(sa_engine::adapter::ErrorClass::Protocol, msg))
+                    Err(AdapterError::new(
+                        sa_engine::adapter::ErrorClass::Protocol,
+                        msg,
+                    ))
                 }
             }
         }
@@ -221,7 +227,10 @@ impl Fx {
     }
 
     pub fn with(s: Script, catalog: Value, opts: EngineOptions) -> Self {
-        let dir = tempfile::Builder::new().prefix("superagent-rust-test-").tempdir().unwrap();
+        let dir = tempfile::Builder::new()
+            .prefix("superagent-rust-test-")
+            .tempdir()
+            .unwrap();
         let project = dir.path().join("project");
         let data = dir.path().join("state");
         std::fs::create_dir_all(&project).unwrap();
@@ -267,7 +276,8 @@ impl Fx {
     }
 
     pub async fn finish(&self, ticket: i64, state: &str) {
-        self.until(|| root_state(&self.engine, ticket) == state).await
+        self.until(|| root_state(&self.engine, ticket) == state)
+            .await
     }
 
     pub fn all(&self, sql: &str) -> Vec<Map<String, Value>> {
@@ -317,7 +327,8 @@ pub fn wire(tag: &str, v: Value) -> String {
 
 /// `send(x)` of `engine.test.cjs`.
 pub fn send(extra: Value) -> String {
-    let mut base = json!({"id": "peer", "to": "deepseek", "body": "核对  \r\n\t🧭", "write": false});
+    let mut base =
+        json!({"id": "peer", "to": "deepseek", "body": "核对  \r\n\t🧭", "write": false});
     if let (Value::Object(b), Value::Object(e)) = (&mut base, extra) {
         for (k, v) in e {
             b.insert(k, v);

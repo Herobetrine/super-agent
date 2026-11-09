@@ -148,7 +148,8 @@ impl ProjectExtensions {
                 return Err(anyhow!("MCP 服务已禁用或已更改"));
             };
             let config = mcp::ServerConfig::from_row(&row)?;
-            let client = mcp::connect(&config, &a.cancel).await?;
+            let mut lease = inner.pool.acquire(a.ticket, server, &revision, &a.cwd, &config, &a.cancel).await?;
+            let revoked = lease.revoked();
             let called = async {
                 ensure!(!a.cancel.is_cancelled(), CANCELLED);
                 ensure!(
@@ -159,16 +160,19 @@ impl ProjectExtensions {
                     .db
                     .with(|q| q.log(who, "mcp.started", &json!({"id": id, "server": server, "tool": tool})))?;
                 issued = true;
-                mcp::call_tool(&client, tool, args, &a.cancel).await
+                tokio::select! {
+                    biased;
+                    () = revoked.cancelled() => Err(anyhow!("MCP 连接授权已撤销")),
+                    result = mcp::call_tool(lease.client(), tool, args, &a.cancel) => result,
+                }
             }
             .await;
-            if a.cancel.is_cancelled() {
-                // Dropping the connection stops the server (stdin close,
-                // then a job-object kill) without delaying the turn.
-                drop(client);
-            } else {
-                mcp::close(client).await;
+            // Only a returned protocol result may retain the connection. A
+            // transport failure/timeout/cancellation never retries the tool.
+            if called.is_ok() && !a.cancel.is_cancelled() && !revoked.is_cancelled() {
+                lease.keep();
             }
+            drop(lease);
             let result = called?;
             returned = true;
             Ok(result)
@@ -192,7 +196,11 @@ impl ProjectExtensions {
                 }
             }
             Err(e) => (
-                if issued && !returned { "uncertain" } else { "error" },
+                if issued && !returned {
+                    "uncertain"
+                } else {
+                    "error"
+                },
                 json!({"error": e.to_string()}),
             ),
         };

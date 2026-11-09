@@ -7,17 +7,17 @@
 //! read-only observer.
 
 use anyhow::{Context, Result, anyhow, bail};
-use sa_adapters::sys::Sys;
-use sa_engine::db::who_of;
-use sa_engine::{CreateParams, Engine, EngineOptions, owner};
-use serde_json::{Value, json};
-use std::path::{Path, PathBuf};
-use sa_engine::adapter::{AGENTS, Adapter};
-use std::collections::HashMap;
 use sa_adapters::Registry;
+use sa_adapters::sys::Sys;
 use sa_engine::adapter::Route;
+use sa_engine::adapter::{AGENTS, Adapter};
+use sa_engine::db::who_of;
 use sa_engine::runner::RotationSource;
+use sa_engine::{CreateParams, Engine, EngineOptions, owner};
 use sa_store::providers::{self, CustomProvider, Rotation};
+use serde_json::{Value, json};
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock, mpsc};
 use std::thread::JoinHandle;
 
@@ -78,7 +78,34 @@ pub enum Action {
         selections: Value,
         allow_lead_routing: bool,
     },
-    SetLeadRouting { ticket: i64, enabled: bool },
+    SetLeadRouting {
+        ticket: i64,
+        enabled: bool,
+    },
+    SetIsolatedWriters {
+        ticket: i64,
+        enabled: bool,
+    },
+    ValidateWorkspace {
+        job: i64,
+        command: Vec<String>,
+    },
+    IntegrateWorkspace {
+        job: i64,
+    },
+    BindScm {
+        ticket: i64,
+        job: i64,
+        url: String,
+    },
+    RefreshScm {
+        job: i64,
+    },
+    ForkCheckpoint {
+        ticket: i64,
+        seq: i64,
+        goal: String,
+    },
     /// Operator entry in the project knowledge base.
     KnowledgeAdd {
         cwd: String,
@@ -118,25 +145,44 @@ impl Action {
     pub fn kind(&self) -> ActionKind {
         match self {
             Action::Create { .. } => ActionKind::Create,
+            Action::ForkCheckpoint { .. } => ActionKind::Fork,
             Action::Follow { .. } => ActionKind::Follow,
             Action::Note { .. } => ActionKind::Note,
             Action::Cancel { .. } => ActionKind::Cancel,
             Action::Retry { .. } => ActionKind::Retry,
             Action::Decide { allow, .. } => ActionKind::Decide { allow: *allow },
             Action::PlanAdd { .. } | Action::PlanToggle { .. } => ActionKind::Plan,
-            Action::SaveDefaults { .. } | Action::SaveRoutes { .. } | Action::SetLeadRouting { .. } => ActionKind::Routes,
+            Action::SaveDefaults { .. }
+            | Action::SaveRoutes { .. }
+            | Action::SetLeadRouting { .. } => ActionKind::Routes,
             Action::KnowledgeAdd { .. } | Action::KnowledgeArchive { .. } => ActionKind::Knowledge,
-            Action::ProviderSave { .. } | Action::ProviderRemove { .. } | Action::RotationSave { .. } => {
-                ActionKind::Providers
-            }
-            Action::TicketMeta { .. } | Action::SetFailover { .. } => ActionKind::Meta,
+            Action::ProviderSave { .. }
+            | Action::ProviderRemove { .. }
+            | Action::RotationSave { .. } => ActionKind::Providers,
+            Action::TicketMeta { .. }
+            | Action::SetFailover { .. }
+            | Action::SetIsolatedWriters { .. }
+            | Action::ValidateWorkspace { .. }
+            | Action::IntegrateWorkspace { .. }
+            | Action::BindScm { .. }
+            | Action::RefreshScm { .. } => ActionKind::Meta,
         }
+    }
+
+    fn background(&self) -> bool {
+        matches!(
+            self,
+            Self::ValidateWorkspace { .. }
+                | Self::IntegrateWorkspace { .. }
+                | Self::RefreshScm { .. }
+        )
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ActionKind {
     Create,
+    Fork,
     Follow,
     Note,
     Cancel,
@@ -165,6 +211,74 @@ pub struct CatalogReply {
 }
 
 type Notify = Arc<dyn Fn() + Send + Sync>;
+
+fn deliver(out: &mpsc::Sender<Outcome>, wake: &Notify, outcome: Outcome) {
+    let _ = out.send(outcome);
+    wake();
+}
+
+fn maintenance_finished(
+    completed: std::result::Result<(tokio::task::Id, Outcome), tokio::task::JoinError>,
+    kinds: &mut HashMap<tokio::task::Id, ActionKind>,
+    out: &mpsc::Sender<Outcome>,
+    wake: &Notify,
+) {
+    let outcome = match completed {
+        Ok((id, outcome)) => {
+            kinds.remove(&id);
+            outcome
+        }
+        Err(error) => Outcome {
+            kind: kinds.remove(&error.id()).unwrap_or(ActionKind::Meta),
+            result: Err("后台操作异常结束；请核对操作记录后重试".into()),
+        },
+    };
+    deliver(out, wake, outcome);
+}
+
+/// Routine mutations remain ordered. Potentially long Git/SCM operations use
+/// engine-owned workspace leases and send their own completion when ready, so
+/// Cancel/Decide/Note never wait behind a test process or remote status fetch.
+/// Track tasks to completion rather than detaching spawn_blocking work from its
+/// journal and lock owner during shutdown.
+async fn action_loop(
+    engine: &Engine,
+    shared: &Shared,
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<Action>,
+    out: &mpsc::Sender<Outcome>,
+    wake: &Notify,
+) {
+    let mut maintenance = tokio::task::JoinSet::new();
+    let mut kinds = HashMap::new();
+    loop {
+        tokio::select! {
+            next = rx.recv() => {
+                let Some(action) = next else { break; };
+                let kind = action.kind();
+                if action.background() {
+                    let (engine, shared) = (engine.clone(), shared.clone());
+                    let task = maintenance.spawn(async move {
+                        let result = execute(&engine, &shared, action).await.map_err(|e| format!("{e:#}"));
+                        Outcome { kind, result }
+                    });
+                    kinds.insert(task.id(), kind);
+                } else {
+                    let result = execute(engine, shared, action).await.map_err(|e| format!("{e:#}"));
+                    deliver(out, wake, Outcome { kind, result });
+                }
+            }
+            Some(completed) = maintenance.join_next_with_id(), if !maintenance.is_empty() => {
+                maintenance_finished(completed, &mut kinds, out, wake);
+            }
+        }
+    }
+    // Stop model activity immediately, but keep the SQLite connection and
+    // desktop.lock alive until every maintenance result has been persisted.
+    engine.quiesce().await;
+    while let Some(completed) = maintenance.join_next_with_id().await {
+        maintenance_finished(completed, &mut kinds, out, wake);
+    }
+}
 
 /// Rotation candidates from the operator's saved order (empty when off).
 /// The host refreshes the cache after every provider or rotation edit.
@@ -238,7 +352,11 @@ impl Host {
     /// Claim `dir`, open the journal and start scheduling. `notify` is called
     /// after every outcome (the UI repaints).
     pub fn start(dir: PathBuf, notify: impl Fn() + Send + Sync + 'static) -> Result<Self> {
-        Self::start_with(dir, |shared| sa_adapters::all_with(Sys::from_process(), shared.registry.clone()), notify)
+        Self::start_with(
+            dir,
+            |shared| sa_adapters::all_with(Sys::from_process(), shared.registry.clone()),
+            notify,
+        )
     }
 
     /// [`start`](Self::start) with explicit harness adapters (tests).
@@ -249,12 +367,17 @@ impl Host {
     ) -> Result<Self> {
         let shared = Shared::new();
         let for_thread = shared.clone();
-        type Ready = (Engine, tokio::runtime::Handle, Vec<Arc<dyn Adapter>>, sa_ext::ProjectExtensions);
+        type Ready = (
+            Engine,
+            tokio::runtime::Handle,
+            Vec<Arc<dyn Adapter>>,
+            sa_ext::ProjectExtensions,
+        );
         let notify: Notify = Arc::new(notify);
         let wake = notify.clone();
         let (ready_tx, ready_rx) = mpsc::channel::<Result<Ready, String>>();
         let (out_tx, out_rx) = mpsc::channel();
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Action>();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Action>();
         let thread = std::thread::Builder::new()
             .name("sa-desktop-scheduler".into())
             .spawn(move || {
@@ -295,14 +418,7 @@ impl Host {
                     };
                     let handle = tokio::runtime::Handle::current();
                     let _ = ready_tx.send(Ok((engine.clone(), handle, adapters, ext.clone())));
-                    while let Some(action) = rx.recv().await {
-                        let kind = action.kind();
-                        // Create awaits attachment snapshots; run every action in
-                        // order so the UI sees outcomes in submission order.
-                        let result = execute(&engine, &for_thread, action).await.map_err(|e| format!("{e:#}"));
-                        let _ = out_tx.send(Outcome { kind, result });
-                        wake();
-                    }
+                    action_loop(&engine, &for_thread, rx, &out_tx, &wake).await;
                     engine.close().await;
                     ext.close();
                     // `_owner` drops here: the lock is released after the
@@ -324,7 +440,12 @@ impl Host {
                     engine,
                     thread: Some(thread),
                     runtime,
-                    adapters: Arc::new(adapters.into_iter().map(|a| (a.agent().to_string(), a)).collect()),
+                    adapters: Arc::new(
+                        adapters
+                            .into_iter()
+                            .map(|a| (a.agent().to_string(), a))
+                            .collect(),
+                    ),
                     catalog_tx,
                     catalogs,
                     notify,
@@ -354,13 +475,25 @@ impl Host {
             return request_id;
         }
         let adapter = self.adapters.get(agent).cloned();
-        let (tx, notify, agent) = (self.catalog_tx.clone(), self.notify.clone(), agent.to_string());
+        let (tx, notify, agent) = (
+            self.catalog_tx.clone(),
+            self.notify.clone(),
+            agent.to_string(),
+        );
         self.runtime.spawn(async move {
             let result = match adapter {
-                Some(a) => a.catalog().await.map(|c| c.value).map_err(|e| format!("{e:#}")),
+                Some(a) => a
+                    .catalog()
+                    .await
+                    .map(|c| c.value)
+                    .map_err(|e| format!("{e:#}")),
                 None => Err("未知执行器".into()),
             };
-            let _ = tx.send(CatalogReply { agent, request_id, result });
+            let _ = tx.send(CatalogReply {
+                agent,
+                request_id,
+                result,
+            });
             notify();
         });
         request_id
@@ -399,13 +532,43 @@ impl Host {
     pub fn failover(&self, ticket: i64) -> bool {
         self.engine.failover(ticket).unwrap_or(false)
     }
+    pub fn isolated_writers(&self, ticket: i64) -> bool {
+        self.engine.isolated_writers(ticket).unwrap_or(false)
+    }
+    pub fn workspaces(&self, ticket: i64) -> Result<Vec<sa_engine::workspaces::Workspace>> {
+        self.engine.workspaces(ticket)
+    }
+    pub fn checkpoints(&self, ticket: i64) -> Result<Vec<Value>> {
+        self.engine.checkpoints(ticket)
+    }
+    pub fn scm_bindings(&self, ticket: i64) -> Result<Vec<Value>> {
+        self.engine.scm_bindings(ticket)
+    }
+    pub fn branch_source(&self, ticket: i64) -> Result<Value> {
+        self.engine.db().with(|q| {
+            q.one(
+                "SELECT lead,permission_profile FROM tickets WHERE id=?",
+                &[&ticket],
+            )?
+            .map(Value::Object)
+            .ok_or_else(|| anyhow!("工单不存在"))
+        })
+    }
 
     pub fn providers(&self) -> Vec<CustomProvider> {
-        self.shared.registry.read().unwrap_or_else(|p| p.into_inner()).clone()
+        self.shared
+            .registry
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
     }
 
     pub fn rotation(&self) -> Rotation {
-        self.shared.rotation.read().unwrap_or_else(|p| p.into_inner()).clone()
+        self.shared
+            .rotation
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
     }
 
     /// Saved routes for new conversations (`route_defaults`).
@@ -415,7 +578,11 @@ impl Host {
             .with(|q| q.one("SELECT routes FROM route_defaults WHERE singleton=1", &[]))
             .ok()
             .flatten()
-            .and_then(|r| r.get("routes").and_then(Value::as_str).and_then(|s| serde_json::from_str(s).ok()))
+            .and_then(|r| {
+                r.get("routes")
+                    .and_then(Value::as_str)
+                    .and_then(|s| serde_json::from_str(s).ok())
+            })
             .unwrap_or_else(|| json!({}))
     }
 
@@ -437,7 +604,8 @@ impl Host {
         self.engine.active_count()
     }
 
-    /// Stop scheduling, abort running turns and release the journal.
+    /// Stop model scheduling and drain bounded maintenance before releasing the
+    /// journal. In-flight Git commands keep their receipts and exclusive owner.
     pub fn shutdown(&mut self) {
         self.tx.take();
         if let Some(t) = self.thread.take() {
@@ -530,8 +698,18 @@ async fn create(engine: &Engine, action: Action) -> Result<i64> {
 async fn execute(engine: &Engine, shared: &Shared, action: Action) -> Result<Option<i64>> {
     match action {
         a @ Action::Create { .. } => Ok(Some(create(engine, a).await?)),
-        Action::Follow { ticket, body, resume, files } => {
-            engine.follow_with_files(ticket, &body, resume, &files).await?;
+        Action::ForkCheckpoint { ticket, seq, goal } => {
+            Ok(Some(engine.fork_checkpoint(ticket, seq, goal).await?))
+        }
+        Action::Follow {
+            ticket,
+            body,
+            resume,
+            files,
+        } => {
+            engine
+                .follow_with_files(ticket, &body, resume, &files)
+                .await?;
             Ok(None)
         }
         Action::Note { ticket, job, body } => {
@@ -557,7 +735,10 @@ async fn execute(engine: &Engine, shared: &Shared, action: Action) -> Result<Opt
             }
             engine.db().tx(|q| {
                 let root = q.root(ticket)?;
-                let id = q.insert("INSERT INTO studio_plan(ticket,body) VALUES(?,?)", &[&ticket, &body])?;
+                let id = q.insert(
+                    "INSERT INTO studio_plan(ticket,body) VALUES(?,?)",
+                    &[&ticket, &body],
+                )?;
                 q.log(who_of(&root), "plan.add", &json!({"id": id}))?;
                 Ok(())
             })?;
@@ -579,7 +760,10 @@ async fn execute(engine: &Engine, shared: &Shared, action: Action) -> Result<Opt
             })?;
             Ok(None)
         }
-        Action::SaveDefaults { selections, allow_lead_routing } => {
+        Action::SaveDefaults {
+            selections,
+            allow_lead_routing,
+        } => {
             let routes = parse_routes(selections)?.to_string();
             engine.db().tx(|q| {
                 q.run("INSERT OR REPLACE INTO route_defaults(singleton,routes) VALUES(1,?)", &[&routes])?;
@@ -588,17 +772,57 @@ async fn execute(engine: &Engine, shared: &Shared, action: Action) -> Result<Opt
             })?;
             Ok(None)
         }
-        Action::SaveRoutes { ticket, selections, allow_lead_routing } => {
-            save_routes(engine, ticket, parse_routes(selections)?, allow_lead_routing)?;
+        Action::SaveRoutes {
+            ticket,
+            selections,
+            allow_lead_routing,
+        } => {
+            save_routes(
+                engine,
+                ticket,
+                parse_routes(selections)?,
+                allow_lead_routing,
+            )?;
             Ok(None)
         }
         Action::SetLeadRouting { ticket, enabled } => {
             engine.set_lead_routing(ticket, enabled)?;
             Ok(None)
         }
-        Action::KnowledgeAdd { cwd, kind, body, ticket } => {
-            Ok(Some(engine.add_knowledge(&cwd, &kind, &body, ticket)?))
+        Action::SetIsolatedWriters { ticket, enabled } => {
+            engine.set_isolated_writers(ticket, enabled)?;
+            Ok(None)
         }
+        Action::ValidateWorkspace { job, command } => {
+            engine.validate_workspace(job, command).await?;
+            Ok(None)
+        }
+        Action::IntegrateWorkspace { job } => {
+            engine.integrate_workspace(job).await?;
+            Ok(None)
+        }
+        Action::BindScm { ticket, job, url } => {
+            if !engine.db().with(|q| {
+                q.exists(
+                    "SELECT 1 FROM jobs WHERE id=? AND ticket=?",
+                    &[&job, &ticket],
+                )
+            })? {
+                bail!("该任务不属于当前工单");
+            }
+            engine.bind_scm(job, &url)?;
+            Ok(None)
+        }
+        Action::RefreshScm { job } => {
+            engine.refresh_scm(job).await?;
+            Ok(None)
+        }
+        Action::KnowledgeAdd {
+            cwd,
+            kind,
+            body,
+            ticket,
+        } => Ok(Some(engine.add_knowledge(&cwd, &kind, &body, ticket)?)),
         Action::KnowledgeArchive { id, archived } => {
             engine.archive_knowledge(id, archived)?;
             Ok(None)
@@ -624,16 +848,28 @@ async fn execute(engine: &Engine, shared: &Shared, action: Action) -> Result<Opt
                 if !q.exists("SELECT 1 FROM tickets WHERE id=?", &[&ticket])? {
                     bail!("工单不存在");
                 }
-                q.run("INSERT OR IGNORE INTO studio_ticket_meta(ticket) VALUES(?)", &[&ticket])?;
+                q.run(
+                    "INSERT OR IGNORE INTO studio_ticket_meta(ticket) VALUES(?)",
+                    &[&ticket],
+                )?;
                 if let Some(t) = &title {
                     let t: Option<&str> = (!t.is_empty()).then_some(t.as_str());
-                    q.run("UPDATE studio_ticket_meta SET title=? WHERE ticket=?", &[&t, &ticket])?;
+                    q.run(
+                        "UPDATE studio_ticket_meta SET title=? WHERE ticket=?",
+                        &[&t, &ticket],
+                    )?;
                 }
                 if let Some(p) = pinned {
-                    q.run("UPDATE studio_ticket_meta SET pinned=? WHERE ticket=?", &[&(p as i64), &ticket])?;
+                    q.run(
+                        "UPDATE studio_ticket_meta SET pinned=? WHERE ticket=?",
+                        &[&(p as i64), &ticket],
+                    )?;
                 }
                 if let Some(a) = archived {
-                    q.run("UPDATE studio_ticket_meta SET archived=? WHERE ticket=?", &[&(a as i64), &ticket])?;
+                    q.run(
+                        "UPDATE studio_ticket_meta SET archived=? WHERE ticket=?",
+                        &[&(a as i64), &ticket],
+                    )?;
                 }
                 Ok(())
             })?;
@@ -644,7 +880,9 @@ async fn execute(engine: &Engine, shared: &Shared, action: Action) -> Result<Opt
             Ok(None)
         }
         Action::RotationSave { rotation } => {
-            engine.db().with(|q| providers::save_rotation(q.conn(), &rotation))?;
+            engine
+                .db()
+                .with(|q| providers::save_rotation(q.conn(), &rotation))?;
             shared.reload(engine)?;
             Ok(None)
         }
@@ -653,17 +891,29 @@ async fn execute(engine: &Engine, shared: &Shared, action: Action) -> Result<Opt
 
 /// `parseRoutes` (ST:57-70): `{agent: {mode, model, provider}}`.
 pub fn parse_routes(routes: Value) -> Result<Value> {
-    sa_engine::protocol::routes(&routes).map(Value::Object).map_err(anyhow::Error::msg)
+    sa_engine::protocol::routes(&routes)
+        .map(Value::Object)
+        .map_err(anyhow::Error::msg)
 }
 
 fn routing_default(engine: &Engine) -> Result<bool> {
-    engine.db().with(|q| Ok(q.one("SELECT allow_lead_routing FROM studio_model_policy WHERE singleton=1", &[])?
-        .is_none_or(|row| row["allow_lead_routing"].as_i64() == Some(1))))
+    engine.db().with(|q| {
+        Ok(q.one(
+            "SELECT allow_lead_routing FROM studio_model_policy WHERE singleton=1",
+            &[],
+        )?
+        .is_none_or(|row| row["allow_lead_routing"].as_i64() == Some(1)))
+    })
 }
 
 /// `saveRoutes` (ST:239-290): every job must be terminal; changed agents
 /// lose their bound route and native session.
-fn save_routes(engine: &Engine, ticket: i64, selections: Value, allow_lead_routing: bool) -> Result<()> {
+fn save_routes(
+    engine: &Engine,
+    ticket: i64,
+    selections: Value,
+    allow_lead_routing: bool,
+) -> Result<()> {
     engine.db().tx(|q| {
         let row = q
             .one("SELECT agent_routes FROM tickets WHERE id=?", &[&ticket])?
@@ -763,7 +1013,11 @@ pub(crate) mod tests {
         ) -> Boxed<Result<RunOutcome, AdapterError>> {
             Box::pin(async move {
                 let approved = if req.profile == "ask" {
-                    if host.approve(json!({"tool": "fixture-write"})).await { " approved" } else { " denied" }
+                    if host.approve(json!({"tool": "fixture-write"})).await {
+                        " approved"
+                    } else {
+                        " denied"
+                    }
                 } else {
                     ""
                 };
@@ -790,9 +1044,13 @@ pub(crate) mod tests {
             self.0
         }
         fn catalog(&self) -> Boxed<anyhow::Result<Catalog>> {
-            let mut providers: Vec<Value> = vec![json!({"id": "test-local", "models": [{"id": "default"}]})];
+            let mut providers: Vec<Value> =
+                vec![json!({"id": "test-local", "models": [{"id": "default"}]})];
             for r in &self.1 {
-                let (p, m) = (r["provider"].as_str().unwrap_or_default(), r["model"].as_str().unwrap_or_default());
+                let (p, m) = (
+                    r["provider"].as_str().unwrap_or_default(),
+                    r["model"].as_str().unwrap_or_default(),
+                );
                 providers.push(json!({"id": p, "models": [{"id": m}]}));
             }
             let route = json!({"provider": "test-local", "model": "default", "mode": "cli"});
@@ -899,13 +1157,22 @@ pub(crate) mod tests {
             assert!(outcome(&host).result.is_ok());
             let end = Instant::now() + Duration::from_secs(30);
             while !(root_state(&host, ticket) == "done" && replies(&host) > before) {
-                assert!(Instant::now() < end, "ticket {ticket} stuck: {:?}", host.engine.root(ticket));
+                assert!(
+                    Instant::now() < end,
+                    "ticket {ticket} stuck: {:?}",
+                    host.engine.root(ticket)
+                );
                 std::thread::sleep(Duration::from_millis(50));
             }
             let reply = host
                 .engine
                 .db()
-                .with(|q| q.one("SELECT result FROM jobs WHERE ticket=? AND parent IS NULL", &[&ticket]))
+                .with(|q| {
+                    q.one(
+                        "SELECT result FROM jobs WHERE ticket=? AND parent IS NULL",
+                        &[&ticket],
+                    )
+                })
                 .unwrap()
                 .unwrap();
             eprintln!("ticket {ticket}: {}", reply["result"]);
@@ -930,11 +1197,20 @@ pub(crate) mod tests {
             let pending = host
                 .engine
                 .db()
-                .with(|q| q.all("SELECT id,action FROM approvals WHERE ticket=? AND decision='pending'", &[&ticket]))
+                .with(|q| {
+                    q.all(
+                        "SELECT id,action FROM approvals WHERE ticket=? AND decision='pending'",
+                        &[&ticket],
+                    )
+                })
                 .unwrap();
             for a in pending {
                 let action = a["action"].as_str().unwrap_or_default();
-                eprintln!("approval {}: {}", a["id"], action.chars().take(160).collect::<String>());
+                eprintln!(
+                    "approval {}: {}",
+                    a["id"],
+                    action.chars().take(160).collect::<String>()
+                );
                 let _ = host.engine.decide(a["id"].as_i64().unwrap(), true);
             }
             let root = host.engine.root(ticket).unwrap();
@@ -955,7 +1231,10 @@ pub(crate) mod tests {
     /// The `sa-ext` fixture MCP server built next to this test binary.
     fn fixture_mcp() -> Option<PathBuf> {
         let deps = std::env::current_exe().ok()?.parent()?.to_path_buf();
-        let exe = deps.parent()?.join(format!("sa-ext-fixture-mcp{}", std::env::consts::EXE_SUFFIX));
+        let exe = deps.parent()?.join(format!(
+            "sa-ext-fixture-mcp{}",
+            std::env::consts::EXE_SUFFIX
+        ));
         exe.is_file().then_some(exe)
     }
 
@@ -976,11 +1255,14 @@ pub(crate) mod tests {
         let host = Host::start(data.path().to_path_buf(), || {}).unwrap();
         let ext = host.ext();
         let server = ext
-            .save_server(&json!({"name": "proof", "command": exe, "args": [secret_file], "enabled": true}))
+            .save_server(
+                &json!({"name": "proof", "command": exe, "args": [secret_file], "enabled": true}),
+            )
             .unwrap();
         let tools = host.runtime().block_on(ext.probe(&server)).unwrap();
         eprintln!("probed tools: {tools}");
-        ext.set_defaults(&json!({"skills": [], "servers": [server]}), None).unwrap();
+        ext.set_defaults(&json!({"skills": [], "servers": [server]}), None)
+            .unwrap();
 
         let memo = format!("构建口令 {secret} 已核对");
         let goal = format!(
@@ -1002,7 +1284,10 @@ pub(crate) mod tests {
         let ticket = outcome(&host).result.unwrap().unwrap();
         let root = drive_live(&host, ticket, Duration::from_secs(420));
         let k = kinds(&host, ticket);
-        eprintln!("state={} result={:?} kinds={k:?}", root["state"], root["result"]);
+        eprintln!(
+            "state={} result={:?} kinds={k:?}",
+            root["state"], root["result"]
+        );
         for e in host
             .engine
             .db()
@@ -1024,14 +1309,31 @@ pub(crate) mod tests {
             .with(|q| q.one("SELECT state FROM studio_tool_receipts WHERE job=(SELECT id FROM jobs WHERE ticket=? AND parent IS NULL)", &[&ticket]))
             .unwrap();
         eprintln!("receipt {receipt:?}");
-        assert!(root["result"].as_str().unwrap_or_default().contains(&secret), "secret not returned");
+        assert!(
+            root["result"]
+                .as_str()
+                .unwrap_or_default()
+                .contains(&secret),
+            "secret not returned"
+        );
         let entries = host
             .engine
-            .knowledge(&sa_engine::services::realpath(project.path()).unwrap().display().to_string())
+            .knowledge(
+                &sa_engine::services::realpath(project.path())
+                    .unwrap()
+                    .display()
+                    .to_string(),
+            )
             .unwrap();
         eprintln!("knowledge: {entries:?}");
-        assert!(entries.iter().any(|e| e.kind == "memory" && e.body == memo), "SA_MEMO not recorded");
-        assert!(entries.iter().any(|e| e.kind == "progress"), "no automatic progress entry");
+        assert!(
+            entries.iter().any(|e| e.kind == "memory" && e.body == memo),
+            "SA_MEMO not recorded"
+        );
+        assert!(
+            entries.iter().any(|e| e.kind == "progress"),
+            "no automatic progress entry"
+        );
     }
 
     /// Billable: `SA_LIVE_PROVIDER=<agent>,<base_url>,<KEY_ENV>,<model>`. One
@@ -1039,11 +1341,15 @@ pub(crate) mod tests {
     #[test]
     fn live_custom_provider_turn() {
         let Ok(spec) = std::env::var("SA_LIVE_PROVIDER") else {
-            eprintln!("set SA_LIVE_PROVIDER=agent,base_url,KEY_ENV,model to run a billable custom-provider turn");
+            eprintln!(
+                "set SA_LIVE_PROVIDER=agent,base_url,KEY_ENV,model to run a billable custom-provider turn"
+            );
             return;
         };
         let parts: Vec<&str> = spec.split(',').collect();
-        let [agent, base, key_env, model] = parts[..] else { panic!("bad SA_LIVE_PROVIDER") };
+        let [agent, base, key_env, model] = parts[..] else {
+            panic!("bad SA_LIVE_PROVIDER")
+        };
         let data = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
         let nonce = format!("cp-{:x}", std::process::id() as u64 * 7_919 + 3);
@@ -1060,7 +1366,11 @@ pub(crate) mod tests {
         };
         host.probe_models(provider.clone());
         match host.probes.recv_timeout(Duration::from_secs(30)).unwrap() {
-            Ok(models) => eprintln!("probe: {} models, listed={}", models.len(), models.iter().any(|m| m == model)),
+            Ok(models) => eprintln!(
+                "probe: {} models, listed={}",
+                models.len(),
+                models.iter().any(|m| m == model)
+            ),
             Err(e) => eprintln!("probe failed: {e}"),
         }
         host.submit(Action::ProviderSave { provider });
@@ -1082,13 +1392,29 @@ pub(crate) mod tests {
         let bound = host
             .engine
             .db()
-            .with(|q| q.one("SELECT route FROM native_routes WHERE job=?", &[&root["id"].as_i64().unwrap()]))
+            .with(|q| {
+                q.one(
+                    "SELECT route FROM native_routes WHERE job=?",
+                    &[&root["id"].as_i64().unwrap()],
+                )
+            })
             .unwrap();
-        eprintln!("state={} result={:?} route={bound:?}", root["state"], root["result"]);
+        eprintln!(
+            "state={} result={:?} route={bound:?}",
+            root["state"], root["result"]
+        );
         assert_eq!(root["state"], json!("done"));
         // Weaker models may wrap the answer; the file content must be there.
-        assert!(root["result"].as_str().unwrap_or_default().contains(&nonce), "challenge not read");
-        assert!(bound.unwrap()["route"].as_str().unwrap().contains(&saved.route_id()));
+        assert!(
+            root["result"].as_str().unwrap_or_default().contains(&nonce),
+            "challenge not read"
+        );
+        assert!(
+            bound.unwrap()["route"]
+                .as_str()
+                .unwrap()
+                .contains(&saved.route_id())
+        );
     }
 
     /// Billable: `SA_LIVE_ROTATION=<agent>,<base_url>,<KEY_ENV>,<model>`. The
@@ -1097,11 +1423,15 @@ pub(crate) mod tests {
     #[test]
     fn live_rotation_after_auth_failure() {
         let Ok(spec) = std::env::var("SA_LIVE_ROTATION") else {
-            eprintln!("set SA_LIVE_ROTATION=agent,base_url,KEY_ENV,model to run a billable rotation turn");
+            eprintln!(
+                "set SA_LIVE_ROTATION=agent,base_url,KEY_ENV,model to run a billable rotation turn"
+            );
             return;
         };
         let parts: Vec<&str> = spec.split(',').collect();
-        let [agent, base, key_env, model] = parts[..] else { panic!("bad SA_LIVE_ROTATION") };
+        let [agent, base, key_env, model] = parts[..] else {
+            panic!("bad SA_LIVE_ROTATION")
+        };
         // SAFETY: set before any adapter thread reads the environment.
         unsafe { std::env::set_var("SA_ROTATION_INVALID_KEY", "sk-invalid-for-rotation-test") };
         let data = tempfile::tempdir().unwrap();
@@ -1155,17 +1485,24 @@ pub(crate) mod tests {
             .db()
             .with(|q| q.all("SELECT payload FROM events WHERE ticket=? AND kind IN ('route.rotated','turn.gave_up','turn.retry_scheduled')", &[&ticket]))
             .unwrap();
-        eprintln!("state={} result={:?} resilience={rotated:?}", root["state"], root["result"]);
+        eprintln!(
+            "state={} result={:?} resilience={rotated:?}",
+            root["state"], root["result"]
+        );
         assert_eq!(root["state"], json!("done"));
         assert!(root["result"].as_str().unwrap_or_default().contains(&nonce));
         assert!(
-            rotated.iter().any(|e| e["payload"].as_str().unwrap_or_default().contains(&backup)),
+            rotated
+                .iter()
+                .any(|e| e["payload"].as_str().unwrap_or_default().contains(&backup)),
             "no rotation to the backup provider"
         );
     }
 
     fn outcome(host: &Host) -> Outcome {
-        host.rx.recv_timeout(Duration::from_secs(10)).expect("outcome")
+        host.rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("outcome")
     }
 
     fn until(cond: impl Fn() -> bool) {
@@ -1190,11 +1527,288 @@ pub(crate) mod tests {
     fn kinds(host: &Host, ticket: i64) -> Vec<String> {
         host.engine
             .db()
-            .with(|q| q.all("SELECT kind FROM events WHERE ticket=? ORDER BY seq", &[&ticket]))
+            .with(|q| {
+                q.all(
+                    "SELECT kind FROM events WHERE ticket=? ORDER BY seq",
+                    &[&ticket],
+                )
+            })
             .unwrap()
             .into_iter()
             .map(|r| r["kind"].as_str().unwrap_or_default().to_string())
             .collect()
+    }
+
+    #[cfg(windows)]
+    fn create_fixture_ticket(host: &Host, cwd: &Path, profile: &str) -> i64 {
+        host.submit(Action::Create {
+            goal: "fixture".into(),
+            cwd: Some(cwd.into()),
+            lead: "deepseek".into(),
+            profile: profile.into(),
+            files: vec![],
+            selections: None,
+            allow_lead_routing: None,
+            extensions: None,
+        });
+        let reply = outcome(host);
+        assert_eq!(reply.kind, ActionKind::Create);
+        reply.result.unwrap().unwrap()
+    }
+
+    #[cfg(windows)]
+    fn slow_validation_fixture() -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        Host,
+        i64,
+        Vec<String>,
+        PathBuf,
+        PathBuf,
+    ) {
+        let data = tempfile::tempdir().unwrap();
+        let source = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let exe = Sys::from_process().which("git.exe").unwrap();
+            let out = std::process::Command::new(exe)
+                .current_dir(source.path())
+                .args([
+                    "-c",
+                    "user.name=Queue Fixture",
+                    "-c",
+                    "user.email=queue@example.invalid",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init", "-q"]);
+        std::fs::write(source.path().join("base.txt"), b"fixture\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "fixture"]);
+        let host = Host::start_with(data.path().into(), fakes, || {}).unwrap();
+        let ticket = create_fixture_ticket(&host, source.path(), "full");
+        until(|| root_state(&host, ticket) == "done" && host.active_count() == 0);
+        let job = host.engine.root(ticket).unwrap()["id"].as_i64().unwrap();
+        host.engine
+            .db()
+            .tx(|q| {
+                sa_engine::workspaces::plan(
+                    q,
+                    data.path(),
+                    job,
+                    ticket,
+                    source.path().to_str().unwrap(),
+                )
+            })
+            .unwrap();
+        let w = host
+            .engine
+            .db()
+            .with(|q| sa_engine::workspaces::get(q, job))
+            .unwrap()
+            .unwrap();
+        let w = sa_engine::workspaces::provision(&w, data.path()).unwrap();
+        host.engine
+            .db()
+            .tx(|q| sa_engine::workspaces::save(q, &w))
+            .unwrap();
+        let entered = data.path().join("validation-entered");
+        let release = data.path().join("validation-release");
+        let script = data.path().join("validation-gate.ps1");
+        std::fs::write(
+            &script,
+            r#"param([string]$Entered,[string]$Release)
+[System.IO.File]::WriteAllText($Entered,'entered')
+$deadline=[DateTime]::UtcNow.AddSeconds(20)
+while(-not [System.IO.File]::Exists($Release)) {
+  if([DateTime]::UtcNow -gt $deadline) { exit 9 }
+  Start-Sleep -Milliseconds 20
+}
+exit 0
+"#,
+        )
+        .unwrap();
+        let command = vec![
+            "powershell.exe".into(),
+            "-NoProfile".into(),
+            "-NonInteractive".into(),
+            "-ExecutionPolicy".into(),
+            "Bypass".into(),
+            "-File".into(),
+            script.to_string_lossy().into_owned(),
+            entered.to_string_lossy().into_owned(),
+            release.to_string_lossy().into_owned(),
+        ];
+        (data, source, host, job, command, entered, release)
+    }
+
+    #[cfg(windows)]
+    struct ReleaseValidation(PathBuf);
+    #[cfg(windows)]
+    impl Drop for ReleaseValidation {
+        fn drop(&mut self) {
+            let _ = std::fs::write(&self.0, b"release");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn slow_workspace_validation_does_not_block_cancel_or_approval() {
+        let (_data, _source, host, job, command, entered, release) = slow_validation_fixture();
+        let _release_on_panic = ReleaseValidation(release.clone());
+        let approval_project = tempfile::tempdir().unwrap();
+        let cancel_project = tempfile::tempdir().unwrap();
+        let approve = create_fixture_ticket(&host, approval_project.path(), "ask");
+        let cancel = create_fixture_ticket(&host, cancel_project.path(), "ask");
+        let approval = |ticket| {
+            host.engine
+                .db()
+                .with(|q| {
+                    q.one(
+                        "SELECT id FROM approvals WHERE ticket=? AND decision='pending'",
+                        &[&ticket],
+                    )
+                })
+                .unwrap()
+        };
+        until(|| approval(approve).is_some() && approval(cancel).is_some());
+        let id = approval(approve).unwrap()["id"].as_i64().unwrap();
+        host.submit(Action::ValidateWorkspace { job, command });
+        until(|| entered.is_file());
+        host.submit(Action::Decide { id, allow: true });
+        host.submit(Action::Cancel { ticket: cancel });
+        // The gate cannot complete yet: these acknowledgements prove that the
+        // real subprocess does not occupy the ordered operator-action queue.
+        let first = host
+            .rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("approval blocked behind validation");
+        let second = host
+            .rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("cancel blocked behind validation");
+        assert_eq!(first.kind, ActionKind::Decide { allow: true });
+        assert!(first.result.is_ok());
+        assert_eq!(second.kind, ActionKind::Cancel);
+        assert!(second.result.is_ok());
+        assert!(!release.exists());
+        until(|| root_state(&host, approve) == "done" && root_state(&host, cancel) == "cancelled");
+        std::fs::write(&release, b"release").unwrap();
+        let completed = outcome(&host);
+        assert_eq!(completed.kind, ActionKind::Meta);
+        assert!(completed.result.is_ok(), "{:?}", completed.result);
+        assert_eq!(
+            host.engine
+                .db()
+                .with(|q| sa_engine::workspaces::get(q, job))
+                .unwrap()
+                .unwrap()
+                .state,
+            "validated"
+        );
+        assert!(
+            host.rx.try_recv().is_err(),
+            "each maintenance action emits exactly one Outcome"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn shutdown_quiesces_models_but_drains_maintenance_before_releasing_journal() {
+        let (data, _source, mut host, job, command, entered, release) = slow_validation_fixture();
+        let _release_on_panic = ReleaseValidation(release.clone());
+        let waiting_project = tempfile::tempdir().unwrap();
+        let ticket = create_fixture_ticket(&host, waiting_project.path(), "ask");
+        until(|| {
+            host.engine
+                .db()
+                .with(|q| {
+                    q.exists(
+                        "SELECT 1 FROM approvals WHERE ticket=? AND decision='pending'",
+                        &[&ticket],
+                    )
+                })
+                .unwrap()
+        });
+        host.submit(Action::ValidateWorkspace { job, command });
+        until(|| entered.exists());
+        host.tx.take();
+        until(|| host.active_count() == 0);
+        assert!(
+            owner::is_claimed(data.path()),
+            "maintenance still owns the journal"
+        );
+        assert!(
+            !host.engine.db().is_closed(),
+            "background receipt needs the open DB"
+        );
+        assert!(host.rx.try_recv().is_err(), "maintenance has not completed");
+        std::fs::write(&release, b"release").unwrap();
+        host.shutdown();
+        let completed = outcome(&host);
+        assert_eq!(completed.kind, ActionKind::Meta);
+        assert!(completed.result.is_ok());
+        assert!(host.engine.db().is_closed());
+        assert!(!owner::is_claimed(data.path()));
+        let db = rusqlite::Connection::open(data.path().join(sa_store::DB_FILE)).unwrap();
+        assert_eq!(
+            db.query_row("SELECT state FROM job_workspaces WHERE job=?", [job], |r| r
+                .get::<_, String>(0))
+                .unwrap(),
+            "validated"
+        );
+        assert_eq!(
+            db.query_row(
+                "SELECT count(*) FROM events WHERE kind='workspace.result'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn scm_binding_rejects_a_job_from_another_selected_ticket() {
+        let data = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let host = Host::start_with(data.path().into(), fakes, || {}).unwrap();
+        let ticket = create_fixture_ticket(&host, project.path(), "readonly");
+        let other = create_fixture_ticket(&host, project.path(), "readonly");
+        until(|| root_state(&host, ticket) == "done" && root_state(&host, other) == "done");
+        let job = host.engine.root(ticket).unwrap()["id"].as_i64().unwrap();
+        let foreign = host.engine.root(other).unwrap()["id"].as_i64().unwrap();
+        let url = "https://github.com/example/repository/pull/1".to_string();
+        host.submit(Action::BindScm {
+            ticket,
+            job: foreign,
+            url: url.clone(),
+        });
+        assert_eq!(outcome(&host).result.unwrap_err(), "该任务不属于当前工单");
+        assert!(host.scm_bindings(other).unwrap().is_empty());
+        assert!(host.scm_bindings(ticket).unwrap().is_empty());
+        host.submit(Action::BindScm {
+            ticket,
+            job,
+            url: url.clone(),
+        });
+        assert!(outcome(&host).result.is_ok());
+        let bound = host.scm_bindings(ticket).unwrap();
+        assert_eq!(bound.len(), 1);
+        assert_eq!(bound[0]["url"], url);
+        assert!(host.scm_bindings(other).unwrap().is_empty());
+        let inherited = host.branch_source(ticket).unwrap();
+        assert_eq!(inherited["lead"], "deepseek");
+        assert_eq!(inherited["permission_profile"], "readonly");
     }
 
     #[test]
@@ -1205,7 +1819,9 @@ pub(crate) mod tests {
         let mut host = Host::start_with(data.path().to_path_buf(), fakes, || {}).unwrap();
 
         // A second workbench on the same journal is refused.
-        let busy = Host::start_with(data.path().to_path_buf(), fakes, || {}).err().unwrap();
+        let busy = Host::start_with(data.path().to_path_buf(), fakes, || {})
+            .err()
+            .unwrap();
         assert_eq!(busy.to_string(), owner::BUSY);
 
         // Attachments outside the project are rejected before submission.
@@ -1237,17 +1853,35 @@ pub(crate) mod tests {
             files: Vec::new(),
         });
         assert!(outcome(&host).result.is_ok());
-        until(|| root_state(&host, ticket) == "done" && kinds(&host, ticket).iter().filter(|k| *k == "reply").count() == 2);
+        until(|| {
+            root_state(&host, ticket) == "done"
+                && kinds(&host, ticket)
+                    .iter()
+                    .filter(|k| *k == "reply")
+                    .count()
+                    == 2
+        });
 
         // Markdown transcript: goal, follow-up and both replies, controls removed.
         let md = data.path().join("t.md");
         crate::ops::export_markdown(data.path(), ticket, &md).unwrap();
         let text = std::fs::read_to_string(&md).unwrap();
-        assert!(text.starts_with("# fixture
-"), "{text}");
-        assert!(text.contains("## 你 · 追加指令") && text.contains("继续"), "{text}");
+        assert!(
+            text.starts_with(
+                "# fixture
+"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("## 你 · 追加指令") && text.contains("继续"),
+            "{text}"
+        );
         assert_eq!(text.matches("· 主控 ·").count(), 2, "{text}");
-        assert!(crate::ops::export_markdown(data.path(), ticket, &md).is_err(), "never overwrites");
+        assert!(
+            crate::ops::export_markdown(data.path(), ticket, &md).is_err(),
+            "never overwrites"
+        );
 
         host.submit(Action::PlanAdd {
             ticket,
@@ -1264,13 +1898,19 @@ pub(crate) mod tests {
         let id = plan["id"].as_i64().unwrap();
         host.submit(Action::PlanToggle { ticket, id });
         assert!(outcome(&host).result.is_ok());
-        host.submit(Action::PlanToggle { ticket, id: id + 99 });
+        host.submit(Action::PlanToggle {
+            ticket,
+            id: id + 99,
+        });
         assert_eq!(outcome(&host).result.unwrap_err(), "计划项不存在");
 
         // Invalid actions come back as errors without stopping the host.
         host.submit(Action::Retry { job: 9999 });
         assert!(outcome(&host).result.is_err());
-        host.submit(Action::Decide { id: 9999, allow: true });
+        host.submit(Action::Decide {
+            id: 9999,
+            allow: true,
+        });
         assert_eq!(outcome(&host).result.unwrap_err(), "审批已失效");
         host.submit(Action::Create {
             goal: "  ".into(),
@@ -1306,7 +1946,10 @@ pub(crate) mod tests {
         let routes = json!({"codex":{"provider":"test-local","model":"default","mode":"cli","reasoning_effort":"high"}});
         let mut host = Host::start_with(data.path().into(), fakes, || {}).unwrap();
         assert!(host.allow_lead_routing_default());
-        host.submit(Action::SaveDefaults { selections: routes.clone(), allow_lead_routing: false });
+        host.submit(Action::SaveDefaults {
+            selections: routes.clone(),
+            allow_lead_routing: false,
+        });
         assert!(outcome(&host).result.is_ok());
         assert!(!host.allow_lead_routing_default());
         assert_eq!(host.defaults(), routes);
@@ -1315,23 +1958,52 @@ pub(crate) mod tests {
         let host = Host::start_with(data.path().into(), fakes, || {}).unwrap();
         assert!(!host.allow_lead_routing_default());
         host.submit(Action::Create {
-            goal: "fixed primary".into(), cwd: Some(project.path().into()), lead: "codex".into(),
-            profile: "readonly".into(), files: Vec::new(), selections: None,
-            allow_lead_routing: None, extensions: None,
+            goal: "fixed primary".into(),
+            cwd: Some(project.path().into()),
+            lead: "codex".into(),
+            profile: "readonly".into(),
+            files: Vec::new(),
+            selections: None,
+            allow_lead_routing: None,
+            extensions: None,
         });
         let ticket = outcome(&host).result.unwrap().unwrap();
         until(|| root_state(&host, ticket) == "done");
-        let policy = || host.engine.db().with(|q| q.one("SELECT allow_lead_routing FROM tickets WHERE id=?", &[&ticket])).unwrap().unwrap()["allow_lead_routing"].as_i64().unwrap();
+        let policy = || {
+            host.engine
+                .db()
+                .with(|q| {
+                    q.one(
+                        "SELECT allow_lead_routing FROM tickets WHERE id=?",
+                        &[&ticket],
+                    )
+                })
+                .unwrap()
+                .unwrap()["allow_lead_routing"]
+                .as_i64()
+                .unwrap()
+        };
         assert_eq!(policy(), 0);
-        let bound = || host.engine.db().with(|q| q.one("SELECT route FROM native_routes WHERE job=(SELECT id FROM jobs WHERE ticket=? AND parent IS NULL)", &[&ticket])).unwrap().unwrap()["route"].as_str().unwrap().to_string();
+        let bound = || {
+            host.engine.db().with(|q| q.one("SELECT route FROM native_routes WHERE job=(SELECT id FROM jobs WHERE ticket=? AND parent IS NULL)", &[&ticket])).unwrap().unwrap()["route"].as_str().unwrap().to_string()
+        };
         let fixed = bound();
-        assert_eq!(serde_json::from_str::<Value>(&fixed).unwrap()["reasoning_effort"], "high");
-        host.submit(Action::SetLeadRouting { ticket, enabled: true });
+        assert_eq!(
+            serde_json::from_str::<Value>(&fixed).unwrap()["reasoning_effort"],
+            "high"
+        );
+        host.submit(Action::SetLeadRouting {
+            ticket,
+            enabled: true,
+        });
         assert!(outcome(&host).result.is_ok());
         assert_eq!(policy(), 1);
         assert_eq!(bound(), fixed);
 
-        host.submit(Action::SaveDefaults { selections: json!({"unknown":{"provider":"x","model":"y","mode":"cli"}}), allow_lead_routing: true });
+        host.submit(Action::SaveDefaults {
+            selections: json!({"unknown":{"provider":"x","model":"y","mode":"cli"}}),
+            allow_lead_routing: true,
+        });
         assert!(outcome(&host).result.is_err());
         assert!(!host.allow_lead_routing_default());
         assert_eq!(host.defaults(), routes);

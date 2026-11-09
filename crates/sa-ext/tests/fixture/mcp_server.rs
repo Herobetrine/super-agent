@@ -50,11 +50,19 @@ fn handle(msg: &Value) -> Option<Value> {
     let id = msg.get("id")?.clone();
     let params = msg.get("params").cloned().unwrap_or(json!({}));
     let result = match msg["method"].as_str().unwrap_or_default() {
-        "initialize" => Ok(json!({
-            "protocolVersion": params["protocolVersion"],
-            "capabilities": {"tools": {}},
-            "serverInfo": {"name": "studio-proof", "version": "1"}
-        })),
+        "initialize" => {
+            append(".initializes");
+            let reject = format!("{}.reject-init", secret());
+            if std::fs::remove_file(reject).is_ok() {
+                Err(json!({"code": -32603, "message": "fixture refused initialization"}))
+            } else {
+                Ok(json!({
+                    "protocolVersion": params["protocolVersion"],
+                    "capabilities": {"tools": {}},
+                    "serverInfo": {"name": "studio-proof", "version": "1"}
+                }))
+            }
+        }
         "ping" => Ok(json!({})),
         "tools/list" => Ok(match params["cursor"].as_str() {
             None => json!({
@@ -68,11 +76,22 @@ fn handle(msg: &Value) -> Option<Value> {
         "tools/call" => match params["name"].as_str().unwrap_or_default() {
             "challenge" => {
                 append(".calls");
-                Ok(text(std::fs::read_to_string(secret()).unwrap()))
+                match params["arguments"]["fixture"].as_str() {
+                    Some("disconnect") => std::process::exit(0),
+                    Some("identity") => Ok(text(
+                        json!({
+                            "pid": std::process::id(), "cwd": std::env::current_dir().unwrap()
+                        })
+                        .to_string(),
+                    )),
+                    _ => Ok(text(std::fs::read_to_string(secret()).unwrap())),
+                }
             }
             "env" => {
                 let name = params["arguments"]["name"].as_str().unwrap_or_default();
-                Ok(text(std::env::var(name).unwrap_or_else(|_| "<unset>".into())))
+                Ok(text(
+                    std::env::var(name).unwrap_or_else(|_| "<unset>".into()),
+                ))
             }
             "fail" => Ok(json!({"content": [{"type": "text", "text": "boom"}], "isError": true})),
             "big" => Ok(text("x".repeat(600 * 1024))),

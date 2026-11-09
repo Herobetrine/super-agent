@@ -11,7 +11,7 @@ use std::{path::PathBuf, sync::Arc, time::Duration};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-pub const AGENTS: [&str; 4] = ["codex", "claude", "deepseek", "antigravity"];
+pub const AGENTS: [&str; 5] = ["codex", "claude", "deepseek", "antigravity", "acp"];
 
 /// `{provider, model, mode}` selection (spec §6.4).
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]

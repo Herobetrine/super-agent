@@ -25,6 +25,7 @@ pub mod skills;
 pub mod validate;
 
 mod invoke;
+mod pool;
 
 use anyhow::{Result, bail, ensure};
 use futures::future::BoxFuture;
@@ -87,6 +88,7 @@ pub(crate) struct Inner {
     pub(crate) db: Db,
     pub(crate) data_dir: PathBuf,
     opts: ExtOptions,
+    pub(crate) pool: pool::Pool,
 }
 
 /// The extension service. Cheap to clone; all clones share one connection.
@@ -117,7 +119,10 @@ fn clear_default(q: &Q, group: &str, id: &str) -> Result<()> {
 }
 
 fn defaults_in(q: &Q) -> Result<Value> {
-    let row = q.one("SELECT selected FROM studio_extension_defaults WHERE singleton=1", &[])?;
+    let row = q.one(
+        "SELECT selected FROM studio_extension_defaults WHERE singleton=1",
+        &[],
+    )?;
     parse(row.as_ref().map_or(EMPTY_SCOPE, |r| text(r, "selected")))
 }
 
@@ -141,20 +146,27 @@ impl ProjectExtensions {
                 .collect::<rusqlite::Result<_>>()?;
             for (name, definition) in SERVER_ADDITIONS {
                 if !existing.contains(name) {
-                    q.conn()
-                        .execute_batch(&format!("ALTER TABLE studio_servers ADD COLUMN {name} {definition}"))?;
+                    q.conn().execute_batch(&format!(
+                        "ALTER TABLE studio_servers ADD COLUMN {name} {definition}"
+                    ))?;
                 }
             }
             Ok(())
         })?;
         Ok(Self {
-            inner: Arc::new(Inner { db, data_dir, opts }),
+            inner: Arc::new(Inner {
+                db,
+                data_dir,
+                opts,
+                pool: pool::Pool::default(),
+            }),
         })
     }
 
     /// Close the service's journal connection. In-flight MCP calls fail
     /// their final write; their server processes are torn down on drop.
     pub fn close(&self) {
+        self.inner.pool.clear();
         self.inner.db.close();
     }
 
@@ -239,7 +251,10 @@ impl ProjectExtensions {
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_default();
         self.inner.db.with(|q| {
-            q.run("INSERT OR REPLACE INTO studio_skill_dirs VALUES(?,?)", &[&s.id, &dir])?;
+            q.run(
+                "INSERT OR REPLACE INTO studio_skill_dirs VALUES(?,?)",
+                &[&s.id, &dir],
+            )?;
             Ok(())
         })?;
         Ok(s.id)
@@ -283,8 +298,10 @@ impl ProjectExtensions {
         };
         let args_ok = args.as_array().is_some_and(|a| {
             a.len() <= 64
-                && a.iter()
-                    .all(|s| s.as_str().is_some_and(|s| utf16_len(s) <= 8192 && !s.contains('\0')))
+                && a.iter().all(|s| {
+                    s.as_str()
+                        .is_some_and(|s| utf16_len(s) <= 8192 && !s.contains('\0'))
+                })
         });
         let (true, Some(enabled), true) = (nonempty(row.get("name"), 100), enabled, args_ok) else {
             bail!("MCP 服务参数无效");
@@ -321,7 +338,7 @@ impl ProjectExtensions {
             Some(v) if v.as_f64() == Some(0.0) => None,
             Some(_) => bail!("此服务已删除"),
         };
-        self.inner.db.tx(|q| {
+        let saved = self.inner.db.tx(|q| {
             let old = match &wanted {
                 Some(id) => {
                     let old = q.one("SELECT * FROM studio_servers WHERE id=?", &[id])?;
@@ -359,8 +376,12 @@ impl ProjectExtensions {
             if !enabled || !same {
                 clear_default(q, "servers", &id)?;
             }
-            Ok(id)
-        })
+            Ok((id, old.as_ref().is_some_and(|o| text(o, "revision") != revision)))
+        })?;
+        if saved.1 {
+            self.inner.pool.revoke(&saved.0);
+        }
+        Ok(saved.0)
     }
 
     /// `mcpRemove({id})` → `remove(id)` (X:201-206).
@@ -368,7 +389,9 @@ impl ProjectExtensions {
         self.inner.db.tx(|q| {
             q.run("DELETE FROM studio_servers WHERE id=?", &[&id])?;
             clear_default(q, "servers", id)
-        })
+        })?;
+        self.inner.pool.revoke(id);
+        Ok(())
     }
 
     /// `mcpProbe({id})` → `probe(id)` (X:207-238): connect, page through
@@ -395,7 +418,10 @@ impl ProjectExtensions {
                     let description = t
                         .get("description")
                         .filter(|d| d.as_str().is_some_and(|d| !d.is_empty()));
-                    tool.insert("description".into(), description.cloned().unwrap_or(json!("")));
+                    tool.insert(
+                        "description".into(),
+                        description.cloned().unwrap_or(json!("")),
+                    );
                     if let Some(schema) = t.get("inputSchema") {
                         tool.insert("inputSchema".into(), schema.clone());
                     }
@@ -457,7 +483,10 @@ impl ProjectExtensions {
         let servers = self.inner.db.with(|q| {
             let mut out = vec![];
             for id in &d.servers {
-                let row = q.one("SELECT * FROM studio_servers WHERE id=? AND enabled=1", &[id])?;
+                let row = q.one(
+                    "SELECT * FROM studio_servers WHERE id=? AND enabled=1",
+                    &[id],
+                )?;
                 let Some(row) = row.filter(|r| r.get("tools").is_some_and(Value::is_string)) else {
                     bail!("请先启用服务并连接读取工具");
                 };
@@ -507,7 +536,9 @@ impl ProjectExtensions {
                         &[&s["id"].as_str(), &s["revision"].as_str()],
                     )?;
                     if live {
-                        mcp.push(json!({"server": s["id"], "name": s["name"], "tools": s["tools"]}));
+                        mcp.push(
+                            json!({"server": s["id"], "name": s["name"], "tools": s["tools"]}),
+                        );
                     }
                 }
             }
@@ -563,7 +594,10 @@ pub fn summary_in(conn: &Connection, ticket: i64) -> Result<Value> {
 }
 
 fn scope_in(q: &Q, ticket: i64) -> Result<Value> {
-    let row = q.one("SELECT scope FROM studio_ticket_extensions WHERE ticket=?", &[&ticket])?;
+    let row = q.one(
+        "SELECT scope FROM studio_ticket_extensions WHERE ticket=?",
+        &[&ticket],
+    )?;
     parse(row.as_ref().map_or(EMPTY_SCOPE, |r| text(r, "scope")))
 }
 

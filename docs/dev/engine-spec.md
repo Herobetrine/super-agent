@@ -155,7 +155,7 @@ Studio's UI-visible subset is listed in ST:15-40.
   5. If ≥8 jobs were admitted, schedule another `tick()` on `setImmediate` (E:200-205). Reader concurrency is unbounded; T1 runs 80 readers plus 1 writer at once.
 
 ### 2.3 Writer serialization
-- **One declared writer runs at a time, process-wide and across tickets.** This is enforced by the in-memory `writer` slot (E:25, 151, 188, 197). T1 "declared writers serialize across tickets" checks it.
+- **Historical baseline: one declared writer runs at a time, process-wide and across tickets.** This was enforced by the in-memory `writer` slot (E:25, 151, 188, 197). T1 "declared writers serialize across tickets" checks overlapping project directories. The Rust update of 2026-11-09 uses canonical directory overlap instead: unrelated directories and isolated Git worktrees may write concurrently; the same/nested directory remains serialized. Operator validation/integration leases both the source and isolated directory. See [community integration](community-integration.md) and `tests/workspaces.rs` for the current behavior; the numbered JavaScript algorithm above remains a historical reference.
 - Readers always run concurrently.
 - `writing` means a declared write, not an OS capability. A full or auto child dispatched with `write:false` is a "reader" but still has full OS access (G:39-41).
 

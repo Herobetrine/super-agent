@@ -87,6 +87,10 @@ impl App {
                     } else {
                         self.footer(ui);
                     }
+                    if let Some(snapshot) = self.view.as_ref().and_then(|view| view.snap.as_ref()) {
+                        ui.add_space(6.0);
+                        crate::usage::footer(ui, &snapshot.usage, &pal);
+                    }
                 });
             });
 

@@ -29,6 +29,9 @@ mod usage;
 mod ui_tests;
 mod widgets;
 mod worker;
+mod workflow;
+#[cfg(test)]
+mod workflow_tests;
 
 use std::sync::{Arc, Mutex};
 

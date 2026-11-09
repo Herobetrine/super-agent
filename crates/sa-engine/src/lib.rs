@@ -10,6 +10,7 @@
 //! - `activity`: live per-job activity and status badges for the UI.
 
 pub mod activity;
+pub mod checkpoints;
 pub mod adapter;
 pub mod autonomy;
 pub mod context;
@@ -25,6 +26,9 @@ pub mod protocol;
 pub mod resilience;
 pub mod runner;
 pub mod services;
+pub mod scm;
+pub mod workspaces;
+pub mod stuck;
 
 pub use activity::{ActivityPhase, BadgeTone, JobActivity, RetryInfo};
 pub use engine::{CreateParams, Engine, EngineOptions};

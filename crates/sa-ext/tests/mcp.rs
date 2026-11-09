@@ -4,7 +4,9 @@
 
 use futures::FutureExt;
 use futures::future::BoxFuture;
-use sa_engine::adapter::{AGENTS, Adapter, AdapterError, Catalog, EventSink, RunOutcome, RunRequest, TurnHost};
+use sa_engine::adapter::{
+    AGENTS, Adapter, AdapterError, Catalog, EventSink, RunOutcome, RunRequest, TurnHost,
+};
 use sa_engine::services::{Extensions, InvokeArgs};
 use sa_engine::{CreateParams, Engine, EngineOptions};
 use sa_ext::skills::SkillHomes;
@@ -75,7 +77,10 @@ struct Fx {
 }
 
 fn fx(script: Script) -> Fx {
-    let dir = tempfile::Builder::new().prefix("sa-ext-mcp-").tempdir().unwrap();
+    let dir = tempfile::Builder::new()
+        .prefix("sa-ext-mcp-")
+        .tempdir()
+        .unwrap();
     let state = dir.path().join("state");
     let secret = dir.path().join("secret");
     std::fs::write(&secret, SECRET).unwrap();
@@ -172,9 +177,34 @@ fn names(tools: &Value) -> Vec<&str> {
 }
 
 /// Start the HTTP fixture; returns the child and its `/mcp` URL.
-fn http_fixture(secret: &Path, token: Option<&str>) -> (Child, String) {
+struct HttpFixture(Child);
+
+impl std::ops::Deref for HttpFixture {
+    type Target = Child;
+    fn deref(&self) -> &Child {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for HttpFixture {
+    fn deref_mut(&mut self) -> &mut Child {
+        &mut self.0
+    }
+}
+
+impl Drop for HttpFixture {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+fn http_fixture(secret: &Path, token: Option<&str>) -> (HttpFixture, String) {
     let mut cmd = Command::new(FIXTURE);
-    cmd.arg(secret).arg("http").stdout(Stdio::piped()).stderr(Stdio::null());
+    cmd.arg(secret)
+        .arg("http")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
     if let Some(t) = token {
         cmd.env("FIXTURE_TOKEN", t);
     }
@@ -183,8 +213,10 @@ fn http_fixture(secret: &Path, token: Option<&str>) -> (Child, String) {
     std::io::BufReader::new(child.stdout.take().unwrap())
         .read_line(&mut line)
         .unwrap();
-    let port = serde_json::from_str::<Value>(&line).unwrap()["port"].as_u64().unwrap();
-    (child, format!("http://127.0.0.1:{port}/mcp"))
+    let port = serde_json::from_str::<Value>(&line).unwrap()["port"]
+        .as_u64()
+        .unwrap();
+    (HttpFixture(child), format!("http://127.0.0.1:{port}/mcp"))
 }
 
 fn alive(pid: u32) -> bool {
@@ -222,11 +254,18 @@ async fn skills_stdio_and_http_transports_consent_and_revocation() {
         names(&f.ext.probe(&server).await.unwrap()),
         ["challenge", "env", "fail", "big", "sleep"]
     );
-    let (ticket, job) = f.ticket("ask", json!({"skills": [skill], "servers": [server]})).await;
+    let (ticket, job) = f
+        .ticket("ask", json!({"skills": [skill], "servers": [server]}))
+        .await;
     f.run_job(job);
     std::fs::write(folder.join("SKILL.md"), "changed").unwrap();
     let ctx = f.ext.context(ticket, "ask");
-    assert!(ctx["skills"][0]["body"].as_str().unwrap().contains("Keep exact bytes"));
+    assert!(
+        ctx["skills"][0]["body"]
+            .as_str()
+            .unwrap()
+            .contains("Keep exact bytes")
+    );
     assert_eq!(ctx["mcp"][0]["server"], json!(server));
     assert_eq!(ctx["mcp"][0]["tools"].as_array().unwrap().len(), 5);
     assert_eq!(f.ext.context(ticket, "readonly")["mcp"], json!([]));
@@ -253,7 +292,10 @@ async fn skills_stdio_and_http_transports_consent_and_revocation() {
             .new_receipt
     );
     assert_eq!(f.ext.results(job)[0]["state"], json!("error"));
-    assert_eq!(f.ext.results(job)[0]["result"], json!({"error": "用户未批准调用"}));
+    assert_eq!(
+        f.ext.results(job)[0]["result"],
+        json!({"error": "用户未批准调用"})
+    );
     assert_eq!(f.calls(".calls"), None);
     // Approved once; an identical replay is a no-op.
     assert!(
@@ -301,10 +343,22 @@ async fn skills_stdio_and_http_transports_consent_and_revocation() {
     assert_ne!(text("env-path"), "<unset>");
 
     // isError results and oversized results.
-    f.ext.invoke(call("fail", "fail", true, json!({}))).await.unwrap();
-    f.ext.invoke(call("big", "big", true, json!({}))).await.unwrap();
+    f.ext
+        .invoke(call("fail", "fail", true, json!({})))
+        .await
+        .unwrap();
+    f.ext
+        .invoke(call("big", "big", true, json!({})))
+        .await
+        .unwrap();
     let results = f.ext.results(job);
-    let by = |id: &str| results.iter().find(|r| r["id"] == json!(id)).unwrap().clone();
+    let by = |id: &str| {
+        results
+            .iter()
+            .find(|r| r["id"] == json!(id))
+            .unwrap()
+            .clone()
+    };
     assert_eq!(by("fail")["state"], json!("error"));
     assert_eq!(by("fail")["result"]["isError"], json!(true));
     let big = by("big");
@@ -313,7 +367,10 @@ async fn skills_stdio_and_http_transports_consent_and_revocation() {
     assert!(object.starts_with(f.state.join("context-objects")));
     let raw = std::fs::read_to_string(&object).unwrap();
     assert_eq!(big["result"]["bytes"], json!(raw.len()));
-    assert_eq!(big["result"]["sha256"], json!(sa_engine::protocol::digest(&raw)));
+    assert_eq!(
+        big["result"]["sha256"],
+        json!(sa_engine::protocol::digest(&raw))
+    );
     assert!(raw.len() > 512 * 1024);
 
     // Unknown tools and readonly profiles never get a receipt.
@@ -335,7 +392,10 @@ async fn skills_stdio_and_http_transports_consent_and_revocation() {
     let kinds: Vec<&str> = events.iter().map(|e| e["kind"].as_str().unwrap()).collect();
     assert_eq!(kinds.iter().filter(|k| **k == "mcp.result").count(), 6);
     assert_eq!(kinds.iter().filter(|k| **k == "mcp.started").count(), 5);
-    let journal: String = events.iter().map(|e| e["payload"].as_str().unwrap()).collect();
+    let journal: String = events
+        .iter()
+        .map(|e| e["payload"].as_str().unwrap())
+        .collect();
     assert!(!journal.contains("sa-ext-secret-token"));
 
     // Disabling and re-enabling issues a new revision: the binding is revoked.
@@ -355,10 +415,14 @@ async fn skills_stdio_and_http_transports_consent_and_revocation() {
     let (mut plain, url) = http_fixture(&f.secret, None);
     let remote = f
         .ext
-        .save_server(&json!({"name": "HTTP local", "transport": "http", "url": url, "enabled": true}))
+        .save_server(
+            &json!({"name": "HTTP local", "transport": "http", "url": url, "enabled": true}),
+        )
         .unwrap();
     assert_eq!(names(&f.ext.probe(&remote).await.unwrap())[0], "challenge");
-    let (t2, j2) = f.ticket("full", json!({"skills": [], "servers": [remote]})).await;
+    let (t2, j2) = f
+        .ticket("full", json!({"skills": [], "servers": [remote]}))
+        .await;
     f.run_job(j2);
     let http_call = args(
         t2,
@@ -368,7 +432,10 @@ async fn skills_stdio_and_http_transports_consent_and_revocation() {
         json!({"id": "h", "server": remote, "tool": "challenge", "arguments": {}}),
     );
     assert!(f.ext.invoke(http_call).await.unwrap().new_receipt);
-    assert_eq!(f.ext.results(j2)[0]["result"]["content"][0]["text"], json!(SECRET));
+    assert_eq!(
+        f.ext.results(j2)[0]["result"]["content"][0]["text"],
+        json!(SECRET)
+    );
     plain.kill().unwrap();
 
     // Bearer token from the configured `MCP_*` variable only.
@@ -385,7 +452,9 @@ async fn skills_stdio_and_http_transports_consent_and_revocation() {
     );
     let anonymous = f
         .ext
-        .save_server(&json!({"name": "anonymous", "transport": "http", "url": url, "enabled": true}))
+        .save_server(
+            &json!({"name": "anonymous", "transport": "http", "url": url, "enabled": true}),
+        )
         .unwrap();
     assert!(f.ext.probe(&anonymous).await.is_err());
     let token = f
@@ -414,7 +483,10 @@ async fn sa_tool_from_a_turn_writes_a_receipt_and_takes_another_turn() {
     let f = fx(Arc::new(move |packet| {
         if packet["turn"] == json!(1) {
             let server = sid.lock().unwrap().clone();
-            assert_eq!(packet["project_extensions"]["mcp"][0]["server"], json!(server));
+            assert_eq!(
+                packet["project_extensions"]["mcp"][0]["server"],
+                json!(server)
+            );
             assert_eq!(packet["mcp_results"], json!([]));
             return format!("checking\n{}", call.replace("SERVER", &server));
         }
@@ -423,7 +495,9 @@ async fn sa_tool_from_a_turn_writes_a_receipt_and_takes_another_turn() {
     let server = f.stdio_server();
     *server_id.lock().unwrap() = server.clone();
     f.ext.probe(&server).await.unwrap();
-    let (ticket, job) = f.ticket("full", json!({"skills": [], "servers": [server]})).await;
+    let (ticket, job) = f
+        .ticket("full", json!({"skills": [], "servers": [server]}))
+        .await;
     f.engine.start().unwrap();
     let end = Instant::now() + Duration::from_secs(30);
     while f.engine.root(ticket).unwrap()["state"] != json!("done") {
@@ -474,7 +548,9 @@ async fn cancelling_an_issued_call_is_uncertain_and_stops_the_server() {
     let f = fx(Arc::new(|_| "unused".into()));
     let server = f.stdio_server();
     f.ext.probe(&server).await.unwrap();
-    let (ticket, job) = f.ticket("full", json!({"skills": [], "servers": [server]})).await;
+    let (ticket, job) = f
+        .ticket("full", json!({"skills": [], "servers": [server]}))
+        .await;
     f.run_job(job);
     let a = args(
         ticket,
@@ -508,7 +584,10 @@ async fn cancelling_an_issued_call_is_uncertain_and_stops_the_server() {
     assert_eq!(r["result"], json!({"error": "操作已取消"}));
     let end = Instant::now() + Duration::from_secs(10);
     while alive(pid) {
-        assert!(Instant::now() < end, "MCP server {pid} survived cancellation");
+        assert!(
+            Instant::now() < end,
+            "MCP server {pid} survived cancellation"
+        );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     // A stale turn cannot start a new call.
@@ -523,7 +602,318 @@ async fn cancelling_an_issued_call_is_uncertain_and_stops_the_server() {
         false,
         json!({"id": "late", "server": server, "tool": "challenge", "arguments": {}}),
     );
-    assert_eq!(f.ext.invoke(stale).await.unwrap_err().to_string(), "旧轮次已停止");
+    assert_eq!(
+        f.ext.invoke(stale).await.unwrap_err().to_string(),
+        "旧轮次已停止"
+    );
+    f.engine.close().await;
+    f.ext.close();
+}
+
+fn initializations(f: &Fx) -> usize {
+    f.calls(".initializes").unwrap_or_default().lines().count()
+}
+
+fn receipt(f: &Fx, job: i64, id: &str) -> Value {
+    f.ext
+        .results(job)
+        .into_iter()
+        .find(|r| r["id"] == id)
+        .unwrap()
+}
+
+fn pooled_call(
+    ticket: i64,
+    job: i64,
+    server: &str,
+    id: &str,
+    fixture: &str,
+    cwd: &Path,
+) -> InvokeArgs {
+    let mut a = args(
+        ticket,
+        job,
+        "full",
+        false,
+        json!({"id": id, "server": server, "tool": "challenge", "arguments": {"fixture": fixture}}),
+    );
+    a.cwd = cwd.to_string_lossy().into_owned();
+    a
+}
+
+async fn wait_dead(pid: u32) {
+    let end = Instant::now() + Duration::from_secs(10);
+    while alive(pid) {
+        assert!(Instant::now() < end, "MCP server {pid} survived cleanup");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn private_pool_reuses_stdio_and_isolates_ticket_cwd_and_revocation() {
+    let f = fx(Arc::new(|_| "unused".into()));
+    let server = f.stdio_server();
+    f.ext.probe(&server).await.unwrap();
+    assert_eq!(initializations(&f), 1);
+    let scope = json!({"skills": [], "servers": [server]});
+    let (ticket, job) = f.ticket("full", scope.clone()).await;
+    f.run_job(job);
+    for id in ["one", "two"] {
+        f.ext
+            .invoke(pooled_call(
+                ticket,
+                job,
+                &server,
+                id,
+                "identity",
+                f.dir.path(),
+            ))
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        initializations(&f),
+        2,
+        "one probe plus one reused ticket session"
+    );
+    let identity = |job, id| {
+        serde_json::from_str::<Value>(
+            receipt(&f, job, id)["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap()
+    };
+    let first = identity(job, "one");
+    assert_eq!(first, identity(job, "two"));
+    assert_eq!(
+        std::fs::canonicalize(first["cwd"].as_str().unwrap()).unwrap(),
+        std::fs::canonicalize(f.dir.path()).unwrap()
+    );
+    let first_pid = first["pid"].as_u64().unwrap() as u32;
+
+    let (other_ticket, other_job) = f.ticket("full", scope).await;
+    f.run_job(other_job);
+    f.ext
+        .invoke(pooled_call(
+            other_ticket,
+            other_job,
+            &server,
+            "other",
+            "identity",
+            f.dir.path(),
+        ))
+        .await
+        .unwrap();
+    let other_pid = identity(other_job, "other")["pid"].as_u64().unwrap() as u32;
+    assert_ne!(first_pid, other_pid);
+    assert_eq!(
+        initializations(&f),
+        3,
+        "tickets never share a server session"
+    );
+
+    let next_cwd = f.dir.path().join("another-worktree");
+    std::fs::create_dir(&next_cwd).unwrap();
+    f.ext
+        .invoke(pooled_call(
+            ticket, job, &server, "moved", "identity", &next_cwd,
+        ))
+        .await
+        .unwrap();
+    let moved_pid = identity(job, "moved")["pid"].as_u64().unwrap() as u32;
+    assert_eq!(initializations(&f), 4);
+    assert_ne!(first_pid, moved_pid);
+    wait_dead(first_pid).await;
+    assert!(
+        alive(other_pid),
+        "one ticket changing cwd must not stop another ticket"
+    );
+
+    f.ext.save_server(&json!({"id": server, "name": "proof", "command": FIXTURE, "args": [f.secret], "enabled": false})).unwrap();
+    wait_dead(moved_pid).await;
+    wait_dead(other_pid).await;
+    assert!(
+        f.ext
+            .invoke(pooled_call(
+                ticket, job, &server, "revoked", "identity", &next_cwd
+            ))
+            .await
+            .unwrap()
+            .new_receipt
+    );
+    assert_eq!(receipt(&f, job, "revoked")["state"], "error");
+    assert_eq!(initializations(&f), 4, "revoked grant must not reconnect");
+    f.engine.close().await;
+    f.ext.close();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pooled_transport_failure_is_not_replayed_and_next_call_reconnects() {
+    let f = fx(Arc::new(|_| "unused".into()));
+    let server = f.stdio_server();
+    f.ext.probe(&server).await.unwrap();
+    let (ticket, job) = f
+        .ticket("full", json!({"skills": [], "servers": [server]}))
+        .await;
+    f.run_job(job);
+    let call = |id, mode| pooled_call(ticket, job, &server, id, mode, f.dir.path());
+    f.ext.invoke(call("warm", "identity")).await.unwrap();
+    let broken = call("lost", "disconnect");
+    f.ext.invoke(broken.clone()).await.unwrap();
+    assert_eq!(receipt(&f, job, "lost")["state"], "uncertain");
+    assert!(!f.ext.invoke(broken).await.unwrap().new_receipt);
+    assert_eq!(
+        f.calls(".calls").unwrap().lines().count(),
+        2,
+        "lost tool call must not replay"
+    );
+    f.ext.invoke(call("after", "identity")).await.unwrap();
+    assert_eq!(receipt(&f, job, "after")["state"], "done");
+    assert_eq!(initializations(&f), 3);
+    f.engine.close().await;
+    f.ext.close();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn failed_initialization_does_not_poison_private_pool() {
+    let f = fx(Arc::new(|_| "unused".into()));
+    let server = f.stdio_server();
+    f.ext.probe(&server).await.unwrap();
+    let (ticket, job) = f
+        .ticket("full", json!({"skills": [], "servers": [server]}))
+        .await;
+    f.run_job(job);
+    std::fs::write(format!("{}.reject-init", f.secret.display()), "reject once").unwrap();
+    f.ext
+        .invoke(pooled_call(
+            ticket,
+            job,
+            &server,
+            "fail-connect",
+            "identity",
+            f.dir.path(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(receipt(&f, job, "fail-connect")["state"], "error");
+    assert_eq!(
+        f.calls(".calls"),
+        None,
+        "failed initialization must not issue tools/call"
+    );
+    f.ext
+        .invoke(pooled_call(
+            ticket,
+            job,
+            &server,
+            "retry-new",
+            "identity",
+            f.dir.path(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(receipt(&f, job, "retry-new")["state"], "done");
+    assert_eq!(initializations(&f), 3);
+    f.engine.close().await;
+    f.ext.close();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn http_private_pool_reuses_handshake_and_keeps_ticket_sessions_separate() {
+    let f = fx(Arc::new(|_| "unused".into()));
+    let (mut process, url) = http_fixture(&f.secret, None);
+    let server = f
+        .ext
+        .save_server(
+            &json!({"name": "HTTP pool", "transport": "http", "url": url, "enabled": true}),
+        )
+        .unwrap();
+    f.ext.probe(&server).await.unwrap();
+    let scope = json!({"skills": [], "servers": [server]});
+    let (ticket, job) = f.ticket("full", scope.clone()).await;
+    f.run_job(job);
+    for id in ["h1", "h2"] {
+        f.ext
+            .invoke(pooled_call(
+                ticket,
+                job,
+                &server,
+                id,
+                "identity",
+                f.dir.path(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(receipt(&f, job, id)["state"], "done");
+    }
+    assert_eq!(initializations(&f), 2);
+    let (other_ticket, other_job) = f.ticket("full", scope).await;
+    f.run_job(other_job);
+    f.ext
+        .invoke(pooled_call(
+            other_ticket,
+            other_job,
+            &server,
+            "h3",
+            "identity",
+            f.dir.path(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(initializations(&f), 3);
+    f.ext.remove(&server).unwrap();
+    f.ext
+        .invoke(pooled_call(
+            ticket,
+            job,
+            &server,
+            "h4",
+            "identity",
+            f.dir.path(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(receipt(&f, job, "h4")["state"], "error");
+    assert_eq!(initializations(&f), 3);
+    f.engine.close().await;
+    f.ext.close();
+    process.kill().unwrap();
+    process.wait().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn revoking_active_pool_call_marks_uncertain_and_closes_process() {
+    let f = fx(Arc::new(|_| "unused".into()));
+    let server = f.stdio_server();
+    f.ext.probe(&server).await.unwrap();
+    let (ticket, job) = f
+        .ticket("full", json!({"skills": [], "servers": [server]}))
+        .await;
+    f.run_job(job);
+    let a = args(
+        ticket,
+        job,
+        "full",
+        false,
+        json!({"id": "active", "server": server, "tool": "sleep"}),
+    );
+    let ext = f.ext.clone();
+    let task = tokio::spawn(async move { ext.invoke(a).await });
+    let end = Instant::now() + Duration::from_secs(20);
+    while f.calls(".sleeps").is_none() {
+        assert!(Instant::now() < end);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let pid: u32 = f.calls(".pid").unwrap().parse().unwrap();
+    f.ext.remove(&server).unwrap();
+    tokio::time::timeout(Duration::from_secs(2), task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(receipt(&f, job, "active")["state"], "uncertain");
+    wait_dead(pid).await;
     f.engine.close().await;
     f.ext.close();
 }
