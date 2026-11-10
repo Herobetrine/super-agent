@@ -41,6 +41,8 @@ pub struct ServerForm {
     pub token_env: String,
     pub enabled: bool,
     pub trusted: bool,
+    pub directory_only: bool,
+    pub scope_root: String,
 }
 
 pub enum View {
@@ -65,6 +67,9 @@ enum Task {
 pub struct ExtDialog {
     pub scope: ExtScope,
     cwd: Option<PathBuf>,
+    current_project: Option<PathBuf>,
+    defaults_directory: bool,
+    defaults_path: String,
     pub data: Option<Result<Value, String>>,
     /// Ticket grants (locked) or the draft's previous choice.
     saved: Option<Value>,
@@ -109,9 +114,11 @@ impl ExtDialog {
         if !self.locked {
             let servers = data["servers"].as_array().cloned().unwrap_or_default();
             self.servers.retain(|id| {
-                servers
-                    .iter()
-                    .any(|s| s["id"].as_str() == Some(id) && s["enabled"] == json!(true) && s["tools"].is_array())
+                let available = self.scope != ExtScope::Defaults
+                    || data["availableServers"].as_array().is_some_and(|ids| ids.iter().any(|v| v.as_str() == Some(id)));
+                available && servers.iter().any(|row| {
+                    row["id"].as_str() == Some(id) && row["enabled"] == json!(true) && row["tools"].is_array()
+                })
             });
             let skills = data["skills"].as_array().cloned().unwrap_or_default();
             self.skills.retain(|id| skills.iter().any(|s| s["id"].as_str() == Some(id)));
@@ -136,6 +143,9 @@ impl App {
         self.extensions = Some(ExtDialog {
             scope,
             cwd,
+            current_project: self.composer.project.clone(),
+            defaults_directory: false,
+            defaults_path: self.composer.project.as_ref().map(|p| p.display().to_string()).unwrap_or_default(),
             data: None,
             saved,
             skills: vec![],
@@ -155,9 +165,23 @@ impl App {
     fn ext_task(&mut self, task: Task) {
         let (Some(host), Some(d)) = (&self.host, self.extensions.as_mut()) else { return };
         let ext = host.ext();
+        d.data = None;
         let cwd = d.cwd.clone();
+        let management = d.scope == ExtScope::Defaults;
         let pending = match &task {
-            Task::Reload => Pending::spawn(&self.ctx, move || ext.list(cwd.as_deref())),
+            Task::Reload => Pending::spawn(&self.ctx, move || {
+                if !management {
+                    return ext.list(cwd.as_deref());
+                }
+                let mut data = ext.list(None)?;
+                let scoped = if cwd.is_some() { ext.list(cwd.as_deref())? } else { data.clone() };
+                data["skills"] = scoped["skills"].clone();
+                data["defaults"] = scoped["defaults"].clone();
+                data["availableServers"] = json!(scoped["servers"].as_array().into_iter().flatten()
+                    .filter(|r| cwd.is_some() || s(r, "scopeRoot").is_empty())
+                    .map(|r| s(r, "id")).collect::<Vec<_>>());
+                Ok(data)
+            }),
             _ => return,
         };
         d.task = Some((task, pending));
@@ -290,7 +314,8 @@ impl App {
                             );
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                 if !d.locked {
-                                    let ok = !busy && matches!(d.data, Some(Ok(_)));
+                                    let ok = !busy && matches!(d.data, Some(Ok(_)))
+                                        && !(d.scope == ExtScope::Defaults && d.defaults_directory && d.cwd.is_none());
                                     if ui
                                         .add_enabled_ui(ok, |ui| widgets::primary_button(ui, icon::CHECK, "保存授权", &pal, ok))
                                         .inner
@@ -299,9 +324,10 @@ impl App {
                                         match d.scope {
                                             ExtScope::Defaults => {
                                                 let sel = d.selection();
+                                                let cwd = d.cwd.clone();
                                                 next = Some((
                                                     Task::Saved,
-                                                    Box::new(move |ext, _| ext.set_defaults(&sel, None).map(|_| Value::Null)),
+                                                    Box::new(move |ext, _| ext.set_defaults(&sel, cwd.as_deref()).map(|_| Value::Null)),
                                                 ));
                                             }
                                             _ => save_draft = Some((!d.follow).then(|| d.selection())),
@@ -435,9 +461,60 @@ fn list_view(
             d.query.clear();
         }
     });
+    if d.scope == ExtScope::Defaults {
+        let before = d.defaults_directory;
+        ui.add_enabled_ui(!busy, |ui| {
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut d.defaults_directory, false, "全局默认授权");
+                ui.selectable_value(&mut d.defaults_directory, true, "工作目录默认授权");
+            });
+            if d.defaults_directory {
+                let previous_path = d.defaults_path.clone();
+                let r = ui.add(egui::TextEdit::singleline(&mut d.defaults_path).hint_text("工作目录绝对路径").desired_width(440.0));
+                r.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::TextEdit, true, "默认授权工作目录"));
+                ui.horizontal(|ui| {
+                    if ui.add_enabled(d.current_project.is_some(), egui::Button::new("使用当前草稿目录")).clicked() {
+                        d.defaults_path = d.current_project.as_ref().unwrap().display().to_string();
+                    }
+                    if ui.button("浏览默认授权目录").clicked()
+                        && let Some(path) = rfd::FileDialog::new().set_title("选择默认授权工作目录").pick_folder()
+                    {
+                        d.defaults_path = path.display().to_string();
+                    }
+                    if previous_path != d.defaults_path {
+                        d.cwd = None;
+                    }
+                    if ui.button("载入目录默认授权").clicked() {
+                        match sa_engine::services::realpath(std::path::Path::new(d.defaults_path.trim())) {
+                            Ok(path) if path.is_dir() => {
+                                d.cwd = Some(path);
+                                d.selection_ready = false;
+                                d.data = None;
+                                d.notice = None;
+                                *reload = true;
+                            }
+                            _ => d.notice = Some(("请选择存在的工作目录。".into(), true)),
+                        }
+                    }
+                });
+                ui.label(RichText::new("目录默认授权覆盖全局默认，适用于该目录及子目录；最近的祖先目录配置优先。").font(theme::body(theme::SMALL)).color(pal.mute));
+            }
+        });
+        if before != d.defaults_directory {
+            d.cwd = None;
+            d.selection_ready = false;
+            d.data = None;
+            *reload = true;
+        }
+        if let Some(path) = &d.cwd {
+            ui.label(format!("正在编辑目录默认 · {}", path.display()));
+        } else if d.defaults_directory {
+            ui.label(RichText::new("先载入目录，再保存该目录默认授权。").color(pal.warn.fg));
+        }
+    }
     if d.scope == ExtScope::Draft {
         let before = d.follow;
-        widgets::toggle(ui, &mut d.follow, "跟随全局默认授权", pal);
+        widgets::toggle(ui, &mut d.follow, "跟随工作目录有效默认授权", pal);
         if d.follow && !before {
             d.skills = ids(data["defaults"].get("skills"));
             d.servers = ids(data["defaults"].get("servers"));
@@ -517,6 +594,8 @@ fn list_view(
         let missing = row["missing"] == json!(true);
         let inactive = servers && row["enabled"] != json!(true);
         let unprobed = servers && !row["tools"].is_array();
+        let outside = servers && d.scope == ExtScope::Defaults
+            && !data["availableServers"].as_array().is_some_and(|ids| ids.iter().any(|v| v.as_str() == Some(&id)));
         Frame::new()
             .fill(pal.canvas)
             .stroke(Stroke::new(1.0_f32, pal.line_soft))
@@ -527,7 +606,7 @@ fn list_view(
                 ui.horizontal(|ui| {
                     let list = if servers { &mut d.servers } else { &mut d.skills };
                     let mut on = list.contains(&id);
-                    let enabled = !d.locked && !d.follow && (on || !(missing || inactive || unprobed));
+                    let enabled = !d.locked && !d.follow && !outside && (on || !(missing || inactive || unprobed));
                     let r = ui.add_enabled(enabled, egui::Checkbox::new(&mut on, RichText::new(&name).strong()));
                     let label = format!("选择 {name}");
                     r.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Checkbox, enabled, on, &label));
@@ -560,6 +639,16 @@ fn list_view(
                         format!("stdio · {}", s(&row, "command"))
                     };
                     ui.label(RichText::new(line).monospace().size(11.5).color(pal.mute));
+                    let root = s(&row, "scopeRoot");
+                    let scope = if root.is_empty() {
+                        "适用目录 · 全局".to_string()
+                    } else {
+                        format!("适用目录 · {root} 及子目录（其他项目不可用）")
+                    };
+                    ui.label(RichText::new(scope).font(theme::body(theme::SMALL)).color(pal.mute));
+                    if outside {
+                        ui.label(RichText::new("请载入适用的工作目录默认授权后勾选此服务。").font(theme::body(theme::SMALL)).color(pal.warn.fg));
+                    }
                     if d.scope == ExtScope::Defaults && !missing {
                         ui.horizontal(|ui| {
                             if widgets::quiet_button(ui, icon::PENCIL_SIMPLE, &format!("编辑 {name}"), pal, false).clicked() {
@@ -573,6 +662,8 @@ fn list_view(
                                     token_env: s(&row, "tokenEnv").to_string(),
                                     enabled: row["enabled"] == json!(true),
                                     trusted: false,
+                                    directory_only: !s(&row, "scopeRoot").is_empty(),
+                                    scope_root: s(&row, "scopeRoot").to_string(),
                                 });
                                 d.notice = None;
                             }
@@ -631,6 +722,22 @@ fn edit_view(ui: &mut Ui, d: &mut ExtDialog, pal: &theme::Palette, busy: bool, n
         });
     };
     row(ui, "服务名称", &mut f.name, "", false);
+    ui.horizontal(|ui| {
+        ui.label("适用范围");
+        ui.selectable_value(&mut f.directory_only, false, "全局可用");
+        ui.selectable_value(&mut f.directory_only, true, "指定工作目录");
+    });
+    if f.directory_only {
+        row(ui, "服务适用目录", &mut f.scope_root, "工作目录绝对路径", false);
+        ui.horizontal(|ui| {
+            if ui.button("浏览服务适用目录").clicked()
+                && let Some(path) = rfd::FileDialog::new().set_title("选择 MCP 服务适用目录").pick_folder()
+            {
+                f.scope_root = path.display().to_string();
+            }
+            ui.label(RichText::new("仅此目录及子目录可授权，其他项目不可用。").font(theme::body(theme::SMALL)).color(pal.mute));
+        });
+    }
     ui.horizontal(|ui| {
         ui.add_sized([120.0, 24.0], Label::new(RichText::new("传输方式").font(theme::body(13.0))));
         let before = f.http;
@@ -699,6 +806,10 @@ fn server_record(f: &ServerForm) -> Result<Value, String> {
         return Err("填写服务名称。".into());
     }
     let mut record = json!({"name": f.name.trim(), "enabled": f.enabled, "transport": if f.http { "http" } else { "stdio" }});
+    if f.directory_only && f.scope_root.trim().is_empty() {
+        return Err("填写服务适用的工作目录。".into());
+    }
+    record["scopeRoot"] = json!(if f.directory_only { f.scope_root.trim() } else { "" });
     if f.http {
         let url = url::Url::parse(f.url.trim()).map_err(|_| "请输入完整的服务地址。".to_string())?;
         let loopback = matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"));

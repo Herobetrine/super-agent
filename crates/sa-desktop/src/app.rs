@@ -127,6 +127,7 @@ pub struct App {
     pub export: Option<Pending<PathBuf>>,
     pub knowledge: crate::knowledge::KnowledgeState,
     pub providers: Option<crate::providers::ProvidersDialog>,
+    pub efficiency: Option<crate::efficiency::EfficiencyDialog>,
     pub palette: Option<crate::palette::PaletteState>,
     /// Focus the sidebar search on the next frame.
     pub focus_search: bool,
@@ -213,6 +214,7 @@ impl App {
             export: None,
             knowledge: Default::default(),
             providers: None,
+            efficiency: None,
             palette: None,
             focus_search: false,
             show_archived: false,
@@ -236,6 +238,7 @@ impl App {
         match app.opts.dialog.as_deref() {
             Some("models") => app.open_models(crate::models::Scope::Defaults),
             Some("providers") => app.open_providers(),
+            Some("efficiency") => app.open_efficiency(),
             Some("extensions") => app.open_extensions(crate::extensions::ExtScope::Defaults),
             Some("palette") => app.palette = Some(Default::default()),
             Some("rotation") => {
@@ -591,6 +594,7 @@ impl eframe::App for App {
         self.confirm_dialog(ctx);
         self.models_dialog(ctx);
         self.providers_dialog(ctx);
+        self.efficiency_dialog(ctx);
         self.extensions_dialog(ctx);
         self.palette_ui(ctx);
         self.rename_dialog(ctx);
@@ -877,6 +881,12 @@ impl App {
         });
         ui.with_layout(egui::Layout::bottom_up(egui::Align::Center), |ui| {
             ui.spacing_mut().item_spacing.y = 10.0;
+            let settings = widgets::icon_button(ui, icon::GEAR, 38.0, pal.rail_ink, Color32::from_white_alpha(18), self.efficiency.is_some())
+                .on_hover_text("Token 与缓存");
+            settings.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Token 与缓存设置"));
+            if settings.clicked() {
+                self.open_efficiency();
+            }
             let (color, tip) = match (&self.source.error, &self.source.label) {
                 (Some(e), _) => (Color32::from_rgb(0xe0, 0x7a, 0x52), format!("未连接 · {e}")),
                 (None, Some(l)) => (Color32::from_rgb(0x7c, 0xc4, 0x8f), l.clone()),

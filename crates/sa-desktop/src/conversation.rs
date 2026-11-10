@@ -264,6 +264,7 @@ impl App {
         {
             if self.composer.project.as_ref() != Some(&p) {
                 self.composer.attachments.clear();
+                self.composer.extensions = None;
             }
             self.composer.project = Some(p);
         }

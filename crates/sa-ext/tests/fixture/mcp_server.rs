@@ -15,6 +15,9 @@
 //! the variable `arguments.name` (or `<unset>`); `fail` returns `isError`;
 //! `big` returns ~600 KiB; `sleep` appends to `<secret-file>.sleeps`, then
 //! blocks for two minutes.
+//! Optional `<secret-file>.catalog` JSON `{count, descriptionRepeats}` replaces
+//! the tool directory with generated tools, paged in groups of 100. Each
+//! description repeat is one supplementary Unicode character (two UTF-16 units).
 
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -52,6 +55,14 @@ fn handle(msg: &Value) -> Option<Value> {
     let result = match msg["method"].as_str().unwrap_or_default() {
         "initialize" => {
             append(".initializes");
+            std::fs::write(
+                format!("{}.initialize-cwd", secret()),
+                std::env::current_dir()
+                    .unwrap()
+                    .to_string_lossy()
+                    .as_bytes(),
+            )
+            .unwrap();
             let reject = format!("{}.reject-init", secret());
             if std::fs::remove_file(reject).is_ok() {
                 Err(json!({"code": -32603, "message": "fixture refused initialization"}))
@@ -64,15 +75,38 @@ fn handle(msg: &Value) -> Option<Value> {
             }
         }
         "ping" => Ok(json!({})),
-        "tools/list" => Ok(match params["cursor"].as_str() {
-            None => json!({
-                "tools": [tool("challenge", "Read the one-time verification code from the test service.")],
-                "nextCursor": "page-2"
-            }),
-            Some(_) => {
-                json!({"tools": [tool("env", ""), tool("fail", "Always fails."), tool("big", "Large"), tool("sleep", "Blocks")]})
-            }
-        }),
+        "tools/list" => Ok(
+            if let Ok(raw) = std::fs::read_to_string(format!("{}.catalog", secret())) {
+                let catalog: Value = serde_json::from_str(&raw).unwrap();
+                let count = catalog["count"].as_u64().unwrap() as usize;
+                let repeats = catalog["descriptionRepeats"].as_u64().unwrap() as usize;
+                let start = params["cursor"]
+                    .as_str()
+                    .unwrap_or("0")
+                    .parse::<usize>()
+                    .unwrap();
+                let end = (start + 100).min(count);
+                let description = "🧪".repeat(repeats);
+                let tools: Vec<Value> = (start..end)
+                    .map(|i| tool(&format!("generated_{i}"), &description))
+                    .collect();
+                let mut page = json!({"tools": tools});
+                if end < count {
+                    page["nextCursor"] = json!(end.to_string());
+                }
+                page
+            } else {
+                match params["cursor"].as_str() {
+                    None => json!({
+                        "tools": [tool("challenge", "Read the one-time verification code from the test service.")],
+                        "nextCursor": "page-2"
+                    }),
+                    Some(_) => {
+                        json!({"tools": [tool("env", ""), tool("fail", "Always fails."), tool("big", "Large"), tool("sleep", "Blocks")]})
+                    }
+                }
+            },
+        ),
         "tools/call" => match params["name"].as_str().unwrap_or_default() {
             "challenge" => {
                 append(".calls");

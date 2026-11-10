@@ -32,6 +32,19 @@ pub struct Ctx {
 }
 
 impl Ctx {
+    /// Historical assertions may inspect the lossless recovery view. Keep
+    /// `packet` itself as the real wire view so delivery tests cannot hide bugs.
+    pub fn full_packet(&self) -> Value {
+        if self.packet["context_delivery"]["mode"] != "delta" {
+            return self.packet.clone();
+        }
+        let reference = &self.packet["full_context"];
+        let bytes = std::fs::read(reference["object_path"].as_str().unwrap()).unwrap();
+        assert_eq!(bytes.len() as u64, reference["bytes"].as_u64().unwrap());
+        assert_eq!(sha(&bytes), reference["sha256"].as_str().unwrap());
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
     pub fn emit(&self, kind: &str, data: Value) {
         let _ = self.events.send(AdapterEvent::Journal {
             kind: kind.into(),

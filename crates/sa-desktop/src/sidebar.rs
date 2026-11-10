@@ -81,6 +81,10 @@ impl App {
             )
             .show_separator_line(false)
             .show_inside(ui, |ui| {
+                if widgets::wide_button(ui, icon::GEAR, "Token 与缓存", "", &pal).clicked() {
+                    self.open_efficiency();
+                }
+                ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     let (color, text) = match (&self.source.error, &self.source.label) {
                         (Some(_), _) => (pal.fail.fg, "未连接到工单数据库".to_string()),

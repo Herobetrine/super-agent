@@ -412,6 +412,7 @@ impl App {
                 }
                 (ActionKind::Follow, Ok(_)) => {}
                 (ActionKind::Routes, r) => self.routes_saved(r.map(|_| ())),
+                (ActionKind::Efficiency, r) => self.efficiency_saved(r.map(|_| ())),
                 (ActionKind::Knowledge, r) => self.knowledge_saved(r.map(|_| ())),
                 (ActionKind::Providers, r) => self.providers_saved(r.map(|_| ())),
                 (ActionKind::Meta, Ok(_)) => {}
@@ -493,6 +494,7 @@ impl App {
                 Ok(real) if real.is_dir() => {
                     if self.composer.project.as_ref() != Some(&real) {
                         self.composer.attachments.clear();
+                        self.composer.extensions = None;
                     }
                     self.composer.project = Some(real);
                 }
@@ -568,6 +570,7 @@ impl App {
             if let Ok(real) = sa_engine::services::realpath(&dropped[0]) {
                 if self.composer.project.as_ref() != Some(&real) {
                     self.composer.attachments.clear();
+                    self.composer.extensions = None;
                 }
                 self.composer.project = Some(real);
             }

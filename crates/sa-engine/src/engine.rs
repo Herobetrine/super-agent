@@ -67,6 +67,8 @@ pub struct EngineOptions {
     pub rotation: Arc<dyn RotationSource>,
     pub extensions: Option<Arc<dyn Extensions>>,
     pub snapshotter: Arc<dyn Snapshotter>,
+    /// Current context delivery preferences, shared with the desktop host.
+    pub efficiency: sa_store::efficiency::Shared,
     /// Admission interval (80 ms in the JS engine).
     pub tick: Duration,
 }
@@ -78,6 +80,7 @@ impl Default for EngineOptions {
             rotation: Arc::new(NoRotation),
             extensions: None,
             snapshotter: Arc::new(FsSnapshotter),
+            efficiency: sa_store::efficiency::shared(Default::default()),
             tick: Duration::from_millis(80),
         }
     }
@@ -1257,7 +1260,8 @@ impl Inner {
         if fresh && let Some(until) = self.opts.runner.admission_blocked_until(&job.agent, &route, now()) {
             return Err(TurnError::Wait(until));
         }
-        let mut guide = guides::BASE.to_string();
+        let efficiency = self.opts.efficiency.read().unwrap_or_else(|e| e.into_inner()).clone();
+        let mut guide = guides::base(efficiency.concise_handoffs);
         if primary {
             guide.push('\n');
             guide.push_str(guides::CONTINUOUS);
@@ -1267,6 +1271,9 @@ impl Inner {
         }
         guide.push_str(guides::KNOWLEDGE);
         let mut packet = turn.packet().clone();
+        packet.insert("collaboration_preferences".into(), json!({
+            "concise_handoffs": efficiency.concise_handoffs,
+        }));
         if primary && packet.get("autonomy").and_then(|a| a.get("phase")).and_then(Value::as_str) == Some("discover") {
             guide.push_str(guides::DISCOVERY);
         }
@@ -1304,16 +1311,47 @@ impl Inner {
         if !images.is_empty() && !crate::images::supports_native_images(&job.agent) {
             return Err(anyhow!(crate::images::UNSUPPORTED).into());
         }
-        let mut prompt = format!("{guide}\n{}", stringify(&Value::Object(packet.clone())));
-        if prompt.len() > MAX_PROMPT_BYTES {
-            packet = context::compact(&packet, &guide, &self.data_dir, MAX_PROMPT_BYTES)?;
+        // Keep the admission/enrichment snapshot separate from the delivery
+        // view. Reports used by commit_reply must retain every known child.
+        let snapshot = packet.clone();
+        let snapshot_sha256 = digest(&stringify(&context::sort_keys(&Value::Object(snapshot.clone()))));
+        // Recovery files live outside the project. Restricted harness policies
+        // have no confirmed read grant there, so they retain complete prompts.
+        let baseline = if efficiency.incremental_context && p::is_full(&job.profile) {
+            self.db.with(|q| context::delivery::baseline(q, job.id, job.session.as_deref(), &route))?
+        } else {
+            None
+        };
+        let incremental = baseline.is_some();
+        let full_prompt_bytes = guide.len() + 1 + stringify(&Value::Object(snapshot.clone())).len();
+        let delivered_guide = if let Some(baseline) = baseline {
+            let (delta, delivered_guide) = context::delivery::delta(&packet, &guide, &baseline);
+            packet = delta;
+            packet.insert("full_context".into(), context::archive(&snapshot, &self.data_dir)?);
+            delivered_guide
+        } else {
+            guide.clone()
+        };
+        let mut prompt = format!("{delivered_guide}\n{}", stringify(&Value::Object(packet.clone())));
+        let compacted = prompt.len() > MAX_PROMPT_BYTES;
+        if compacted {
+            // Compact a full snapshot so its fallback reference always
+            // resolves to complete semantics, including unchanged fields.
+            packet = context::compact(&snapshot, &guide, &self.data_dir, MAX_PROMPT_BYTES)?;
             prompt = format!("{guide}\n{}", stringify(&Value::Object(packet.clone())));
         }
         turn.ensure_current()?;
-        self.db.tx(|q| {
+        let snapshot_seq = self.db.tx(|q| {
+            let snapshot_seq = q.log(job.who(), "context.snapshot", &Value::Object(snapshot.clone()))?;
             q.log(job.who(), "input", &Value::Object(packet.clone()))?;
-            q.log(job.who(), "running", &json!({"guide": guide, "prompt_sha256": digest(&prompt)}))?;
-            Ok(())
+            q.log(job.who(), "running", &json!({
+                "guide": if compacted { &guide } else { &delivered_guide },
+                "prompt_sha256": digest(&prompt), "snapshot_seq": snapshot_seq,
+                "snapshot_sha256": snapshot_sha256, "incremental": incremental && !compacted,
+                "full_prompt_bytes": full_prompt_bytes, "sent_prompt_bytes": prompt.len(),
+                "saved_bytes": full_prompt_bytes.saturating_sub(prompt.len()),
+            }))?;
+            Ok(snapshot_seq)
         })?;
         if prompt.len() > MAX_PROMPT_BYTES {
             return Err(anyhow!("输入超过 6 MiB 上限，请拆分任务").into());
@@ -1405,8 +1443,14 @@ impl Inner {
         turn.ensure_current()?;
         self.opts.runner.on_success(&job.agent, &route);
         self.db.tx(|q| {
+            if !q.live(job.who())? { return Ok(()); }
             self.log_transitions(q, job.who())?;
-            self.commit_reply(q, turn, &outcome.text, outcome.session_id.as_deref(), &stream.invalid)
+            self.commit_reply(q, turn, &outcome.text, outcome.session_id.as_deref(), &stream.invalid)?;
+            let same_session = !incremental || outcome.session_id == job.session;
+            context::delivery::acknowledge(q, job.who(), &route, json!({
+                "snapshot_seq": snapshot_seq, "snapshot_sha256": snapshot_sha256,
+                "guide_sha256": digest(&guide), "complete": !compacted && same_session,
+            }))
         })?;
         Ok(())
     }
@@ -1521,6 +1565,9 @@ impl Inner {
             }
             for (kind, data) in &journal {
                 let seq = q.log(job.who(), kind, data)?;
+                if kind == "native" && context::delivery::native_compaction(data) {
+                    q.log(job.who(), "context.compacted", &json!({"source_seq": seq}))?;
+                }
                 if kind == "native"
                     && job.continuous
                     && let Some(proof) = p::tools_proof(data)
@@ -1879,11 +1926,7 @@ impl Inner {
             tried.push(str_of(&prev, "agent").to_string());
             cursor = int_of(&prev, "original");
         }
-        let menus = q
-            .one(
-                "SELECT payload FROM events WHERE ticket=? AND job=? AND kind='input' ORDER BY seq DESC LIMIT 1",
-                &[&job.ticket, &parent],
-            )?
+        let menus = context::delivery::full_input(q, parent, i64::MAX)?
             .and_then(|r| parse(Some(str_of(&r, "payload"))).get("delegate_models").cloned())
             .and_then(|d| match d {
                 Value::Object(m) if !m.is_empty() => Some(m),

@@ -30,7 +30,7 @@ pub fn capture(q: &Q, ticket: i64, seq: i64) -> Result<Value> {
     let r=q.one("SELECT e.* FROM events e JOIN jobs j ON j.id=e.job WHERE e.ticket=? AND e.seq=? AND e.kind='reply' AND j.parent IS NULL",&[&ticket,&seq])?.ok_or_else(||anyhow!("请选择该工单的一条主控终稿作为检查点"))?;
     let reply = str_of(&r, "payload");
     ensure!(digest(reply) == str_of(&r, "sha256"), "检查点摘要不匹配");
-    let input=q.one("SELECT payload,sha256 FROM events WHERE ticket=? AND job=? AND kind='input' AND seq<? ORDER BY seq DESC LIMIT 1",&[&ticket,&int_of(&r,"job"),&seq])?;
+    let input=crate::context::delivery::full_input(q,int_of(&r,"job"),seq)?;
     let mut context = match input {
         Some(input) => {
             ensure!(

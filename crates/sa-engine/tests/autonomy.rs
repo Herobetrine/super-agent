@@ -67,8 +67,9 @@ async fn new_continuous_goal_must_follow_a_real_inspection() {
                 c.prove();
                 return Ok(done());
             }
-            assert_eq!(c.packet["autonomy"]["learning"], json!("remember exact bytes"));
-            if c.packet["autonomy"]["milestone"] == json!(1) {
+            let full_packet = c.full_packet();
+            assert_eq!(full_packet["autonomy"]["learning"], json!("remember exact bytes"));
+            if full_packet["autonomy"]["milestone"] == json!(1) {
                 if pr.fetch_add(1, Ordering::SeqCst) == 0 {
                     return Ok(format!(
                         "{}\n{later}",
@@ -335,7 +336,7 @@ async fn mcp_effects_are_final_only_and_need_another_turn_for_receipts() {
         script(move |c| {
             let (inv, rec) = (inv.clone(), rec.clone());
             async move {
-                assert_eq!(c.packet["project_extensions"]["skills"][0]["name"], json!("fixture"));
+                assert_eq!(c.full_packet()["project_extensions"]["skills"][0]["name"], json!("fixture"));
                 if c.turn() == 1 {
                     let command = cmd(
                         "SA_TOOL",

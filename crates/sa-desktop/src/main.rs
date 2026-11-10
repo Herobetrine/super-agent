@@ -8,6 +8,9 @@ mod composer;
 mod conversation;
 mod data;
 mod demo;
+mod efficiency;
+#[cfg(test)]
+mod efficiency_tests;
 mod extensions;
 mod feed;
 mod files;

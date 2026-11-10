@@ -72,6 +72,10 @@ pub enum Action {
         selections: Value,
         allow_lead_routing: bool,
     },
+    /// Workbench-wide settings for subsequent model turns.
+    SaveEfficiency {
+        settings: sa_store::efficiency::Settings,
+    },
     /// `saveRoutes` (ST:239-290): routes of a stopped ticket.
     SaveRoutes {
         ticket: i64,
@@ -155,6 +159,7 @@ impl Action {
             Action::SaveDefaults { .. }
             | Action::SaveRoutes { .. }
             | Action::SetLeadRouting { .. } => ActionKind::Routes,
+            Action::SaveEfficiency { .. } => ActionKind::Efficiency,
             Action::KnowledgeAdd { .. } | Action::KnowledgeArchive { .. } => ActionKind::Knowledge,
             Action::ProviderSave { .. }
             | Action::ProviderRemove { .. }
@@ -190,6 +195,7 @@ pub enum ActionKind {
     Decide { allow: bool },
     Plan,
     Routes,
+    Efficiency,
     Knowledge,
     Providers,
     Meta,
@@ -309,6 +315,7 @@ impl RotationSource for DbRotation {
 pub struct Shared {
     pub registry: Registry,
     pub rotation: Arc<RwLock<Rotation>>,
+    pub efficiency: sa_store::efficiency::Shared,
 }
 
 impl Shared {
@@ -316,17 +323,19 @@ impl Shared {
         Self {
             registry: sa_adapters::registry(vec![]),
             rotation: Arc::default(),
+            efficiency: sa_store::efficiency::shared(Default::default()),
         }
     }
 
     /// Reload both caches from the journal.
     fn reload(&self, engine: &Engine) -> Result<()> {
-        let (list, rotation) = engine.db().with(|q| {
+        let (list, rotation, efficiency) = engine.db().with(|q| {
             providers::ensure_schema(q.conn())?;
-            Ok((providers::list(q.conn())?, providers::rotation(q.conn())?))
+            Ok((providers::list(q.conn())?, providers::rotation(q.conn())?, sa_store::efficiency::load(q.conn())?))
         })?;
         *self.registry.write().unwrap_or_else(|p| p.into_inner()) = list;
         *self.rotation.write().unwrap_or_else(|p| p.into_inner()) = rotation;
+        *self.efficiency.write().unwrap_or_else(|p| p.into_inner()) = efficiency;
         Ok(())
     }
 }
@@ -354,7 +363,7 @@ impl Host {
     pub fn start(dir: PathBuf, notify: impl Fn() + Send + Sync + 'static) -> Result<Self> {
         Self::start_with(
             dir,
-            |shared| sa_adapters::all_with(Sys::from_process(), shared.registry.clone()),
+            |shared| sa_adapters::all_with_efficiency(Sys::from_process(), shared.registry.clone(), shared.efficiency.clone()),
             notify,
         )
     }
@@ -464,6 +473,10 @@ impl Host {
 
     pub fn submit(&self, action: Action) -> bool {
         self.tx.as_ref().is_some_and(|tx| tx.send(action).is_ok())
+    }
+
+    pub fn efficiency_settings(&self) -> sa_store::efficiency::Settings {
+        self.shared.efficiency.read().unwrap_or_else(|p| p.into_inner()).clone()
     }
 
     /// Probe one harness catalog concurrently with the action queue (probes
@@ -629,6 +642,7 @@ fn open_engine(
     let opts = EngineOptions {
         rotation: Arc::new(DbRotation(shared.rotation.clone())),
         extensions: Some(Arc::new(ext.clone())),
+        efficiency: shared.efficiency.clone(),
         ..Default::default()
     };
     let engine = Engine::open(dir, adapters, opts)?;
@@ -636,6 +650,7 @@ fn open_engine(
         .db()
         .with(|q| {
             q.conn().execute_batch(sa_store::STUDIO_PLAN)?;
+            sa_store::efficiency::init(q.conn())?;
             q.conn().execute_batch("CREATE TABLE IF NOT EXISTS studio_model_policy(singleton INTEGER PRIMARY KEY CHECK(singleton=1),allow_lead_routing INTEGER NOT NULL CHECK(allow_lead_routing IN (0,1)))")?;
             Ok(q.conn().execute_batch(sa_store::TICKET_META)?)
         })?;
@@ -770,6 +785,13 @@ async fn execute(engine: &Engine, shared: &Shared, action: Action) -> Result<Opt
                 q.run("INSERT OR REPLACE INTO studio_model_policy(singleton,allow_lead_routing) VALUES(1,?)", &[&i64::from(allow_lead_routing)])?;
                 Ok(())
             })?;
+            Ok(None)
+        }
+        Action::SaveEfficiency { settings } => {
+            // Publish only after SQLite commits. A failed save leaves both
+            // the running policy and the next startup's policy unchanged.
+            engine.db().tx(|q| sa_store::efficiency::save(q.conn(), &settings))?;
+            *shared.efficiency.write().unwrap_or_else(|p| p.into_inner()) = settings;
             Ok(None)
         }
         Action::SaveRoutes {
@@ -1937,6 +1959,45 @@ exit 0
         assert!(!owner::is_claimed(data.path()));
         let again = Host::start_with(data.path().to_path_buf(), fakes, || {}).unwrap();
         drop(again);
+    }
+
+    #[test]
+    fn efficiency_settings_persist_publish_and_preserve_other_defaults() {
+        use sa_store::efficiency::{Settings, Ttl};
+        let data = tempfile::tempdir().unwrap();
+        let mut host = Host::start_with(data.path().into(), fakes, || {}).unwrap();
+        assert_eq!(host.efficiency_settings(), Settings::default());
+        let routes = host.defaults();
+        let policy = host.allow_lead_routing_default();
+        let changed = Settings {
+            incremental_context: false,
+            concise_handoffs: false,
+            claude_cache_ttl: Ttl::OneHour,
+        };
+        assert!(host.submit(Action::SaveEfficiency { settings: changed.clone() }));
+        let saved = outcome(&host);
+        assert_eq!(saved.kind, ActionKind::Efficiency);
+        assert!(saved.result.is_ok());
+        assert_eq!(host.efficiency_settings(), changed);
+        assert_eq!(host.defaults(), routes);
+        assert_eq!(host.allow_lead_routing_default(), policy);
+        host.shutdown();
+
+        let host = Host::start_with(data.path().into(), fakes, || {}).unwrap();
+        assert_eq!(host.efficiency_settings(), changed);
+        assert_eq!(host.defaults(), routes);
+        host.engine.db().with(|q| {
+            q.conn().execute_batch("CREATE TRIGGER reject_efficiency BEFORE UPDATE ON studio_efficiency BEGIN SELECT RAISE(ABORT, 'fixture save rejection'); END;")?;
+            Ok(())
+        }).unwrap();
+        assert!(host.submit(Action::SaveEfficiency { settings: Settings::default() }));
+        assert!(outcome(&host).result.is_err());
+        assert_eq!(host.efficiency_settings(), changed);
+        assert_eq!(host.engine.db().with(|q| sa_store::efficiency::load(q.conn())).unwrap(), changed);
+        host.engine.db().with(|q| { q.conn().execute_batch("DROP TRIGGER reject_efficiency")?; Ok(()) }).unwrap();
+        assert!(host.submit(Action::SaveEfficiency { settings: Settings::default() }));
+        assert!(outcome(&host).result.is_ok());
+        assert_eq!(host.efficiency_settings(), Settings::default());
     }
 
     #[test]

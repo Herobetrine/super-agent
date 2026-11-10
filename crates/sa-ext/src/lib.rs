@@ -24,6 +24,7 @@ pub mod mcp;
 pub mod skills;
 pub mod validate;
 
+mod directory;
 mod invoke;
 mod pool;
 
@@ -45,24 +46,26 @@ use validate::{Choices, choices, endpoint, executable, nonempty, token_env};
 /// Extension tables (X:100-106).
 const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS studio_skill_dirs(id TEXT PRIMARY KEY,folder TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS studio_servers(id TEXT PRIMARY KEY,name TEXT NOT NULL,command TEXT NOT NULL,args TEXT NOT NULL,
-        enabled INTEGER NOT NULL,revision TEXT NOT NULL,tools TEXT,transport TEXT NOT NULL DEFAULT 'stdio',url TEXT NOT NULL DEFAULT '',token_env TEXT NOT NULL DEFAULT '');
+        enabled INTEGER NOT NULL,revision TEXT NOT NULL,tools TEXT,transport TEXT NOT NULL DEFAULT 'stdio',url TEXT NOT NULL DEFAULT '',token_env TEXT NOT NULL DEFAULT '',scope_root TEXT NOT NULL DEFAULT '');
       CREATE TABLE IF NOT EXISTS studio_extension_defaults(singleton INTEGER PRIMARY KEY CHECK(singleton=1),selected TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS studio_project_extension_defaults(scope_root TEXT PRIMARY KEY,selected TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS studio_ticket_extensions(ticket INTEGER PRIMARY KEY REFERENCES tickets,scope TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS studio_tool_receipts(job INTEGER NOT NULL REFERENCES jobs,logical INTEGER NOT NULL,key TEXT NOT NULL,
         request TEXT NOT NULL,result TEXT,state TEXT NOT NULL,PRIMARY KEY(job,logical,key));";
 
 /// Columns added to `studio_servers` after its first release; added only
 /// when an old journal lacks them.
-const SERVER_ADDITIONS: [(&str, &str); 3] = [
+const SERVER_ADDITIONS: [(&str, &str); 4] = [
     ("transport", "TEXT NOT NULL DEFAULT 'stdio'"),
     ("url", "TEXT NOT NULL DEFAULT ''"),
     ("token_env", "TEXT NOT NULL DEFAULT ''"),
+    ("scope_root", "TEXT NOT NULL DEFAULT ''"),
 ];
 
 const EMPTY_SCOPE: &str = r#"{"skills":[],"servers":[]}"#;
 /// Largest tool catalog kept per server (X:225).
-const MAX_TOOLS: usize = 150;
-const MAX_CATALOG: usize = 256_000;
+const MAX_TOOLS: usize = 512;
+const MAX_CATALOG: usize = 1_048_576;
 /// Distinct `tools/list` cursors accepted per probe (X:229).
 const MAX_PAGES: usize = 16;
 
@@ -115,6 +118,19 @@ fn clear_default(q: &Q, group: &str, id: &str) -> Result<()> {
         "INSERT OR REPLACE INTO studio_extension_defaults VALUES(1,?)",
         &[&stringify(&d)],
     )?;
+    for row in q.all(
+        "SELECT scope_root,selected FROM studio_project_extension_defaults",
+        &[],
+    )? {
+        let mut selected = parse(text(&row, "selected"))?;
+        if let Some(Value::Array(list)) = selected.get_mut(group) {
+            list.retain(|x| x.as_str() != Some(id));
+        }
+        q.run(
+            "UPDATE studio_project_extension_defaults SET selected=? WHERE scope_root=?",
+            &[&stringify(&selected), &text(&row, "scope_root")],
+        )?;
+    }
     Ok(())
 }
 
@@ -124,6 +140,30 @@ fn defaults_in(q: &Q) -> Result<Value> {
         &[],
     )?;
     parse(row.as_ref().map_or(EMPTY_SCOPE, |r| text(r, "selected")))
+}
+
+fn project_defaults_in(q: &Q, cwd: Option<&Path>) -> Result<Vec<(PathBuf, Value)>> {
+    let mut overrides = vec![];
+    if let Some(cwd) = cwd {
+        for row in q.all(
+            "SELECT scope_root,selected FROM studio_project_extension_defaults",
+            &[],
+        )? {
+            let root = Path::new(text(&row, "scope_root"));
+            if directory::contains(root, cwd) {
+                overrides.push((root.to_path_buf(), parse(text(&row, "selected"))?));
+            }
+        }
+    }
+    overrides.sort_by_key(|(root, _)| std::cmp::Reverse(root.components().count()));
+    Ok(overrides)
+}
+
+fn selected_in(q: &Q, cwd: Option<&Path>) -> Result<Value> {
+    match project_defaults_in(q, cwd)?.into_iter().next() {
+        Some((_, selected)) => Ok(selected),
+        None => defaults_in(q),
+    }
 }
 
 impl ProjectExtensions {
@@ -182,8 +222,33 @@ impl ProjectExtensions {
     }
 
     fn scan(&self, cwd: Option<&Path>) -> Result<skills::Catalog> {
-        let imported = self.inner.db.with(|q| self.imported_folders(q))?;
-        Ok(skills::scan(&self.inner.opts.homes, cwd, &imported))
+        let real_cwd = cwd.map(directory::real_directory).transpose()?;
+        let (imported, overrides) = self.inner.db.with(|q| {
+            Ok((
+                self.imported_folders(q)?,
+                project_defaults_in(q, real_cwd.as_deref())?,
+            ))
+        })?;
+        let mut catalog = skills::scan(&self.inner.opts.homes, real_cwd.as_deref(), &imported);
+        // Only the skills granted by the effective ancestor override are inherited.
+        // Current-directory and user/imported entries retain their existing priority.
+        let granted = overrides
+            .first()
+            .map(|(_, selected)| choices(selected))
+            .transpose()?
+            .unwrap_or_default()
+            .skills;
+        for (root, _) in overrides {
+            let inherited = skills::scan(&self.inner.opts.homes, Some(&root), &imported);
+            for id in &granted {
+                if catalog.get(id).is_none()
+                    && let Some(skill) = inherited.get(id)
+                {
+                    catalog.set(skill.clone());
+                }
+            }
+        }
+        Ok(catalog)
     }
 
     /// `defaults()` (X:108-113): `{skills: [id], servers: [id]}` preselected
@@ -192,21 +257,47 @@ impl ProjectExtensions {
         self.inner.db.with(defaults_in)
     }
 
+    /// Effective complete selection at the closest real ancestor, with unavailable servers removed.
+    pub fn defaults_for(&self, cwd: Option<&Path>) -> Result<Value> {
+        let cwd = cwd.map(directory::real_directory).transpose()?;
+        self.inner.db.with(|q| {
+            let selected = selected_in(q, cwd.as_deref())?;
+            let mut ids = choices(&selected)?;
+            let mut servers = vec![];
+            for id in ids.servers {
+                if let Some(row) =
+                    q.one("SELECT scope_root FROM studio_servers WHERE id=?", &[&id])?
+                    && directory::available(&row, cwd.as_deref())
+                {
+                    servers.push(id);
+                }
+            }
+            ids.servers = servers;
+            Ok(ids.to_value())
+        })
+    }
+
     /// `extensions({cwd})` → `list(cwd)` (X:114-133):
     /// `{skills: [{id,name,description,source,imported}],
-    ///   servers: [{id,name,command,args,enabled,tools,transport,url,tokenEnv}],
+    ///   servers: [{id,name,command,args,enabled,tools,transport,url,tokenEnv,scopeRoot}],
     ///   defaults}`; `tools` is the list of probed tool names or `null`.
-    /// `cwd` adds the project's `.agents/skills` and `.claude/skills`.
+    /// `cwd` restricts server availability and adds current/authorized ancestor project skills.
     pub fn list(&self, cwd: Option<&Path>) -> Result<Value> {
+        let real_cwd = cwd.map(directory::real_directory).transpose()?;
         let skills: Vec<Value> = self.scan(cwd)?.iter().map(skills::Skill::meta).collect();
         let rows = self.inner.db.with(|q| {
             q.all(
-                "SELECT id,name,command,args,enabled,tools,transport,url,token_env AS tokenEnv FROM studio_servers ORDER BY name",
+                "SELECT id,name,command,args,enabled,tools,transport,url,token_env AS tokenEnv,scope_root FROM studio_servers ORDER BY name",
                 &[],
             )
         })?;
         let mut servers = vec![];
         for mut r in rows {
+            if cwd.is_some() && !directory::available(&r, real_cwd.as_deref()) {
+                continue;
+            }
+            let scope_root = r.remove("scope_root").unwrap_or(json!(""));
+            r.insert("scopeRoot".into(), scope_root);
             let args = parse(text(&r, "args"))?;
             let enabled = r.get("enabled").and_then(Value::as_i64).unwrap_or(0) != 0;
             let tools = match r.get("tools").and_then(Value::as_str) {
@@ -225,19 +316,31 @@ impl ProjectExtensions {
             r.insert("tools".into(), tools);
             servers.push(Value::Object(r));
         }
-        Ok(json!({"skills": skills, "servers": servers, "defaults": self.defaults()?}))
+        Ok(json!({"skills": skills, "servers": servers, "defaults": self.defaults_for(cwd)?}))
     }
 
     /// `extensionDefaults({skills, servers, cwd})` → `setDefaults` (X:134-138).
-    /// Every id must be usable now (same checks as ticket creation).
+    /// Every id must be usable now (same checks as ticket creation). `cwd` stores
+    /// a complete directory override; `None` updates only the global selection.
     pub fn set_defaults(&self, raw: &Value, cwd: Option<&Path>) -> Result<()> {
         let ids = choices(raw)?;
         self.prepare_choices(&ids, cwd)?;
-        self.inner.db.with(|q| {
-            q.run(
-                "INSERT OR REPLACE INTO studio_extension_defaults VALUES(1,?)",
-                &[&stringify(&ids.to_value())],
-            )?;
+        let root = cwd.map(directory::real_directory).transpose()?;
+        self.inner.db.tx(|q| {
+            let selected = stringify(&ids.to_value());
+            // Recheck inside the write transaction so a concurrent revocation cannot
+            // be followed by saving the obsolete grant back into the defaults.
+            for id in &ids.servers {
+                let row = q.one("SELECT * FROM studio_servers WHERE id=? AND enabled=1 AND tools IS NOT NULL", &[id])?;
+                let Some(row) = row else { bail!("请先启用服务并连接读取工具") };
+                ensure!(directory::available(&row, root.as_deref()), "此 MCP 服务在当前工作目录不可用");
+            }
+            if let Some(root) = root {
+                let key = root.to_string_lossy().into_owned();
+                q.run("INSERT OR REPLACE INTO studio_project_extension_defaults(scope_root,selected) VALUES(?,?)", &[&key, &selected])?;
+            } else {
+                q.run("INSERT OR REPLACE INTO studio_extension_defaults VALUES(1,?)", &[&selected])?;
+            }
             Ok(())
         })
     }
@@ -282,10 +385,10 @@ impl ProjectExtensions {
     /// `mcpSave(row)` → `saveServer(row)` (X:157-200); returns the server id.
     ///
     /// `row`: `{id?, name, transport?: "stdio"|"http", command?, args?: [str],
-    /// url?, tokenEnv?, enabled?: bool}`. A new revision (which revokes every
-    /// ticket binding) is issued when launch parameters change or the server
-    /// is enabled/disabled; the probed tool list survives only unchanged
-    /// launch parameters.
+    /// url?, tokenEnv?, enabled?: bool, scopeRoot?: str}`. A new revision (which
+    /// revokes every ticket binding) is issued when launch parameters, availability
+    /// directory or enabled state changes. The cached tools survive unchanged
+    /// launch parameters. An empty `scopeRoot` makes the service globally available.
     pub fn save_server(&self, row: &Value) -> Result<String> {
         let empty = json!([]);
         let args = match row.get("args") {
@@ -330,6 +433,14 @@ impl ProjectExtensions {
             _ => String::new(),
         };
         token_env(&token)?;
+        let scope_root = match row.get("scopeRoot") {
+            None | Some(Value::Null) => String::new(),
+            Some(Value::String(s)) if s.is_empty() => String::new(),
+            Some(Value::String(s)) => directory::real_directory(Path::new(s))?
+                .to_string_lossy()
+                .into_owned(),
+            Some(_) => bail!("MCP 服务目录范围无效"),
+        };
         let argv = stringify(args);
         let wanted = match row.get("id") {
             Some(Value::String(s)) if !s.is_empty() => Some(s.clone()),
@@ -354,13 +465,16 @@ impl ProjectExtensions {
                     && text(o, "url") == url
                     && text(o, "token_env") == token
             });
+            let same_scope = old.as_ref().is_some_and(|o| {
+                text(o, "scope_root") == scope_root
+            });
             let id = old
                 .as_ref()
                 .map_or_else(|| uuid::Uuid::new_v4().to_string(), |o| text(o, "id").to_string());
             // Changing launch parameters or disabling a service permanently
             // revokes existing bindings.
             let revision = match &old {
-                Some(o) if same && o.get("enabled").and_then(Value::as_i64) == Some(enabled as i64) => {
+                Some(o) if same && same_scope && o.get("enabled").and_then(Value::as_i64) == Some(enabled as i64) => {
                     text(o, "revision").to_string()
                 }
                 _ => uuid::Uuid::new_v4().to_string(),
@@ -370,10 +484,10 @@ impl ProjectExtensions {
                 .filter(|_| same)
                 .and_then(|o| o.get("tools").and_then(Value::as_str).map(str::to_string));
             q.run(
-                "INSERT OR REPLACE INTO studio_servers(id,name,command,args,enabled,revision,tools,transport,url,token_env) VALUES(?,?,?,?,?,?,?,?,?,?)",
-                &[&id, &name, &command, &argv, &(enabled as i64), &revision, &tools, &transport, &url, &token],
+                "INSERT OR REPLACE INTO studio_servers(id,name,command,args,enabled,revision,tools,transport,url,token_env,scope_root) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                &[&id, &name, &command, &argv, &(enabled as i64), &revision, &tools, &transport, &url, &token, &scope_root],
             )?;
-            if !enabled || !same {
+            if !enabled || !same || !same_scope {
                 clear_default(q, "servers", &id)?;
             }
             Ok((id, old.as_ref().is_some_and(|o| text(o, "revision") != revision)))
@@ -395,7 +509,7 @@ impl ProjectExtensions {
     }
 
     /// `mcpProbe({id})` → `probe(id)` (X:207-238): connect, page through
-    /// `tools/list` (≤150 tools, ≤256 000 JSON chars, ≤16 cursors), store
+    /// `tools/list` (≤512 tools, ≤1 048 576 UTF-16 code units, ≤16 cursors), store
     /// `[{name, description, inputSchema}]` if the server was not changed
     /// meanwhile, and return `[{name, description}]`.
     pub async fn probe(&self, id: &str) -> Result<Value> {
@@ -405,7 +519,8 @@ impl ProjectExtensions {
             .with(|q| q.one("SELECT * FROM studio_servers WHERE id=?", &[&id]))?;
         let Some(s) = s else { bail!("未知服务") };
         let config = mcp::ServerConfig::from_row(&s)?;
-        let client = mcp::connect(&config, &CancellationToken::new()).await?;
+        let prepared = mcp::prepare(&config, text(&s, "scope_root"))?;
+        let client = mcp::connect_prepared(&config, &prepared, &CancellationToken::new()).await?;
         let listed = async {
             let mut list: Vec<Value> = vec![];
             let mut cursor: Option<String> = None;
@@ -464,6 +579,7 @@ impl ProjectExtensions {
     /// `prepare(raw, cwd)` for parsed choices (X:239-255): the frozen scope
     /// `{skills: [{id,name,source,body,sha256}], servers: [{id,name,revision,tools}]}`.
     fn prepare_choices(&self, d: &Choices, cwd: Option<&Path>) -> Result<Value> {
+        let real_cwd = cwd.map(directory::real_directory).transpose()?;
         let mut skills = vec![];
         if !d.skills.is_empty() {
             let entries = self.scan(cwd)?;
@@ -490,6 +606,10 @@ impl ProjectExtensions {
                 let Some(row) = row.filter(|r| r.get("tools").is_some_and(Value::is_string)) else {
                     bail!("请先启用服务并连接读取工具");
                 };
+                ensure!(
+                    directory::available(&row, real_cwd.as_deref()),
+                    "此 MCP 服务在当前工作目录不可用"
+                );
                 out.push(json!({
                     "id": id,
                     "name": row["name"],
@@ -502,11 +622,11 @@ impl ProjectExtensions {
         Ok(json!({"skills": skills, "servers": servers}))
     }
 
-    /// `prepare(raw ?? defaults(), cwd)` (X:239-255).
+    /// `prepare(raw ?? defaults_for(cwd), cwd)` (X:239-255).
     pub fn prepare_scope(&self, raw: Option<&Value>, cwd: Option<&Path>) -> Result<Value> {
         let d = match raw.filter(|r| !r.is_null()) {
             Some(r) => choices(r)?,
-            None => choices(&self.defaults()?)?,
+            None => choices(&self.defaults_for(cwd)?)?,
         };
         self.prepare_choices(&d, cwd)
     }
@@ -530,12 +650,13 @@ impl ProjectExtensions {
             let scope = scope_in(q, ticket)?;
             let mut mcp = vec![];
             if !matches!(profile, "readonly" | "legacy") {
+                let cwd = directory::ticket_directory(q, ticket)?;
                 for s in scope["servers"].as_array().into_iter().flatten() {
-                    let live = q.exists(
-                        "SELECT 1 FROM studio_servers WHERE id=? AND enabled AND revision=?",
+                    let live = q.one(
+                        "SELECT scope_root FROM studio_servers WHERE id=? AND enabled AND revision=?",
                         &[&s["id"].as_str(), &s["revision"].as_str()],
                     )?;
-                    if live {
+                    if live.is_some_and(|row| directory::available(&row, Some(&cwd))) {
                         mcp.push(
                             json!({"server": s["id"], "name": s["name"], "tools": s["tools"]}),
                         );

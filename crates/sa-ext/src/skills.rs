@@ -131,7 +131,7 @@ impl SkillHomes {
 pub struct Catalog(Vec<Skill>);
 
 impl Catalog {
-    fn set(&mut self, skill: Skill) {
+    pub(crate) fn set(&mut self, skill: Skill) {
         match self.0.iter_mut().find(|s| s.id == skill.id) {
             Some(slot) => *slot = skill,
             None => self.0.push(skill),

@@ -131,7 +131,11 @@ impl Fx {
     }
 
     async fn ticket(&self, profile: &str, extensions: Value) -> (i64, i64) {
-        let mut params = CreateParams::new("demo", self.dir.path())
+        self.ticket_at(profile, extensions, self.dir.path()).await
+    }
+
+    async fn ticket_at(&self, profile: &str, extensions: Value, cwd: &Path) -> (i64, i64) {
+        let mut params = CreateParams::new("demo", cwd)
             .lead("deepseek")
             .profile(profile);
         params.extensions = Some(extensions);
@@ -152,7 +156,14 @@ impl Fx {
     }
 }
 
-fn args(ticket: i64, job: i64, profile: &str, approve: bool, command: Value) -> InvokeArgs {
+fn args(
+    cwd: &Path,
+    ticket: i64,
+    job: i64,
+    profile: &str,
+    approve: bool,
+    command: Value,
+) -> InvokeArgs {
     InvokeArgs {
         ticket,
         job,
@@ -160,7 +171,7 @@ fn args(ticket: i64, job: i64, profile: &str, approve: bool, command: Value) -> 
         admission: 0,
         logical_turn: 1,
         profile: profile.into(),
-        cwd: String::new(),
+        cwd: cwd.to_string_lossy().into_owned(),
         cancel: CancellationToken::new(),
         approve: Arc::new(move |_| async move { approve }.boxed()),
         command,
@@ -276,6 +287,7 @@ async fn skills_stdio_and_http_transports_consent_and_revocation() {
 
     let call = |id: &str, tool: &str, approve: bool, arguments: Value| {
         args(
+            f.dir.path(),
             ticket,
             job,
             "ask",
@@ -425,6 +437,7 @@ async fn skills_stdio_and_http_transports_consent_and_revocation() {
         .await;
     f.run_job(j2);
     let http_call = args(
+        f.dir.path(),
         t2,
         j2,
         "full",
@@ -553,6 +566,7 @@ async fn cancelling_an_issued_call_is_uncertain_and_stops_the_server() {
         .await;
     f.run_job(job);
     let a = args(
+        f.dir.path(),
         ticket,
         job,
         "full",
@@ -596,6 +610,7 @@ async fn cancelling_an_issued_call_is_uncertain_and_stops_the_server() {
         .with(|q| q.run("UPDATE jobs SET state='cancelled' WHERE id=?", &[&job]))
         .unwrap();
     let stale = args(
+        f.dir.path(),
         ticket,
         job,
         "full",
@@ -612,6 +627,73 @@ async fn cancelling_an_issued_call_is_uncertain_and_stops_the_server() {
 
 fn initializations(f: &Fx) -> usize {
     f.calls(".initializes").unwrap_or_default().lines().count()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn large_catalog_is_cached_completely_and_oversized_catalogs_are_rejected() {
+    let f = fx(Arc::new(|_| "unused".into()));
+    let catalog = format!("{}.catalog", f.secret.display());
+    let write_catalog = |count, repeats| {
+        std::fs::write(
+            &catalog,
+            json!({"count": count, "descriptionRepeats": repeats}).to_string(),
+        )
+        .unwrap();
+    };
+    write_catalog(229, 1_700);
+    let server = f.stdio_server();
+    let listed = f.ext.probe(&server).await.unwrap();
+    assert_eq!(listed.as_array().unwrap().len(), 229);
+    let cached = f.sql("SELECT tools FROM studio_servers")[0]["tools"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(cached.encode_utf16().count() > 256_000);
+    assert!(cached.encode_utf16().count() <= 1_048_576);
+    assert!(
+        cached.len() > 1_048_576,
+        "the bound counts UTF-16, not UTF-8 bytes"
+    );
+    let tools: Value = serde_json::from_str(&cached).unwrap();
+    for (i, tool) in tools.as_array().unwrap().iter().enumerate() {
+        assert_eq!(tool["name"], format!("generated_{i}"));
+        assert_eq!(tool["description"], "🧪".repeat(1_700));
+        assert_eq!(tool["inputSchema"]["type"], "object");
+    }
+
+    // Rejected probes never replace a complete cached catalog with partial pages.
+    for (count, repeats) in [(513, 0), (2, 262_144)] {
+        write_catalog(count, repeats);
+        assert_eq!(
+            f.ext.probe(&server).await.unwrap_err().to_string(),
+            "工具目录超过上限"
+        );
+        assert_eq!(
+            f.sql("SELECT tools FROM studio_servers")[0]["tools"],
+            cached
+        );
+        let fresh = f.stdio_server();
+        assert_eq!(
+            f.ext.probe(&fresh).await.unwrap_err().to_string(),
+            "工具目录超过上限"
+        );
+        let rows = f.sql("SELECT id,tools FROM studio_servers");
+        assert!(rows.iter().find(|r| r["id"] == fresh).unwrap()["tools"].is_null());
+        f.ext.remove(&fresh).unwrap();
+    }
+    write_catalog(512, 0);
+    assert_eq!(
+        f.ext
+            .probe(&server)
+            .await
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .len(),
+        512
+    );
+    f.engine.close().await;
+    f.ext.close();
 }
 
 fn receipt(f: &Fx, job: i64, id: &str) -> Value {
@@ -631,6 +713,7 @@ fn pooled_call(
     cwd: &Path,
 ) -> InvokeArgs {
     let mut a = args(
+        cwd,
         ticket,
         job,
         "full",
@@ -715,6 +798,15 @@ async fn private_pool_reuses_stdio_and_isolates_ticket_cwd_and_revocation() {
 
     let next_cwd = f.dir.path().join("another-worktree");
     std::fs::create_dir(&next_cwd).unwrap();
+    f.engine
+        .db()
+        .with(|q| {
+            q.run(
+                "UPDATE tickets SET cwd=? WHERE id=?",
+                &[&next_cwd.to_string_lossy().as_ref(), &ticket],
+            )
+        })
+        .unwrap();
     f.ext
         .invoke(pooled_call(
             ticket, job, &server, "moved", "identity", &next_cwd,
@@ -892,6 +984,7 @@ async fn revoking_active_pool_call_marks_uncertain_and_closes_process() {
         .await;
     f.run_job(job);
     let a = args(
+        f.dir.path(),
         ticket,
         job,
         "full",
@@ -914,6 +1007,156 @@ async fn revoking_active_pool_call_marks_uncertain_and_closes_process() {
         .unwrap();
     assert_eq!(receipt(&f, job, "active")["state"], "uncertain");
     wait_dead(pid).await;
+    f.engine.close().await;
+    f.ext.close();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn scoped_server_is_enforced_for_real_context_and_calls() {
+    let f = fx(Arc::new(|_| "unused".into()));
+    let project = f.dir.path().join("project");
+    let child = project.join("child");
+    let sibling = f.dir.path().join("project-other");
+    std::fs::create_dir_all(&child).unwrap();
+    std::fs::create_dir(&sibling).unwrap();
+    let mut config = json!({"name": "scoped", "command": FIXTURE, "args": [f.secret], "enabled": true, "scopeRoot": project});
+    let server = f.ext.save_server(&config).unwrap();
+    config["id"] = json!(server);
+    f.ext.probe(&server).await.unwrap();
+    assert_eq!(
+        std::fs::canonicalize(f.calls(".initialize-cwd").unwrap()).unwrap(),
+        std::fs::canonicalize(&project).unwrap()
+    );
+    let selected = json!({"skills": [], "servers": [server]});
+    assert_eq!(f.ext.list(Some(&sibling)).unwrap()["servers"], json!([]));
+    assert!(
+        f.ext
+            .prepare_scope(Some(&selected), Some(&sibling))
+            .is_err()
+    );
+    let (ticket, job) = f.ticket_at("full", selected.clone(), &child).await;
+    f.run_job(job);
+    assert_eq!(f.ext.context(ticket, "full")["mcp"][0]["server"], server);
+    f.ext
+        .invoke(pooled_call(
+            ticket, job, &server, "inside", "identity", &child,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(receipt(&f, job, "inside")["state"], "done");
+    let identity: Value = serde_json::from_str(
+        receipt(&f, job, "inside")["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        std::fs::canonicalize(identity["cwd"].as_str().unwrap()).unwrap(),
+        std::fs::canonicalize(&child).unwrap()
+    );
+    assert!(
+        f.ext
+            .invoke(pooled_call(
+                ticket,
+                job,
+                &server,
+                "forged-cwd",
+                "identity",
+                &sibling
+            ))
+            .await
+            .is_err()
+    );
+    assert!(f.ext.results(job).iter().all(|r| r["id"] != "forged-cwd"));
+
+    // A previously frozen binding cannot be reused after the ticket leaves the root.
+    f.engine
+        .db()
+        .with(|q| {
+            q.run(
+                "UPDATE tickets SET cwd=? WHERE id=?",
+                &[&sibling.to_string_lossy().as_ref(), &ticket],
+            )
+        })
+        .unwrap();
+    assert_eq!(f.ext.context(ticket, "full")["mcp"], json!([]));
+    assert!(
+        f.ext
+            .invoke(pooled_call(
+                ticket, job, &server, "outside", "identity", &sibling
+            ))
+            .await
+            .is_err()
+    );
+    assert_eq!(f.calls(".calls").unwrap().lines().count(), 1);
+
+    // Restore the ticket, then changing the scope revokes that old revision.
+    f.engine
+        .db()
+        .with(|q| {
+            q.run(
+                "UPDATE tickets SET cwd=? WHERE id=?",
+                &[&child.to_string_lossy().as_ref(), &ticket],
+            )
+        })
+        .unwrap();
+    config["scopeRoot"] = json!(sibling);
+    f.ext.save_server(&config).unwrap();
+    assert_eq!(f.ext.context(ticket, "full")["mcp"], json!([]));
+    f.ext
+        .invoke(pooled_call(
+            ticket,
+            job,
+            &server,
+            "revoked-scope",
+            "identity",
+            &child,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(receipt(&f, job, "revoked-scope")["state"], "error");
+    assert_eq!(f.calls(".calls").unwrap().lines().count(), 1);
+    f.engine.close().await;
+    f.ext.close();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn changing_ticket_directory_during_approval_cannot_issue_a_call() {
+    let f = fx(Arc::new(|_| "unused".into()));
+    let server = f.stdio_server();
+    f.ext.probe(&server).await.unwrap();
+    let (ticket, job) = f
+        .ticket("ask", json!({"skills": [], "servers": [server]}))
+        .await;
+    f.run_job(job);
+    let outside = f.dir.path().join("other");
+    std::fs::create_dir(&outside).unwrap();
+    let db = sa_engine::db::Db::open(&f.state).unwrap();
+    let mut call = args(
+        f.dir.path(),
+        ticket,
+        job,
+        "ask",
+        true,
+        json!({"id": "approval-moved", "server": server, "tool": "challenge"}),
+    );
+    call.approve = Arc::new(move |_| {
+        db.with(|q| {
+            q.run(
+                "UPDATE tickets SET cwd=? WHERE id=?",
+                &[&outside.to_string_lossy().as_ref(), &ticket],
+            )
+        })
+        .unwrap();
+        async { true }.boxed()
+    });
+    f.ext.invoke(call).await.unwrap();
+    assert_eq!(receipt(&f, job, "approval-moved")["state"], "error");
+    assert_eq!(
+        receipt(&f, job, "approval-moved")["result"]["error"],
+        "MCP 调用工作目录与工单不一致"
+    );
+    assert_eq!(f.calls(".calls"), None);
     f.engine.close().await;
     f.ext.close();
 }

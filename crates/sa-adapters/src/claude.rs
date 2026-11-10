@@ -27,6 +27,7 @@ static DEFAULT_MODEL_KEY: LazyLock<Regex> =
 pub struct Claude {
     sys: Sys,
     registry: Registry,
+    efficiency: sa_store::efficiency::Shared,
 }
 
 impl Claude {
@@ -35,7 +36,19 @@ impl Claude {
     }
 
     pub fn with_registry(sys: Sys, registry: Registry) -> Self {
-        Self { sys, registry }
+        Self::with_efficiency(sys, registry, sa_store::efficiency::shared(Default::default()))
+    }
+
+    pub fn with_efficiency(
+        sys: Sys,
+        registry: Registry,
+        efficiency: sa_store::efficiency::Shared,
+    ) -> Self {
+        Self {
+            sys,
+            registry,
+            efficiency,
+        }
     }
 }
 
@@ -111,6 +124,7 @@ struct Record {
     catalog_error: Option<String>,
     preferred: String,
     reason: String,
+    cache_settings: Value,
 }
 
 impl Record {
@@ -277,6 +291,7 @@ async fn make_record(
         auth: auth.into(),
         token: env[auth].as_str().map(str::to_string),
         preferred,
+        cache_settings: crate::cache_policy::selected_settings(cfg),
         ..Default::default()
     };
     let attempt: anyhow::Result<()> = async {
@@ -587,7 +602,9 @@ impl Adapter for Claude {
         events: EventSink,
         cancel: CancellationToken,
     ) -> BoxFuture<'static, Result<RunOutcome, AdapterError>> {
-        let sys = self.sys.clone();
+        let mut sys = self.sys.clone();
+        let ttl = self.efficiency.read().unwrap_or_else(|e| e.into_inner()).claude_cache_ttl;
+        crate::cache_policy::select_fallback(&mut sys, ttl);
         let customs = custom::snapshot(&self.registry, "claude");
         Box::pin(async move { run(sys, customs, request, host, Emit(events), cancel).await })
     }
@@ -703,6 +720,15 @@ async fn run(
     if high {
         env.set("CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST", "1");
     }
+    crate::cache_policy::configure(
+        &exe,
+        &req.cwd,
+        &native_file(&sys),
+        &r.cache_settings,
+        &mut env,
+        &cancel,
+    )
+    .await?;
     args.push("--model".into());
     args.push(s.model.clone());
     if let Some(effort) = &s.reasoning_effort {

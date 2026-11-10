@@ -765,6 +765,115 @@ fn extensions_dialog_grants_skills_and_probed_mcp_servers() {
 }
 
 #[test]
+fn extensions_directory_scope_editor_defaults_and_draft_isolation() {
+    let data = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let other = tempfile::tempdir().unwrap();
+    let fixture = fixture_mcp().expect("build workspace MCP fixture before this UI test");
+    let secret = data.path().join("directory-mcp-secret");
+    std::fs::write(&secret, "directory-proof").unwrap();
+    let mut h = harness(data.path(), "readonly");
+    h.run_steps(4);
+    h.state_mut().composer.project = Some(project.path().to_path_buf());
+    let loaded = |a: &App| a.extensions.as_ref().is_some_and(|d| matches!(d.data, Some(Ok(_))));
+    h.state_mut().open_extensions(crate::extensions::ExtScope::Defaults);
+    until(&mut h, "directory extension list", loaded);
+    h.run_steps(3);
+    h.get_by_role_and_label(Role::TextInput, "搜索技能或来源").type_text("directory-proof");
+    h.run_steps(3);
+    h.get_by_label("MCP 服务 0").click();
+    h.run_steps(3);
+    h.get_by_label("添加服务").click();
+    h.run_steps(3);
+    h.get_by_label("指定工作目录").click();
+    h.run_steps(3);
+    for (label, text) in [
+        ("服务名称", "directory-proof".to_string()),
+        ("服务适用目录", other.path().display().to_string()),
+        ("可执行程序", fixture.display().to_string()),
+    ] {
+        let input = h.get_by_role_and_label(Role::TextInput, label);
+        input.focus();
+        input.type_text(&text);
+        h.run_steps(2);
+    }
+    if let Some(crate::extensions::View::Edit(f)) = h.state_mut().extensions.as_mut().map(|d| &mut d.view) {
+        f.args = serde_json::to_string(&[secret.display().to_string()]).unwrap();
+    }
+    h.run_steps(3);
+    h.get_by_label("保存服务").click();
+    until(&mut h, "directory server saved", |a| {
+        a.extensions.as_ref().is_some_and(|d| matches!(d.view, crate::extensions::View::List)
+            && d.data.as_ref().and_then(|v| v.as_ref().ok()).is_some_and(|v| v["servers"].as_array().is_some_and(|s| s.len() == 1)))
+    });
+    let ext = h.state().host.as_ref().unwrap().ext();
+    let initial = ext.list(None).unwrap()["servers"][0].clone();
+    let id = initial["id"].as_str().unwrap().to_string();
+    assert_eq!(std::path::Path::new(initial["scopeRoot"].as_str().unwrap()), sa_engine::services::realpath(other.path()).unwrap());
+    h.run_steps(3);
+    h.get_by_label("编辑 directory-proof").click();
+    h.run_steps(3);
+    if let Some(crate::extensions::View::Edit(f)) = h.state_mut().extensions.as_mut().map(|d| &mut d.view) {
+        assert!(f.directory_only);
+        f.scope_root.clear();
+    }
+    h.run_steps(1);
+    let input = h.get_by_role_and_label(Role::TextInput, "服务适用目录");
+    input.focus();
+    input.type_text(&project.path().display().to_string());
+    h.run_steps(3);
+    h.get_by_label("保存服务").click();
+    until(&mut h, "edited directory server saved", |a| loaded(a)
+        && a.extensions.as_ref().is_some_and(|d| matches!(d.view, crate::extensions::View::List)));
+    let row = ext.list(None).unwrap()["servers"][0].clone();
+    assert_eq!(row["id"].as_str(), Some(id.as_str()));
+    assert_eq!(std::path::Path::new(row["scopeRoot"].as_str().unwrap()), sa_engine::services::realpath(project.path()).unwrap());
+    // Probe a local fixture only. No model request or external service is used.
+    let mut enabled = row;
+    enabled["enabled"] = serde_json::json!(true);
+    ext.save_server(&enabled).unwrap();
+    h.state().host.as_ref().unwrap().runtime().block_on(ext.probe(&id)).unwrap();
+    h.state_mut().open_extensions(crate::extensions::ExtScope::Defaults);
+    until(&mut h, "global defaults list", loaded);
+    h.run_steps(3);
+    h.get_by_role_and_label(Role::TextInput, "搜索技能或来源").type_text("directory-proof");
+    h.run_steps(3);
+    h.get_by_label("MCP 服务 1").click();
+    h.run_steps(3);
+    assert!(h.state().extensions.as_ref().unwrap().servers.is_empty());
+    h.get_by_label("选择 directory-proof").click();
+    h.run_steps(2);
+    assert!(h.state().extensions.as_ref().unwrap().servers.is_empty(), "directory server cannot enter global defaults");
+    h.get_by_label("工作目录默认授权").click();
+    until(&mut h, "directory defaults mode", loaded);
+    h.run_steps(3);
+    h.get_by_label("使用当前草稿目录").click();
+    h.run_steps(2);
+    h.get_by_label("载入目录默认授权").click();
+    until(&mut h, "directory defaults loaded", loaded);
+    h.run_steps(3);
+    h.get_by_label("选择 directory-proof").click();
+    h.run_steps(2);
+    assert_eq!(h.state().extensions.as_ref().unwrap().servers, vec![id.clone()]);
+    h.get_by_label("保存授权").click();
+    until(&mut h, "directory defaults saved", |a| a.extensions.is_none());
+    assert_eq!(ext.defaults_for(Some(project.path())).unwrap()["servers"], serde_json::json!([id.clone()]));
+    assert_eq!(ext.defaults().unwrap()["servers"], serde_json::json!([]));
+    for (cwd, expected) in [(project.path(), vec![id.clone()]), (other.path(), vec![])] {
+        h.state_mut().composer.project = Some(cwd.to_path_buf());
+        h.state_mut().open_extensions(crate::extensions::ExtScope::Draft);
+        until(&mut h, "draft directory defaults", loaded);
+        h.run_steps(3);
+        let dialog = h.state().extensions.as_ref().unwrap();
+        assert!(dialog.follow);
+        assert_eq!(dialog.servers, expected);
+        h.get_by_label("保存授权").click();
+        h.run_steps(3);
+        assert!(h.state().composer.extensions.is_none(), "following defaults remains directory-sensitive at ticket creation");
+    }
+}
+
+#[test]
 fn command_palette_and_shortcuts() {
     let data = tempfile::tempdir().unwrap();
     let mut h = harness(data.path(), "readonly");
