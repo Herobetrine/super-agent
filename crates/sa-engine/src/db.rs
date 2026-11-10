@@ -45,6 +45,7 @@ impl Db {
         // Additive Rust-port table; the Node engine ignores it.
         conn.execute_batch(sa_store::knowledge::SCHEMA)?;
         conn.execute_batch(SCHEMA)?;
+        conn.execute_batch(crate::pause::SCHEMA)?;
         conn.execute_batch(crate::workspaces::SCHEMA)?;
         conn.execute_batch(crate::scm::SCHEMA)?;
         conn.execute_batch(crate::checkpoints::SCHEMA)?;

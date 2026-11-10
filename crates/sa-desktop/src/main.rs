@@ -5,6 +5,7 @@
 mod app;
 mod cli;
 mod composer;
+mod control;
 mod conversation;
 mod data;
 mod demo;

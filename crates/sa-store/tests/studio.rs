@@ -8,6 +8,20 @@ use sa_store::Store;
 use std::collections::HashSet;
 
 #[test]
+fn pause_gate_is_read_without_requiring_new_schema_on_legacy_databases() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::open(dir.path()).unwrap();
+    let conn = writer(dir.path());
+    let job = create_ticket(&conn, "C:/fixture", "pause read", "codex");
+    assert_eq!(store.snapshot(job.ticket, 0).unwrap().ticket.pause_status, None);
+    conn.execute_batch("CREATE TABLE ticket_pause(ticket INTEGER PRIMARY KEY,state TEXT NOT NULL);").unwrap();
+    conn.execute("INSERT INTO ticket_pause VALUES(?,'paused')", [job.ticket]).unwrap();
+    assert_eq!(store.snapshot(job.ticket, 0).unwrap().ticket.pause_status.as_deref(), Some("paused"));
+    conn.execute("DELETE FROM ticket_pause WHERE ticket=?", [job.ticket]).unwrap();
+    assert_eq!(store.snapshot(job.ticket, 0).unwrap().ticket.pause_status, None);
+}
+
+#[test]
 fn ticket_preview_and_collaboration_pages_preserve_every_task_address() {
     let dir = tempfile::tempdir().unwrap();
     let mut store = Store::open(dir.path()).unwrap();

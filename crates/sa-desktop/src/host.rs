@@ -52,6 +52,12 @@ pub enum Action {
     Cancel {
         ticket: i64,
     },
+    PauseAfterHandoff {
+        ticket: i64,
+    },
+    ResumePaused {
+        ticket: i64,
+    },
     Retry {
         job: i64,
     },
@@ -164,7 +170,9 @@ impl Action {
             Action::ProviderSave { .. }
             | Action::ProviderRemove { .. }
             | Action::RotationSave { .. } => ActionKind::Providers,
-            Action::TicketMeta { .. }
+            Action::PauseAfterHandoff { .. }
+            | Action::ResumePaused { .. }
+            | Action::TicketMeta { .. }
             | Action::SetFailover { .. }
             | Action::SetIsolatedWriters { .. }
             | Action::ValidateWorkspace { .. }
@@ -425,9 +433,25 @@ impl Host {
                             return;
                         }
                     };
+                    let control = match crate::control::Server::open(&dir) {
+                        Ok(server) => server,
+                        Err(e) => {
+                            let _ = ready_tx.send(Err(format!("本地控制接口无法打开：{e:#}")));
+                            engine.close().await;
+                            ext.close();
+                            return;
+                        }
+                    };
+                    let control_engine = engine.clone();
+                    let control_wake = wake.clone();
+                    let control_task = tokio::spawn(async move {
+                        control.run(control_engine, control_wake).await;
+                    });
                     let handle = tokio::runtime::Handle::current();
                     let _ = ready_tx.send(Ok((engine.clone(), handle, adapters, ext.clone())));
                     action_loop(&engine, &for_thread, rx, &out_tx, &wake).await;
+                    control_task.abort();
+                    let _ = control_task.await;
                     engine.close().await;
                     ext.close();
                     // `_owner` drops here: the lock is released after the
@@ -733,6 +757,14 @@ async fn execute(engine: &Engine, shared: &Shared, action: Action) -> Result<Opt
         }
         Action::Cancel { ticket } => {
             engine.cancel(ticket)?;
+            Ok(None)
+        }
+        Action::PauseAfterHandoff { ticket } => {
+            engine.request_pause_after_handoff(ticket)?;
+            Ok(None)
+        }
+        Action::ResumePaused { ticket } => {
+            engine.resume_paused(ticket)?;
             Ok(None)
         }
         Action::Retry { job } => {
@@ -2069,4 +2101,43 @@ exit 0
         assert!(!host.allow_lead_routing_default());
         assert_eq!(host.defaults(), routes);
     }
+    #[test]
+    fn local_control_uses_owned_engine_and_rejects_old_generation() {
+        let data = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let mut host = Host::start_with(data.path().into(), fakes, || {}).unwrap();
+        host.submit(Action::Create {
+            goal: "local control fixture".into(), cwd: Some(project.path().into()),
+            lead: "deepseek".into(), profile: "readonly".into(), files: vec![],
+            selections: None, allow_lead_routing: None, extensions: None,
+        });
+        let ticket = outcome(&host).result.unwrap().unwrap();
+        until(|| root_state(&host, ticket) == "done");
+        let control = data.path().join("control");
+        let ready: Value = serde_json::from_slice(&std::fs::read(control.join("ready.json")).unwrap()).unwrap();
+        assert_eq!(ready["protocol"], "super-agent-local-control");
+        let request = |id: &str, command: &str, generation: &Value| -> Value {
+            let value = json!({"version":1,"id":id,"command":command,"ticket":ticket,"generation":generation});
+            let temporary = control.join(format!("{id}.tmp"));
+            std::fs::write(&temporary, serde_json::to_vec(&value).unwrap()).unwrap();
+            std::fs::rename(temporary, control.join(format!("requests/{id}.json"))).unwrap();
+            let response = control.join(format!("responses/{id}.json"));
+            until(|| response.exists());
+            serde_json::from_slice(&std::fs::read(response).unwrap()).unwrap()
+        };
+        let status = request("status", "status", &ready["generation"]);
+        assert_eq!(status["ok"], true);
+        assert_eq!(status["result"]["jobs"][0]["state"], "done");
+        assert!(status["result"]["jobs"][0].get("result").is_none());
+        assert_eq!(request("pause", "pause_after_handoff", &ready["generation"])["ok"], true);
+        let paused = host.engine().pause_status(ticket).unwrap();
+        assert_ne!(paused, sa_engine::PauseStatus::Running);
+        assert_eq!(request("old", "resume", &json!("stale-generation"))["ok"], false);
+        assert_eq!(host.engine().pause_status(ticket).unwrap(), paused);
+        assert_eq!(request("resume", "resume", &ready["generation"])["ok"], true);
+        assert_eq!(host.engine().pause_status(ticket).unwrap(), sa_engine::PauseStatus::Running);
+        host.shutdown();
+        assert!(!control.join("ready.json").exists());
+    }
+
 }

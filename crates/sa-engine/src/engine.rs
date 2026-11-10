@@ -21,6 +21,7 @@ use crate::dispatch::{self, CmdError};
 use crate::guides;
 use crate::job::{JobCtx, envelope};
 use crate::knowledge;
+use crate::pause::{self, PauseStatus};
 use crate::protocol::{self as p, END_SQL, digest, stringify};
 use crate::resilience::{Health, HealthTransition, Recovery, ResilienceConfig, TurnLedger, TurnResult, classify};
 use crate::runner::{NoRotation, ResilientRunner, RotationSource, TurnRunner};
@@ -408,6 +409,27 @@ impl Engine {
             }
         }
         Ok(())
+    }
+
+    /// Finish the current root turn, drain its children and make at most one
+    /// final consolidation turn before blocking further ticket admissions.
+    pub fn request_pause_after_handoff(&self, ticket: i64) -> Result<PauseStatus> {
+        let _sched = lock(&self.inner.sched);
+        self.inner.db.tx(|q| pause::request(q, ticket))
+    }
+
+    /// Explicitly remove the durable admission gate. Follow-up messages and
+    /// job retries retain the gate until this operation is called.
+    pub fn resume_paused(&self, ticket: i64) -> Result<PauseStatus> {
+        let _sched = lock(&self.inner.sched);
+        self.inner.db.tx(|q| pause::resume(q, ticket))
+    }
+
+    pub fn pause_status(&self, ticket: i64) -> Result<PauseStatus> {
+        self.inner.db.with(|q| {
+            q.root(ticket)?;
+            pause::status(q, ticket)
+        })
     }
 
     /// `decide({id, allow})` (E:74-87).
@@ -1026,12 +1048,16 @@ impl Inner {
         let mut aborts = vec![];
         let admitted = self.db.tx(|q| {
             q.wake()?;
+            pause::reconcile(q)?;
             let queued = "SELECT j.*,t.cwd,t.claude_route,t.follow_config,t.agent_routes,t.allow_lead_routing,t.writes,
         t.permission_profile AS ticket_profile,coalesce(j.permission_override,t.permission_profile) AS profile,
         t.auto_cycles,r.route AS bound_route,c.ticket AS continuous_ticket,coalesce(c.boundary_job,0) AS floor
         FROM jobs j JOIN tickets t ON t.id=j.ticket LEFT JOIN native_routes r ON r.job=j.id
         LEFT JOIN continuous_runs c ON c.ticket=j.ticket
-        WHERE j.state='queued' AND j.ready_after<=? AND j.writing=? ORDER BY j.id LIMIT ?";
+        WHERE j.state='queued' AND j.ready_after<=? AND j.writing=?
+        AND NOT EXISTS(SELECT 1 FROM ticket_pause p WHERE p.ticket=j.ticket
+          AND (p.state='paused' OR (p.state='draining' AND j.parent IS NULL)))
+        ORDER BY j.id LIMIT ?";
             let time = now();
             let mut candidates = q.all(queued, &[&time, &0, &(READS_PER_SLICE as i64)])?;
             candidates.extend(q.all(queued, &[&time, &1, &256])?);
@@ -1073,6 +1099,12 @@ impl Inner {
                     q.run("UPDATE tickets SET auto_cycles=auto_cycles+1 WHERE id=?", &[&job.ticket])?;
                 }
                 let mut packet = envelope(q, &job, health.clone())?;
+                if job.is_root() && pause::consolidating(q, job.ticket)? {
+                    packet.insert("pause_after_handoff".into(), json!({
+                        "consolidation": true,
+                        "instruction": "用户已请求暂停。这是最后一次交接轮，请汇总已完成工作、验证证据、未完成事项和下一步，然后结束本轮。平台已禁止新派工，恢复前不会再启动轮次。"
+                    }));
+                }
                 packet.insert("execution_directory".into(),json!(job.cwd));
                 packet.insert("isolated_writers".into(),json!(q.exists("SELECT 1 FROM workspace_policy WHERE ticket=? AND isolated=1", &[&job.ticket])?));
                 if let Some(w) = crate::workspaces::get(q,job.id)? { packet.insert("workspace".into(),serde_json::to_value(w)?); }
@@ -1781,6 +1813,7 @@ impl Inner {
         )?;
         let ids:Vec<i64>=turn.packet().get("scm_feedback").and_then(Value::as_array).into_iter().flatten().filter_map(|v|v["id"].as_i64()).collect();
         crate::scm::acknowledge(q,job.id,&ids,job.turn)?;
+        pause::after_reply(q, job, outstanding)?;
         Ok(())
     }
 
@@ -1871,7 +1904,7 @@ impl Inner {
         coalesce((SELECT max(seq) FROM events WHERE job=? AND kind IN ('reply','user.follow')),0)",
                 &[&job.id, &job.id],
             )?;
-            if job.continuous || attempts < 2 {
+            if (job.continuous && pause::status(q, job.ticket)? == PauseStatus::Running) || attempts < 2 {
                 let delay = 2f64.powi((attempts + 1).min(9) as i32).min(300.0);
                 q.interrupt(who, &job.ticket_profile)?;
                 q.run("UPDATE jobs SET ready_after=? WHERE id=?", &[&(now() + delay), &job.id])?;
@@ -2092,7 +2125,8 @@ impl Inner {
             Recovery::GiveUp { class, attempts } => {
                 // A continuous project keeps retrying transient failures,
                 // bounded per hour (spec §9.2 A).
-                if job.primary() && classify::is_retryable(class) {
+                if job.primary() && classify::is_retryable(class)
+                    && pause::status(q, job.ticket)? == PauseStatus::Running {
                     let recent = q.int(
                         "SELECT count(*) FROM events WHERE job=? AND kind IN ('turn.retry_scheduled','route.rotated') AND ts>?",
                         &[&job.id, &(at - 3600.0)],

@@ -43,6 +43,9 @@ pub struct TicketDetail {
     pub allow_lead_routing: bool,
     /// State of the root (lead) job.
     pub state: String,
+    /// Durable admission gate, independent of the current root job state.
+    #[serde(default)]
+    pub pause_status: Option<String>,
 }
 
 /// A job row with bounded body/result previews (`JOB_DETAILS`).

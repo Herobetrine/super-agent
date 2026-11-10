@@ -22,6 +22,7 @@ pub mod images;
 pub mod job;
 pub mod knowledge;
 pub mod owner;
+pub mod pause;
 pub mod protocol;
 pub mod resilience;
 pub mod runner;
@@ -32,4 +33,5 @@ pub mod stuck;
 
 pub use activity::{ActivityPhase, BadgeTone, JobActivity, RetryInfo};
 pub use engine::{CreateParams, Engine, EngineOptions};
+pub use pause::PauseStatus;
 pub use sa_store::knowledge::KnowledgeEntry;

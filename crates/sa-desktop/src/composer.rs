@@ -687,6 +687,50 @@ impl App {
             ui.add_space(6.0);
         }
 
+        let pause_status = self.view.as_ref().and_then(|v| v.snap.as_ref())
+            .and_then(|s| s.ticket.pause_status.clone());
+        if let Some(ticket) = cur.ticket
+            && (in_flight || pause_status.is_some())
+        {
+            let mut action = None;
+            ui.horizontal_wrapped(|ui| {
+                let (label, hint) = match pause_status.as_deref() {
+                    Some("paused") => ("已暂停后续调度", "可补充指令；点击恢复调度后才会继续执行。"),
+                    Some("draining") => ("等待当前工作完成交接", "正在执行的操作会继续，已有协作者完成后由主控收拢交接。"),
+                    Some("handoff") => ("等待主控完成本轮交接", "保留当前操作；收齐已有回报后的最终交接轮禁止新派工。"),
+                    _ => ("", "保留当前操作，等待协作者完成并由主控交接后暂停后续调度。"),
+                };
+                if !label.is_empty() {
+                    ui.label(RichText::new(label).color(pal.mute)).on_hover_text(hint);
+                }
+                let enabled = self.writable() && !busy;
+                match pause_status.as_deref() {
+                    Some("paused") => {
+                        if ui.add_enabled(enabled, egui::Button::new("恢复调度")).clicked() {
+                            action = Some(Action::ResumePaused { ticket });
+                        }
+                    }
+                    Some("draining" | "handoff") => {
+                        if ui.add_enabled(enabled, egui::Button::new("取消暂停请求"))
+                            .on_hover_text("恢复正常调度；正在进行的交接轮仍会完成。")
+                            .clicked()
+                        {
+                            action = Some(Action::ResumePaused { ticket });
+                        }
+                    }
+                    _ => {
+                        if ui.add_enabled(enabled, egui::Button::new("交接后暂停"))
+                            .on_hover_text(hint).clicked()
+                        {
+                            action = Some(Action::PauseAfterHandoff { ticket });
+                        }
+                    }
+                }
+            });
+            if let Some(action) = action { self.submit(action); }
+            ui.add_space(6.0);
+        }
+
         let mut send = false;
         let mut stop = false;
         let mut pick_project = false;

@@ -282,6 +282,9 @@ fn check(q: &Q, turn: &Turn, cmd: &Value) -> Result<Option<Child>> {
         }
         return Ok(None);
     }
+    if job.is_root() && crate::pause::consolidating(q, job.ticket)? {
+        return Err(anyhow!("工单正在最后一次暂停交接，请汇总已有结果并结束本轮"));
+    }
     let mut selection = None;
     if let Some(model) = model {
         let menus = turn.menus();

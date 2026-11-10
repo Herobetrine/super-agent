@@ -845,6 +845,7 @@ mod tests {
             permission_profile: "readonly".into(),
             agent_routes: json!({}),
             allow_lead_routing: true,
+            pause_status: None,
             state: "running".into(),
         }
     }

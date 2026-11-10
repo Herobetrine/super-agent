@@ -121,6 +121,7 @@ fn detail(
         permission_profile: profile.into(),
         agent_routes: json!({}),
         allow_lead_routing: true,
+        pause_status: None,
         state: state.into(),
     }
 }

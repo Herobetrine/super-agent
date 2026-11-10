@@ -126,6 +126,54 @@ fn ticket_count(app: &App) -> usize {
 }
 
 #[test]
+fn handoff_pause_clicks_keep_active_work_and_require_explicit_resume() {
+    let data = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let mut h = harness(data.path(), "ask");
+    h.state_mut().composer.project = Some(project.path().to_path_buf());
+    h.run_steps(3);
+    h.get_by_label("输入框").focus();
+    h.get_by_label("输入框").type_text("完成当前检查后交接");
+    h.run_steps(2);
+    h.key_press(egui::Key::Enter);
+    until(&mut h, "approval", |app| app.view.as_ref().and_then(|v| v.snap.as_ref())
+        .is_some_and(|s| !s.approvals.is_empty()));
+    let ticket = h.state().view.as_ref().unwrap().id;
+    h.run_steps(3);
+    h.get_by_role_and_label(Role::Button, "交接后暂停").click();
+    until(&mut h, "pause requested", |app| app.view.as_ref().and_then(|v| v.snap.as_ref())
+        .is_some_and(|s| s.ticket.pause_status.as_deref() == Some("handoff")));
+    assert_eq!(root_state(h.state()), "running");
+    h.state_mut().inspector_open = true;
+    h.state_mut().tab = Tab::Approvals;
+    h.run_steps(3);
+    h.get_by_label("允许本次请求").click();
+    until(&mut h, "paused after reply", |app| app.view.as_ref().and_then(|v| v.snap.as_ref())
+        .is_some_and(|s| s.ticket.pause_status.as_deref() == Some("paused")));
+    assert_ne!(root_state(h.state()), "running");
+    assert!(kinds(h.state(), ticket).iter().any(|k| k == "reply"));
+    assert!(!kinds(h.state(), ticket).iter().any(|k| k == "cancelled"));
+
+    // A follow-up remains queued behind the gate until the explicit button.
+    h.state_mut().inspector_open = false;
+    h.run_steps(3);
+    h.get_by_label("输入框").focus();
+    h.get_by_label("输入框").type_text("后续检查");
+    h.run_steps(2);
+    h.key_press(egui::Key::Enter);
+    until(&mut h, "queued behind pause", |app| root_state(app) == "queued" && app.composer.pending == 0);
+    h.run_steps(3);
+    h.get_by_role_and_label(Role::Button, "恢复调度").click();
+    until(&mut h, "resumed approval", |app| app.view.as_ref().and_then(|v| v.snap.as_ref())
+        .is_some_and(|s| s.ticket.pause_status.is_none() && !s.approvals.is_empty()));
+    h.state_mut().inspector_open = true;
+    h.state_mut().tab = Tab::Approvals;
+    h.run_steps(3);
+    h.get_by_label("允许本次请求").click();
+    until(&mut h, "resumed reply", |app| root_state(app) == "done");
+}
+
+#[test]
 fn workflow_fork_runs_through_host_selects_result_and_keeps_source_policy() {
     use egui_kittest::kittest::NodeT;
     let data = tempfile::tempdir().unwrap();
