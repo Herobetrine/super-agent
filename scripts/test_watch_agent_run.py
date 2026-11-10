@@ -133,5 +133,22 @@ class WatchRunTests(unittest.TestCase):
         self.assertNotIn("DO-NOT-LEAK", json.dumps(records))
 
 
+    def test_failed_native_result_and_durable_gate_are_not_success_or_zero_cache(self):
+        self.event({"type": "result", "subtype": "success", "is_error": True,
+                    "usage": dict.fromkeys(watch.TOKEN_NAMES, 0)})
+        self.event({}, kind="turn.retry_scheduled")
+        self.event({}, kind="auto.retry")
+        records, _ = self.sampler.poll()
+        summary = self.sampler.summary()
+        self.assertTrue(summary["observed_turns"][0]["native_is_error"])
+        self.assertIsNone(summary["claude_terminal"]["cache_read_fraction"])
+        self.assertEqual([r["event"] for r in records if r["record"] == "retry"],
+                         ["turn.retry_scheduled", "auto.retry"])
+        self.assertIsNone(summary["pause_state"])
+        self.sampler.connection.execute("CREATE TABLE ticket_pause(ticket INTEGER PRIMARY KEY,state TEXT)")
+        self.sampler.connection.execute("INSERT INTO ticket_pause VALUES(?,'paused')", (self.sampler.ticket,))
+        self.assertEqual(self.sampler.summary()["pause_state"], "paused")
+
+
 if __name__ == "__main__":
     unittest.main()

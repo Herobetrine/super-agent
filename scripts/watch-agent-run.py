@@ -153,6 +153,8 @@ class Sampler:
         if agent == "claude" and value.get("parent_tool_use_id") is None:
             if value.get("type") == "result":
                 self.turns[key]["ended"] = True
+                self.turns[key]["native_ended_at"] = base["ts"]
+                self.turns[key]["native_is_error"] = value.get("is_error") if type(value.get("is_error")) is bool else None
                 usage = counts(value.get("usage"), agent)
                 if value.get("subtype") == "error_during_execution" and not any(usage.values()):
                     usage = {name: None for name in TOKEN_NAMES}
@@ -220,6 +222,10 @@ class Sampler:
                 for job, parent, agent, turn, state in self.connection.execute(
                     "SELECT id,parent,agent,turn,state FROM jobs WHERE ticket=? ORDER BY id", (self.ticket,))]
         claude = aggregate(self.results.values(), "claude")
+        pause_state = None
+        if self.connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='ticket_pause'").fetchone():
+            row = self.connection.execute("SELECT state FROM ticket_pause WHERE ticket=?", (self.ticket,)).fetchone()
+            pause_state = row[0] if row and row[0] in {"draining", "handoff", "paused"} else None
         return {"schema_version": 1, "ticket": self.ticket, "after_seq": self.start_seq,
                 "through_seq": self.cursor, "updated_at": time.time(), "scope": "partial_tail_main_loop_only",
                 "event_counts": dict(self.event_counts), "delivery": dict(self.delivery),
@@ -235,10 +241,11 @@ class Sampler:
                                         claude_terminal_usage_complete=all(number is not None for number in self.results[job, turn].values())
                                         if (job, turn) in self.results else None)
                                    for (job, turn), data in sorted(self.turns.items())],
-                "jobs": jobs,
+                "jobs": jobs, "pause_state": pause_state,
                 "cache_assessment": "warm_up_or_missing" if claude["cache_ratio_samples"] < 3 else "observed_partial_sample",
                 "alert_candidates": ["delivery_byte_inconsistency"] if self.delivery["inconsistent_requests"] else [],
                 "limitations": ["No automatic cancellation or provider calls.",
+                                "Retry event counts are raw events, not distinct attempts. One retry can emit multiple events.",
                                 "Missing usage is null, not zero. Replayed usage_update rows replace prior samples.",
                                 "Claude internal subagents excluded. Terminal totals and request samples overlap.",
                                 "Tail starts mid-history. Codex first frame uses last request only.",

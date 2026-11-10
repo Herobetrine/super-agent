@@ -234,3 +234,42 @@ async fn continuous_root_pause_uses_finite_retry_budget() {
     assert_eq!(fx.int("SELECT count(*) FROM events WHERE kind='turn.gave_up'"), 1);
     fx.engine.close().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn terminal_root_resume_keeps_lifecycle_and_delivers_revocation_on_follow() {
+    for terminal in ["done", "cancelled", "failed"] {
+        let mut fx = Fx::new(script(|c| async move {
+            if c.turn() > 1 {
+                assert_eq!(c.full_packet()["pause_control"]["state"], "running");
+                assert!(c.full_packet()["pause_control"]["instruction"].as_str().unwrap().contains("之前的小结交接后暂停指令已撤销"));
+            }
+            Ok("terminal fixture".into())
+        }), t1_catalog());
+        let ticket = fx.begin(fx.params()).await;
+        fx.finish(ticket, "done").await;
+        settled(&fx.engine).await;
+        // Fixtures cover each terminal lifecycle without invoking a model.
+        fx.engine.db().tx(|q| {
+            q.run("UPDATE jobs SET state=? WHERE ticket=? AND parent IS NULL", &[&terminal, &ticket])?;
+            Ok(())
+        }).unwrap();
+        let before = fx.engine.root(ticket).unwrap();
+        assert_eq!(fx.engine.request_pause_after_handoff(ticket).unwrap(), PauseStatus::Paused);
+        assert_eq!(fx.engine.resume_paused(ticket).unwrap(), PauseStatus::Running);
+        assert_eq!(fx.engine.resume_paused(ticket).unwrap(), PauseStatus::Running);
+        assert_eq!(fx.engine.root(ticket).unwrap(), before);
+        assert_eq!(fx.engine.step(), 0);
+        assert_eq!(fx.shared.count(|_| true), 1);
+        assert_eq!(fx.int("SELECT count(*) FROM mailbox"), 0);
+        assert_eq!(fx.int("SELECT count(*) FROM events WHERE kind='user.follow'"), 0);
+        assert_eq!(fx.int("SELECT count(*) FROM events WHERE kind='ticket.resumed'"), 1);
+        let plan = fx.all(&format!("EXPLAIN QUERY PLAN SELECT payload FROM events WHERE ticket={ticket} AND kind='ticket.resumed' ORDER BY seq DESC LIMIT 1"));
+        assert!(plan.iter().any(|row| row["detail"].as_str().is_some_and(|detail| detail.contains("events_ticket_kind"))));
+        fx.restart(quiet()).await;
+        fx.engine.follow(ticket, "explicit next task", true).unwrap();
+        fx.engine.start().unwrap();
+        fx.until(|| fx.shared.count(|_| true) == 2).await;
+        fx.finish(ticket, "done").await;
+        fx.engine.close().await;
+    }
+}

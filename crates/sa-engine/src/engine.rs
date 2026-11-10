@@ -1099,6 +1099,9 @@ impl Inner {
                     q.run("UPDATE tickets SET auto_cycles=auto_cycles+1 WHERE id=?", &[&job.ticket])?;
                 }
                 let mut packet = envelope(q, &job, health.clone())?;
+                if job.is_root() && let Some(control) = pause::resumed_control(q, job.ticket)? {
+                    packet.insert("pause_control".into(), control);
+                }
                 if job.is_root() && pause::consolidating(q, job.ticket)? {
                     packet.insert("pause_after_handoff".into(), json!({
                         "consolidation": true,

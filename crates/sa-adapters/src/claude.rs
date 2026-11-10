@@ -1,21 +1,23 @@
 //! Claude Code adapter (port of `runtime/adapters/claude.cjs`, spec §7.3).
 
 use crate::common::{
-    Emit, cc_rows, endpoint, fingerprint, local_host, modes, probe_failed, read_json_or,
+    Emit, cc_rows, endpoint, fingerprint, local_host, modes, probe_failed, read_json, read_json_or,
     route_gone, scope, select, session_mismatch,
 };
 use crate::custom::{self, CustomProvider, Registry};
-use crate::proc::{capture, start, stream};
+use crate::proc::{Proc, capture, start, stream};
 use crate::sys::Sys;
 use futures::future::{BoxFuture, join_all};
 use regex::Regex;
 use sa_engine::adapter::{
     Adapter, AdapterError, Catalog, ErrorClass, EventSink, RunOutcome, RunRequest, TurnHost,
 };
-use sa_engine::resilience::classify::{classified, classify_text, claude_api_retry};
+use sa_engine::resilience::classify::{
+    classified, classify_text, claude_api_retry, from_http_status,
+};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 use tokio::sync::Mutex as AsyncMutex;
@@ -36,7 +38,11 @@ impl Claude {
     }
 
     pub fn with_registry(sys: Sys, registry: Registry) -> Self {
-        Self::with_efficiency(sys, registry, sa_store::efficiency::shared(Default::default()))
+        Self::with_efficiency(
+            sys,
+            registry,
+            sa_store::efficiency::shared(Default::default()),
+        )
     }
 
     pub fn with_efficiency(
@@ -603,7 +609,11 @@ impl Adapter for Claude {
         cancel: CancellationToken,
     ) -> BoxFuture<'static, Result<RunOutcome, AdapterError>> {
         let mut sys = self.sys.clone();
-        let ttl = self.efficiency.read().unwrap_or_else(|e| e.into_inner()).claude_cache_ttl;
+        let ttl = self
+            .efficiency
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .claude_cache_ttl;
         crate::cache_policy::select_fallback(&mut sys, ttl);
         let customs = custom::snapshot(&self.registry, "claude");
         Box::pin(async move { run(sys, customs, request, host, Emit(events), cancel).await })
@@ -612,6 +622,47 @@ impl Adapter for Claude {
 
 fn strip_1m(m: &str) -> &str {
     m.strip_suffix("[1M]").unwrap_or(m)
+}
+
+const MODEL_CAPABILITIES: &str = "CLAUDE_CODE_MODEL_CAPABILITIES";
+
+fn local_gateway_settings(
+    env: &Sys,
+    cwd: &Path,
+    high: bool,
+    model: &str,
+) -> Result<Value, AdapterError> {
+    let mut capabilities = env.get(MODEL_CAPABILITIES).unwrap_or_default().to_owned();
+    // Restricted calls already pass --setting-sources "" and must keep that boundary.
+    if high {
+        let mut paths = vec![native_file(env)];
+        for directory in cwd.ancestors().collect::<Vec<_>>().into_iter().rev() {
+            paths.push(directory.join(".claude/settings.json"));
+            paths.push(directory.join(".claude/settings.local.json"));
+        }
+        for path in paths {
+            let source = read_json(&path, Value::Null).map_err(|_| {
+                route_gone("Claude 本地网关兼容设置无法读取现有 settings，已停止本次调用")
+            })?;
+            if let Some(value) = source["env"].get(MODEL_CAPABILITIES) {
+                capabilities = value
+                    .as_str()
+                    .ok_or_else(|| route_gone("Claude 模型能力设置必须是字符串，已停止本次调用"))?
+                    .to_owned();
+            }
+        }
+    }
+    // CLI 2.1.317 merges matching entries per capability in order, including
+    // duplicate exact selectors and wildcards. Append only the selected override
+    // so all other effective capability tokens and unrelated entries survive.
+    let entry = format!("{model}=-mid_conv_system");
+    let capabilities = capabilities.trim_end_matches(';');
+    let merged = if capabilities.is_empty() {
+        entry
+    } else {
+        format!("{capabilities};{entry}")
+    };
+    Ok(json!({"env":{MODEL_CAPABILITIES:merged}}))
 }
 
 /// `run(o)` (CL:267-356).
@@ -703,18 +754,14 @@ async fn run(
         let bound_base = api_base(d.bound["base_url"].as_str().unwrap_or_default());
         let local = endpoint(&r.base).is_ok_and(|u| local_host(u.host_str().unwrap_or_default()));
         if bound_base == base && local {
-            let caps = env
-                .get("CLAUDE_CODE_MODEL_CAPABILITIES")
-                .map(|c| c.trim_end_matches(';').to_string())
-                .filter(|c| !c.is_empty());
-            let entry = format!("{}=-mid_conv_system", s.model);
-            env.set(
-                "CLAUDE_CODE_MODEL_CAPABILITIES",
-                match caps {
-                    Some(c) => format!("{c};{entry}"),
-                    None => entry,
-                },
-            );
+            let settings = local_gateway_settings(&env, &req.cwd, high, &s.model)?;
+            let capabilities = settings["env"][MODEL_CAPABILITIES]
+                .as_str()
+                .unwrap_or_default();
+            env.set(MODEL_CAPABILITIES, capabilities);
+            // Claude applies settings.env after inherited shell variables. A narrow
+            // per-session override keeps this local gateway compatibility setting effective.
+            args.extend(["--settings".into(), settings.to_string()]);
         }
     }
     if high {
@@ -747,11 +794,32 @@ async fn run(
         json!({"type": "user", "message": {"role": "user", "content": crate::images::claude(&req)}})
     );
     let mut proc = start(&exe, &args, &req.cwd, &env)?;
+    collect_turn(
+        &mut proc,
+        &input,
+        req.session_id.as_deref(),
+        (!sdk).then_some(s.model.as_str()),
+        emit,
+        &cancel,
+    )
+    .await
+}
+
+/// Consume the native process using the same terminal contract for real and fake CLIs.
+async fn collect_turn(
+    proc: &mut Proc,
+    input: &str,
+    expected_session: Option<&str>,
+    expected_model: Option<&str>,
+    emit: Emit,
+    cancel: &CancellationToken,
+) -> Result<RunOutcome, AdapterError> {
     let mut terminal: Option<Value> = None;
     let mut last_retry: Option<Value> = None;
-    let mut session: Option<String> = req.session_id.clone();
+    let mut assistant_error: Option<AdapterError> = None;
+    let mut session: Option<String> = expected_session.map(str::to_owned);
     let mut open_tools: HashSet<String> = HashSet::new();
-    let streamed = stream(&mut proc, &input, &cancel, |e| {
+    let streamed = stream(proc, input, cancel, |e| {
         emit.journal("native", e.clone());
         if e["type"] == json!("stream_event") {
             if e["event"]["delta"]["type"] == json!("text_delta") {
@@ -771,7 +839,7 @@ async fn run(
                 .as_str()
                 .map(str::to_string)
                 .unwrap_or_else(|| e["model"].to_string());
-            if !sdk && strip_1m(&model) != strip_1m(&s.model) {
+            if expected_model.is_some_and(|expected| strip_1m(&model) != strip_1m(expected)) {
                 return Err(route_gone("Claude 原生模型与所选路由不符"));
             }
         }
@@ -785,21 +853,39 @@ async fn run(
             emit.native_retry(after);
             last_retry = Some(e.clone());
         }
+        if e["type"] == json!("assistant") {
+            assistant_error = e["message"]["content"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|block| block["text"].as_str())
+                .map(classify_claude_text)
+                .find(|error| error.class != ErrorClass::Other);
+        }
         if e["type"] == json!("result") {
             terminal = Some(e);
         }
         Ok(())
     })
     .await;
+    let t = terminal.unwrap_or(Value::Null);
     if let Err(mut err) = streamed {
-        err.session_id = err.session_id.or(session);
+        // Only a generic process crash may be refined by a completed native error.
+        // Cancellation, transport, protocol and callback failures keep their precedence.
+        if err.class == ErrorClass::ProcessCrashed && terminal_reports_error(&t) {
+            let native_error = terminal_error(&t, assistant_error, last_retry.as_ref());
+            if native_error.class != ErrorClass::Other {
+                err = native_error;
+            }
+        }
+        err.session_id = err
+            .session_id
+            .or_else(|| t["session_id"].as_str().map(str::to_owned))
+            .or(session);
         return Err(err);
     }
-    let t = terminal.unwrap_or(Value::Null);
-    let resumed_other = req
-        .session_id
-        .as_deref()
-        .is_some_and(|sid| t["session_id"].as_str().is_some_and(|got| got != sid));
+    let resumed_other =
+        expected_session.is_some_and(|sid| t["session_id"].as_str().is_some_and(|got| got != sid));
     if resumed_other {
         return Err(session_mismatch("Claude 未返回匹配会话的成功终态"));
     }
@@ -808,16 +894,7 @@ async fn run(
         && t["result"].is_string()
         && t["session_id"].as_str().is_some_and(|s| !s.is_empty());
     if !ok {
-        // The result text is only inspected for a class, never copied.
-        let mut err = if let Some(retry) = &last_retry {
-            claude_api_retry(retry)
-        } else if let Some(text) = t["result"].as_str() {
-            classify_text(text)
-        } else if t.is_null() {
-            classified(ErrorClass::ProcessCrashed, "claude:no_terminal")
-        } else {
-            classified(ErrorClass::Other, "claude:error_result")
-        };
+        let mut err = terminal_error(&t, assistant_error, last_retry.as_ref());
         err.message = "Claude 未返回匹配会话的成功终态".into();
         err.session_id = t["session_id"].as_str().map(str::to_string).or(session);
         return Err(err);
@@ -826,6 +903,55 @@ async fn run(
         text: t["result"].as_str().unwrap_or_default().to_string(),
         session_id: t["session_id"].as_str().map(str::to_string),
     })
+}
+
+fn terminal_reports_error(terminal: &Value) -> bool {
+    terminal["is_error"] == true
+        || terminal["subtype"]
+            .as_str()
+            .is_some_and(|kind| kind.starts_with("error"))
+}
+
+fn classify_claude_text(text: &str) -> AdapterError {
+    // Claude's native API-error assistant frame carries an explicit HTTP status.
+    // Inspect only this envelope and keep the provider body out of operator errors.
+    if let Some(status) = text
+        .trim_start()
+        .strip_prefix("API Error: ")
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|word| word.parse::<u16>().ok())
+        .filter(|status| (400..=599).contains(status))
+    {
+        return from_http_status(status, None);
+    }
+    classify_text(text)
+}
+
+fn terminal_error(
+    terminal: &Value,
+    assistant_error: Option<AdapterError>,
+    last_retry: Option<&Value>,
+) -> AdapterError {
+    if let Some(text) = terminal["result"].as_str() {
+        let error = classify_claude_text(text);
+        if error.class != ErrorClass::Other {
+            return error;
+        }
+    }
+    // Assistant prose is evidence only when a terminal frame declares an error.
+    if terminal_reports_error(terminal)
+        && let Some(error) = assistant_error
+    {
+        return error;
+    }
+    if let Some(retry) = last_retry {
+        return claude_api_retry(retry);
+    }
+    if terminal.is_null() {
+        classified(ErrorClass::ProcessCrashed, "claude:no_terminal")
+    } else {
+        classified(ErrorClass::Other, "claude:error_result")
+    }
 }
 
 /// `tool_use` blocks open a tool; matching `tool_result` blocks close it.
@@ -849,5 +975,168 @@ fn track_tools(e: &Value, emit: &Emit, open: &mut HashSet<String>) {
             }
             _ => {}
         }
+    }
+}
+#[cfg(test)]
+mod terminal_tests {
+    use super::*;
+    use sa_engine::resilience::classify::is_retryable;
+    use sa_engine::resilience::policy::RetryLimits;
+
+    async fn fake_cli(
+        records: Vec<Value>,
+        exit: i32,
+        stderr: &str,
+    ) -> Result<RunOutcome, AdapterError> {
+        let sys = Sys::from_process();
+        let node = sys
+            .which(if cfg!(windows) { "node.exe" } else { "node" })
+            .expect("native-stream fixture requires Node.js");
+        let data = tempfile::tempdir().unwrap();
+        let code = format!(
+            r#"
+            require('node:fs').readFileSync(0);
+            for (const record of {}) process.stdout.write(JSON.stringify(record) + "\n");
+            process.stderr.write({});
+            setTimeout(() => {{ process.exitCode = {}; }}, 30);
+        "#,
+            serde_json::to_string(&records).unwrap(),
+            serde_json::to_string(stderr).unwrap(),
+            exit
+        );
+        let mut proc = start(&node, &["-e".into(), code], data.path(), &sys).unwrap();
+        let (events, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        collect_turn(
+            &mut proc,
+            "{}\n",
+            None,
+            None,
+            Emit(events),
+            &CancellationToken::new(),
+        )
+        .await
+    }
+
+    fn assistant_error() -> Value {
+        json!({"type":"assistant","message":{"content":[{"type":"text","text":"API Error: 400 Per-turn system messages require upstream per-turn-control support private-provider-body"}]}})
+    }
+
+    fn result(is_error: bool) -> Value {
+        json!({"type":"result","subtype":"success","is_error":is_error,"session_id":"fixture-session","result":"","usage":{"input_tokens":0,"output_tokens":0}})
+    }
+
+    #[tokio::test]
+    async fn native_400_with_nonzero_exit_is_permanent_and_redacted() {
+        let error = fake_cli(vec![assistant_error(), result(true)], 1, "")
+            .await
+            .unwrap_err();
+        assert_eq!(error.class, ErrorClass::Protocol);
+        assert_eq!(error.http_status, Some(400));
+        assert_eq!(error.code.as_deref(), Some("http:400"));
+        assert_eq!(error.session_id.as_deref(), Some("fixture-session"));
+        assert!(!is_retryable(error.class));
+        assert_eq!(RetryLimits::default().for_error(&error), 0);
+        assert!(!error.message.contains("private-provider-body"));
+    }
+
+    #[tokio::test]
+    async fn error_prose_only_refines_a_terminal_declared_failure() {
+        let unknown = json!({"type":"result","subtype":"success","is_error":true,"session_id":"fixture-session","result":"unknown native failure"});
+        let error = fake_cli(vec![unknown], 1, "").await.unwrap_err();
+        assert_eq!(error.class, ErrorClass::ProcessCrashed);
+        let error = fake_cli(vec![assistant_error()], 1, "").await.unwrap_err();
+        assert_eq!(error.class, ErrorClass::ProcessCrashed);
+        let error = fake_cli(vec![assistant_error(), result(false)], 1, "")
+            .await
+            .unwrap_err();
+        assert_eq!(error.class, ErrorClass::ProcessCrashed);
+        let outcome = fake_cli(vec![assistant_error(), result(false)], 0, "")
+            .await
+            .unwrap();
+        assert_eq!(outcome.text, "");
+        let error = fake_cli(vec![assistant_error(), result(true)], 0, "")
+            .await
+            .unwrap_err();
+        assert_eq!(error.class, ErrorClass::Protocol);
+    }
+
+    #[tokio::test]
+    async fn transport_failure_keeps_precedence_over_native_error_text() {
+        let error = fake_cli(
+            vec![assistant_error(), result(true)],
+            1,
+            "fixture-private ECONNRESET\n",
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.class, ErrorClass::Network);
+        assert!(!error.message.contains("fixture-private"));
+    }
+    #[test]
+    fn gateway_capabilities_follow_file_precedence_without_copying_other_env() {
+        let data = tempfile::tempdir().unwrap();
+        let home = data.path().join("home");
+        let cwd = data.path().join("project/nested");
+        std::fs::create_dir_all(home.join(".claude")).unwrap();
+        std::fs::create_dir_all(cwd.join(".claude")).unwrap();
+        let env = Sys::new(
+            vec![(MODEL_CAPABILITIES.into(), "shell=effort".into())],
+            home.clone(),
+            data.path().into(),
+        );
+        std::fs::write(home.join(".claude/settings.json"), json!({"env":{MODEL_CAPABILITIES:"user=effort","ANTHROPIC_AUTH_TOKEN":"fixture-private"}}).to_string()).unwrap();
+        let project = cwd.parent().unwrap();
+        std::fs::create_dir_all(project.join(".claude")).unwrap();
+        std::fs::write(project.join(".claude/settings.json"), json!({"env":{MODEL_CAPABILITIES:"unrelated=effort;claude-fable-*=effort,mid_conv_system;claude-fable-5-2=-effort;claude-fable-*=effort"}}).to_string()).unwrap();
+        let settings = local_gateway_settings(&env, &cwd, true, "claude-fable-5-2").unwrap();
+        assert_eq!(
+            settings["env"][MODEL_CAPABILITIES],
+            "unrelated=effort;claude-fable-*=effort,mid_conv_system;claude-fable-5-2=-effort;claude-fable-*=effort;claude-fable-5-2=-mid_conv_system"
+        );
+        assert_eq!(settings["env"].as_object().unwrap().len(), 1);
+        assert!(!settings.to_string().contains("fixture-private"));
+        std::fs::write(
+            cwd.join(".claude/settings.local.json"),
+            json!({"env":{MODEL_CAPABILITIES:"local=effort;"}}).to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            local_gateway_settings(&env, &cwd, true, "claude-fable-5-2").unwrap()["env"]
+                [MODEL_CAPABILITIES],
+            "local=effort;claude-fable-5-2=-mid_conv_system"
+        );
+    }
+
+    #[test]
+    fn gateway_capabilities_fail_closed_on_bad_settings_but_restricted_ignores_files() {
+        let data = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(data.path().join(".claude")).unwrap();
+        std::fs::write(
+            data.path().join(".claude/settings.json"),
+            b"invalid-json-private",
+        )
+        .unwrap();
+        let env = Sys::new(
+            vec![(
+                MODEL_CAPABILITIES.into(),
+                "shell=effort;claude-fable-5-2=effort".into(),
+            )],
+            data.path().into(),
+            data.path().into(),
+        );
+        let error =
+            local_gateway_settings(&env, data.path(), true, "claude-fable-5-2").unwrap_err();
+        assert!(!error.message.contains("invalid-json-private"));
+        assert_eq!(
+            local_gateway_settings(&env, data.path(), false, "claude-fable-5-2").unwrap()["env"]
+                [MODEL_CAPABILITIES],
+            "shell=effort;claude-fable-5-2=effort;claude-fable-5-2=-mid_conv_system"
+        );
+        std::fs::write(
+            data.path().join(".claude/settings.json"),
+            json!({"env":{MODEL_CAPABILITIES:42}}).to_string(),
+        )
+        .unwrap();
+        assert!(local_gateway_settings(&env, data.path(), true, "claude-fable-5-2").is_err());
     }
 }

@@ -10,6 +10,8 @@ use serde_json::{Map, Value, json};
 pub(crate) const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS ticket_pause(
   ticket INTEGER PRIMARY KEY,state TEXT NOT NULL,consolidation INTEGER NOT NULL DEFAULT 0);";
 
+const RESUME_INSTRUCTION: &str = "用户已明确恢复工单，之前的小结交接后暂停指令已撤销。请按当前工单目标与最新要求继续工作。恢复操作本身只解除准入暂停，是否启动下一轮仍遵循现有任务状态。";
+
 /// Admission state, independent of the existing job lifecycle and result.
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -68,7 +70,7 @@ pub(crate) fn request(q: &Q, ticket: i64) -> Result<PauseStatus> {
         ("paused", false)
     };
     set(q, &root, phase, consolidation, "ticket.pause_requested")?;
-    if phase != "paused" {
+    if phase != "paused" && matches!(state, "queued" | "running" | "waiting") {
         q.record_note(ticket, Some(&root["id"]), Some(&json!(
             "用户请求在小结交接后暂停。请汇总已完成工作、验证证据、未完成事项与下一步。已有子任务可完成，平台将在收齐回报后仅允许一次主控交接轮，之后等待用户明确恢复。"
         )), None, None)?;
@@ -79,12 +81,23 @@ pub(crate) fn request(q: &Q, ticket: i64) -> Result<PauseStatus> {
 pub(crate) fn resume(q: &Q, ticket: i64) -> Result<PauseStatus> {
     let root = q.root(ticket)?;
     if q.run("DELETE FROM ticket_pause WHERE ticket=?", &[&ticket])? > 0 {
-        q.log(who_of(&root), "ticket.resumed", &json!({}))?;
-        q.record_note(ticket, Some(&root["id"]), Some(&json!(
-            "用户已明确恢复工单，之前的小结交接后暂停指令已撤销。请按当前工单目标与最新要求继续工作。恢复操作本身只解除准入暂停，是否启动下一轮仍遵循现有任务状态。"
-        )), None, None)?;
+        q.log(who_of(&root), "ticket.resumed", &json!({"state": "running", "instruction": RESUME_INSTRUCTION}))?;
+        if matches!(str_of(&root, "state"), "queued" | "running" | "waiting") {
+            q.record_note(ticket, Some(&root["id"]), Some(&json!(RESUME_INSTRUCTION)), None, None)?;
+        }
     }
     Ok(PauseStatus::Running)
+}
+
+/// Terminal roots cannot accept mailbox notes. Deliver the durable revocation
+/// with their next ordinary admission, including after a native-session reset.
+pub(crate) fn resumed_control(q: &Q, ticket: i64) -> Result<Option<Value>> {
+    if status(q, ticket)? != PauseStatus::Running {
+        return Ok(None);
+    }
+    q.one("SELECT payload FROM events WHERE ticket=? AND kind='ticket.resumed' ORDER BY seq DESC LIMIT 1", &[&ticket])?
+        .map(|row| Ok(serde_json::from_str(str_of(&row, "payload"))?))
+        .transpose()
 }
 
 /// Called after normal wakeup, in the same transaction as admission. This also
