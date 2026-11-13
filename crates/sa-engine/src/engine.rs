@@ -1350,10 +1350,12 @@ impl Inner {
         // view. Reports used by commit_reply must retain every known child.
         let snapshot = packet.clone();
         let snapshot_sha256 = digest(&stringify(&context::sort_keys(&Value::Object(snapshot.clone()))));
+        let lazy_mcp_schemas = efficiency.lazy_mcp_schemas && p::is_full(&job.profile);
         // Recovery files live outside the project. Restricted harness policies
         // have no confirmed read grant there, so they retain complete prompts.
         let baseline = if efficiency.incremental_context && p::is_full(&job.profile) {
             self.db.with(|q| context::delivery::baseline(q, job.id, job.session.as_deref(), &route))?
+                .filter(|baseline| baseline.lazy_mcp_schemas == lazy_mcp_schemas)
         } else {
             None
         };
@@ -1362,17 +1364,32 @@ impl Inner {
         let delivered_guide = if let Some(baseline) = baseline {
             let (delta, delivered_guide) = context::delivery::delta(&packet, &guide, &baseline);
             packet = delta;
-            packet.insert("full_context".into(), context::archive(&snapshot, &self.data_dir)?);
             delivered_guide
         } else {
             guide.clone()
         };
+        let deferred_schemas = lazy_mcp_schemas && context::delivery::defer_mcp_schemas(&mut packet, &snapshot);
+        if incremental || deferred_schemas {
+            packet.insert("full_context".into(), context::archive(&snapshot, &self.data_dir)?);
+        }
         let mut prompt = format!("{delivered_guide}\n{}", stringify(&Value::Object(packet.clone())));
         let compacted = prompt.len() > MAX_PROMPT_BYTES;
         if compacted {
-            // Compact a full snapshot so its fallback reference always
-            // resolves to complete semantics, including unchanged fields.
-            packet = context::compact(&snapshot, &guide, &self.data_dir, MAX_PROMPT_BYTES)?;
+            // Preserve the original recovery target when compacting a lazy
+            // view, reserving room for its exact reference and lookup guide.
+            let mut full_view = snapshot.clone();
+            let reserved = if deferred_schemas {
+                context::delivery::defer_mcp_schemas(&mut full_view, &snapshot);
+                json!({"full_context":packet["full_context"],"mcp_schema_lookup":full_view["mcp_schema_lookup"]})
+            } else {
+                json!({})
+            };
+            let reserve_bytes = if deferred_schemas { stringify(&reserved).len() } else { 0 };
+            packet = context::compact(&full_view, &guide, &self.data_dir, MAX_PROMPT_BYTES.saturating_sub(reserve_bytes))?;
+            if deferred_schemas {
+                packet.insert("full_context".into(), reserved["full_context"].clone());
+                packet.insert("mcp_schema_lookup".into(), reserved["mcp_schema_lookup"].clone());
+            }
             prompt = format!("{guide}\n{}", stringify(&Value::Object(packet.clone())));
         }
         turn.ensure_current()?;
@@ -1385,6 +1402,7 @@ impl Inner {
                 "snapshot_sha256": snapshot_sha256, "incremental": incremental && !compacted,
                 "full_prompt_bytes": full_prompt_bytes, "sent_prompt_bytes": prompt.len(),
                 "saved_bytes": full_prompt_bytes.saturating_sub(prompt.len()),
+                "lazy_mcp_schemas": deferred_schemas,
             }))?;
             Ok(snapshot_seq)
         })?;
@@ -1485,6 +1503,7 @@ impl Inner {
             context::delivery::acknowledge(q, job.who(), &route, json!({
                 "snapshot_seq": snapshot_seq, "snapshot_sha256": snapshot_sha256,
                 "guide_sha256": digest(&guide), "complete": !compacted && same_session,
+                "lazy_mcp_schemas": lazy_mcp_schemas,
             }))
         })?;
         Ok(())

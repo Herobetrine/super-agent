@@ -25,6 +25,7 @@
 点击侧栏底部 **Token 与缓存**（左侧齿轮也可打开）：
 
 - **增量上下文**：默认开启，关闭后后续轮次完整投递；受限权限仍保持原有完整投递方式。
+- **按需读取 MCP 参数**：默认开启，大目录仅投递名称和简述，调用前从完整快照检索参数。受限权限和小目录保留完整内容。
 - **精简协作提示**：默认开启，要求简短交接、只传相关证据，将长日志留在文件中；关闭后按任务需要决定说明详细程度。
 - **Claude 缓存时长**：选择 **沿用执行端 / 5 分钟 / 1 小时**，同时作为主会话与内部子请求的默认时长。已有 CLI 显式时长、强制或禁用缓存设置仍优先。
 
@@ -72,6 +73,16 @@ python scripts/audit-context-cost.py "$env:USERPROFILE\.local\share\superagent\c
 桌面控件接续验证（2026-11-10）：4 项真实 App 点击测试覆盖取消、保存、重启回读、恢复默认、失败重试、只读窗口与演示预览；Host 验证数据库保存失败不发布运行时设置。全量测试报告 375 passed / 0 failed / 3 ignored，环境门控提前返回仍不算真实模型调用；workspace build、Clippy 与 release build 通过。新版 release 已在独立空库中打开设置面板并截图检查，空库始终 0 个任务。桌面快捷方式指向已更新的 `target/release/super-agent.exe`，没有改变真实账户的设置。控件验证回执位于用户数据目录的 `checks/token-settings-ui-20261110/`，不提交私有日志。
 
 ## 设计来源
+
+### 大型 MCP 目录按需读取
+
+2026-11-13 的正常工单首包为 338,977 UTF-8 字节，其中 237 个 MCP 工具占 273,998 字节（80.83%）。首轮已触发原生压缩；因此新增 **Token 与缓存 → 按需读取 MCP 参数**，默认开启。单个服务工具目录达到 16 KiB 时，仅向完全访问和自动模式发送工具名称、最多 120 个字符的简述以及参数定位信息。调用前从 `full_context` 指向的不可变 JSON 快照按服务与工具名提取完整描述和 `inputSchema`，不应把整份目录读回上下文。
+
+完整账本快照、执行端授权判断和实际 MCP 调用保持完整目录。受限权限、较小目录保留原样；切换开关会刷新投递基线，关闭后恢复完整目录。读取快照失败时须报告缺失，不能猜测参数或把简述当完整调用合同。这复用了现有 SHA-256 快照，没有增加模型调用、工具检索服务或新的依赖。
+
+方案参考 [Anthropic 按需加载 MCP 工具](https://www.anthropic.com/engineering/code-execution-with-mcp)。这里使用本地快照读取，而非声称 CLI 或网关支持 API 的 `defer_loading`。字节下降仅衡量平台注入，不代表原生插件、系统提示、思考或账单同比下降；99% 缓存率仍需实际工作负载验证。
+
+本次全量回归为 402 passed / 0 failed / 3 ignored，环境门控提前返回不算真实模型验证；workspace build、Clippy `-D warnings`、release build 通过。15 项上下文专项包含完整参数读取、授权调用、旧回执、开关切换、受限权限、失败重试及 6 MiB 压缩。合成 MCP 冷启动从 95,915 降为 20,067 字节（79.08%），保留完整快照。真实 App 设置点击覆盖持久化与恢复默认，1280×900 渲染已查看；测试等待 Modal 控件坐标稳定后点击，避免居中重排导致误点。真实工单的修复后 Token 效果待正常续跑观测。
 
 - [Claude Code prompt caching](https://code.claude.com/docs/en/prompt-caching)：TTL、覆盖优先级、1h 成本和网关要求。
 - [Anthropic 上下文工程](https://www.anthropic.com/research/effective-context-engineering-for-ai-agents)：按需检索、压缩、结构化笔记和子任务隔离。

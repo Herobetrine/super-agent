@@ -2003,6 +2003,7 @@ exit 0
         let policy = host.allow_lead_routing_default();
         let changed = Settings {
             incremental_context: false,
+            lazy_mcp_schemas: false,
             concise_handoffs: false,
             claude_cache_ttl: Ttl::OneHour,
         };

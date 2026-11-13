@@ -57,6 +57,7 @@ pub const BASE: &str = concat!(
     "When blocked only on peers, end this turn promptly. Do not sleep, poll status, or send keepalive messages to preserve a model cache.\n",
     "Do not redispatch already completed work.\n",
     "Add an optional \"files\":[\"relative/path\"] to SA_SEND to snapshot project artifacts, up to 64 MiB per message.\n",
+    "files lists existing input attachments only. Put paths of files the recipient should create in body, and omit them from files.\n",
     "Recipients get the exact byte count, SHA-256 and immutable copy path; verify before using the original project path.\n",
     "Report file paths, relevant verification, failures and uncertainties. Never invent a peer response.",
 );
@@ -169,7 +170,7 @@ mod tests {
     /// Pin protocol-guide bytes; BASE includes the current routing policy.
     #[test]
     fn guides_are_byte_exact() {
-        assert_eq!(digest(super::BASE), "f0016020591b9a8b2212e14dbec80eb512649426c1d8645a514ee3f57bd58d34");
+        assert_eq!(digest(super::BASE), "9bcf3f60c03bdf96a63756a44c7ae2b7dbfe2af2cb857576cc04931e6cb7f0fe");
         assert_eq!(super::base(false), super::BASE);
         assert!(super::base(true).ends_with(super::CONCISE_HANDOFFS));
         assert_eq!(digest(super::CONTINUOUS), "fd0fa7b25db7c20413b502eb74a5aaf637a3a4fa54ccf6411ded9626181050ac");

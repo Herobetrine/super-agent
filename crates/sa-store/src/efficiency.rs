@@ -19,6 +19,7 @@ pub enum Ttl {
 #[serde(default)]
 pub struct Settings {
     pub incremental_context: bool,
+    pub lazy_mcp_schemas: bool,
     pub concise_handoffs: bool,
     pub claude_cache_ttl: Ttl,
 }
@@ -27,6 +28,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             incremental_context: true,
+            lazy_mcp_schemas: true,
             concise_handoffs: true,
             claude_cache_ttl: Ttl::Inherit,
         }

@@ -26,6 +26,46 @@ pub struct Baseline {
     pub guide_sha256: String,
     pub snapshot_sha256: String,
     pub reply: String,
+    pub lazy_mcp_schemas: bool,
+}
+
+const LAZY_MCP_MIN_BYTES: usize = 16 * 1024;
+const TOOL_DESCRIPTION_CHARS: usize = 120;
+
+/// Change only the wire view. The caller attaches an archive of `snapshot`,
+/// whose full descriptions and schemas still authorize and validate calls.
+/// An omitted directory in a delta keeps its prior references, resolved
+/// against the current full snapshot with the same unchanged directory.
+pub fn defer_mcp_schemas(view: &mut Map<String, Value>, snapshot: &Map<String, Value>) -> bool {
+    let Some(servers) = snapshot.get("project_extensions").and_then(|ext| ext.get("mcp")).and_then(Value::as_array) else {
+        return false;
+    };
+    let eligible: Vec<_> = servers.iter().enumerate().filter_map(|(index, server)| {
+        let tools = server.get("tools")?.as_array()?;
+        (super::bytes(&server["tools"]) >= LAZY_MCP_MIN_BYTES
+            && tools.iter().all(|tool| tool.get("name").and_then(Value::as_str).is_some()))
+            .then_some(index)
+    }).collect();
+    if eligible.is_empty() { return false; }
+    if let Some(delivered) = view.get_mut("project_extensions").and_then(|ext| ext.get_mut("mcp")).and_then(Value::as_array_mut) {
+        for index in eligible {
+            let Some(server) = delivered.get_mut(index) else { continue };
+            let tools = servers[index]["tools"].as_array().expect("checked tool array");
+            server["tools"] = Value::Array(tools.iter().enumerate().map(|(tool_index, tool)| {
+                let description: String = tool["description"].as_str().unwrap_or_default()
+                    .chars().take(TOOL_DESCRIPTION_CHARS).collect();
+                json!({
+                    "name":tool["name"],"description":description,
+                    "schema_ref":format!("/project_extensions/mcp/{index}/tools/{tool_index}"),
+                })
+            }).collect());
+        }
+    }
+    view.insert("mcp_schema_lookup".into(), json!({
+        "source":"full_context","description_max_chars":TOOL_DESCRIPTION_CHARS,
+        "instructions":"工具目录中的描述为短预览。使用工具前，以 Python/PowerShell JSON 解析在内存读取 full_context.object_path，验证 bytes 和 sha256，按 server 和 tool 精确筛选 project_extensions.mcp[].tools[] 或按 schema_ref JSON Pointer 定位，并核对工具名。只输出目标工具的完整 description 和 inputSchema，遵守完整描述及 schema 后再构造参数。禁止 cat/type/Get-Content 将整个快照回灌上下文。增量中沿用的 schema_ref 仍相对于当前 full_context。引用不改变现有授权范围。",
+    }));
+    true
 }
 
 /// Both adapters journal these native objects without wrapping them. Unknown
@@ -107,6 +147,7 @@ pub fn baseline(q: &Q, job: i64, session: Option<&str>, route: &Route) -> Result
         guide_sha256: receipt["guide_sha256"].as_str().unwrap_or_default().into(),
         snapshot_sha256: sha,
         reply: reply["text"].as_str().unwrap_or_default().into(),
+        lazy_mcp_schemas: receipt["lazy_mcp_schemas"].as_bool().unwrap_or(false),
     }))
 }
 

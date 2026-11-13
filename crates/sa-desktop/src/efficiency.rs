@@ -124,6 +124,9 @@ impl App {
                         ui.checkbox(&mut dialog.draft.incremental_context, "增量上下文");
                         description(ui, "续轮仅补充变化的上下文，完整内容保留为恢复依据。适用于完全访问与自动模式。", &pal);
                         ui.add_space(14.0);
+                        ui.checkbox(&mut dialog.draft.lazy_mcp_schemas, "按需读取 MCP 参数");
+                        description(ui, "大工具目录先发送名称和简述，调用前从完整快照读取该工具的参数。适用于完全访问与自动模式；关闭后恢复完整目录。", &pal);
+                        ui.add_space(14.0);
                         ui.checkbox(&mut dialog.draft.concise_handoffs, "精简协作提示");
                         description(ui, "要求简短交接、只传相关证据，将长日志留在文件中。", &pal);
                         ui.add_space(18.0);

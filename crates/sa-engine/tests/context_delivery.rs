@@ -22,9 +22,20 @@ impl Extensions for TestExtensions {
         NoopExtensions.bind(conn, ticket, prepared)
     }
     fn context(&self, _ticket: i64, _profile: &str) -> Value { self.0.lock().unwrap().clone() }
-    fn can_invoke(&self) -> bool { false }
+    fn can_invoke(&self) -> bool { true }
     fn invoke(&self, args: InvokeArgs) -> BoxFuture<'static, anyhow::Result<InvokeResult>> {
-        NoopExtensions.invoke(args)
+        let mut context = self.0.lock().unwrap();
+        let authorized = context["mcp"].as_array().into_iter().flatten()
+            .filter(|server| server["server"] == args.command["server"])
+            .flat_map(|server| server["tools"].as_array().into_iter().flatten())
+            .any(|tool| tool["name"] == args.command["tool"] && tool.get("inputSchema").is_some());
+        if authorized {
+            context["invoke_count"] = json!(context["invoke_count"].as_u64().unwrap_or_default() + 1);
+        }
+        Box::pin(async move {
+            anyhow::ensure!(authorized, "fixture requires exact authorized schema");
+            Ok(InvokeResult { new_receipt: false })
+        })
     }
 }
 
@@ -77,7 +88,7 @@ fn delta_restores_complete_semantics_without_truncating_new_reports() {
         "autonomy":{"phase":"execute","learning":"learning".repeat(20_000),"milestone":"old"},
         "remove_me":"stale"
     }));
-    let old = Baseline { packet:original.clone(), guide_sha256:digest(&guide), snapshot_sha256:"sha".into(), reply:"last success".into() };
+    let old = Baseline { packet:original.clone(), guide_sha256:digest(&guide), snapshot_sha256:"sha".into(), reply:"last success".into(), lazy_mcp_schemas:false };
     let mut next = original;
     next.insert("turn".into(), json!(2));
     next.insert("permission_profile".into(), json!("auto"));
@@ -106,6 +117,7 @@ fn removals_rewrites_and_guide_changes_are_explicit() {
     let old = Baseline {
         packet: object(json!({"reports":[{"id":1},{"id":2}],"notes":["a","b"],"autonomy":{"phase":"execute","obsolete":true}})),
         guide_sha256:digest("old guide"), snapshot_sha256:"sha".into(), reply:"reply".into(),
+        lazy_mcp_schemas:false,
     };
     let next = object(json!({"reports":[{"id":2}],"notes":["rewritten"],"autonomy":{"phase":"discover"},"previous_reply":"reply"}));
     let (view, guide) = delivery::delta(&next, "new guide", &old);
@@ -303,7 +315,7 @@ fn large_unchanged_context_has_more_than_ninety_nine_percent_byte_reduction() {
         "reports":[{"id":2,"state":"done","result":"retained report\n".repeat(2000)}],
         "notes":[{"seq":1,"body":"retained note\n".repeat(1000)}]
     }));
-    let baseline = Baseline { packet:packet.clone(), guide_sha256:digest(&guide), snapshot_sha256:"sha".into(), reply:"reply".into() };
+    let baseline = Baseline { packet:packet.clone(), guide_sha256:digest(&guide), snapshot_sha256:"sha".into(), reply:"reply".into(), lazy_mcp_schemas:false };
     let (view, guide_view) = delivery::delta(&packet, &guide, &baseline);
     assert_eq!(restore(&baseline, &view), packet);
     let full_bytes = guide.len() + 1 + stringify(&Value::Object(packet)).len();
@@ -342,4 +354,210 @@ async fn live_efficiency_settings_switch_on_off_on_between_turns() {
         }
     }
     fx.engine.close().await;
+}
+
+fn schema_fixture() -> Value {
+    let tools: Vec<_> = (0..24).map(|index| json!({
+        "name":format!("tool_{index}"),
+        "description":format!("{}完整操作约束末行", "工具说明🧭e\u{301}".repeat(100)),
+        "inputSchema":{
+            "type":"object","required":["choice"],"additionalProperties":false,
+            "properties":{"choice":{"type":"string","enum":[format!("精确选项_{index}_{}", "x".repeat(1500))]}},
+        },
+    })).collect();
+    json!({"skills":[],"mcp":[
+        {"server":"catalog","name":"large fixture","tools":tools},
+        {"server":"small","name":"small fixture","tools":[{"name":"inspect","description":"short","inputSchema":{"type":"object"}}]},
+    ]})
+}
+
+fn read_archive(packet: &Value) -> Value {
+    let reference = &packet["full_context"];
+    let raw = std::fs::read(reference["object_path"].as_str().unwrap()).unwrap();
+    assert_eq!(raw.len() as u64, reference["bytes"].as_u64().unwrap());
+    assert_eq!(sha(&raw), reference["sha256"].as_str().unwrap());
+    serde_json::from_slice(&raw).unwrap()
+}
+
+#[test]
+fn lazy_schema_view_keeps_exact_references_and_unicode_safe_previews() {
+    let source = object(json!({"project_extensions":schema_fixture()}));
+    let mut view = source.clone();
+    assert!(delivery::defer_mcp_schemas(&mut view, &source));
+    let tool = &view["project_extensions"]["mcp"][0]["tools"][0];
+    assert_eq!(tool["description"].as_str().unwrap().chars().count(), 120);
+    assert!(tool.get("inputSchema").is_none());
+    let raw = Value::Object(source.clone());
+    assert_eq!(raw.pointer(tool["schema_ref"].as_str().unwrap()).unwrap(), &source["project_extensions"]["mcp"][0]["tools"][0]);
+    assert_eq!(view["project_extensions"]["mcp"][1], source["project_extensions"]["mcp"][1]);
+    assert!(view["mcp_schema_lookup"]["instructions"].as_str().unwrap().contains("禁止 cat/type/Get-Content"));
+    let small = object(json!({"project_extensions":{"skills":[],"mcp":[source["project_extensions"]["mcp"][1]]}}));
+    let mut small_view = small.clone();
+    assert!(!delivery::defer_mcp_schemas(&mut small_view, &small));
+    assert_eq!(small_view, small);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lazy_schema_initial_and_delta_views_preserve_authorized_calls_and_full_ledger() {
+    let context = schema_fixture();
+    let extensions = Arc::new(TestExtensions(Mutex::new(context.clone())));
+    let opts = sa_engine::EngineOptions { extensions:Some(extensions.clone()), ..quiet() };
+    let expected = context.clone();
+    let fx = Fx::with(script(move |c| {
+        let expected = expected.clone();
+        async move {
+            let original = read_archive(&c.packet);
+            assert_eq!(original["project_extensions"], expected);
+            assert!(c.packet["mcp_schema_lookup"].is_object());
+            if c.turn() == 1 {
+                assert!(c.req.session_id.is_none());
+                let tool = &c.packet["project_extensions"]["mcp"][0]["tools"][0];
+                assert!(tool.get("inputSchema").is_none());
+                let exact = original.pointer(tool["schema_ref"].as_str().unwrap()).unwrap();
+                assert!(exact["description"].as_str().unwrap().ends_with("完整操作约束末行"));
+                assert_eq!(exact["inputSchema"], expected["mcp"][0]["tools"][0]["inputSchema"]);
+                return Ok(wire("SA_TOOL", json!({
+                    "id":"authorized","server":"catalog","tool":"tool_0",
+                    "arguments":{"choice":exact["inputSchema"]["properties"]["choice"]["enum"][0]},
+                })));
+            }
+            assert_eq!(c.packet["context_delivery"]["mode"], "delta");
+            assert!(c.packet.get("project_extensions").is_none());
+            // Inherited references resolve against the current full snapshot.
+            assert!(original.pointer("/project_extensions/mcp/0/tools/0/inputSchema").is_some());
+            Ok("success".into())
+        }
+    }), t1_catalog(), opts);
+    let ticket = fx.begin(fx.params().profile("full")).await;
+    fx.finish(ticket, "done").await;
+    assert_eq!(extensions.0.lock().unwrap()["invoke_count"], 1);
+    let root = fx.engine.root(ticket).unwrap()["id"].as_i64().unwrap();
+    let ledger = fx.engine.db().with(|q| delivery::full_input(q, root, i64::MAX)).unwrap().unwrap();
+    let packet: Value = serde_json::from_str(ledger["payload"].as_str().unwrap()).unwrap();
+    assert_eq!(packet["project_extensions"], context);
+    let metrics = payloads(&fx, "SELECT payload FROM events WHERE kind='running' ORDER BY seq DESC LIMIT 1").pop().unwrap();
+    assert_eq!(metrics["lazy_mcp_schemas"], true);
+    assert!(metrics["sent_prompt_bytes"].as_u64().unwrap() * 2 < metrics["full_prompt_bytes"].as_u64().unwrap());
+    eprintln!("lazy MCP initial bytes full={} sent={} saved={}", metrics["full_prompt_bytes"], metrics["sent_prompt_bytes"], metrics["saved_bytes"]);
+    fx.engine.follow(ticket, "continue", false).unwrap();
+    fx.finish(ticket, "done").await;
+    fx.engine.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lazy_schema_toggle_and_new_session_replay_the_correct_directory_view() {
+    let efficiency = sa_store::efficiency::shared(Default::default());
+    let extensions = Arc::new(TestExtensions(Mutex::new(schema_fixture())));
+    let opts = sa_engine::EngineOptions { efficiency:efficiency.clone(), extensions:Some(extensions), ..quiet() };
+    let fx = Fx::with(script(|_| async { Ok("success".into()) }), t1_catalog(), opts);
+    let ticket = fx.begin(fx.params().profile("full")).await;
+    fx.finish(ticket, "done").await;
+    for enabled in [false, true] {
+        efficiency.write().unwrap().lazy_mcp_schemas = enabled;
+        fx.engine.follow(ticket, "toggle", false).unwrap();
+        fx.finish(ticket, "done").await;
+        let packet = fx.shared.calls(|c| Some(c.packet.clone())).pop().unwrap();
+        assert!(packet.get("context_delivery").is_none());
+        let tool = &packet["project_extensions"]["mcp"][0]["tools"][0];
+        assert_eq!(tool.get("schema_ref").is_some(), enabled);
+        assert_eq!(tool.get("inputSchema").is_some(), !enabled);
+        assert_eq!(packet.get("mcp_schema_lookup").is_some(), enabled);
+    }
+    fx.engine.db().tx(|q| { q.run("UPDATE jobs SET session=NULL", &[])?; Ok(()) }).unwrap();
+    fx.engine.follow(ticket, "new session", false).unwrap();
+    fx.finish(ticket, "done").await;
+    let packet = fx.shared.calls(|c| Some(c.packet.clone())).pop().unwrap();
+    assert!(packet.get("context_delivery").is_none());
+    assert!(packet["project_extensions"]["mcp"][0]["tools"][0]["schema_ref"].is_string());
+    read_archive(&packet);
+    fx.engine.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn legacy_receipt_with_the_same_guide_only_reuses_the_full_schema_mode() {
+    for enabled in [false, true] {
+        let settings = sa_store::efficiency::Settings { lazy_mcp_schemas:false, ..Default::default() };
+        let efficiency = sa_store::efficiency::shared(settings);
+        let extensions = Arc::new(TestExtensions(Mutex::new(schema_fixture())));
+        let opts = sa_engine::EngineOptions { efficiency:efficiency.clone(), extensions:Some(extensions), ..quiet() };
+        let fx = Fx::with(script(|_| async { Ok("success".into()) }), t1_catalog(), opts);
+        let ticket = fx.begin(fx.params().profile("full")).await;
+        fx.finish(ticket, "done").await;
+        // Represent a real pre-feature receipt. Its successful input was sent
+        // in full above, and only the newly introduced mode key is absent.
+        fx.engine.db().tx(|q| {
+            let receipt = q.one("SELECT seq,payload FROM events WHERE kind='context.delivered' ORDER BY seq DESC LIMIT 1", &[])?.unwrap();
+            let mut value: Value = serde_json::from_str(receipt["payload"].as_str().unwrap())?;
+            value.as_object_mut().unwrap().remove("lazy_mcp_schemas");
+            let payload = stringify(&value);
+            q.run("UPDATE events SET payload=?,sha256=? WHERE seq=?", &[&payload, &digest(&payload), &receipt["seq"].as_i64().unwrap()])?;
+            Ok(())
+        }).unwrap();
+        efficiency.write().unwrap().lazy_mcp_schemas = enabled;
+        fx.engine.follow(ticket, "continue", false).unwrap();
+        fx.finish(ticket, "done").await;
+        let packet = fx.shared.calls(|c| Some(c.packet.clone())).pop().unwrap();
+        assert_eq!(packet["context_delivery"]["mode"] == "delta", !enabled);
+        if enabled {
+            assert!(packet["project_extensions"]["mcp"][0]["tools"][0]["schema_ref"].is_string());
+            assert!(read_archive(&packet)["project_extensions"]["mcp"][0]["tools"][0]["inputSchema"].is_object());
+        }
+        fx.engine.close().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn restricted_schema_delivery_stays_complete_and_small_catalogs_stay_inline() {
+    for (profile, large) in [("partial", true), ("full", false)] {
+        let mut context = schema_fixture();
+        if !large { context["mcp"][0]["tools"] = json!([{"name":"inspect","description":"small","inputSchema":{"type":"object"}}]); }
+        let extensions = Arc::new(TestExtensions(Mutex::new(context.clone())));
+        let opts = sa_engine::EngineOptions { extensions:Some(extensions), ..quiet() };
+        let fx = Fx::with(script(|_| async { Ok("success".into()) }), t1_catalog(), opts);
+        let ticket = fx.begin(fx.params().profile(profile)).await;
+        fx.finish(ticket, "done").await;
+        let packet = fx.shared.calls(|c| Some(c.packet.clone())).pop().unwrap();
+        assert_eq!(packet["project_extensions"], context);
+        assert!(packet.get("mcp_schema_lookup").is_none());
+        assert!(packet.get("full_context").is_none());
+        fx.engine.close().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn failed_and_compacted_requests_keep_lazy_schema_references_to_the_raw_snapshot() {
+    for oversized in [false, true] {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let count = attempts.clone();
+        let extensions = Arc::new(TestExtensions(Mutex::new(schema_fixture())));
+        let opts = sa_engine::EngineOptions { extensions:Some(extensions), ..quiet() };
+        let fx = Fx::with(script(move |c| {
+            let count = count.clone();
+            async move {
+                let original = read_archive(&c.packet);
+                assert!(original["project_extensions"]["mcp"][0]["tools"][0]["inputSchema"].is_object());
+                assert!(c.packet["mcp_schema_lookup"].is_object());
+                assert!(c.req.prompt.len() <= sa_engine::context::MAX_PROMPT_BYTES);
+                assert!(c.packet.get("context_delivery").is_none());
+                if count.fetch_add(1, Ordering::SeqCst) == 0 {
+                    return Err(AdapterError::new(ErrorClass::Protocol, "fixture failure"));
+                }
+                Ok("success".into())
+            }
+        }), t1_catalog(), opts);
+        let mut params = fx.params().profile("full");
+        if oversized { params.goal = "大".repeat(800_000); }
+        let ticket = fx.begin(params).await;
+        fx.finish(ticket, "failed").await;
+        assert_eq!(fx.int("SELECT count(*) FROM events WHERE kind='context.delivered'"), 0);
+        let root = fx.engine.root(ticket).unwrap()["id"].as_i64().unwrap();
+        fx.engine.retry(root).unwrap();
+        fx.finish(ticket, "done").await;
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        if oversized {
+            let receipt = payloads(&fx, "SELECT payload FROM events WHERE kind='context.delivered'").pop().unwrap();
+            assert_eq!(receipt["complete"], false);
+        }
+        fx.engine.close().await;
+    }
 }

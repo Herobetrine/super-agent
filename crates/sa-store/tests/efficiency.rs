@@ -16,7 +16,7 @@ fn settings_roundtrip_all_values_and_survive_reopen() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("settings.sqlite3");
     for ttl in [Ttl::Inherit, Ttl::FiveMinutes, Ttl::OneHour] {
-        let settings = Settings { incremental_context: false, concise_handoffs: false, claude_cache_ttl: ttl };
+        let settings = Settings { incremental_context: false, lazy_mcp_schemas: false, concise_handoffs: false, claude_cache_ttl: ttl };
         {
             let mut conn = Connection::open(&path).unwrap();
             efficiency::init(&conn).unwrap();

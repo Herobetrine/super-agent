@@ -56,6 +56,9 @@ fn until(h: &mut Harness<'_, App>, cond: impl Fn(&App) -> bool) {
         h.step();
         if cond(h.state()) {
             h.run_steps(3);
+            if h.state().efficiency.is_some() {
+                settle_dialog(h);
+            }
             return;
         }
         std::thread::sleep(Duration::from_millis(20));
@@ -66,12 +69,46 @@ fn until(h: &mut Harness<'_, App>, cond: impl Fn(&App) -> bool) {
     );
 }
 
+fn settle_dialog(h: &mut Harness<'_, App>) {
+    // Modal centering follows the measured ScrollArea size over several frames.
+    // Click only after its actual visible targets stop moving.
+    let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 900.0));
+    let mut previous = Vec::new();
+    let mut stable_frames = 0;
+    for frame in 0..12 {
+        let rects = [
+            (Role::CheckBox, "增量上下文"),
+            (Role::CheckBox, "按需读取 MCP 参数"),
+            (Role::CheckBox, "精简协作提示"),
+            (Role::RadioButton, "1 小时"),
+            (Role::Button, "恢复默认"),
+            (Role::Button, "保存"),
+        ]
+        .map(|(role, label)| h.get_by_role_and_label(role, label).rect())
+        .to_vec();
+        assert!(rects.iter().all(|rect| viewport.contains_rect(*rect)), "dialog targets outside viewport: {rects:?}");
+        eprintln!("efficiency dialog geometry frame={frame} targets={rects:?}");
+        if rects == previous {
+            stable_frames += 1;
+            if stable_frames == 2 {
+                return;
+            }
+        } else {
+            stable_frames = 0;
+        }
+        previous = rects;
+        h.run_steps(1);
+    }
+    panic!("efficiency dialog targets did not settle within 12 frames");
+}
+
 fn open(h: &mut Harness<'_, App>) {
     h.run_steps(3);
     h.get_by_role_and_label(Role::Button, "Token 与缓存")
         .click();
     h.run_steps(3);
     assert!(h.state().efficiency.is_some());
+    settle_dialog(h);
 }
 
 #[test]
@@ -79,12 +116,21 @@ fn efficiency_clicks_cancel_save_restart_and_restore_defaults() {
     let data = tempfile::tempdir().unwrap();
     let mut h = harness(data.path(), false, false);
     open(&mut h);
+    assert!(h.state().efficiency.as_ref().unwrap().draft.lazy_mcp_schemas);
     h.get_by_role_and_label(Role::CheckBox, "增量上下文")
         .click();
     h.get_by_role_and_label(Role::CheckBox, "精简协作提示")
         .click();
+    h.get_by_role_and_label(Role::CheckBox, "按需读取 MCP 参数")
+        .click();
     h.get_by_role_and_label(Role::RadioButton, "1 小时").click();
     h.run_steps(3);
+    assert_eq!(h.state().efficiency.as_ref().unwrap().draft, Settings {
+        incremental_context: false,
+        lazy_mcp_schemas: false,
+        concise_handoffs: false,
+        claude_cache_ttl: Ttl::OneHour,
+    });
     h.get_by_role_and_label(Role::Button, "取消").click();
     h.run_steps(3);
     assert!(h.state().efficiency.is_none());
@@ -102,12 +148,15 @@ fn efficiency_clicks_cancel_save_restart_and_restore_defaults() {
         .click();
     h.get_by_role_and_label(Role::CheckBox, "精简协作提示")
         .click();
+    h.get_by_role_and_label(Role::CheckBox, "按需读取 MCP 参数")
+        .click();
     h.get_by_role_and_label(Role::RadioButton, "5 分钟").click();
     h.run_steps(3);
     h.get_by_role_and_label(Role::Button, "保存").click();
     until(&mut h, |app| app.efficiency.is_none());
     let saved = Settings {
         incremental_context: false,
+        lazy_mcp_schemas: false,
         concise_handoffs: false,
         claude_cache_ttl: Ttl::FiveMinutes,
     };
@@ -193,6 +242,7 @@ fn efficiency_observer_reads_saved_values_and_demo_can_preview() {
     let data = tempfile::tempdir().unwrap();
     let saved = Settings {
         incremental_context: false,
+        lazy_mcp_schemas: false,
         concise_handoffs: true,
         claude_cache_ttl: Ttl::OneHour,
     };
