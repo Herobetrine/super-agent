@@ -82,7 +82,9 @@ python scripts/audit-context-cost.py "$env:USERPROFILE\.local\share\superagent\c
 
 方案参考 [Anthropic 按需加载 MCP 工具](https://www.anthropic.com/engineering/code-execution-with-mcp)。这里使用本地快照读取，而非声称 CLI 或网关支持 API 的 `defer_loading`。字节下降仅衡量平台注入，不代表原生插件、系统提示、思考或账单同比下降；99% 缓存率仍需实际工作负载验证。
 
-本次全量回归为 402 passed / 0 failed / 3 ignored，环境门控提前返回不算真实模型验证；workspace build、Clippy `-D warnings`、release build 通过。15 项上下文专项包含完整参数读取、授权调用、旧回执、开关切换、受限权限、失败重试及 6 MiB 压缩。合成 MCP 冷启动从 95,915 降为 20,067 字节（79.08%），保留完整快照。真实 App 设置点击覆盖持久化与恢复默认，1280×900 渲染已查看；测试等待 Modal 控件坐标稳定后点击，避免居中重排导致误点。真实工单的修复后 Token 效果待正常续跑观测。
+本次全量回归为 402 passed / 0 failed / 3 ignored，环境门控提前返回不算真实模型验证；workspace build、Clippy `-D warnings`、release build 通过。15 项上下文专项包含完整参数读取、授权调用、旧回执、开关切换、受限权限、失败重试及 6 MiB 压缩。合成 MCP 冷启动从 95,915 降为 20,067 字节（79.08%），保留完整快照。真实 App 设置点击覆盖持久化与恢复默认，1280×900 渲染已查看；测试等待 Modal 控件坐标稳定后点击，避免居中重排导致误点。
+
+安装修复后的正常工作负载已完成首次派工、员工执行和主控收报续轮：初次投递为 128,057 字节，相对该轮完整快照 348,197 字节减少 63.2%；收报续轮为 23,267 字节，相对完整快照 356,179 字节减少 93.5%。等待期间主控没有新增调用，续轮首请求仍报告读取 101,471 缓存 Token。该观察窗口没有重试或压缩信号；生产 MCP 参数按需检索本身尚未被该工作负载调用，其正确性由离线调用回归覆盖。这些是有限窗口的投递与缓存复用证据，不能推广成长期 99% 命中率或账单节省比例。
 
 - [Claude Code prompt caching](https://code.claude.com/docs/en/prompt-caching)：TTL、覆盖优先级、1h 成本和网关要求。
 - [Anthropic 上下文工程](https://www.anthropic.com/research/effective-context-engineering-for-ai-agents)：按需检索、压缩、结构化笔记和子任务隔离。
