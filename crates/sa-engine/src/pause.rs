@@ -70,6 +70,10 @@ pub(crate) fn request(q: &Q, ticket: i64) -> Result<PauseStatus> {
         ("paused", false)
     };
     set(q, &root, phase, consolidation, "ticket.pause_requested")?;
+    if state == "queued" && queued_recovery(q, &root)? {
+        settle_failure(q, &root, "暂停请求终止已排队的恢复尝试。")?;
+        return status(q, ticket);
+    }
     if phase != "paused" && matches!(state, "queued" | "running" | "waiting") {
         q.record_note(ticket, Some(&root["id"]), Some(&json!(
             "用户请求在小结交接后暂停。请汇总已完成工作、验证证据、未完成事项与下一步。已有子任务可完成，平台将在收齐回报后仅允许一次主控交接轮，之后等待用户明确恢复。"
@@ -100,14 +104,61 @@ pub(crate) fn resumed_control(q: &Q, ticket: i64) -> Result<Option<Value>> {
         .transpose()
 }
 
-/// Called after normal wakeup, in the same transaction as admission. This also
-/// settles failed handoffs after their existing bounded retry policy is spent.
+/// A queued recovery has a recovery event after its latest ordinary boundary.
+/// Do not infer this from turn numbers, which also advance on normal follow-up.
+fn queued_recovery(q: &Q, root: &Map<String, Value>) -> Result<bool> {
+    Ok(q.one(
+        "SELECT kind,payload FROM events WHERE job=? AND kind IN
+         ('turn.retry_scheduled','route.rotated','turn.route_wait','turn.deferred','auto.retry',
+          'reply','user.follow','retry','turn.admitted','turn.pause_failure','ticket.handoff_started') ORDER BY seq DESC LIMIT 1",
+        &[&int_of(root, "id")],
+    )?.is_some_and(|event| {
+        if str_of(&event, "kind") == "auto.retry" {
+            let payload = serde_json::from_str::<Value>(str_of(&event, "payload")).unwrap_or(Value::Null);
+            return payload["reason"] != "按新追加的要求重新核对。";
+        }
+        matches!(str_of(&event, "kind"),
+            "turn.retry_scheduled" | "route.rotated" | "turn.route_wait" | "turn.deferred")
+    }))
+}
+
+/// Persist the failed boundary while allowing existing children to finish.
+fn settle_failure(q: &Q, root: &Map<String, Value>, reason: &str) -> Result<()> {
+    let recovery_reason = if str_of(root, "state") == "queued" {
+        q.one("SELECT payload FROM events WHERE job=? AND kind IN ('auto.retry','turn.retry_scheduled','route.rotated','turn.route_wait') AND seq>
+            coalesce((SELECT max(seq) FROM events WHERE job=? AND kind IN ('reply','user.follow','retry')),0)
+            ORDER BY seq DESC LIMIT 1", &[&int_of(root, "id"), &int_of(root, "id")])?
+            .and_then(|row| serde_json::from_str::<Value>(str_of(&row, "payload")).ok())
+            .and_then(|payload| payload.get("error_message").or_else(|| payload.get("reason")).and_then(Value::as_str).map(str::to_owned))
+    } else { None };
+    let reason = recovery_reason.as_deref().unwrap_or(reason);
+    let pending = children_running(q, int_of(root, "ticket"))?;
+    let state = if pending { "waiting" } else { "failed" };
+    q.run("UPDATE jobs SET state=?,result=? WHERE id=?", &[&state, &reason, &int_of(root, "id")])?;
+    q.log(who_of(root), "turn.pause_failure", &json!({"reason": reason, "state": state}))?;
+    set(q, root, if pending { "draining" } else { "paused" }, false,
+        if pending { "ticket.pause_draining" } else { "ticket.paused" })
+}
+
+pub(crate) fn after_failure(q: &Q, job: &JobCtx, reason: &str) -> Result<bool> {
+    if !job.is_root() || status(q, job.ticket)? == PauseStatus::Running {
+        return Ok(false);
+    }
+    settle_failure(q, &q.root(job.ticket)?, reason)?;
+    Ok(true)
+}
+
+/// Called after normal wakeup, in the same transaction as admission.
 pub(crate) fn reconcile(q: &Q) -> Result<()> {
     for row in q.all("SELECT ticket,state FROM ticket_pause WHERE state!='paused'", &[])? {
         let ticket = int_of(&row, "ticket");
         let root = q.root(ticket)?;
         let root_state = str_of(&root, "state");
         if root_state == "running" {
+            continue;
+        }
+        if root_state == "queued" && queued_recovery(q, &root)? {
+            settle_failure(q, &root, "暂停请求终止已排队的恢复尝试。")?;
             continue;
         }
         let pending = children_running(q, ticket)?;

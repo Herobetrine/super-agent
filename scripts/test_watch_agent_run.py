@@ -40,10 +40,10 @@ class WatchRunTests(unittest.TestCase):
         self.event({"type": "assistant", "message": {"id": "secret-message-id", "usage": self.usage(1),
                     "content": [{"text": "DO-NOT-LEAK"}], "credential": "DO-NOT-LEAK"}})
         self.event({"type": "assistant", "message": {"id": "secret-message-id", "usage": self.usage(5)}})
-        self.event({"type": "result", "usage": self.usage(), "result": "DO-NOT-LEAK"})
-        self.event({"type": "result", "usage": self.usage()})
+        self.event({"type": "result", "subtype": "success", "usage": self.usage(), "result": "DO-NOT-LEAK"})
+        self.event({"type": "result", "subtype": "success", "usage": self.usage()})
         self.event({"type": "result", "parent_tool_use_id": "child", "usage": self.usage(999)})
-        self.event({"type": "result", "usage": self.usage(999)}, ticket=7, job=2)
+        self.event({"type": "result", "subtype": "success", "usage": self.usage(999)}, ticket=7, job=2)
         self.event({"guide": "DO-NOT-LEAK", "full_prompt_bytes": 1000, "sent_prompt_bytes": 100,
                     "saved_bytes": 900, "incremental": True}, kind="running")
         records, more = self.sampler.poll()
@@ -67,12 +67,83 @@ class WatchRunTests(unittest.TestCase):
     def test_null_zero_and_failed_result(self):
         self.event({"type": "result", "subtype": "error_during_execution", "usage": {
             name: 0 for name in watch.TOKEN_NAMES}})
-        self.event({"type": "result", "usage": {name: 0 for name in watch.TOKEN_NAMES}}, turn=2)
+        self.event({"type": "result", "subtype": "success", "usage": {name: 0 for name in watch.TOKEN_NAMES}}, turn=2)
         self.sampler.poll()
         summary = self.sampler.summary()
         self.assertEqual(summary["claude_terminal"]["samples"], 2)
-        self.assertEqual(summary["claude_terminal"]["complete_samples"], 1)
+        self.assertEqual(summary["claude_terminal"]["complete_samples"], 2)
         self.assertIsNone(summary["claude_terminal"]["cache_read_fraction"])
+
+    def test_failed_terminal_preserves_zero_and_excludes_positive_usage(self):
+        self.event({"type": "result", "subtype": "error_during_execution",
+                    "usage": dict.fromkeys(watch.TOKEN_NAMES, 0)})
+        self.event({"type": "result", "subtype": "success", "is_error": True,
+                    "usage": self.usage()}, turn=2)
+        self.sampler.poll()
+        summary = self.sampler.summary()
+        terminal = summary["claude_terminal"]
+        self.assertEqual(terminal["tokens"]["input_tokens"], 10)
+        self.assertEqual(terminal["complete_samples"], 2)
+        self.assertEqual(terminal["cache_ratio_samples"], 0)
+        self.assertEqual(terminal["outcomes"], {"failed": 2})
+        self.assertEqual(summary["observed_turns"][0]["claude_terminal_tokens"],
+                         dict.fromkeys(watch.TOKEN_NAMES, 0))
+        self.assertEqual(summary["cache_assessment"], "no_successful_terminal")
+
+    def test_partial_requests_survive_failed_terminal_separately(self):
+        self.event({"type": "assistant", "message": {"id": "request", "usage": self.usage()}})
+        self.sampler.poll()
+        pending = self.sampler.summary()
+        self.assertEqual(pending["observed_turns"][0]["outcome"], "pending")
+        self.assertEqual(pending["claude_terminal"]["samples"], 0)
+        self.assertEqual(pending["cache_assessment"], "awaiting_terminal")
+        self.event({"type": "result", "subtype": "error_during_execution"})
+        self.sampler.poll()
+        summary = self.sampler.summary()
+        self.assertEqual(summary["observed_turns"][0]["outcome"], "failed")
+        self.assertEqual(summary["claude_terminal"]["cache_ratio_samples"], 0)
+        self.assertIsNone(summary["claude_terminal"]["tokens"]["input_tokens"])
+        self.assertEqual(summary["claude_requests_separate_do_not_add"]["cache_ratio_samples"], 1)
+        self.assertEqual(summary["claude_requests_separate_do_not_add"]["cache_read_fraction"], .8)
+
+    def test_unknown_and_success_zero_are_distinct_from_cache_samples(self):
+        self.event({"type": "result", "usage": {"input_tokens": 0}})
+        self.event({"type": "result", "subtype": "success",
+                    "usage": dict.fromkeys(watch.TOKEN_NAMES, 0)}, turn=2)
+        self.sampler.poll()
+        summary = self.sampler.summary()
+        self.assertEqual(summary["claude_terminal"]["outcomes"], {"unknown": 1, "success": 1})
+        self.assertEqual(summary["claude_terminal"]["cache_ratio_samples"], 0)
+        self.assertEqual(summary["cache_assessment"], "warm_up_or_missing")
+        tokens = summary["observed_turns"][0]["claude_terminal_tokens"]
+        self.assertEqual(tokens["input_tokens"], 0)
+        self.assertIsNone(tokens["cache_read_input_tokens"])
+
+    def test_terminal_replay_replaces_outcome_without_double_counting(self):
+        self.event({"type": "result", "subtype": "success", "usage": self.usage()})
+        self.sampler.poll()
+        self.assertEqual(self.sampler.summary()["claude_terminal"]["cache_ratio_samples"], 1)
+        self.event({"type": "result", "subtype": "error_during_execution",
+                    "usage": dict.fromkeys(watch.TOKEN_NAMES, 0)})
+        self.event({}, kind="reply")
+        self.sampler.poll()
+        summary = self.sampler.summary()
+        self.assertEqual(summary["claude_terminal"]["samples"], 1)
+        self.assertEqual(summary["claude_terminal"]["cache_ratio_samples"], 0)
+        self.assertEqual(summary["claude_terminal"]["outcomes"], {"failed": 1})
+        self.assertEqual(summary["claude_terminal"]["tokens"]["output_tokens"], 0)
+
+    def test_pause_failure_ends_attempt_without_inventing_native_usage(self):
+        self.event({"state": "waiting", "reason": "DO-NOT-LEAK"}, kind="turn.pause_failure")
+        records, _ = self.sampler.poll()
+        summary = self.sampler.summary()
+        turn = summary["observed_turns"][0]
+        self.assertTrue(turn["ended"])
+        self.assertEqual(turn["outcome"], "failed")
+        self.assertIsNotNone(turn["platform_ended_at"])
+        self.assertIsNone(turn["claude_terminal_tokens"])
+        self.assertEqual(summary["claude_terminal"]["samples"], 0)
+        self.assertNotIn("DO-NOT-LEAK", json.dumps(records))
 
     def test_codex_first_last_delta_dedup_and_rollback(self):
         def codex(total, last):

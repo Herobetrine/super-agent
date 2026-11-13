@@ -20,7 +20,7 @@ RETRIES = {"retry", "auto.retry", "turn.retry_scheduled", "route.rotated"}
 CONTROLS = {"control", "control.invalid", "control.rejected", "control.accepted", "send", "spawn", "cancel",
             "protocol.progress_invalid", "protocol.preview_invalid", "job.progress", "cancel.rejected", "child.cancelled"}
 PAUSE_EVENTS = {"ticket.pause_requested", "ticket.resumed", "ticket.paused", "ticket.handoff_started", "ticket.pause_draining"}
-TERMINALS = {"reply", "failed", "cancelled", "interrupted", "partial", "turn.gave_up"}
+TERMINALS = {"reply", "failed", "cancelled", "interrupted", "partial", "turn.gave_up", "turn.pause_failure"}
 
 
 def integer(value):
@@ -54,12 +54,14 @@ def counts(usage, agent):
     return result
 
 
-def aggregate(samples, agent):
+def aggregate(samples, agent, outcomes=None):
     samples = list(samples)
     totals = {name: sum(row[name] for row in samples if row[name] is not None)
               if any(row[name] is not None for row in samples) else None for name in TOKEN_NAMES}
     ratio_names = TOKEN_NAMES[:3] if agent == "claude" else TOKEN_NAMES[:2]
-    paired = [row for row in samples if all(row[name] is not None for name in ratio_names)]
+    eligible = samples if outcomes is None else [row for row, outcome in zip(samples, outcomes) if outcome == "success"]
+    paired = [row for row in eligible if all(row[name] is not None for name in ratio_names)
+              and (sum(row[name] for name in ratio_names) if agent == "claude" else row["input_tokens"]) > 0]
     denominator = sum(sum(row[name] for name in TOKEN_NAMES[:3]) if agent == "claude"
                       else row["input_tokens"] for row in paired)
     reads = sum(row["cache_read_input_tokens"] for row in paired)
@@ -103,7 +105,7 @@ class Sampler:
                     "agent": agent if agent in AGENTS else "unknown", "parent": parent, "is_root": parent is None}
             if job is not None and turn is not None:
                 self.turns.setdefault((job, turn), {"agent": base["agent"], "running": 0, "ended": False,
-                                                  "started_at": None, "platform_ended_at": None})
+                                                  "started_at": None, "platform_ended_at": None, "outcome": "pending"})
             try:
                 value = json.loads(payload) if kind in {"running", "native"} else {}
             except (ValueError, TypeError):
@@ -135,6 +137,9 @@ class Sampler:
                 if category == "terminal" and (job, turn) in self.turns:
                     self.turns[job, turn]["ended"] = True
                     self.turns[job, turn]["platform_ended_at"] = timestamp
+                    outcome = "success" if kind == "reply" else "failed" if kind in {"turn.gave_up", "turn.pause_failure"} else kind
+                    if outcome != "success" or self.turns[job, turn]["outcome"] not in {"failed", "cancelled", "interrupted", "partial"}:
+                        self.turns[job, turn]["outcome"] = outcome
                 records.append(dict(base, record=category, event=kind))
         return records, len(rows) == self.batch_size
 
@@ -156,8 +161,11 @@ class Sampler:
                 self.turns[key]["native_ended_at"] = base["ts"]
                 self.turns[key]["native_is_error"] = value.get("is_error") if type(value.get("is_error")) is bool else None
                 usage = counts(value.get("usage"), agent)
-                if value.get("subtype") == "error_during_execution" and not any(usage.values()):
-                    usage = {name: None for name in TOKEN_NAMES}
+                subtype = value.get("subtype")
+                outcome = ("failed" if value.get("is_error") is True or
+                           isinstance(subtype, str) and subtype.startswith("error") else
+                           "success" if subtype == "success" or value.get("is_error") is False else "unknown")
+                self.turns[key]["outcome"] = outcome
                 if any(number is not None for number in usage.values()) or key not in self.results:
                     self.results[key] = usage
                 source = "claude_terminal_main_loop"
@@ -221,7 +229,9 @@ class Sampler:
                  "turn": turn, "state": state if state in STATES else "unknown"}
                 for job, parent, agent, turn, state in self.connection.execute(
                     "SELECT id,parent,agent,turn,state FROM jobs WHERE ticket=? ORDER BY id", (self.ticket,))]
-        claude = aggregate(self.results.values(), "claude")
+        terminal_outcomes = [self.turns[key]["outcome"] for key in self.results]
+        claude = aggregate(self.results.values(), "claude", terminal_outcomes)
+        claude["outcomes"] = dict(Counter(terminal_outcomes))
         pause_state = None
         if self.connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='ticket_pause'").fetchone():
             row = self.connection.execute("SELECT state FROM ticket_pause WHERE ticket=?", (self.ticket,)).fetchone()
@@ -242,12 +252,18 @@ class Sampler:
                                         if (job, turn) in self.results else None)
                                    for (job, turn), data in sorted(self.turns.items())],
                 "jobs": jobs, "pause_state": pause_state,
-                "cache_assessment": "warm_up_or_missing" if claude["cache_ratio_samples"] < 3 else "observed_partial_sample",
+                "cache_assessment": ("awaiting_terminal" if not terminal_outcomes and
+                                     any(data["outcome"] == "pending" for data in self.turns.values()) else
+                                     "no_observed_terminal" if not terminal_outcomes else
+                                     "no_successful_terminal" if "success" not in terminal_outcomes else
+                                     "warm_up_or_missing" if claude["cache_ratio_samples"] < 3 else "observed_partial_sample"),
                 "alert_candidates": ["delivery_byte_inconsistency"] if self.delivery["inconsistent_requests"] else [],
                 "limitations": ["No automatic cancellation or provider calls.",
                                 "Retry event counts are raw events, not distinct attempts. One retry can emit multiple events.",
                                 "Missing usage is null, not zero. Replayed usage_update rows replace prior samples.",
                                 "Claude internal subagents excluded. Terminal totals and request samples overlap.",
+                                "Terminal cache ratios require successful outcome and positive known input denominator.",
+                                "Request ratios describe reported requests even if their turn is pending or later fails.",
                                 "Tail starts mid-history. Codex first frame uses last request only.",
                                 "Unsupported native usage and unreported retries are unknown."]}
 

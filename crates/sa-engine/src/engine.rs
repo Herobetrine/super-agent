@@ -1081,6 +1081,9 @@ impl Inner {
                 if sched.maintenance.iter().any(|s| crate::workspaces::overlaps(s,&key))
                     || (job.writing && occupied.iter().any(|s| crate::workspaces::overlaps(s,&key))) { continue; }
                 if let Some(until) = self.route_blocked(&job, time) {
+                    if pause::after_failure(q, &job, "交接时执行路由熔断，暂停后续恢复尝试。")? {
+                        continue;
+                    }
                     if let Some(ids) = self.failover(q, &job, "circuit_open")? {
                         aborts.extend(ids);
                         continue;
@@ -1851,6 +1854,16 @@ impl Inner {
         if self.stopping.load(Ordering::SeqCst) {
             return q.interrupt(who, &job.ticket_profile);
         }
+        if job.is_root() && pause::status(q, job.ticket)? != PauseStatus::Running {
+            let error = match err {
+                TurnError::Adapter(error) => json!({"class": class_name(error.class), "code": error.code, "http_status": error.http_status}),
+                _ => json!({}),
+            };
+            q.log(who, "turn.pause_error", &json!({"reason": reason, "error": error, "timed_out": timed_out}))?;
+        }
+        if pause::after_failure(q, job, &reason)? {
+            return Ok(());
+        }
         if turn.loop_detected.load(Ordering::SeqCst) {
             return self.give_up(q,job,"工具操作与结果持续重复，已停止空转；请调整方法后重试。");
         }
@@ -2114,6 +2127,7 @@ impl Inner {
                     resume_session.as_deref().map(Some)
                 };
                 self.requeue(q, job, at + delay.as_secs_f64(), session, "turn.retry_scheduled", json!({
+                    "reason": err.message,
                     "class": class_name(err.class),
                     "attempt": attempt,
                     "max": max,
@@ -2131,6 +2145,7 @@ impl Inner {
                 )?;
                 // A different upstream cannot resume the old native session.
                 self.requeue(q, job, at + delay.as_secs_f64(), Some(None), "route.rotated", json!({
+                    "error_message": err.message,
                     "from": route_json(route),
                     "to": route_json(&to),
                     "reason": class_name(reason),
@@ -2140,6 +2155,7 @@ impl Inner {
                 notice(q, delay.as_secs_f64())
             }
             Recovery::WaitForRoute { until_secs } => self.requeue(q, job, until_secs, None, "turn.route_wait", json!({
+                "reason": err.message,
                 "until": p::seconds_json(until_secs),
                 "class": class_name(err.class),
                 "route": route_json(route),
