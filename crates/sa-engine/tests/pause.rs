@@ -98,25 +98,20 @@ async fn waiting_root_drains_children_and_gets_exactly_one_consolidation() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn pause_requested_during_root_allows_its_already_planned_children_to_drain() {
+async fn pause_requested_during_root_preserves_planned_children_until_resume() {
     let root_gate = Gate::new();
-    let child_gate = Gate::new();
     let fx = Fx::new(script({
         let root_gate = root_gate.clone();
-        let child_gate = child_gate.clone();
         move |c| {
             let root_gate = root_gate.clone();
-            let child_gate = child_gate.clone();
             async move {
                 if c.depth() > 0 {
-                    child_gate.wait().await;
-                    return Ok("child done".into());
+                    return Ok("resumed child done".into());
                 }
                 if c.turn() == 1 {
                     root_gate.wait().await;
                     return Ok(send(json!({})));
                 }
-                assert_eq!(c.packet["pause_after_handoff"]["consolidation"], true);
                 Ok("handoff".into())
             }
         }
@@ -125,10 +120,14 @@ async fn pause_requested_during_root_allows_its_already_planned_children_to_drai
     fx.until(|| fx.shared.count(|_| true) == 1).await;
     fx.engine.request_pause_after_handoff(ticket).unwrap();
     root_gate.open();
-    fx.until(|| fx.engine.pause_status(ticket).unwrap() == PauseStatus::Draining && fx.shared.count(|c| c.packet["depth"] == 1) == 1).await;
-    child_gate.open();
     fx.until(|| fx.engine.pause_status(ticket).unwrap() == PauseStatus::Paused).await;
-    assert_eq!(fx.shared.count(|_| true), 3);
+    settled(&fx.engine).await;
+    assert_eq!(fx.shared.count(|c| c.packet["depth"].as_i64().unwrap() > 0), 0);
+    assert_eq!(fx.int("SELECT count(*) FROM jobs WHERE parent IS NOT NULL AND state='queued'"), 1);
+    assert_eq!(fx.shared.count(|c| c.packet["depth"] == 0), 2);
+    fx.engine.resume_paused(ticket).unwrap();
+    fx.until(|| fx.shared.count(|c| c.packet["depth"].as_i64().unwrap() > 0) == 1).await;
+    fx.finish(ticket, "done").await;
     fx.engine.close().await;
 }
 
@@ -503,5 +502,93 @@ async fn queued_user_directed_recheck_is_allowed_one_handoff() {
     fx.until(|| fx.engine.pause_status(ticket).unwrap() == PauseStatus::Paused).await;
     assert_eq!(fx.shared.count(|_| true), 1);
     assert_eq!(root_state(&fx.engine, ticket), "done");
+    fx.engine.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn nested_checkpoint_followup_and_mail_survive_pause_restart_and_resume() {
+    let child_gate = Gate::new();
+    let mut fx = Fx::new(script({
+        let child_gate = child_gate.clone();
+        move |c| {
+            let child_gate = child_gate.clone();
+            async move {
+                if c.depth() == 2 {
+                    return Ok("nested final receipt".into());
+                }
+                if c.depth() == 1 && c.turn() == 1 {
+                    c.emit("delta", json!(format!("{}\n", send(json!({"id":"nested"})))));
+                    child_gate.wait().await;
+                    return Ok("saved checkpoint, tools settled".into());
+                }
+                if c.depth() == 1 {
+                    assert_eq!(c.full_packet()["reports"][0]["result"], "nested final receipt");
+                    assert!(c.full_packet()["notes"].as_array().unwrap().iter().any(|n| n["body"] == "deferred instruction"));
+                    return Ok("resumed child complete".into());
+                }
+                if c.turn() == 1 {
+                    return Ok(send(json!({"id":"writer"})));
+                }
+                Ok("root consolidated checkpoint and frozen followup".into())
+            }
+        }
+    }), t1_catalog());
+    let ticket = fx.begin(fx.params()).await;
+    fx.until(|| fx.shared.count(|c| c.packet["depth"] == 2) == 1).await;
+    fx.until(|| fx.int("SELECT count(*) FROM jobs WHERE depth=2 AND state='done'") == 1).await;
+    let child = fx.int("SELECT id FROM jobs WHERE depth=1");
+    fx.engine.request_pause_after_handoff(ticket).unwrap();
+    fx.engine.note(ticket, child, "deferred instruction").unwrap();
+    child_gate.open();
+    fx.until(|| fx.engine.pause_status(ticket).unwrap() == PauseStatus::Paused).await;
+    settled(&fx.engine).await;
+    assert_eq!(fx.shared.count(|c| c.packet["depth"] == 1), 1);
+    assert_eq!(fx.shared.count(|c| c.packet["depth"] == 0), 2);
+    assert_eq!(fx.int("SELECT count(*) FROM jobs WHERE depth=1 AND state='queued'"), 1);
+    assert_eq!(fx.int("SELECT count(*) FROM mailbox WHERE target=(SELECT id FROM jobs WHERE depth=1) AND consumed_turn IS NULL"), 1);
+    fx.restart(quiet()).await;
+    fx.engine.start().unwrap();
+    for _ in 0..4 { fx.engine.step(); }
+    assert_eq!(fx.shared.count(|c| c.packet["depth"] == 1), 1);
+    fx.engine.resume_paused(ticket).unwrap();
+    fx.until(|| fx.shared.count(|c| c.packet["depth"] == 1) == 2).await;
+    fx.until(|| fx.int("SELECT count(*) FROM jobs WHERE depth=1 AND state='done'") == 1).await;
+    fx.finish(ticket, "done").await;
+    fx.engine.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn preexisting_queued_children_remain_durable_through_final_handoff_and_restart() {
+    let mut fx = Fx::new(script(|c| async move {
+        if c.depth() == 0 {
+            if c.full_packet()["pause_after_handoff"]["consolidation"] == true {
+                assert_eq!(c.full_packet()["reports"].as_array().unwrap().len(), 2);
+                assert!(c.full_packet()["reports"].as_array().unwrap().iter().all(|r| r["state"] == "queued"));
+            }
+            return Ok("frozen work summary".into());
+        }
+        Ok("queued child resumed".into())
+    }), t1_catalog());
+    let ticket = fx.create(fx.params()).await;
+    let root = fx.engine.root(ticket).unwrap()["id"].as_i64().unwrap();
+    fx.engine.db().tx(|q| {
+        for name in ["first", "second"] {
+            q.run("INSERT INTO jobs(ticket,parent,sender,agent,body,writing,depth,state,msgkey) VALUES(?,?,'fixture','deepseek',?,0,1,'queued',?)", &[&ticket, &root, &name, &name])?;
+        }
+        Ok(())
+    }).unwrap();
+    assert_eq!(fx.engine.request_pause_after_handoff(ticket).unwrap(), PauseStatus::Handoff);
+    fx.engine.start().unwrap();
+    fx.until(|| fx.engine.pause_status(ticket).unwrap() == PauseStatus::Paused).await;
+    settled(&fx.engine).await;
+    assert_eq!(fx.shared.count(|_| true), 1);
+    assert_eq!(fx.int("SELECT count(*) FROM jobs WHERE parent IS NOT NULL AND state='queued'"), 2);
+    fx.restart(quiet()).await;
+    fx.engine.start().unwrap();
+    for _ in 0..4 { fx.engine.step(); }
+    assert_eq!(fx.shared.count(|_| true), 1);
+    fx.engine.resume_paused(ticket).unwrap();
+    fx.until(|| fx.int("SELECT count(*) FROM jobs WHERE parent IS NOT NULL AND state='done'") == 2).await;
+    fx.finish(ticket, "done").await;
     fx.engine.close().await;
 }

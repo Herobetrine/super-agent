@@ -1056,7 +1056,7 @@ impl Inner {
         LEFT JOIN continuous_runs c ON c.ticket=j.ticket
         WHERE j.state='queued' AND j.ready_after<=? AND j.writing=?
         AND NOT EXISTS(SELECT 1 FROM ticket_pause p WHERE p.ticket=j.ticket
-          AND (p.state='paused' OR (p.state='draining' AND j.parent IS NULL)))
+          AND (j.parent IS NOT NULL OR p.state='paused' OR p.state='draining'))
         ORDER BY j.id LIMIT ?";
             let time = now();
             let mut candidates = q.all(queued, &[&time, &0, &(READS_PER_SLICE as i64)])?;
@@ -1362,17 +1362,27 @@ impl Inner {
         } else {
             None
         };
-        let incremental = baseline.is_some();
+        let incremental = baseline.as_ref().is_some_and(|baseline| !baseline.needs_recovery);
+        let recovery_delivery = baseline.as_ref().is_some_and(|baseline| baseline.needs_recovery);
+        let full_context = if baseline.is_some() {
+            Some(context::archive(&snapshot, &self.data_dir)?)
+        } else { None };
         let full_prompt_bytes = guide.len() + 1 + stringify(&Value::Object(snapshot.clone())).len();
         let delivered_guide = if let Some(baseline) = baseline {
-            let (delta, delivered_guide) = context::delivery::delta(&packet, &guide, &baseline);
+            let (delta, delivered_guide) = if recovery_delivery {
+                context::delivery::recovery(&packet, &guide, &baseline, full_context.as_ref().expect("archived continuation"))
+            } else {
+                context::delivery::delta(&packet, &guide, &baseline)
+            };
             packet = delta;
             delivered_guide
         } else {
             guide.clone()
         };
         let deferred_schemas = lazy_mcp_schemas && context::delivery::defer_mcp_schemas(&mut packet, &snapshot);
-        if incremental || deferred_schemas {
+        if let Some(reference) = full_context {
+            packet.insert("full_context".into(), reference);
+        } else if deferred_schemas {
             packet.insert("full_context".into(), context::archive(&snapshot, &self.data_dir)?);
         }
         let mut prompt = format!("{delivered_guide}\n{}", stringify(&Value::Object(packet.clone())));
@@ -1403,6 +1413,7 @@ impl Inner {
                 "guide": if compacted { &guide } else { &delivered_guide },
                 "prompt_sha256": digest(&prompt), "snapshot_seq": snapshot_seq,
                 "snapshot_sha256": snapshot_sha256, "incremental": incremental && !compacted,
+                "recovery_delivery": recovery_delivery && !compacted,
                 "full_prompt_bytes": full_prompt_bytes, "sent_prompt_bytes": prompt.len(),
                 "saved_bytes": full_prompt_bytes.saturating_sub(prompt.len()),
                 "lazy_mcp_schemas": deferred_schemas,
@@ -1502,11 +1513,13 @@ impl Inner {
             if !q.live(job.who())? { return Ok(()); }
             self.log_transitions(q, job.who())?;
             self.commit_reply(q, turn, &outcome.text, outcome.session_id.as_deref(), &stream.invalid)?;
-            let same_session = !incremental || outcome.session_id == job.session;
+            let same_session = !(incremental || recovery_delivery) || outcome.session_id == job.session;
             context::delivery::acknowledge(q, job.who(), &route, json!({
                 "snapshot_seq": snapshot_seq, "snapshot_sha256": snapshot_sha256,
                 "guide_sha256": digest(&guide), "complete": !compacted && same_session,
                 "lazy_mcp_schemas": lazy_mcp_schemas,
+                "full_context": packet.get("full_context"),
+                "recovery_delivery": recovery_delivery && !compacted,
             }))
         })?;
         Ok(())
@@ -1622,8 +1635,8 @@ impl Inner {
             }
             for (kind, data) in &journal {
                 let seq = q.log(job.who(), kind, data)?;
-                if kind == "native" && context::delivery::native_compaction(data) {
-                    q.log(job.who(), "context.compacted", &json!({"source_seq": seq}))?;
+                if kind == "native" {
+                    context::delivery::record_compaction(q, job.who(), job.admission, seq, data)?;
                 }
                 if kind == "native"
                     && job.continuous
@@ -1933,6 +1946,9 @@ impl Inner {
                 return self.recover(q, job, &route, e, decision, ledger.failures);
             }
         }
+        if let TurnError::Adapter(e) = err && e.native_retry_exhausted() {
+            return self.give_up(q, job, &reason);
+        }
         if auto_root && (timed_out || TRANSIENT.is_match(&reason)) {
             let attempts = q.int(
                 "SELECT count(*) AS n FROM events WHERE job=? AND kind='auto.retry' AND seq>
@@ -2163,7 +2179,7 @@ impl Inner {
             Recovery::GiveUp { class, attempts } => {
                 // A continuous project keeps retrying transient failures,
                 // bounded per hour (spec §9.2 A).
-                if job.primary() && classify::is_retryable(class)
+                if job.primary() && classify::is_retryable(class) && !err.native_retry_exhausted()
                     && pause::status(q, job.ticket)? == PauseStatus::Running {
                     let recent = q.int(
                         "SELECT count(*) FROM events WHERE job=? AND kind IN ('turn.retry_scheduled','route.rotated') AND ts>?",

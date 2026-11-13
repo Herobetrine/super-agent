@@ -262,7 +262,7 @@ async fn image_reader_failover_keeps_native_images_and_stops_when_capable_harnes
                         "merged".into()
                     });
                 }
-                assert!(matches!(c.name.as_str(), "codex" | "claude"));
+                assert!(matches!(c.name.as_str(), "codex" | "claude" | "antigravity"));
                 assert_eq!(c.req.images.len(), 1);
                 assert_eq!(c.req.images[0].media_type(), "image/png");
                 assert!(!c.req.writable);
@@ -278,16 +278,20 @@ async fn image_reader_failover_keeps_native_images_and_stops_when_capable_harnes
         image::RgbImage::new(2, 2).save_with_format(fx.project.join("截图.PNG"), image::ImageFormat::Png).unwrap();
         let ticket = fx.begin(fx.params().failover(true)).await;
         fx.finish(ticket, if replacement_ok { "done" } else { "partial" }).await;
-        assert_eq!(fx.int("SELECT count(*) FROM job_failovers"), 1);
-        assert_eq!(fx.int("SELECT count(*) FROM jobs WHERE agent IN ('deepseek','antigravity')"), 0);
+        assert_eq!(fx.int("SELECT count(*) FROM job_failovers"), if replacement_ok { 1 } else { 2 });
+        assert_eq!(fx.int("SELECT count(*) FROM jobs WHERE agent='deepseek'"), 0);
         let children = fx.all("SELECT id,agent,state FROM jobs WHERE parent IS NOT NULL ORDER BY id");
-        assert_eq!(children.len(), 2);
+        assert_eq!(children.len(), if replacement_ok { 2 } else { 3 });
         assert_eq!(children[0]["state"], json!("cancelled"));
         assert_eq!(children[1]["agent"], json!("claude"));
-        assert_eq!(children[1]["state"], json!(if replacement_ok { "done" } else { "failed" }));
+        assert_eq!(children[1]["state"], json!(if replacement_ok { "done" } else { "cancelled" }));
+        if !replacement_ok {
+            assert_eq!(children[2]["agent"], json!("antigravity"));
+            assert_eq!(children[2]["state"], json!("failed"));
+        }
         let manifests = fx.all("SELECT manifest FROM job_files ORDER BY job");
-        assert_eq!(manifests.len(), 2);
-        assert_eq!(manifests[0], manifests[1]);
+        assert_eq!(manifests.len(), children.len());
+        assert!(manifests.iter().all(|manifest| manifest == &manifests[0]));
     }
 }
 

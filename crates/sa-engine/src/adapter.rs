@@ -118,6 +118,12 @@ pub struct AdapterError {
 }
 
 impl AdapterError {
+    /// The native harness already exhausted its own bounded retries. This
+    /// trusted adapter code prevents multiplying the same failed work again.
+    pub fn native_retry_exhausted(&self) -> bool {
+        self.code.as_deref().is_some_and(|c| c.starts_with("native:retry_exhausted:"))
+    }
+
     pub fn new(class: ErrorClass, message: impl Into<String>) -> Self {
         Self {
             class,

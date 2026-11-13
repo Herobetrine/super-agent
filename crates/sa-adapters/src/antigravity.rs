@@ -18,7 +18,7 @@ use regex::Regex;
 use sa_engine::adapter::{
     Adapter, AdapterError, Catalog, ErrorClass, EventSink, RunOutcome, RunRequest, TurnHost,
 };
-use sa_engine::resilience::classify::classified;
+use sa_engine::resilience::classify::{classified, classify_text, from_http_status};
 use serde_json::{Value, json};
 use std::collections::HashSet;
 use std::io::Write;
@@ -168,6 +168,9 @@ fn environment(
         return Err(route_gone("Antigravity 供应商失效"));
     }
     if reader {
+        overrides.insert("toolPermission".into(), json!("strict"));
+        overrides.insert("disableSlashCommands".into(), json!(true));
+        overrides.insert("agentMode".into(), json!(""));
         let name = if provider == "google" {
             "agy-reader".to_string()
         } else {
@@ -453,12 +456,51 @@ async fn run(
     })?;
     let s = select(&d.catalog, &req.route)?;
     let high = boundary == "danger-full-access";
+    if !req.images.is_empty() {
+        image_provider(&s.provider)?;
+        if high {
+            image_account_settings(&native_settings(&sys))?;
+        }
+    }
     let r = d.rows.iter().find(|v| v.id == s.provider);
     let (env, overrides) = environment(&sys, &s.provider, r, !high)?;
     let exe = d
         .exe
         .clone()
         .ok_or_else(|| route_gone("本机未安装所选原生执行端"))?;
+    if !req.images.is_empty() {
+        // ACP reads permissions from its actual settings file. Root
+        // --settings overrides are not propagated into the ACP server.
+        // Reuse the same persistent root as text turns for session continuity.
+        let gemini = if high {
+            sys.home.join(".gemini")
+        } else {
+            PathBuf::from(env.get("HOME").unwrap_or_default()).join(".gemini")
+        };
+        let mut args = vec![
+            "acp".into(),
+            "--gemini-dir".into(),
+            gemini.to_string_lossy().into_owned(),
+        ];
+        if high {
+            args.push("--dangerously-skip-permissions".into());
+        }
+        let server = crate::acp::Server {
+            id: s.provider.clone(),
+            label: "Antigravity CLI".into(),
+            command: exe.to_string_lossy().into_owned(),
+            args,
+            env: vec![],
+            models: vec![s.model.clone()],
+            model_config_id: None,
+            permission_modes: ["readonly", "ask", "partial", "legacy"]
+                .into_iter()
+                .map(|profile| (profile.into(), "default".into()))
+                .collect(),
+            trusted_sandbox: true,
+        };
+        return crate::acp::run_server(env, req, host, emit, cancel, server, true).await;
+    }
     let mut args: Vec<String> = [
         "--input-format",
         "stream-json",
@@ -541,8 +583,16 @@ async fn run(
     })
     .await;
     if let Err(mut err) = streamed {
-        err.session_id = err.session_id.or(session);
-        return Err(err);
+        // A nonzero exit may accompany an upstream ERROR terminal. Preserve
+        // that terminal's provider classification instead of its exit code.
+        if err.class == ErrorClass::Cancelled
+            || last
+                .as_ref()
+                .is_none_or(|result| result["status"] != "ERROR")
+        {
+            err.session_id = err.session_id.or(session);
+            return Err(err);
+        }
     }
     let last = last.unwrap_or(Value::Null);
     let conversation = last["conversation_id"].as_str().filter(|c| !c.is_empty());
@@ -558,9 +608,11 @@ async fn run(
         let mut err = if last.is_null() {
             classified(ErrorClass::ProcessCrashed, "agy:no_terminal")
         } else {
-            classified(ErrorClass::Other, "agy:status")
+            native_failure(last["error"].as_str().unwrap_or_default())
         };
-        err.message = FAILED.into();
+        if matches!(err.class, ErrorClass::Other | ErrorClass::ProcessCrashed) {
+            err.message = FAILED.into();
+        }
         err.session_id = conversation.map(str::to_string).or(session);
         return Err(err);
     }
@@ -570,9 +622,102 @@ async fn run(
     })
 }
 
+fn image_provider(provider: &str) -> Result<(), AdapterError> {
+    if provider != "google" {
+        return Err(AdapterError::new(
+            ErrorClass::Protocol,
+            "Antigravity 原生图片输入目前支持 Google 登录账号；所选 API 或 ADC 来源的 ACP 认证与会话尚未接入",
+        ));
+    }
+    Ok(())
+}
+
+fn image_account_settings(settings: &Value) -> Result<(), AdapterError> {
+    let custom_model_provider = settings["modelProvider"]
+        .as_str()
+        .is_some_and(|provider| !provider.is_empty());
+    let custom_auth = settings["auth"]["type"]
+        .as_str()
+        .is_some_and(|auth| !matches!(auth, "" | "oauth-personal" | "oauth-business"));
+    if custom_model_provider || custom_auth {
+        return Err(AdapterError::new(
+            ErrorClass::Protocol,
+            "Antigravity 当前本机 ACP 配置使用其他认证来源，无法为所选 Google 账号安全复用图片会话",
+        ));
+    }
+    Ok(())
+}
+
+/// Inspect upstream failures without copying native text into operator errors.
+pub(crate) fn native_failure(text: &str) -> AdapterError {
+    static STATUS: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?i)(?:code|status|http)[ :]*(\d{3})\b").unwrap());
+    static ATTEMPTS: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?i)API error \(attempt (\d+)\)").unwrap());
+    let mut error =
+        if let Some(status) = STATUS.captures(text).and_then(|c| c[1].parse::<u16>().ok()) {
+            from_http_status(status, None)
+        } else {
+            classify_text(text)
+        };
+    if error.class == ErrorClass::Other
+        && text.to_ascii_lowercase().contains("no capacity available")
+    {
+        error = classified(ErrorClass::Overloaded, "agy:no_capacity");
+    }
+    if let Some(attempts) = ATTEMPTS
+        .captures(text)
+        .and_then(|c| c[1].parse::<u32>().ok())
+        .filter(|n| *n >= 2)
+    {
+        error.code = Some(format!("native:retry_exhausted:agy:attempts:{attempts}"));
+    }
+    error
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn image_routes_reject_other_providers_without_falling_back() {
+        assert!(image_provider("google").is_ok());
+        for provider in ["adc", "agy-configured-api", "missing"] {
+            assert_eq!(
+                image_provider(provider).unwrap_err().class,
+                ErrorClass::Protocol
+            );
+        }
+    }
+
+    #[test]
+    fn google_image_routes_refuse_other_saved_authentication_sources() {
+        assert!(image_account_settings(&json!({})).is_ok());
+        assert!(image_account_settings(&json!({"auth":{"type":"oauth-personal"}})).is_ok());
+        assert!(image_account_settings(&json!({"modelProvider":"gemini"})).is_err());
+        for auth in ["gemini-api-key", "agent-platform", "unknown"] {
+            assert!(image_account_settings(&json!({"auth":{"type":auth}})).is_err());
+        }
+    }
+
+    #[test]
+    fn terminal_native_retries_preserve_overload_and_exhaustion() {
+        let error = native_failure(
+            "API error (attempt 4): UNAVAILABLE (code 503): No capacity available for model private-model",
+        );
+        assert_eq!(error.class, ErrorClass::Overloaded);
+        assert_eq!(error.http_status, Some(503));
+        assert_eq!(
+            error.code.as_deref(),
+            Some("native:retry_exhausted:agy:attempts:4")
+        );
+        assert!(!error.message.contains("private-model"));
+        for text in ["API error (attempt 1): UNAVAILABLE (code 503)", "HTTP 503"] {
+            let error = native_failure(text);
+            assert_eq!(error.http_status, Some(503));
+            assert!(!error.code.unwrap().starts_with("native:retry_exhausted:"));
+        }
+    }
+
     #[test]
     fn empty_or_changed_native_format_is_not_a_complete_model_list() {
         for output in [

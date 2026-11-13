@@ -16,10 +16,10 @@ pub const MAX_IMAGES: usize = 4;
 pub const MAX_IMAGE_BYTES: usize = 5 * 1024 * 1024;
 pub const MAX_TOTAL_BYTES: usize = 16 * 1024 * 1024;
 pub const UNSUPPORTED: &str =
-    "当前执行端尚未接入原生图片输入，请选择 Codex 或 Claude Code，并使用支持视觉输入的模型";
+    "当前执行端尚未接入原生图片输入，请选择 Codex、Claude Code 或 Antigravity，并使用支持视觉输入的模型";
 
 pub fn supports_native_images(agent: &str) -> bool {
-    matches!(agent, "codex" | "claude")
+    matches!(agent, "codex" | "claude" | "antigravity")
 }
 
 /// Used by the composer for early feedback. Image attachments are selected
@@ -227,6 +227,7 @@ mod tests {
         let files = serde_json::json!([object(d.path(), "notes.txt", b"plain text")]);
         assert!(from_manifest(&files, d.path()).unwrap().is_empty());
         assert!(supports_native_images("codex") && supports_native_images("claude"));
-        assert!(!supports_native_images("deepseek") && !supports_native_images("antigravity"));
+        assert!(supports_native_images("antigravity"));
+        assert!(!supports_native_images("deepseek") && !supports_native_images("acp"));
     }
 }

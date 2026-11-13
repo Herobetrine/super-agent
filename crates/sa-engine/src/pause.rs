@@ -34,11 +34,12 @@ pub(crate) fn status(q: &Q, ticket: i64) -> Result<PauseStatus> {
     }
 }
 
-/// Interrupted children require operator action and cannot make further progress.
+/// Only admitted child turns drain. Queued and waiting children remain durable
+/// work for explicit resume and must not prevent maintenance from converging.
 fn children_running(q: &Q, ticket: i64) -> Result<bool> {
     q.exists(
         "SELECT 1 FROM jobs WHERE ticket=? AND parent IS NOT NULL
-         AND state IN ('queued','running','waiting','draining') LIMIT 1",
+         AND state='running' LIMIT 1",
         &[&ticket],
     )
 }
@@ -76,7 +77,7 @@ pub(crate) fn request(q: &Q, ticket: i64) -> Result<PauseStatus> {
     }
     if phase != "paused" && matches!(state, "queued" | "running" | "waiting") {
         q.record_note(ticket, Some(&root["id"]), Some(&json!(
-            "用户请求在小结交接后暂停。请汇总已完成工作、验证证据、未完成事项与下一步。已有子任务可完成，平台将在收齐回报后仅允许一次主控交接轮，之后等待用户明确恢复。"
+            "用户请求在小结交接后暂停。请汇总已完成工作、验证证据、未完成事项与下一步。已准入子轮可完成，尚未准入的子轮和排队任务保留至恢复。平台将在活动轮结束后仅允许一次主控交接轮，汇总冻结任务及未处理回报，之后等待用户明确恢复。"
         )), None, None)?;
     }
     status(q, ticket)

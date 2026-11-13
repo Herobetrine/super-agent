@@ -8,6 +8,7 @@ use crate::{
     sys::Sys,
 };
 use agent_client_protocol::{self as sdk, Agent, ByteStreams, Client};
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use futures::future::BoxFuture;
 use sa_engine::adapter::{
     Adapter, AdapterError, Catalog, ErrorClass, EventSink, RunOutcome, RunRequest, TurnHost,
@@ -171,7 +172,20 @@ fn failure(class: ErrorClass, code: &str) -> AdapterError {
     e.code = Some(code.into());
     e
 }
-fn sdk_failure(e: sdk::Error) -> AdapterError {
+fn sdk_failure(e: sdk::Error, antigravity: bool) -> AdapterError {
+    if e.data
+        .as_ref()
+        .is_some_and(|data| data == "session identity mismatch")
+    {
+        return failure(ErrorClass::SessionMismatch, "acp:session_mismatch");
+    }
+    if antigravity {
+        let diagnostic = format!("{} {}", e.message, e.data.as_ref().unwrap_or(&Value::Null));
+        let classified = crate::antigravity::native_failure(&diagnostic);
+        if classified.class != ErrorClass::Other {
+            return classified;
+        }
+    }
     let class = match e.code.value() {
         -32000 => ErrorClass::Auth,
         -32800 => ErrorClass::Cancelled,
@@ -196,6 +210,20 @@ async fn run(
         .into_iter()
         .find(|s| s.id == req.route.provider)
         .ok_or_else(|| route_gone("ACP 服务不存在"))?;
+    run_server(sys, req, host, emit, cancel, server, false).await
+}
+
+/// Reuse ACP lifecycle and permission handling for the built-in agy adapter.
+/// Antigravity supplies its already isolated environment and verified server.
+pub(crate) async fn run_server(
+    sys: Sys,
+    req: RunRequest,
+    host: Arc<dyn TurnHost>,
+    emit: Emit,
+    cancel: CancellationToken,
+    server: Server,
+    antigravity: bool,
+) -> Result<RunOutcome, AdapterError> {
     if !matches!(
         req.profile.as_str(),
         "readonly" | "ask" | "partial" | "full" | "auto" | "legacy"
@@ -223,23 +251,25 @@ async fn run(
     }
     let exe = executable(&sys, &server).ok_or_else(|| route_gone("ACP 执行程序不存在"))?;
     let mut env = sys.clone();
-    env.retain(|name| {
-        [
-            "PATH",
-            "PATHEXT",
-            "SYSTEMROOT",
-            "WINDIR",
-            "TEMP",
-            "TMP",
-            "HOME",
-            "USERPROFILE",
-            "LOCALAPPDATA",
-            "APPDATA",
-        ]
-        .iter()
-        .any(|n| name.eq_ignore_ascii_case(n))
-            || server.env.iter().any(|n| name.eq_ignore_ascii_case(n))
-    });
+    if !antigravity {
+        env.retain(|name| {
+            [
+                "PATH",
+                "PATHEXT",
+                "SYSTEMROOT",
+                "WINDIR",
+                "TEMP",
+                "TMP",
+                "HOME",
+                "USERPROFILE",
+                "LOCALAPPDATA",
+                "APPDATA",
+            ]
+            .iter()
+            .any(|n| name.eq_ignore_ascii_case(n))
+                || server.env.iter().any(|n| name.eq_ignore_ascii_case(n))
+        });
+    }
     let mut process = proc::start(&exe, &server.args, &req.cwd, &env)?;
     let stdin = process
         .stdin
@@ -261,7 +291,13 @@ async fn run(
     let handler_emit = emit.clone();
     let permission_emit = emit.clone();
     let permission_cancel = cancel.clone();
-    let permission_profile = effective_profile.to_string();
+    let permission_profile = if antigravity && !unrestricted {
+        "readonly"
+    } else {
+        effective_profile
+    }
+    .to_string();
+    let permission_agent = req.agent.clone();
     let callback_active = active.clone();
     let callback_emit = emit.clone();
     let callback_cancel = cancel.clone();
@@ -291,7 +327,7 @@ async fn run(
             else if matches!(permission_profile.as_str(),"full"|"auto"){true}
             else {
                 let _=permission_emit.0.send(sa_engine::adapter::AdapterEvent::AwaitingApproval);
-                tokio::select!{r=host.approve(json!({"agent":"acp","action":"tool","request":permission}))=>r,()=permission_cancel.cancelled()=>false}
+                tokio::select!{r=host.approve(json!({"agent":permission_agent,"action":"tool","request":permission}))=>r,()=permission_cancel.cancelled()=>false}
             };
             let selected=permission.options.iter().find(|o|o.kind==if allow{PermissionOptionKind::AllowOnce}else{PermissionOptionKind::RejectOnce});
             let outcome=selected.map(|o|RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(o.option_id.clone()))).unwrap_or(RequestPermissionOutcome::Cancelled);
@@ -301,7 +337,12 @@ async fn run(
         .connect_with(ByteStreams::new(stdin.compat_write(),stdout.compat()),move |connection:ConnectionTo<Agent>| async move {
             let init=connection.send_request(InitializeRequest::new(ProtocolVersion::V1)).block_task().await?;
             if init.protocol_version!=ProtocolVersion::V1 { return Err(sdk::Error::invalid_params()); }
-            let (sid,session)=if let Some(sid)=&callback_req.session_id {
+            if !callback_req.images.is_empty() && !init.agent_capabilities.prompt_capabilities.image {
+                return Err(sdk::Error::invalid_params().data("image capability required"));
+            }
+            let (sid,session)=if antigravity {
+                native_session(&connection, &callback_req, init.agent_capabilities.load_session).await?
+            } else if let Some(sid)=&callback_req.session_id {
                 if !init.agent_capabilities.load_session {return Err(sdk::Error::invalid_params());}
                 *callback_active.lock().unwrap()=Some(sid.clone());
                 let loaded=connection.send_request(LoadSessionRequest::new(sid.clone(),callback_req.cwd.clone())).block_task().await?;
@@ -312,20 +353,27 @@ async fn run(
                 (sid,serde_json::to_value(created).unwrap())
             };
             *callback_active.lock().unwrap()=Some(sid.clone()); callback_emit.session(&sid);
-            if let Some(mode)=restricted_mode {
-                let advertised=session["modes"]["availableModes"].as_array().is_some_and(|m|m.iter().any(|m|m["id"]==mode));
+            if let Some(mode)=&restricted_mode {
+                let advertised=session["modes"]["availableModes"].as_array().is_some_and(|m|m.iter().any(|m|m["id"]==*mode));
                 if !advertised{return Err(sdk::Error::invalid_params());}
-                connection.send_request(SetSessionModeRequest::new(sid.clone(),mode)).block_task().await?;
+                connection.send_request(SetSessionModeRequest::new(sid.clone(),mode.clone())).block_task().await?;
+            }
+            if antigravity {
+                configure_native(&connection, &callback_req, &sid, &session, restricted_mode.as_deref()).await?;
             }
             if let Some(config_id)=server.model_config_id {
                 let advertised=session["configOptions"].as_array().is_some_and(|v|v.iter().any(|v|v["id"]==config_id && v["options"].as_array().is_some_and(|o|o.iter().any(|o|o["value"]==callback_req.route.model))));
                 if !advertised{return Err(sdk::Error::invalid_params());}
                 connection.send_request(SetSessionConfigOptionRequest::new(sid.clone(),config_id,callback_req.route.model.as_str())).block_task().await?;
             }
-            callback_emit.journal("adapter.permission",json!({"profile":callback_req.profile,"scope":if unrestricted{"danger-full-access"}else{"operator-verified-acp-mode"}}));
-            callback_emit.journal("adapter.route",json!({"provider":callback_req.route.provider,"requested_model":callback_req.route.model,"mode":"cli","protocol":"acp-v1"}));
+            callback_emit.journal("adapter.permission",json!({"profile":callback_req.profile,"scope":if unrestricted{"danger-full-access"}else if antigravity{"cli-deny-policy+mode"}else{"operator-verified-acp-mode"}}));
+            callback_emit.journal("adapter.route",json!({"agent":callback_req.agent,"provider":callback_req.route.provider,"requested_model":callback_req.route.model,"mode":"cli","protocol":"acp-v1"}));
             prompting.store(true,Ordering::SeqCst);
-            let prompt=connection.send_request(PromptRequest::new(sid.clone(),vec![ContentBlock::Text(TextContent::new(callback_req.prompt))])).block_task();
+            let mut content = vec![ContentBlock::Text(TextContent::new(callback_req.prompt.clone()))];
+            for image in &callback_req.images {
+                content.push(ContentBlock::Image(ImageContent::new(STANDARD.encode(image.data()), image.media_type())));
+            }
+            let prompt=connection.send_request(PromptRequest::new(sid.clone(),content)).block_task();
             tokio::pin!(prompt);
             let reply=tokio::select! {
                 r=&mut prompt=>r?,
@@ -341,7 +389,7 @@ async fn run(
         });
     tokio::pin!(operation);
     let result = tokio::select! {
-        result=&mut operation=>result.map_err(sdk_failure),
+        result=&mut operation=>result.map_err(|error| sdk_failure(error, antigravity)),
         ()=cancel.cancelled()=>{
             let _=tokio::time::timeout(Duration::from_millis(500),&mut operation).await;
             Err(failure(ErrorClass::Cancelled,"acp:cancelled"))
@@ -349,7 +397,7 @@ async fn run(
     };
     process.kill_tree().await;
     process.wait().await;
-    let sid = active.lock().unwrap().clone();
+    let sid = active.lock().unwrap().clone().or(req.session_id);
     if invalid_session.load(Ordering::SeqCst) {
         return Err(failure(ErrorClass::SessionMismatch, "acp:session_mismatch"));
     }
@@ -367,3 +415,115 @@ async fn run(
         session_id: sid,
     })
 }
+
+// agy retains legacy model IDs alongside standard ACP config options. Keep
+// those fields using SDK untyped requests rather than dropping them in the
+// standard session response schema.
+async fn native_session(
+    connection: &ConnectionTo<Agent>,
+    req: &RunRequest,
+    can_load: bool,
+) -> Result<(String, Value), sdk::Error> {
+    let (method, params) = if let Some(sid) = &req.session_id {
+        if !can_load {
+            return Err(sdk::Error::invalid_params());
+        }
+        (
+            "session/load",
+            json!({"sessionId":sid,"cwd":req.cwd,"mcpServers":[]}),
+        )
+    } else {
+        ("session/new", json!({"cwd":req.cwd,"mcpServers":[]}))
+    };
+    let session = connection
+        .send_request(sdk::UntypedMessage::new(method, params)?)
+        .block_task()
+        .await?;
+    let sid = session["sessionId"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(sdk::Error::invalid_params)?
+        .to_string();
+    if req
+        .session_id
+        .as_deref()
+        .is_some_and(|wanted| wanted != sid)
+    {
+        return Err(sdk::Error::invalid_params().data("session identity mismatch"));
+    }
+    if !session["_meta"]["antigravity"]["tier"].is_object() {
+        return Err(sdk::Error::invalid_params().data("Google account route could not be verified"));
+    }
+    Ok((sid, session))
+}
+
+fn native_option<'a>(session: &'a Value, id: &str, value: &str) -> Result<&'a Value, sdk::Error> {
+    session["configOptions"]
+        .as_array()
+        .and_then(|options| options.iter().find(|o| o["id"] == id))
+        .filter(|option| {
+            option["options"]
+                .as_array()
+                .is_some_and(|values| values.iter().any(|o| o["value"] == value))
+        })
+        .ok_or_else(sdk::Error::invalid_params)
+}
+
+async fn configure_native(
+    connection: &ConnectionTo<Agent>,
+    req: &RunRequest,
+    sid: &str,
+    session: &Value,
+    mode: Option<&str>,
+) -> Result<(), sdk::Error> {
+    if req.route.model != "@native" {
+        if !session["models"]["availableModels"]
+            .as_array()
+            .is_some_and(|models| models.iter().any(|m| m["modelId"] == req.route.model))
+        {
+            return Err(sdk::Error::invalid_params().data("requested model unavailable"));
+        }
+        connection
+            .send_request(sdk::UntypedMessage::new(
+                "session/set_model",
+                json!({"sessionId":sid,"modelId":req.route.model}),
+            )?)
+            .block_task()
+            .await?;
+    }
+    // A load on the same ACP connection reads the selected exact model and
+    // mode back before any prompt. History updates remain outside prompting.
+    let loaded = connection
+        .send_request(sdk::UntypedMessage::new(
+            "session/load",
+            json!({"sessionId":sid,"cwd":req.cwd,"mcpServers":[]}),
+        )?)
+        .block_task()
+        .await?;
+    if loaded["sessionId"] != sid
+        || (req.route.model != "@native" && loaded["models"]["currentModelId"] != req.route.model)
+        || mode.is_some_and(|mode| loaded["modes"]["currentModeId"] != mode)
+    {
+        return Err(sdk::Error::invalid_params().data("native route readback mismatch"));
+    }
+    if let Some(effort) = &req.route.reasoning_effort {
+        native_option(&loaded, "thought_level", effort)?;
+        let configured = connection
+            .send_request(SetSessionConfigOptionRequest::new(
+                sid.to_string(),
+                "thought_level",
+                effort.as_str(),
+            ))
+            .block_task()
+            .await?;
+        let value = serde_json::to_value(configured)?;
+        if native_option(&value, "thought_level", effort)?["currentValue"] != *effort {
+            return Err(sdk::Error::invalid_params().data("native effort readback mismatch"));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+#[path = "antigravity_tests.rs"]
+mod antigravity_tests;
