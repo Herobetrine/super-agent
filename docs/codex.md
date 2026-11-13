@@ -4,6 +4,10 @@
 
 ## 供应商与会话
 
+适配器为独立 CLI 的目录探测和执行轮次移除继承的 `CODEX_WINDOWS_REGISTERED_CORE` 环境变量。由 Codex 桌面启动工作台时，该内部变量可能要求独立 CLI 使用桌面注册的启动身份，导致只读命令报 `registered Core launch requires an installed app`。修正仅作用于 Codex 的子进程环境副本，其余环境变量、会话权限与审批策略沿用原配置。2026-11-13 已在本机 Codex CLI 0.166.0 离线复现该差异。
+
+同次验证对 npm 与 WindowsApps resources 中的原生 CLI 分别检查：继承该标志时重现错误，移除后读取成功，覆盖与新建文件均被拒绝，原文件保持不变。测试使用本机 `sandbox --include-managed-config --permission-profile :read-only`，未调用模型。全量 Rust 回归为 409 passed / 0 failed / 3 ignored，workspace build 与 Clippy `-D warnings` 通过；这不代替修复版安装后的实际工单审计结果。
+
 模型选项按当前来源读取。显式 `base_url` 使用该来源的配对认证在线获取模型并处理分页；配置缺少端点时由 Codex CLI 解析登录来源和原生目录。显式 `model_catalog_json` 继续使用指定文件。目录保留模型声明的 `supported_reasoning_levels` 并传到界面的思考强度选择，执行时通过 `turn/start.effort` 交给 app-server。目录失败时标注当前列表的范围。正在执行的任务沿用启动时的选择。
 
 输入发送到指定的原生 thread 和 turn。恢复会话需收到匹配的线程标识；派工期间可给活动任务投递信件，平台以原生 steering 回执记录轮内接受。连接中断后未确认的消息进入后续轮次。即使已经收到协议回执，模型是否实际采用消息仍应检查其输出。
