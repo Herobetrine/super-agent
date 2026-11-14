@@ -323,6 +323,20 @@ impl Q<'_> {
         source: Option<&NoteSource>,
         key: Option<&str>,
     ) -> Result<i64> {
+        self.record_note_within(ticket, dest, body, source, key, 128)
+    }
+
+    /// [`record_note`](Self::record_note) with a caller-chosen automated
+    /// mailbox budget (the collaboration bus uses its own, larger budget).
+    pub fn record_note_within(
+        &self,
+        ticket: i64,
+        dest: Option<&Value>,
+        body: Option<&Value>,
+        source: Option<&NoteSource>,
+        key: Option<&str>,
+        budget: i64,
+    ) -> Result<i64> {
         let dest = match p::safe_int(dest) {
             Some(d) if d > 0 && p::valid_text(body, usize::MAX) => d,
             _ => return Err(crate::dispatch::rejected("收件任务或正文无效")),
@@ -361,7 +375,7 @@ impl Q<'_> {
                 ),
                 &[&ticket, &ticket],
             )?;
-            if n >= 128 {
+            if n >= budget {
                 rejection = Some("自动信箱达到预算");
             }
         }

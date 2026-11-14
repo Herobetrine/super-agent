@@ -117,6 +117,12 @@ pub fn is_file(p: &Path) -> bool {
     p.is_file()
 }
 
+/// Child environment variable carrying the collaboration bus token, so the
+/// token never appears on a command line (`docs/dev/collab-bus.md`).
+pub const BUS_TOKEN_ENV: &str = "SA_BUS_TOKEN";
+/// MCP server name of the collaboration bus inside each harness.
+pub const BUS_SERVER: &str = "sa_bus";
+
 /// CC Switch database path (AC:41-51).
 fn cc_database(sys: &Sys) -> Result<PathBuf> {
     let locator = sys.appdata().join("com.ccswitch.desktop/app_paths.json");

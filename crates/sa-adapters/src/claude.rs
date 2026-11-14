@@ -924,6 +924,21 @@ async fn run(
     }
     if high {
         env.set("CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST", "1");
+        // Prototype scope: `--safe-mode` (restricted turns) disables all MCP.
+        if let Some(bus) = &req.bus {
+            let server = crate::common::BUS_SERVER;
+            let token = crate::common::BUS_TOKEN_ENV;
+            let config = json!({"mcpServers": {server: {
+                "type": "http",
+                "url": bus.url,
+                // Claude Code defers MCP tools behind tool search by default;
+                // collaboration only works if the model sees these tools.
+                "alwaysLoad": true,
+                "headers": {"Authorization": format!("Bearer ${{{token}}}")},
+            }}});
+            args.extend(["--mcp-config".into(), config.to_string()]);
+            env.set(token, bus.token.clone());
+        }
     }
     crate::cache_policy::configure(
         &exe,

@@ -1,0 +1,24 @@
+[package]
+name = "sa-bus"
+description = "Super Agent collaboration bus: a loopback MCP server shared by every harness of a ticket"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["net"] }
+tokio-util.workspace = true
+uuid = { version = "1", features = ["v4"] }
+# Official MCP Rust SDK (Apache-2.0), server role over Streamable HTTP.
+rmcp = { version = "3.8", default-features = false, features = ["server", "transport-streamable-http-server"] }
+http = "1"
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "service"] }
+sa-engine = { path = "../sa-engine" }
+
+[dev-dependencies]
+tempfile.workspace = true
+rmcp = { version = "3.8", default-features = false, features = ["client", "transport-streamable-http-client-reqwest"] }

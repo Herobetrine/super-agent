@@ -94,6 +94,7 @@ async fn turn(adapter: &Arc<dyn Adapter>, project: &Path, route: Route, prompt: 
         profile: "readonly".into(),
         writable: false,
         session_id: session,
+        bus: None,
     };
     let (tx, mut rx) = mpsc::unbounded_channel();
     let run = adapter.run(req, Arc::new(Host), tx, CancellationToken::new());

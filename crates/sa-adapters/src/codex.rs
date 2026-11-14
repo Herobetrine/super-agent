@@ -227,7 +227,7 @@ impl Adapter for Codex {
 }
 
 async fn run(
-    sys: Sys,
+    mut sys: Sys,
     customs: Vec<CustomProvider>,
     req: RunRequest,
     host: Arc<dyn TurnHost>,
@@ -292,6 +292,20 @@ async fn run(
             args.push("-c".into());
             args.push(format!("mcp_servers.{name}.enabled=false"));
         }
+    }
+    // Prototype scope: only full-access turns mount the collaboration bus.
+    if perm.native
+        && let Some(bus) = &req.bus
+    {
+        let server = crate::common::BUS_SERVER;
+        args.push("-c".into());
+        args.push(format!("mcp_servers.{server}.url={}", json!(bus.url)));
+        args.push("-c".into());
+        args.push(format!(
+            "mcp_servers.{server}.bearer_token_env_var={}",
+            json!(crate::common::BUS_TOKEN_ENV)
+        ));
+        sys.set(crate::common::BUS_TOKEN_ENV, bus.token.clone());
     }
     if cancel.is_cancelled() {
         return Err(cancelled());
@@ -930,6 +944,7 @@ const recv = async () => JSON.parse((await lines.next()).value), send = (o) => p
             profile: "partial".into(),
             writable: true,
             session_id: None,
+            bus: None,
         };
         let perm = policy("partial", true).unwrap();
         let host = Arc::new(Host::default());

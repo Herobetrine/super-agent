@@ -105,6 +105,7 @@ fn request() -> RunRequest {
         profile: "full".into(),
         writable: true,
         session_id: None,
+        bus: None,
     }
 }
 

@@ -54,6 +54,7 @@ fn setup(mode: &str, restricted: bool) -> (tempfile::TempDir, Sys, RunRequest) {
         profile: "full".into(),
         writable: true,
         session_id: None,
+        bus: None,
     };
     (dir, sys, req)
 }

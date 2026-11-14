@@ -40,6 +40,15 @@ pub struct RunRequest {
     pub writable: bool,
     /// Native session to resume, if any.
     pub session_id: Option<String>,
+    /// Collaboration bus access for this turn (`docs/dev/collab-bus.md`).
+    pub bus: Option<BusGrant>,
+}
+
+/// Loopback MCP endpoint and a bearer token valid for one job turn.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BusGrant {
+    pub url: String,
+    pub token: String,
 }
 
 /// One item emitted by an adapter during a turn.

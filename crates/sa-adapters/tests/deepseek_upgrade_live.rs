@@ -70,6 +70,7 @@ async fn candidate_real_write_boundary_and_resume() {
         profile: "partial".into(),
         writable: true,
         session_id: None,
+        bus: None,
     };
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let first = tokio::time::timeout(

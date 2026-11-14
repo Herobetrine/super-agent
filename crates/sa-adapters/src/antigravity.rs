@@ -844,6 +844,7 @@ int main(int argc, char **argv) {
             profile: "full".into(),
             writable: true,
             session_id: None,
+            bus: None,
         };
         let (events, _rx) = tokio::sync::mpsc::unbounded_channel();
         Antigravity::new(sys)

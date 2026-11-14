@@ -62,6 +62,13 @@ pub trait Extensions: Send + Sync {
     fn invoke(&self, args: InvokeArgs) -> BoxFuture<'static, Result<InvokeResult>>;
 }
 
+/// Collaboration bus (`docs/dev/collab-bus.md`): grants a per-turn token at
+/// admission and revokes it when the turn ends.
+pub trait Bus: Send + Sync {
+    fn grant(&self, ticket: i64, job: i64, turn: i64, agent: &str) -> Option<crate::adapter::BusGrant>;
+    fn revoke(&self, token: &str);
+}
+
 /// Extension service with no skills, no MCP servers and no tools.
 pub struct NoopExtensions;
 

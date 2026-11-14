@@ -17,6 +17,7 @@ sa-store = { path = "../sa-store" }
 sa-engine = { path = "../sa-engine" }
 sa-adapters = { path = "../sa-adapters" }
 sa-ext = { path = "../sa-ext" }
+sa-bus = { path = "../sa-bus" }
 tokio.workspace = true
 tokio-util.workspace = true
 tempfile.workspace = true

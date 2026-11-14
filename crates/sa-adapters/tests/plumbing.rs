@@ -89,6 +89,7 @@ fn request(profile: &str, writable: bool) -> RunRequest {
         profile: profile.into(),
         writable,
         session_id: None,
+        bus: None,
     }
 }
 

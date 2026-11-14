@@ -72,6 +72,7 @@ mod tests {
             profile: "readonly".into(),
             writable: false,
             session_id: None,
+            bus: None,
         };
         for session in [None, Some("resumed-session".to_string())] {
             req.session_id = session;

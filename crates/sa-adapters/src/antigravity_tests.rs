@@ -58,6 +58,7 @@ fn setup(scenario: &str) -> (tempfile::TempDir, Sys, Server, RunRequest) {
         profile: "readonly".into(),
         writable: false,
         session_id: None,
+        bus: None,
     };
     (dir, sys, server, req)
 }

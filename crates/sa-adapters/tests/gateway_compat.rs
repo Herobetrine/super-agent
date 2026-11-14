@@ -132,6 +132,7 @@ async fn aggregation_route_turn_sends_no_in_conversation_system_messages() {
             profile: "readonly".into(),
             writable: false,
             session_id: None,
+            bus: None,
         };
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let outcome = adapter.run(request, Arc::new(Host), tx, CancellationToken::new()).await;

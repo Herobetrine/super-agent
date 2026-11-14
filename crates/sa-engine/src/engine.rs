@@ -67,6 +67,8 @@ pub struct EngineOptions {
     pub runner: Arc<dyn TurnRunner>,
     pub rotation: Arc<dyn RotationSource>,
     pub extensions: Option<Arc<dyn Extensions>>,
+    /// Collaboration bus; `None` disables it.
+    pub bus: Option<Arc<dyn crate::services::Bus>>,
     pub snapshotter: Arc<dyn Snapshotter>,
     /// Current context delivery preferences, shared with the desktop host.
     pub efficiency: sa_store::efficiency::Shared,
@@ -80,6 +82,7 @@ impl Default for EngineOptions {
             runner: Arc::new(ResilientRunner::default()),
             rotation: Arc::new(NoRotation),
             extensions: None,
+            bus: None,
             snapshotter: Arc::new(FsSnapshotter),
             efficiency: sa_store::efficiency::shared(Default::default()),
             tick: Duration::from_millis(80),
@@ -1476,7 +1479,10 @@ impl Inner {
             },
             writable: p::is_full(&job.profile) || job.writing,
             session_id: job.session.clone(),
+            bus: self.opts.bus.as_ref().and_then(|b| b.grant(job.ticket, job.id, job.turn, &job.agent)),
         };
+        // The token is valid only while this turn runs.
+        let _bus = BusLease(self.opts.bus.clone(), request.bus.as_ref().map(|g| g.token.clone()));
         let host: Arc<dyn TurnHost> = Arc::new(Host(turn.clone()));
         let (tx, mut rx) = mpsc::unbounded_channel();
         let runner = self.opts.runner.clone();
@@ -2491,6 +2497,17 @@ pub(crate) async fn approve(turn: Arc<Turn>, action: Value) -> bool {
         });
     }
     false
+}
+
+/// Revokes a turn's bus token on every exit path.
+struct BusLease(Option<Arc<dyn crate::services::Bus>>, Option<String>);
+
+impl Drop for BusLease {
+    fn drop(&mut self) {
+        if let (Some(bus), Some(token)) = (&self.0, &self.1) {
+            bus.revoke(token);
+        }
+    }
 }
 
 /// Engine services handed to the adapter for one turn.

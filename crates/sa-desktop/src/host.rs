@@ -426,7 +426,13 @@ impl Host {
                             return;
                         }
                     };
-                    let engine = match open_engine(&dir, adapters.clone(), &for_thread, &ext) {
+                    // The workbench still schedules without the bus if it cannot start.
+                    let bus = if std::env::var("SA_COLLAB_BUS").is_ok_and(|v| v == "0") {
+                        None
+                    } else {
+                        sa_bus::CollabBus::start(&dir).await.ok()
+                    };
+                    let engine = match open_engine(&dir, adapters.clone(), &for_thread, &ext, bus) {
                         Ok(e) => e,
                         Err(e) => {
                             let _ = ready_tx.send(Err(format!("{e:#}")));
@@ -662,10 +668,12 @@ fn open_engine(
     adapters: Vec<Arc<dyn Adapter>>,
     shared: &Shared,
     ext: &sa_ext::ProjectExtensions,
+    bus: Option<Arc<sa_bus::CollabBus>>,
 ) -> Result<Engine> {
     let opts = EngineOptions {
         rotation: Arc::new(DbRotation(shared.rotation.clone())),
         extensions: Some(Arc::new(ext.clone())),
+        bus: bus.map(|b| b as Arc<dyn sa_engine::services::Bus>),
         efficiency: shared.efficiency.clone(),
         ..Default::default()
     };
