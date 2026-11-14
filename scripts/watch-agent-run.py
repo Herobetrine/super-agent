@@ -18,7 +18,8 @@ AGENTS = {"claude", "codex", "deepseek", "antigravity", "acp"}
 STATES = {"queued", "running", "waiting", "done", "failed", "cancelled", "interrupted", "completed", "partial", "draining"}
 RETRIES = {"retry", "auto.retry", "turn.retry_scheduled", "route.rotated"}
 CONTROLS = {"control", "control.invalid", "control.rejected", "control.accepted", "send", "spawn", "cancel",
-            "protocol.progress_invalid", "protocol.preview_invalid", "job.progress", "cancel.rejected", "child.cancelled"}
+            "protocol.progress_invalid", "protocol.preview_invalid", "protocol.rejected", "job.progress",
+            "cancel.rejected", "child.cancelled"}
 PAUSE_EVENTS = {"ticket.pause_requested", "ticket.resumed", "ticket.paused", "ticket.handoff_started", "ticket.pause_draining"}
 TERMINALS = {"reply", "failed", "cancelled", "interrupted", "partial", "turn.gave_up", "turn.pause_failure"}
 
@@ -87,6 +88,8 @@ class Sampler:
         self.dsh_sessions = {}
         self.dsh_units = {}
         self.incomplete_codex = 0
+        self.rejected_controls = 0
+        self.failed_attempts = {}
 
     def poll(self):
         # events_ticket(ticket,seq) bounds the scan even in a multi-million-row journal.
@@ -106,6 +109,12 @@ class Sampler:
             if job is not None and turn is not None:
                 self.turns.setdefault((job, turn), {"agent": base["agent"], "running": 0, "ended": False,
                                                   "started_at": None, "platform_ended_at": None, "outcome": "pending"})
+            if kind == "protocol.rejected":
+                self.rejected_controls += 1
+            if kind in {"failed", "turn.gave_up", "turn.pause_failure"}:
+                # Keep authoritative failure boundaries even if a later native
+                # replay reports success. Never copy error or command content.
+                self.failed_attempts.setdefault((job, turn), dict(base, event=kind))
             try:
                 value = json.loads(payload) if kind in {"running", "native"} else {}
             except (ValueError, TypeError):
@@ -168,6 +177,8 @@ class Sampler:
                 outcome = ("failed" if value.get("is_error") is True or
                            isinstance(subtype, str) and subtype.startswith("error") else
                            "success" if subtype == "success" or value.get("is_error") is False else "unknown")
+                if key in self.failed_attempts:
+                    outcome = "failed"
                 self.turns[key]["outcome"] = outcome
                 if any(number is not None for number in usage.values()) or key not in self.results:
                     self.results[key] = usage
@@ -239,6 +250,13 @@ class Sampler:
         if self.connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='ticket_pause'").fetchone():
             row = self.connection.execute("SELECT state FROM ticket_pause WHERE ticket=?", (self.ticket,)).fetchone()
             pause_state = row[0] if row and row[0] in {"draining", "handoff", "paused"} else None
+        alerts = []
+        if self.delivery["inconsistent_requests"]:
+            alerts.append("delivery_byte_inconsistency")
+        if self.failed_attempts or any(data["outcome"] == "failed" for data in self.turns.values()):
+            alerts.append("observed_failed_attempt")
+        if self.rejected_controls:
+            alerts.append("observed_protocol_rejection")
         return {"schema_version": 1, "ticket": self.ticket, "after_seq": self.start_seq,
                 "through_seq": self.cursor, "updated_at": time.time(), "scope": "partial_tail_main_loop_only",
                 "event_counts": dict(self.event_counts), "delivery": dict(self.delivery),
@@ -260,8 +278,11 @@ class Sampler:
                                      "no_observed_terminal" if not terminal_outcomes else
                                      "no_successful_terminal" if "success" not in terminal_outcomes else
                                      "warm_up_or_missing" if claude["cache_ratio_samples"] < 3 else "observed_partial_sample"),
-                "alert_candidates": ["delivery_byte_inconsistency"] if self.delivery["inconsistent_requests"] else [],
+                "alert_candidates": alerts,
+                "platform_failed_attempts": list(self.failed_attempts.values()),
+                "protocol_rejection_events": self.rejected_controls,
                 "limitations": ["No automatic cancellation or provider calls.",
+                                "Failure and rejection alerts describe observed history, not necessarily a currently blocked job.",
                                 "Retry event counts are raw events, not distinct attempts. One retry can emit multiple events.",
                                 "Missing usage is null, not zero. Replayed usage_update rows replace prior samples.",
                                 "Claude internal subagents excluded. Terminal totals and request samples overlap.",

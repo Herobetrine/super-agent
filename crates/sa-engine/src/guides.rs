@@ -31,13 +31,15 @@ pub const BASE: &str = concat!(
     "and \"reasoning_effort\":\"<supported value from delegate_models.reasoning_efforts[model]>\" to SA_SEND.\n",
     "Choose the least costly authorized collaborator model and effort that can reliably do the assignment; escalate on evidence.\n",
     "Your own model stays fixed. Omit effort to use the harness default.\n",
-    "If allow_lead_routing is false, dispatch without model or effort overrides to use the operator's fixed routes.\n",
-    "When authorized you may also add \"permission_profile\":\"<one of allowed_child_permissions>\" to SA_SEND.\n",
+    "If allow_lead_routing is false, omit model, reasoning_effort and permission_profile; inherit the fixed route and permissions.\n",
+    "Only when allow_lead_routing is true may you add \"permission_profile\":\"<one of allowed_child_permissions>\" to SA_SEND.\n",
     "Grant only needed access. Use readonly for unrestricted-ticket checks that need no edits.\n",
     "The provider and runtime are chosen by the operator. Omit overrides to inherit. Never choose a new provider,\n",
     "grant powers beyond your ticket, or use a permission preset as a role name. In autonomous projects avoid\n",
     "requesting an interactive child write profile unless the operator requires a human checkpoint.\n",
     "Only emit this line for an intentional dispatch. No markdown fence. Use JSON escapes for multiline text. The receiver gets body verbatim.\n",
+    "A protocol.rejected receipt means that command did not execute. Use the platform feedback to correct it,\n",
+    "do not repeat the unchanged rejected command, and preserve the results of other work you have completed.\n",
     "To message an existing queued/running/waiting job in THIS ticket, use its numeric job from roster:\n",
     "SA_NOTE {\"id\":\"unique-note-key\",\"job\":42,\"body\":\"full exact message to that job\"}\n",
     "Use SA_NOTE for actionable information. Do not send acknowledgements back and forth. Read addressed messages in notes.\n",
@@ -170,7 +172,7 @@ mod tests {
     /// Pin protocol-guide bytes; BASE includes the current routing policy.
     #[test]
     fn guides_are_byte_exact() {
-        assert_eq!(digest(super::BASE), "9bcf3f60c03bdf96a63756a44c7ae2b7dbfe2af2cb857576cc04931e6cb7f0fe");
+        assert_eq!(digest(super::BASE), "291d195ce547b7e708b094db64cd4981ddc7f748049baea06b6aeffe6f48cde7");
         assert_eq!(super::base(false), super::BASE);
         assert!(super::base(true).ends_with(super::CONCISE_HANDOFFS));
         assert_eq!(digest(super::CONTINUOUS), "fd0fa7b25db7c20413b502eb74a5aaf637a3a4fa54ccf6411ded9626181050ac");

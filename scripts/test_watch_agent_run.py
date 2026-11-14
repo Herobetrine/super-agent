@@ -238,6 +238,36 @@ class WatchRunTests(unittest.TestCase):
         self.assertFalse(records[0]["is_root"])
         self.assertNotIn("DO-NOT-LEAK", json.dumps(records))
 
+    def test_platform_failure_alert_survives_replay_without_leaking_content(self):
+        self.event("DO-NOT-LEAK", kind="failed", job=1)
+        self.event("DO-NOT-LEAK", kind="turn.gave_up", job=1)
+        self.event({"type": "result", "subtype": "success", "usage": self.usage()}, job=1)
+        self.event({"text": "DO-NOT-LEAK"}, kind="reply", job=1)
+        self.event({}, kind="cancelled", job=4)
+        records, _ = self.sampler.poll()
+        summary = self.sampler.summary()
+        self.assertEqual(summary["alert_candidates"], ["observed_failed_attempt"])
+        self.assertEqual(len(summary["platform_failed_attempts"]), 1)
+        self.assertEqual(summary["platform_failed_attempts"][0]["job"], 1)
+        self.assertEqual(summary["platform_failed_attempts"][0]["event"], "failed")
+        self.assertEqual(summary["observed_turns"][0]["outcome"], "failed")
+        self.assertEqual(summary["claude_terminal"]["cache_ratio_samples"], 0)
+        self.assertNotIn("DO-NOT-LEAK", json.dumps([records, summary]))
+
+    def test_rejection_alert_does_not_mark_valid_reply_failed(self):
+        self.event({"reason": "DO-NOT-LEAK", "command": "DO-NOT-LEAK"}, kind="protocol.rejected", job=3)
+        self.event({"text": "DO-NOT-LEAK"}, kind="reply", job=3)
+        records, _ = self.sampler.poll()
+        summary = self.sampler.summary()
+        self.assertEqual(summary["alert_candidates"], ["observed_protocol_rejection"])
+        self.assertEqual(summary["protocol_rejection_events"], 1)
+        self.assertEqual(summary["observed_turns"][0]["outcome"], "success")
+        self.assertEqual(summary["platform_failed_attempts"], [])
+        self.assertEqual(records[0]["record"], "control")
+        self.assertNotIn("DO-NOT-LEAK", json.dumps([records, summary]))
+        self.assertEqual(self.sampler.poll(), ([], False))
+        self.assertEqual(self.sampler.summary()["protocol_rejection_events"], 1)
+
 
     def test_failed_native_result_and_durable_gate_are_not_success_or_zero_cache(self):
         self.event({"type": "result", "subtype": "success", "is_error": True,

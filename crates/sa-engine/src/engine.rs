@@ -1492,6 +1492,11 @@ impl Inner {
         if !rest.is_empty() {
             self.absorb(turn, rest, &route, &mut stream).await;
         }
+        // A journal/control failure may have cancelled the native task. Keep
+        // the original internal error instead of its cancellation response.
+        if let Some(fatal) = stream.fatal.take() {
+            return Err(fatal.into());
+        }
         let outcome = match result {
             Ok(TurnResult::Done(outcome)) => outcome,
             Ok(TurnResult::Failed(e)) => return Err(TurnError::Adapter(e)),
@@ -1512,6 +1517,15 @@ impl Inner {
         self.db.tx(|q| {
             if !q.live(job.who())? { return Ok(()); }
             self.log_transitions(q, job.who())?;
+            // These hints were available to the currently running adapter.
+            // Expire only our own hints when that turn successfully replies,
+            // so an unread correction cannot schedule a paid continuation.
+            for seq in &stream.correction_notes {
+                q.run(
+                    "UPDATE mailbox SET consumed_turn=? WHERE seq=? AND target=? AND consumed_turn IS NULL",
+                    &[&job.turn, seq, &job.id],
+                )?;
+            }
             self.commit_reply(q, turn, &outcome.text, outcome.session_id.as_deref(), &stream.invalid)?;
             let same_session = !(incremental || recovery_delivery) || outcome.session_id == job.session;
             context::delivery::acknowledge(q, job.who(), &route, json!({
@@ -1716,18 +1730,86 @@ impl Inner {
             return;
         };
         let tag = line.split(' ').next().unwrap_or_default().to_string();
-        if streaming && matches!(err, CmdError::Syntax(_)) {
-            let _ = self.db.with(|q| q.log(job.who(), "protocol.preview_invalid", &json!({"tag": tag})));
-        } else if job.primary() {
-            let reason = err.message();
-            let _ = self.db.with(|q| q.log(job.who(), "auto.protocol", &json!({"tag": tag, "reason": reason})));
-            match st.invalid.iter_mut().find(|(t, _)| *t == tag) {
-                Some(entry) => entry.1 = reason,
-                None => st.invalid.push((tag, reason)),
-            }
-        } else {
+        if matches!(err, CmdError::Other(_)) {
             st.fatal = Some(err.into_anyhow());
+            turn.cancel.cancel();
+            return;
         }
+        let saved = if streaming && matches!(err, CmdError::Syntax(_)) {
+            self.db
+                .with(|q| q.log(job.who(), "protocol.preview_invalid", &json!({"tag": tag})))
+                .map(|_| None)
+        } else {
+            let reason = err.message();
+            if job.primary() {
+                match st.invalid.iter_mut().find(|(t, _)| *t == tag) {
+                    Some(entry) => entry.1 = reason.clone(),
+                    None => st.invalid.push((tag.clone(), reason.clone())),
+                }
+            }
+            self.reject_command(turn, cleaned, &tag, &reason, streaming)
+        };
+        match saved {
+            Ok(Some(seq)) => st.correction_notes.push(seq),
+            Ok(None) => {}
+            Err(error) => {
+                st.fatal = Some(error);
+                turn.cancel.cancel();
+            }
+        }
+    }
+
+    /// Rejections are durable receipts, independent of subsequent valid
+    /// commands. The transaction also makes parent notification idempotent.
+    fn reject_command(
+        &self,
+        turn: &Turn,
+        line: &str,
+        tag: &str,
+        reason: &str,
+        streaming: bool,
+    ) -> Result<Option<i64>> {
+        let job = &turn.job;
+        let command_sha256 = digest(line);
+        let logical = job.logical();
+        let command: Value = line
+            .split_once(' ')
+            .and_then(|(_, body)| serde_json::from_str(body).ok())
+            .unwrap_or(Value::Null);
+        let id = command.get("id")
+            .filter(|id| p::valid_text(Some(id), 96))
+            .cloned()
+            .unwrap_or(Value::Null);
+        self.db.tx(|q| {
+            if !q.live(job.who())? || q.exists(
+                "SELECT 1 FROM events WHERE job=? AND kind='protocol.rejected' AND json_extract(payload,'$.logical_turn')=? AND json_extract(payload,'$.command_sha256')=? LIMIT 1",
+                &[&job.id, &logical, &command_sha256],
+            )? {
+                return Ok(None);
+            }
+            let receipt = json!({
+                "tag": tag, "id": id, "logical_turn": logical,
+                "command_sha256": command_sha256, "reason": reason, "executed": false,
+            });
+            q.log(job.who(), "protocol.rejected", &receipt)?;
+            if job.primary() {
+                q.log(job.who(), "auto.protocol", &json!({"tag": tag, "reason": reason}))?;
+            }
+            let body = format!("任务 #{} 的 {} 指令被拒绝。该指令未执行，其他工作仍可继续。请依据原因修正控制消息，保留并报告已经完成的业务成果。\n{}",
+                job.id, tag, stringify(&receipt));
+            if let Some(parent) = job.parent
+                && q.exists(
+                    "SELECT 1 FROM jobs WHERE id=? AND ticket=? AND state IN ('queued','running','waiting')",
+                    &[&parent, &job.ticket],
+                )?
+            {
+                platform_note(q, job, parent, &body)?;
+            }
+            if streaming && !job.primary() {
+                return platform_note(q, job, job.id, &body).map(Some);
+            }
+            Ok(None)
+        })
     }
 
     /// `commitReply(ctx, result, reports, primary, invalid)` (E:409-485).
@@ -2247,10 +2329,10 @@ fn ledger(q: &Q, job: i64) -> Result<TurnLedger> {
 
 /// Early wake of the parent after a child's first failed attempt (spec §9.2
 /// F). `source=NULL` keeps it outside the 128-note budget.
-fn platform_note(q: &Q, job: &JobCtx, target: i64, body: &str) -> Result<()> {
+fn platform_note(q: &Q, job: &JobCtx, target: i64, body: &str) -> Result<i64> {
     let seq=q.log(job.who(),"note",&json!({"job":target,"sender":"platform","body":body,"sha256":digest(body)}))?;
     q.run("INSERT INTO mailbox(seq,target,source,source_turn,msgkey) VALUES(?,?,NULL,NULL,NULL)",&[&seq,&target])?;
-    Ok(())
+    Ok(seq)
 }
 
 fn notify_parent(q: &Q, job: &JobCtx, class: ErrorClass, attempt: u32, until: f64) -> Result<()> {
@@ -2299,12 +2381,13 @@ fn log_transition(q: &Q, who: Who, t: &HealthTransition) -> Result<()> {
 }
 
 /// Per-turn stream state: the unterminated delta tail, primary protocol
-/// errors (by tag, first-insertion order) and the first fatal error.
+/// errors, expiring correction hints and the first internal failure.
 #[derive(Default)]
 struct Stream {
     pending: String,
     invalid: Vec<(String, String)>,
     fatal: Option<anyhow::Error>,
+    correction_notes: Vec<i64>,
     detector: crate::stuck::Detector,
 }
 

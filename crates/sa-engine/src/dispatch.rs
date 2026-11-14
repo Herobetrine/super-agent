@@ -16,20 +16,21 @@ use std::sync::{Arc, LazyLock, atomic::Ordering};
 #[derive(Debug)]
 pub enum CmdError {
     Syntax(String),
+    Rejected(String),
     Other(anyhow::Error),
 }
 
 impl CmdError {
     pub fn message(&self) -> String {
         match self {
-            Self::Syntax(m) => m.clone(),
+            Self::Syntax(m) | Self::Rejected(m) => m.clone(),
             Self::Other(e) => e.to_string(),
         }
     }
 
     pub fn into_anyhow(self) -> anyhow::Error {
         match self {
-            Self::Syntax(m) => anyhow!(m),
+            Self::Syntax(m) | Self::Rejected(m) => anyhow!(m),
             Self::Other(e) => e,
         }
     }
@@ -37,8 +38,28 @@ impl CmdError {
 
 impl From<anyhow::Error> for CmdError {
     fn from(e: anyhow::Error) -> Self {
-        Self::Other(e)
+        match e.downcast::<Rejection>() {
+            Ok(rejection) => Self::Rejected(rejection.0),
+            Err(error) => Self::Other(error),
+        }
     }
+}
+
+/// Only explicit protocol/authority checks use this marker. Journal,
+/// filesystem and extension failures retain their original error type.
+#[derive(Debug)]
+struct Rejection(String);
+
+impl std::fmt::Display for Rejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Rejection {}
+
+pub(crate) fn rejected(message: impl Into<String>) -> anyhow::Error {
+    Rejection(message.into()).into()
 }
 
 /// Control, line/paragraph separator and bidi-override characters (D:152).
@@ -57,13 +78,13 @@ pub async fn command(turn: &Arc<Turn>, line: &str, streaming: bool) -> Result<()
     };
     let (tag, rest) = (&line[..sep], &line[sep + 1..]);
     if tag == "SA_PROGRESS" {
-        return progress(turn, rest).map_err(CmdError::Other);
+        return progress(turn, rest).map_err(CmdError::from);
     }
     if tag == "SA_MEMO" {
-        return memo(turn, rest).map_err(CmdError::Other);
+        return memo(turn, rest).map_err(CmdError::from);
     }
     if tag == "SA_CANCEL" {
-        let cancelled = cancel(turn, rest, streaming).map_err(CmdError::Other)?;
+        let cancelled = cancel(turn, rest, streaming).map_err(CmdError::from)?;
         // Abort outside the journal transaction (scheduler lock order).
         turn.inner().abort_jobs(&cancelled);
         return Ok(());
@@ -73,8 +94,8 @@ pub async fn command(turn: &Arc<Turn>, line: &str, streaming: bool) -> Result<()
     }
     let cmd: Value = serde_json::from_str(rest).map_err(|e| CmdError::Syntax(e.to_string()))?;
     match tag {
-        "SA_SEND" => dispatch(turn, &cmd).await.map_err(CmdError::Other),
-        "SA_TOOL" => tool(turn, &cmd).await.map_err(CmdError::Other),
+        "SA_SEND" => dispatch(turn, &cmd).await.map_err(CmdError::from),
+        "SA_TOOL" => tool(turn, &cmd).await.map_err(CmdError::from),
         _ => {
             let job = &turn.job;
             turn.inner().db.tx(|q| {
@@ -83,7 +104,7 @@ pub async fn command(turn: &Arc<Turn>, line: &str, streaming: bool) -> Result<()
                 }
                 if tag == "SA_ROLE" {
                     if !p::valid_text(cmd.get("role"), 120) {
-                        return Err(anyhow!("无效的职能名称"));
+                        return Err(rejected("无效的职能名称"));
                     }
                     let role = cmd["role"].as_str().unwrap_or_default();
                     if q.run("UPDATE jobs SET role=? WHERE id=? AND role!=?", &[&role, &job.id, &role])? > 0 {
@@ -91,7 +112,7 @@ pub async fn command(turn: &Arc<Turn>, line: &str, streaming: bool) -> Result<()
                     }
                 } else {
                     if !p::valid_text(cmd.get("id"), 96) {
-                        return Err(anyhow!("无效的信件 ID"));
+                        return Err(rejected("无效的信件 ID"));
                     }
                     let source = NoteSource {
                         who: job.who(),
@@ -110,13 +131,13 @@ pub async fn command(turn: &Arc<Turn>, line: &str, streaming: bool) -> Result<()
 async fn tool(turn: &Arc<Turn>, cmd: &Value) -> Result<()> {
     let job = &turn.job;
     let inner = turn.inner();
-    if !turn.live() || turn.aborted() {
+    if turn.aborted() || !inner.db.with(|q| q.live(job.who()))? {
         return Ok(());
     }
     let ext = inner.extensions().filter(|e| e.can_invoke());
     let Some(ext) = ext.filter(|_| job.parent.is_none() && !matches!(job.profile.as_str(), "readonly" | "legacy"))
     else {
-        return Err(anyhow!("当前工单或执行者不可调用 MCP 工具"));
+        return Err(rejected("当前工单或执行者不可调用 MCP 工具"));
     };
     if !p::is_obj(Some(cmd))
         || !p::valid_text(cmd.get("id"), 96)
@@ -124,7 +145,7 @@ async fn tool(turn: &Arc<Turn>, cmd: &Value) -> Result<()> {
         || !p::ident(cmd.get("tool"))
         || !p::is_obj(cmd.get("arguments"))
     {
-        return Err(anyhow!("SA_TOOL 需要 id、server、tool 和 arguments 对象"));
+        return Err(rejected("SA_TOOL 需要 id、server、tool 和 arguments 对象"));
     }
     let advertised = turn
         .packet()
@@ -139,7 +160,7 @@ async fn tool(turn: &Arc<Turn>, cmd: &Value) -> Result<()> {
                 .is_some_and(|t| t.iter().any(|t| t.get("name") == cmd.get("tool")))
     });
     if !listed {
-        return Err(anyhow!("工具不在本次工单启用的服务目录内"));
+        return Err(rejected("工具不在本次工单启用的服务目录内"));
     }
     let approver = turn.clone();
     let result = ext
@@ -184,15 +205,15 @@ struct Child {
 fn check(q: &Q, turn: &Turn, cmd: &Value) -> Result<Option<Child>> {
     let job = &turn.job;
     let Some(o) = cmd.as_object() else {
-        return Err(anyhow!("SA_SEND 需要 JSON 对象"));
+        return Err(rejected("SA_SEND 需要 JSON 对象"));
     };
     if ["provider", "mode", "selection", "route", "route_override", "permission_override"]
         .iter()
         .any(|k| o.contains_key(*k))
     {
-        return Err(anyhow!("不可通过派工更换供应商或执行端"));
+        return Err(rejected("不可通过派工更换供应商或执行端"));
     }
-    let bad = || anyhow!("派工参数无效");
+    let bad = || rejected("派工参数无效");
     let write = match o.get("write") {
         None => false,
         Some(Value::Bool(b)) => *b,
@@ -218,17 +239,17 @@ fn check(q: &Q, turn: &Turn, cmd: &Value) -> Result<Option<Child>> {
     let has_profile = o.contains_key("permission_profile");
     let routing = q.int("SELECT allow_lead_routing FROM tickets WHERE id=?", &[&job.ticket])? != 0;
     if (has_model || has_effort || has_profile) && (job.parent.is_some() || !routing) {
-        return Err(anyhow!("只有当前获授权的主控可指定子任务模型、思考强度和权限"));
+        return Err(rejected("只有当前获授权的主控可指定子任务模型、思考强度和权限"));
     }
     let requested = o.get("permission_profile").and_then(Value::as_str);
     if has_profile && !requested.is_some_and(|r| p::child_profiles(&job.profile).contains(&r)) {
-        return Err(anyhow!("子任务权限不能超出上级范围"));
+        return Err(rejected("子任务权限不能超出上级范围"));
     }
     if has_model && !p::ident(o.get("model")) {
-        return Err(anyhow!("模型标识无效"));
+        return Err(rejected("模型标识无效"));
     }
     if has_effort && !p::ident(o.get("reasoning_effort")) {
-        return Err(anyhow!("思考强度无效"));
+        return Err(rejected("思考强度无效"));
     }
     let effort = o.get("reasoning_effort").and_then(Value::as_str);
     let default_model = if has_effort && !has_model {
@@ -238,7 +259,7 @@ fn check(q: &Q, turn: &Turn, cmd: &Value) -> Result<Option<Child>> {
     };
     let model = o.get("model").and_then(Value::as_str).or(default_model.as_deref());
     if has_effort && model.is_none() {
-        return Err(anyhow!("所选执行端没有可用模型目录"));
+        return Err(rejected("所选执行端没有可用模型目录"));
     }
     let override_ = if has_profile {
         requested.map(str::to_string)
@@ -278,12 +299,12 @@ fn check(q: &Q, turn: &Turn, cmd: &Value) -> Result<Option<Child>> {
             || old_override != override_.as_deref()
             || stringify(&files_value) != stringify(&Value::Array(names))
         {
-            return Err(anyhow!("同一消息 ID 携带不同的任务、模型、附件或权限"));
+            return Err(rejected("同一消息 ID 携带不同的任务、模型、附件或权限"));
         }
         return Ok(None);
     }
     if job.is_root() && crate::pause::consolidating(q, job.ticket)? {
-        return Err(anyhow!("工单正在最后一次暂停交接，请汇总已有结果并结束本轮"));
+        return Err(rejected("工单正在最后一次暂停交接，请汇总已有结果并结束本轮"));
     }
     let mut selection = None;
     if let Some(model) = model {
@@ -294,7 +315,7 @@ fn check(q: &Q, turn: &Turn, cmd: &Value) -> Result<Option<Child>> {
             .and_then(Value::as_array)
             .is_some_and(|m| m.iter().any(|x| x.as_str() == Some(model)));
         if !listed {
-            return Err(anyhow!("所选模型不在此任务的供应商和执行端目录"));
+            return Err(rejected("所选模型不在此任务的供应商和执行端目录"));
         }
         let menu = menu.cloned().unwrap_or(Value::Null);
         let mut picked = json!({"provider": menu["provider"], "mode": menu["mode"], "model": model});
@@ -302,7 +323,7 @@ fn check(q: &Q, turn: &Turn, cmd: &Value) -> Result<Option<Child>> {
             let supported = menu["reasoning_efforts"][model].as_array()
                 .is_some_and(|values| values.iter().any(|value| value.as_str() == Some(effort)));
             if !supported {
-                return Err(anyhow!("所选模型未声明支持该思考强度，请从模型目录选择"));
+                return Err(rejected("所选模型未声明支持该思考强度，请从模型目录选择"));
             }
             picked["reasoning_effort"] = json!(effort);
         }
@@ -312,18 +333,18 @@ fn check(q: &Q, turn: &Turn, cmd: &Value) -> Result<Option<Child>> {
             && (pinned.get("provider").and_then(Value::as_str) != Some(&route.provider)
                 || pinned.get("mode").and_then(Value::as_str) != Some(&route.mode))
         {
-            return Err(anyhow!("工单路由已变更"));
+            return Err(rejected("工单路由已变更"));
         }
         selection = Some(p::route_value(&route));
     }
     if write && (!job.writes || effective == "readonly" || !p::can_write(to, &effective)) {
-        return Err(anyhow!("该子任务没有所请求的写权限"));
+        return Err(rejected("该子任务没有所请求的写权限"));
     }
     let files = files_list
         .iter()
         .map(|f| f.as_str().map(str::to_string))
         .collect::<Option<Vec<_>>>()
-        .ok_or_else(|| anyhow!("附件需要最多 16 个项目相对路径"))?;
+        .ok_or_else(|| rejected("附件需要最多 16 个项目相对路径"))?;
     Ok(Some(Child {
         selection,
         effective,
@@ -345,7 +366,7 @@ async fn dispatch(turn: &Arc<Turn>, cmd: &Value) -> Result<()> {
     let superseded = |q: &Q| -> Result<bool> {
         Ok(job.continuous && job.parent.is_none() && q.followed_after(job.ticket, job.admission)?)
     };
-    if turn.aborted() || !turn.live() || inner.db.with(|q| superseded(q))? {
+    if turn.aborted() || !inner.db.with(|q| q.live(job.who()))? || inner.db.with(|q| superseded(q))? {
         return Ok(());
     }
     let Some(first) = inner.db.with(|q| check(q, turn, cmd))? else {

@@ -324,16 +324,19 @@ T1 asserts recovery runs only on `start()`, not in the constructor.
 - All submissions go through one serial promise queue per turn.
 - `SA_GOAL`, `SA_NEXT`, `SA_FINISH`, `SA_LEARN` and `SA_EXHAUSTED` are parsed **only from the final `result.text`**, inside commitReply (PR:91-125), and only for an auto root.
 
-**Error routing** (E:282-289):
+**Error routing** (Rust update, 2026-11-14; replaces historical E:282-289):
 - streaming plus `SyntaxError` (bad JSON) → `protocol.preview_invalid {tag}`; the final pass gets another chance.
-- otherwise, if continuous primary → `invalid.set(tag, msg)` plus `auto.protocol {tag, reason}`. The turn is not failed; the errors become a correction hint.
-- otherwise → `fatal = err`, and the job fails with that message after the queue drains (E:392).
+- Explicit parameter and authority checks produce a typed `CmdError::Rejected`; final JSON syntax errors use the same rejection path. Log `protocol.rejected {tag,id,logical_turn,command_sha256,reason,executed:false}`, deduplicated by job, logical turn and exact command hash. The rejected command does not execute; later valid controls and the authoritative final reply remain eligible for commit.
+- Notify an active parent in the same transaction. A non-primary streaming issuer receives a current-turn correction note. At a successful reply, consume only this physical turn's still-unread correction notes so they cannot cause an extra paid continuation; business notes are untouched. A final-only rejection does not add a self-note.
+- A continuous primary additionally retains `invalid.set(tag,msg)` and `auto.protocol {tag,reason}` so its existing autonomous correction contract still applies.
+- Database, filesystem and extension/internal failures retain their original error type. Set `fatal`, cancel the native turn immediately, and report the original error rather than the resulting cancellation. Failure to save a rejection receipt is also fatal; it is never silently swallowed.
+- Progress views show a fixed label for `protocol.rejected`; command bodies and arbitrary rejection payload fields remain outside the operational projection. The label does not change the job's state to failed.
 
 Lines that do not match the tag regex are ignored. `command()` also ignores lines with no space (D:177-183).
 
 ### 4.2 Per-command rules
 
-**SA_PROGRESS** (D:126-175). Errors never fail the job.
+**SA_PROGRESS** (D:126-175). Validation errors do not fail the job; journal failures remain fatal.
 - Skipped silently if aborted, not live, or a ticket-level `user.follow` exists after this job's admission. **That applies to child jobs too** (T1 cancel/follow tests).
 - Validation:
   - Bad JSON → `protocol.progress_invalid {reason:'invalid_json'}`.
@@ -342,7 +345,7 @@ Lines that do not match the tag regex are ignored. `command()` also ignores line
 - On acceptance: log `job.progress {id, summary}` and insert the receipt. The summary is stored verbatim, including surrounding spaces.
 
 **SA_SEND** (D:5-124):
-- `check()` throws (fatal or auto.protocol) on:
+- `check()` returns a typed rejection (see §4.1) on:
   - a non-object;
   - any of the keys `provider`, `mode`, `selection`, `route`, `route_override`, `permission_override` (`'不可通过派工更换供应商或执行端'`);
   - invalid fields (`'派工参数无效'`): `id` must be validText ≤96; `to` must be in AGENTS; `body` must be validText; `write` must be a boolean (default false); `role` must be a string ≤120 (default ''); `files` must be an array (default []).
@@ -363,7 +366,7 @@ Lines that do not match the tag regex are ignored. `command()` also ignores line
 **SA_NOTE** (D:224-227, S:220-272):
 - `id` must be validText ≤96, otherwise `'无效的信件 ID'`.
 - `recordNote(ticket, cmd.job, cmd.body, sourceJob, id)`: `dest` must be a safe positive integer and `body` must be validText.
-- Dedupe: `(source, source_turn=logical, msgkey)`. An existing row whose job or body differs throws `'同一 SA_NOTE ID 的内容不一致'`; an identical one returns the old seq.
+- Dedupe: `(source, source_turn=logical, msgkey)`. An existing row whose job or body differs returns a typed rejection `'同一 SA_NOTE ID 的内容不一致'`; an identical one returns the old seq. Invalid IDs, destinations or bodies likewise use the typed rejection path for agent controls; user APIs still return the error to their caller.
 - Rejections, logged as `note.rejected` with `reason` and a mailbox row with `target=NULL`, without throwing:
   - the receiver is not in the same ticket, or its state is not queued, running or waiting;
   - the budget is exceeded: the count of agent-sourced mailbox rows with a non-null target in the ticket is ≥128. For continuous tickets only the unconsumed rows whose target job is not terminal count.
@@ -661,7 +664,7 @@ Other harnesses never consume notes mid-turn. T1 checks that host acceptance is 
 16. (T2:71) Continuous flow: work SA_LEARN+FINISH leads to a milestone. In discover, SA_GOAL+NEXT without a tool proof is rejected; after a proof it is accepted. A restart mid-run preserves `learning`. In the second milestone, EXHAUSTED without a proof is rejected, then accepted after one. Totals: 2 milestones, 1 exhausted, 1 discovered, 1 `job.progress`.
 17. (T2:114) Continuous ignores `auto_cycles=200`. A cancelled root stays `cancelled` after restart; `follow` without `resume` throws, and with `resume:true` the root becomes `queued`.
 18. (T2:138) Engine close during a streamed SA_SEND and SA_PROGRESS, then restart: the child is not re-dispatched (1 child call, 1 `send`), progress is not duplicated, and a note queued before the restart is delivered byte-exact.
-19. (T2:178) On `ask` tickets, a SA_SEND with a disabled model, a foreign model, `permission_profile:'full'` or a `provider` key fails the root before any child executes.
+19. (T2:178, updated Rust contract) On `ask` tickets, a SA_SEND with a disabled model, a foreign model, `permission_profile:'full'` or a `provider` key is rejected before any child executes. The ordinary root's reply is preserved with a rejection receipt; internal engine errors still fail the root.
 20. (T2:195) On an auto ticket, a child with narrowed `ask` profile calling `approve` gets false immediately and one `approval.unattended_decline` is logged. A user note wakes the waiting parent while the child is still running.
 21. (T2:230) A streamed SA_TOOL does not invoke. The final SA_TOOL invokes once, with `profile=full` and an integer `admission`. A new receipt forces a turn 2 whose `mcp_results` show it. `project_extensions.skills` is present.
 22. (T2:269) A readonly-narrowed child's grandchild runs with `profile=readonly`, `writable=false` and `allow_lead_routing=false`.

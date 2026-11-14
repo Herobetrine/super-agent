@@ -96,6 +96,7 @@ async fn unsupported_effort_and_changed_replay_are_rejected() {
         json!({"model":"review", "reasoning_effort":"max"}),
         json!({"model":"review", "reasoning_effort":null}),
     ] {
+        let expected = send(fields.clone());
         let fx = Fx::new(
             script(move |_| {
                 let command = send(fields.clone());
@@ -104,10 +105,14 @@ async fn unsupported_effort_and_changed_replay_are_rejected() {
             catalog(),
         );
         let ticket = fx.begin(fx.params()).await;
-        fx.finish(ticket, "failed").await;
+        fx.finish(ticket, "done").await;
         assert_eq!(fx.int("SELECT count(*) FROM jobs"), 1);
+        assert_eq!(fx.engine.root(ticket).unwrap()["result"], expected);
+        let receipts = payloads(&fx, "SELECT payload FROM events WHERE kind='protocol.rejected'");
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0]["executed"], false);
         assert!(
-            fx.engine.root(ticket).unwrap()["result"]
+            receipts[0]["reason"]
                 .as_str()
                 .unwrap()
                 .contains("思考强度")
@@ -127,17 +132,22 @@ async fn unsupported_effort_and_changed_replay_are_rejected() {
         catalog(),
     );
     let ticket = fx.begin(fx.params()).await;
-    fx.finish(ticket, "failed").await;
+    fx.finish(ticket, "done").await;
     assert_eq!(
         fx.int("SELECT count(*) FROM jobs WHERE parent IS NOT NULL"),
         1
     );
     assert!(
-        fx.engine.root(ticket).unwrap()["result"]
+        payloads(&fx, "SELECT payload FROM events WHERE kind='protocol.rejected'")[0]["reason"]
             .as_str()
             .unwrap()
             .contains("同一消息 ID")
     );
+    let first_reply = &payloads(&fx, "SELECT payload FROM events WHERE kind='reply' AND job=(SELECT id FROM jobs WHERE parent IS NULL) ORDER BY seq")[0];
+    assert_eq!(first_reply["text"], [
+        send(json!({"model":"review", "reasoning_effort":"low"})),
+        send(json!({"model":"review", "reasoning_effort":"high"})),
+    ].join("\n"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -150,15 +160,19 @@ async fn collaborator_cannot_select_a_grandchild_effort() {
             if c.depth() == 1 {
                 return Ok(send(json!({"to":"claude", "reasoning_effort":"high"})));
             }
-            Ok("reviewed failure".into())
+            Ok("reviewed result and rejection".into())
         }),
         catalog(),
     );
     let ticket = fx.begin(fx.params()).await;
-    fx.finish(ticket, "partial").await;
+    fx.finish(ticket, "done").await;
     assert_eq!(fx.int("SELECT count(*) FROM jobs WHERE depth=2"), 0);
+    assert_eq!(
+        fx.all("SELECT result FROM jobs WHERE depth=1")[0]["result"],
+        send(json!({"to":"claude", "reasoning_effort":"high"})),
+    );
     assert!(
-        fx.all("SELECT result FROM jobs WHERE depth=1")[0]["result"]
+        payloads(&fx, "SELECT payload FROM events WHERE kind='protocol.rejected'")[0]["reason"]
             .as_str()
             .unwrap()
             .contains("当前获授权的主控")
@@ -195,8 +209,7 @@ async fn live_policy_changes_apply_to_new_dispatches_and_persist() {
         fx.engine.set_lead_routing(ticket, !initial).unwrap();
         fx.engine.set_lead_routing(ticket, !initial).unwrap();
         release.open();
-        fx.finish(ticket, if initial { "failed" } else { "done" })
-            .await;
+        fx.finish(ticket, "done").await;
         assert_eq!(
             fx.int("SELECT count(*) FROM jobs WHERE parent IS NOT NULL"),
             i64::from(!initial)
@@ -205,6 +218,10 @@ async fn live_policy_changes_apply_to_new_dispatches_and_persist() {
             fx.int("SELECT count(*) FROM events WHERE kind='lead_routing.changed'"),
             1
         );
+        assert_eq!(fx.int("SELECT count(*) FROM events WHERE kind='protocol.rejected'"), i64::from(initial));
+        if initial {
+            assert_eq!(fx.engine.root(ticket).unwrap()["result"], send(json!({"model":"review", "reasoning_effort":"high"})));
+        }
         fx.restart(quiet()).await;
         assert_eq!(
             fx.int("SELECT allow_lead_routing FROM tickets"),
@@ -273,8 +290,12 @@ async fn revoking_policy_during_attachment_snapshot_prevents_commit() {
         .unwrap();
     fx.engine.set_lead_routing(ticket, false).unwrap();
     release.open();
-    fx.finish(ticket, "failed").await;
+    fx.finish(ticket, "done").await;
     assert_eq!(fx.int("SELECT count(*) FROM jobs"), 1);
     assert_eq!(fx.int("SELECT count(*) FROM job_files"), 0);
     assert_eq!(fx.int("SELECT count(*) FROM events WHERE kind='send'"), 0);
+    assert_eq!(fx.int("SELECT count(*) FROM events WHERE kind='protocol.rejected'"), 1);
+    assert_eq!(fx.engine.root(ticket).unwrap()["result"], send(
+        json!({"model":"review", "reasoning_effort":"high", "files":["context.txt"]}),
+    ));
 }

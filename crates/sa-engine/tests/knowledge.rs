@@ -277,8 +277,11 @@ async fn root_completion_files_progress_but_children_do_not() {
     let fx = Fx::new(
         script(|c| async move {
             if c.depth() > 0 {
-                // A malformed final control fails the child.
-                return Ok("SA_SEND {broken".into());
+                // A genuine adapter failure makes the root partial.
+                return Err(sa_engine::adapter::AdapterError::new(
+                    sa_engine::adapter::ErrorClass::Protocol,
+                    "fixture adapter failure",
+                ));
             }
             if c.turn() == 1 {
                 return Ok(format!(

@@ -220,11 +220,17 @@ async fn disabled_models_provider_injection_and_escalation_are_rejected() {
     }
     fx.engine.start().unwrap();
     let ids: Vec<i64> = commands.lock().unwrap().keys().copied().collect();
-    fx.until(|| ids.iter().all(|i| root_state(&fx.engine, *i) == "failed")).await;
+    fx.until(|| ids.iter().all(|i| root_state(&fx.engine, *i) == "done")).await;
     assert_eq!(fx.shared.count(|c| c.packet["depth"].as_i64() > Some(0)), 0);
-    let mut reasons: Vec<String> = ids
+    for id in &ids {
+        assert_eq!(fx.engine.root(*id).unwrap()["result"], json!(commands.lock().unwrap()[id]));
+    }
+    let receipts = payloads(&fx, "SELECT payload FROM events WHERE kind='protocol.rejected'");
+    assert_eq!(receipts.len(), ids.len());
+    assert!(receipts.iter().all(|r| r["executed"] == false));
+    let mut reasons: Vec<String> = receipts
         .iter()
-        .map(|i| fx.engine.root(*i).unwrap()["result"].as_str().unwrap().to_string())
+        .map(|r| r["reason"].as_str().unwrap().to_string())
         .collect();
     reasons.sort();
     let mut expected = vec![

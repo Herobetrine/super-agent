@@ -89,6 +89,7 @@ fn stage(kind: &str) -> Option<(&'static str, &'static str, &'static str)> {
         "auto.retry" => ("已安排延后重试", "task", "running"),
         "auto.backoff" => ("等待退避后继续", "task", "running"),
         "auto.protocol" => ("控制指令需要修正", "task", "running"),
+        "protocol.rejected" => ("控制指令被拒绝，该指令未执行", "task", "running"),
         "routes.changed" => ("已更新工单模型绑定", "run", "running"),
         "failed" => ("任务执行失败", "run", "failed"),
         "cancelled" => ("任务已取消", "run", "stopped"),
@@ -264,6 +265,11 @@ mod tests {
     fn stage_labels_and_overrides() {
         assert_eq!(act("plan.add", None).label, "已添加计划项");
         assert_eq!(act("reply", None).state, "completed");
+        let rejection = act("protocol.rejected", None);
+        assert_eq!(
+            (rejection.label.as_str(), rejection.category, rejection.state),
+            ("控制指令被拒绝，该指令未执行", "task", "running")
+        );
         let deny = act("approval.decision", Some("deny"));
         assert_eq!(
             (deny.label.as_str(), deny.state),
