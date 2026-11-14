@@ -178,6 +178,8 @@ pub(crate) struct Inner {
     /// be aborted once it commits (the scheduler lock is taken before the
     /// journal lock, never inside it).
     pending_aborts: Mutex<Vec<i64>>,
+    /// Claude prompt-cache clock per job for keep-alive (in memory only).
+    cache_clocks: Mutex<HashMap<i64, CacheClock>>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -302,6 +304,7 @@ impl Engine {
                 adapters,
                 limits,
                 pending_aborts: Mutex::new(vec![]),
+                cache_clocks: Mutex::default(),
                 opts,
                 sched: Mutex::new(Sched::default()),
                 catalogs: Mutex::new(HashMap::new()),
@@ -355,6 +358,7 @@ impl Engine {
                 while inner.step() >= READS_PER_SLICE {
                     tokio::task::yield_now().await;
                 }
+                inner.keepalive_pass();
             }
         });
         lock(&inner.sched).timer = Some(timer);
@@ -1692,6 +1696,13 @@ impl Inner {
         if turn.aborted() || (journal.is_empty() && sessions.is_empty()) {
             return;
         }
+        if job.agent == "claude" {
+            for (kind, data) in &journal {
+                if kind == "native" {
+                    self.observe_cache(job.id, data);
+                }
+            }
+        }
         let route_text = stringify(&route_json(route));
         let saved = self.db.tx(|q| {
             if !q.live(job.who())? {
@@ -2503,6 +2514,174 @@ pub(crate) async fn approve(turn: Arc<Turn>, action: Value) -> bool {
     false
 }
 
+/// When the Claude lead's prompt cache was last read or written, for how long
+/// it stays warm, and how many keep-alives this wait has used.
+#[derive(Clone, Copy, Debug)]
+struct CacheClock {
+    last: f64,
+    ttl: f64,
+    pings: u32,
+    running: bool,
+}
+
+/// Keep-alives per wait. One refresh reads the prefix (0.1x input price);
+/// an expired cache is rewritten (1.25x for 5 minutes, 2x for 1 hour), so
+/// ten refreshes stay well below one rewrite of a 1-hour cache.
+const KEEPALIVE_CAP: u32 = 10;
+const KEEPALIVE_PROMPT: &str = "Super Agent prompt-cache keep-alive. Reply with the single word OK. Do not use any tools.";
+
+impl Inner {
+    /// Track main-loop Claude requests: `message_start.usage` says whether
+    /// the request wrote 1-hour or 5-minute cache entries.
+    fn observe_cache(&self, job: i64, data: &Value) {
+        if data["type"] != "stream_event" || data["event"]["type"] != "message_start" || !data["parent_tool_use_id"].is_null() {
+            return;
+        }
+        let usage = &data["event"]["message"]["usage"];
+        let one_hour = usage["cache_creation"]["ephemeral_1h_input_tokens"].as_u64().unwrap_or(0) > 0;
+        let five_min = usage["cache_creation"]["ephemeral_5m_input_tokens"].as_u64().unwrap_or(0) > 0;
+        let mut clocks = lock(&self.cache_clocks);
+        let clock = clocks.entry(job).or_insert(CacheClock { last: 0.0, ttl: 0.0, pings: 0, running: false });
+        clock.last = now();
+        clock.pings = 0;
+        if one_hour {
+            clock.ttl = 3600.0;
+        } else if five_min {
+            clock.ttl = 300.0;
+        }
+    }
+
+    /// Start keep-alives for waiting Claude jobs whose cache is about to
+    /// expire. Called from the scheduler timer; never blocks it.
+    fn keepalive_pass(self: &Arc<Self>) {
+        if !self.opts.efficiency.read().unwrap_or_else(|e| e.into_inner()).claude_keepalive {
+            return;
+        }
+        let at = now();
+        let due: Vec<i64> = lock(&self.cache_clocks)
+            .iter()
+            .filter(|(_, c)| {
+                let margin = if c.ttl >= 3600.0 { 300.0 } else { 60.0 };
+                !c.running && c.ttl > 0.0 && c.pings < KEEPALIVE_CAP && at - c.last >= c.ttl - margin
+            })
+            .map(|(job, _)| *job)
+            .collect();
+        for job in due {
+            let Some(adapter) = self.adapters.get("claude").cloned() else { return };
+            let request = match self.db.with(|q| keepalive_request(q, job)) {
+                Ok(Some(request)) => request,
+                // Not waiting any more (or not eligible): forget the clock.
+                _ => {
+                    lock(&self.cache_clocks).remove(&job);
+                    continue;
+                }
+            };
+            if let Some(c) = lock(&self.cache_clocks).get_mut(&job) {
+                c.running = true;
+            }
+            let inner = self.clone();
+            tokio::spawn(async move { inner.keepalive(adapter, request).await });
+        }
+    }
+
+    async fn keepalive(self: Arc<Self>, adapter: Arc<dyn Adapter>, mut request: RunRequest) {
+        let job = request.job;
+        let who = Who { ticket: request.ticket, id: job, turn: request.turn };
+        // The bus contributes tool definitions; the fork must list the same tools.
+        request.bus = self.opts.bus.as_ref().and_then(|b| b.grant(request.ticket, job, request.turn, "claude"));
+        let _bus = BusLease(self.opts.bus.clone(), request.bus.as_ref().map(|g| g.token.clone()));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let cancel = CancellationToken::new();
+        let started = std::time::Instant::now();
+        let run = adapter.keepalive(request, Arc::new(AdviceHost), tx, cancel.clone());
+        let usage = tokio::spawn(async move {
+            let (mut read, mut write) = (0u64, 0u64);
+            while let Some(ev) = rx.recv().await {
+                if let AdapterEvent::Journal { kind, data } = ev
+                    && kind == "native"
+                    && data["type"] == "stream_event"
+                    && data["event"]["type"] == "message_start"
+                    && data["parent_tool_use_id"].is_null()
+                {
+                    let u = &data["event"]["message"]["usage"];
+                    read += u["cache_read_input_tokens"].as_u64().unwrap_or(0);
+                    write += u["cache_creation_input_tokens"].as_u64().unwrap_or(0);
+                }
+            }
+            (read, write)
+        });
+        let outcome = match run {
+            None => Err("执行端不支持缓存保温".to_string()),
+            Some(run) => tokio::select! {
+                r = run => r.map(|_| ()).map_err(|e| e.message),
+                () = tokio::time::sleep(Duration::from_secs(180)) => { cancel.cancel(); Err("保温请求超时".into()) }
+            },
+        };
+        let (read, write) = usage.await.unwrap_or((0, 0));
+        let seconds = (started.elapsed().as_secs_f64() * 10.0).round() / 10.0;
+        let payload = match &outcome {
+            Ok(()) => json!({"ok": true, "cache_read": read, "cache_write": write, "seconds": seconds}),
+            Err(e) => json!({"ok": false, "error": e, "cache_read": read, "cache_write": write, "seconds": seconds}),
+        };
+        let _ = self.db.with(|q| q.log(who, "cache.keepalive", &payload));
+        let mut clocks = lock(&self.cache_clocks);
+        if let Some(c) = clocks.get_mut(&job) {
+            c.running = false;
+            c.pings += 1;
+            if outcome.is_ok() && read > 0 {
+                c.last = now();
+            } else {
+                // A failed or cold refresh will not keep anything warm: stop.
+                c.pings = KEEPALIVE_CAP;
+            }
+        }
+    }
+}
+
+/// The request a keep-alive must send: the job's own session, route, working
+/// directory and permission, so the prefix equals its next real turn's.
+fn keepalive_request(q: &Q, job: i64) -> Result<Option<RunRequest>> {
+    let Some(row) = q.one(
+        "SELECT j.*,t.cwd AS ticket_cwd,coalesce(j.permission_override,t.permission_profile) AS profile,r.route AS bound
+         FROM jobs j JOIN tickets t ON t.id=j.ticket LEFT JOIN native_routes r ON r.job=j.id
+         WHERE j.id=? AND j.agent='claude' AND j.state='waiting' AND coalesce(j.session,'')!=''
+         AND NOT EXISTS(SELECT 1 FROM ticket_pause p WHERE p.ticket=j.ticket)",
+        &[&job],
+    )?
+    else {
+        return Ok(None);
+    };
+    let profile = str_of(&row, "profile").to_string();
+    if !matches!(profile.as_str(), "full" | "auto") {
+        return Ok(None);
+    }
+    let Ok(route) = p::route(Some(&parse(row.get("bound").and_then(Value::as_str)))) else {
+        return Ok(None);
+    };
+    let cwd = if let Some(w) = crate::workspaces::get(q, job)? {
+        w.path
+    } else if let Some(d) = q.one("SELECT cwd FROM job_directories WHERE job=?", &[&job])? {
+        str_of(&d, "cwd").to_string()
+    } else {
+        str_of(&row, "ticket_cwd").to_string()
+    };
+    let writing = int_of(&row, "writing") != 0;
+    Ok(Some(RunRequest {
+        ticket: int_of(&row, "ticket"),
+        job,
+        turn: int_of(&row, "turn"),
+        agent: "claude".into(),
+        prompt: KEEPALIVE_PROMPT.into(),
+        images: vec![],
+        cwd: PathBuf::from(cwd),
+        route,
+        writable: p::is_full(&profile) || writing,
+        profile,
+        session_id: Some(str_of(&row, "session").to_string()),
+        bus: None,
+    }))
+}
+
 /// Advisor turns run read-only: no approvals, no notes.
 struct AdviceHost;
 
@@ -2734,5 +2913,139 @@ mod catalog_tests {
             );
             engine.close().await;
         }
+    }
+}
+
+#[cfg(test)]
+mod keepalive_tests {
+    use super::*;
+    use crate::adapter::{Catalog, EventSink, RunOutcome};
+
+    /// Fake Claude that records keep-alive requests and reports a cache read.
+    #[derive(Default)]
+    struct WarmClaude {
+        seen: Mutex<Vec<RunRequest>>,
+    }
+
+    impl Adapter for WarmClaude {
+        fn agent(&self) -> &'static str {
+            "claude"
+        }
+        fn catalog(&self) -> BoxFuture<'static, Result<Catalog>> {
+            Box::pin(async { Ok(Catalog { value: json!({}) }) })
+        }
+        fn run(&self, _: RunRequest, _: Arc<dyn TurnHost>, _: EventSink, _: CancellationToken) -> BoxFuture<'static, Result<RunOutcome, AdapterError>> {
+            Box::pin(async { Err(AdapterError::new(ErrorClass::Other, "unused")) })
+        }
+        fn keepalive(&self, request: RunRequest, _: Arc<dyn TurnHost>, events: EventSink, _: CancellationToken) -> Option<BoxFuture<'static, Result<RunOutcome, AdapterError>>> {
+            lock(&self.seen).push(request);
+            Some(Box::pin(async move {
+                let _ = events.send(AdapterEvent::Journal {
+                    kind: "native".into(),
+                    data: json!({"type":"stream_event","parent_tool_use_id":null,"event":{"type":"message_start","message":{"usage":{"input_tokens":3,"cache_read_input_tokens":350000,"cache_creation_input_tokens":12}}}}),
+                });
+                Ok(RunOutcome { text: "OK".into(), session_id: None })
+            }))
+        }
+    }
+
+    fn engine(dir: &Path) -> (Engine, Arc<WarmClaude>) {
+        let claude = Arc::new(WarmClaude::default());
+        let opts = EngineOptions { tick: Duration::from_secs(3600), ..Default::default() };
+        let engine = Engine::open(dir, vec![claude.clone() as Arc<dyn Adapter>], opts).unwrap();
+        engine
+            .db()
+            .with(|q| {
+                q.conn().execute_batch(
+                    "INSERT INTO tickets(id,goal,cwd,writes,lead,created,permission_profile) VALUES(1,'g','C:/p',0,'claude',0,'full');
+                     INSERT INTO jobs(id,ticket,parent,agent,body,writing,depth,turn,state,session) VALUES(1,1,NULL,'claude','b',0,0,4,'waiting','sess-1');
+                     INSERT INTO native_routes VALUES(1,'{\"provider\":\"p\",\"model\":\"claude-opus-5-5\",\"mode\":\"cli\"}');",
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        (engine, claude)
+    }
+
+    fn start_event(one_hour: u64, five_min: u64) -> Value {
+        json!({"type":"stream_event","parent_tool_use_id":null,"event":{"type":"message_start","message":{"usage":{
+            "cache_creation":{"ephemeral_1h_input_tokens":one_hour,"ephemeral_5m_input_tokens":five_min}}}}})
+    }
+
+    fn age(engine: &Engine, job: i64, seconds: f64) {
+        lock(&engine.inner.cache_clocks).get_mut(&job).unwrap().last = now() - seconds;
+    }
+
+    async fn settle(engine: &Engine) {
+        for _ in 0..200 {
+            if lock(&engine.inner.cache_clocks).values().all(|c| !c.running) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("keep-alive did not finish");
+    }
+
+    #[tokio::test]
+    async fn refreshes_a_waiting_lead_before_its_cache_expires() {
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, claude) = engine(dir.path());
+        engine.inner.observe_cache(1, &start_event(900, 0));
+        assert_eq!(lock(&engine.inner.cache_clocks)[&1].ttl, 3600.0);
+        age(&engine, 1, 3000.0);
+        engine.inner.keepalive_pass();
+        settle(&engine).await;
+        assert!(lock(&claude.seen).is_empty(), "not due before the 55-minute margin");
+        age(&engine, 1, 3350.0);
+        engine.inner.keepalive_pass();
+        settle(&engine).await;
+        let seen = lock(&claude.seen).clone();
+        assert_eq!(seen.len(), 1);
+        let r = &seen[0];
+        assert_eq!((r.session_id.as_deref(), r.profile.as_str(), r.turn), (Some("sess-1"), "full", 4));
+        assert_eq!(r.route.model, "claude-opus-5-5");
+        assert_eq!(r.cwd, PathBuf::from("C:/p"));
+        assert_eq!(r.prompt, KEEPALIVE_PROMPT);
+        let clock = lock(&engine.inner.cache_clocks)[&1];
+        assert_eq!(clock.pings, 1);
+        assert!(now() - clock.last < 5.0, "a warm read restarts the clock");
+        let logged = engine.db().with(|q| q.one("SELECT payload FROM events WHERE kind='cache.keepalive'", &[])).unwrap().unwrap();
+        assert!(str_of(&logged, "payload").contains("\"cache_read\":350000"));
+        // A real request resets the count; five-minute caches use a 4-minute margin.
+        engine.inner.observe_cache(1, &start_event(0, 50));
+        let clock = lock(&engine.inner.cache_clocks)[&1];
+        assert_eq!((clock.pings, clock.ttl), (0, 300.0));
+    }
+
+    #[tokio::test]
+    async fn skips_paused_read_only_capped_and_disabled_waits() {
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, claude) = engine(dir.path());
+        let due = |engine: &Engine| {
+            engine.inner.observe_cache(1, &start_event(10, 0));
+            age(engine, 1, 3500.0);
+            engine.inner.keepalive_pass();
+        };
+        engine.inner.opts.efficiency.write().unwrap().claude_keepalive = false;
+        due(&engine);
+        settle(&engine).await;
+        engine.inner.opts.efficiency.write().unwrap().claude_keepalive = true;
+        lock(&engine.inner.cache_clocks).get_mut(&1).unwrap().pings = KEEPALIVE_CAP;
+        engine.inner.keepalive_pass();
+        settle(&engine).await;
+        assert!(lock(&claude.seen).is_empty(), "disabled and capped waits are not refreshed");
+        engine.db().with(|q| q.run("INSERT INTO ticket_pause(ticket,state) VALUES(1,'paused')", &[]).map(|_| ())).unwrap();
+        due(&engine);
+        settle(&engine).await;
+        assert!(!lock(&engine.inner.cache_clocks).contains_key(&1), "a paused ticket forgets the clock");
+        engine.db().with(|q| q.run("DELETE FROM ticket_pause", &[]).map(|_| ())).unwrap();
+        engine.db().with(|q| q.run("UPDATE tickets SET permission_profile='readonly'", &[]).map(|_| ())).unwrap();
+        due(&engine);
+        settle(&engine).await;
+        engine.db().with(|q| q.run("UPDATE tickets SET permission_profile='full'", &[]).map(|_| ())).unwrap();
+        engine.db().with(|q| q.run("UPDATE jobs SET state='running'", &[]).map(|_| ())).unwrap();
+        due(&engine);
+        settle(&engine).await;
+        assert!(lock(&claude.seen).is_empty(), "read-only and running jobs are not refreshed");
     }
 }

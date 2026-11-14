@@ -765,7 +765,29 @@ impl Adapter for Claude {
             .claude_cache_ttl;
         crate::cache_policy::select_fallback(&mut sys, ttl);
         let customs = custom::snapshot(&self.registry, "claude");
-        Box::pin(async move { run(sys, customs, request, host, Emit(events), cancel).await })
+        Box::pin(async move { run(sys, customs, request, host, Emit(events), cancel, false).await })
+    }
+
+    /// A forked, unpersisted one-line turn on the same session. Claude Code
+    /// sends the session's tools, system prompt and history unchanged, so the
+    /// request reads (and refreshes) the cache the next real turn will read.
+    fn keepalive(
+        &self,
+        request: RunRequest,
+        host: Arc<dyn TurnHost>,
+        events: EventSink,
+        cancel: CancellationToken,
+    ) -> Option<BoxFuture<'static, Result<RunOutcome, AdapterError>>> {
+        request.session_id.as_ref()?;
+        let mut sys = self.sys.clone();
+        let ttl = self
+            .efficiency
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .claude_cache_ttl;
+        crate::cache_policy::select_fallback(&mut sys, ttl);
+        let customs = custom::snapshot(&self.registry, "claude");
+        Some(Box::pin(async move { run(sys, customs, request, host, Emit(events), cancel, true).await }))
     }
 }
 
@@ -825,6 +847,7 @@ async fn run(
     host: Arc<dyn TurnHost>,
     emit: Emit,
     cancel: CancellationToken,
+    fork: bool,
 ) -> Result<RunOutcome, AdapterError> {
     crate::images::check(&req)?;
     let boundary = scope("claude", &req, &host, &cancel, false).await?;
@@ -962,6 +985,11 @@ async fn run(
     if let Some(sid) = &req.session_id {
         args.push("--resume".into());
         args.push(sid.clone());
+        if fork {
+            // Keep-alive: same prefix, but neither the session nor its
+            // history changes.
+            args.extend(["--fork-session".into(), "--no-session-persistence".into()]);
+        }
     }
     emit.journal(
         "adapter.permission",
@@ -975,11 +1003,12 @@ async fn run(
     collect_turn(
         &mut proc,
         &input,
-        req.session_id.as_deref(),
+        // A fork answers under its own new session id.
+        if fork { None } else { req.session_id.as_deref() },
         (!sdk).then_some(s.model.as_str()),
         emit,
         &cancel,
-        Some(host),
+        (!fork).then_some(host),
     )
     .await
 }

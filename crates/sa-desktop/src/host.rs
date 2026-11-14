@@ -2043,6 +2043,7 @@ exit 0
             lazy_mcp_schemas: false,
             concise_handoffs: false,
             claude_cache_ttl: Ttl::OneHour,
+        claude_keepalive: true,
         };
         assert!(host.submit(Action::SaveEfficiency { settings: changed.clone() }));
         let saved = outcome(&host);

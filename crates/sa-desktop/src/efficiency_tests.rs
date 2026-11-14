@@ -130,6 +130,7 @@ fn efficiency_clicks_cancel_save_restart_and_restore_defaults() {
         lazy_mcp_schemas: false,
         concise_handoffs: false,
         claude_cache_ttl: Ttl::OneHour,
+    claude_keepalive: true,
     });
     h.get_by_role_and_label(Role::Button, "取消").click();
     h.run_steps(3);
@@ -159,6 +160,7 @@ fn efficiency_clicks_cancel_save_restart_and_restore_defaults() {
         lazy_mcp_schemas: false,
         concise_handoffs: false,
         claude_cache_ttl: Ttl::FiveMinutes,
+    claude_keepalive: true,
     };
     assert_eq!(
         h.state().host.as_ref().unwrap().efficiency_settings(),
@@ -245,6 +247,7 @@ fn efficiency_observer_reads_saved_values_and_demo_can_preview() {
         lazy_mcp_schemas: false,
         concise_handoffs: true,
         claude_cache_ttl: Ttl::OneHour,
+    claude_keepalive: true,
     };
     let owner = Host::start_with(data.path().into(), fakes, || {}).unwrap();
     owner

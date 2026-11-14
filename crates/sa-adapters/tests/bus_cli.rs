@@ -697,3 +697,112 @@ async fn live_cross_harness_advise() {
     }
     assert!(outcome.is_ok_and(|o| o.text.contains("ORCHID-7731")), "worker did not get the code through the advisor");
 }
+
+/// Messages stub answering `ok`; records main-loop request bodies.
+fn recording_model(seen: Arc<std::sync::Mutex<Vec<Value>>>) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let seen = seen.clone();
+            std::thread::spawn(move || {
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut head = String::new();
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                    head.push_str(&line);
+                }
+                let length: usize = head
+                    .lines()
+                    .find_map(|l| l.split_once(':').filter(|(k, _)| k.eq_ignore_ascii_case("content-length")))
+                    .and_then(|(_, v)| v.trim().parse().ok())
+                    .unwrap_or(0);
+                let mut body = vec![0; length];
+                reader.read_exact(&mut body).unwrap();
+                let req: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+                if req["tools"].as_array().is_some_and(|t| t.iter().any(|t| t["name"] == "PowerShell" || t["name"] == "Bash")) {
+                    seen.lock().unwrap().push(req.clone());
+                }
+                let (kind, payload) = if head.starts_with("GET") {
+                    ("application/json", json!({"data":[{"id":"claude-opus-5-5"}],"has_more":false}).to_string())
+                } else {
+                    let model = req["model"].as_str().unwrap_or("m").to_string();
+                    let events = [
+                        json!({"type":"message_start","message":{"id":"msg_local","type":"message","role":"assistant","model":model,"content":[],"stop_reason":null,"usage":{"input_tokens":1,"output_tokens":0}}}),
+                        json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
+                        json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ok"}}),
+                        json!({"type":"content_block_stop","index":0}),
+                        json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}),
+                        json!({"type":"message_stop"}),
+                    ];
+                    ("text/event-stream", events.iter().map(|e| format!("event: {}\ndata: {e}\n\n", e["type"].as_str().unwrap())).collect())
+                };
+                let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: {kind}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}", payload.len());
+            });
+        }
+    });
+    port
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn claude_keepalive_shares_the_next_turns_prefix_without_touching_the_session() {
+    if std::env::var("SA_LOCAL_GATEWAY_CLI").is_err() {
+        eprintln!("set SA_LOCAL_GATEWAY_CLI=1 to run the installed Claude CLI against loopback stubs");
+        return;
+    }
+    let data = tempfile::tempdir().unwrap();
+    Db::open(data.path()).unwrap();
+    let bus = CollabBus::start(data.path(), None).await.unwrap();
+    let seen: Arc<std::sync::Mutex<Vec<Value>>> = Arc::default();
+    let home = tempfile::tempdir().unwrap();
+    let base = format!("http://127.0.0.1:{}", recording_model(seen.clone()));
+    std::fs::create_dir_all(home.path().join(".claude")).unwrap();
+    std::fs::write(home.path().join(".claude/settings.json"), json!({"env":{"ANTHROPIC_BASE_URL":base,"ANTHROPIC_AUTH_TOKEN":"dummy"}}).to_string()).unwrap();
+    let adapter = Claude::new(sys(home.path()));
+    let catalog = adapter.catalog().await.unwrap().value;
+    let provider = catalog["providers"].as_array().unwrap().iter()
+        .find(|p| p["available"] == true && p["label"].as_str().is_some_and(|l| l.ends_with("native")))
+        .unwrap()["id"].as_str().unwrap().to_string();
+    let request = |prompt: &str, session: Option<String>| RunRequest {
+        ticket: 1,
+        job: 1,
+        turn: 1,
+        agent: "claude".into(),
+        prompt: prompt.into(),
+        images: vec![],
+        cwd: home.path().into(),
+        route: Route { provider: provider.clone(), model: "claude-opus-5-5".into(), mode: "cli".into(), reasoning_effort: None },
+        profile: "full".into(),
+        writable: true,
+        session_id: session,
+        bus: bus.grant(1, 1, 1, "claude"),
+    };
+    let run = |r: RunRequest| {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        adapter.run(r, Arc::new(Host), tx, CancellationToken::new())
+    };
+    let first = run(request("FIRST real turn", None)).await.unwrap();
+    let session = first.session_id.clone().expect("session");
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let warm = adapter
+        .keepalive(request("KEEPALIVE ping", Some(session.clone())), Arc::new(Host), tx, CancellationToken::new())
+        .expect("Claude supports keep-alive")
+        .await;
+    assert!(warm.is_ok(), "{:?}", warm.err().map(|e| e.message));
+    let second = run(request("SECOND real turn", Some(session.clone()))).await.unwrap();
+    assert_eq!(second.session_id.as_deref(), Some(session.as_str()), "the real session continues");
+    let requests = seen.lock().unwrap().clone();
+    let find = |marker: &str| requests.iter().rev().find(|r| r["messages"].to_string().contains(marker)).cloned().unwrap();
+    let (keepalive, real) = (find("KEEPALIVE ping"), find("SECOND real turn"));
+    for key in ["tools", "system", "model", "thinking"] {
+        assert_eq!(keepalive[key], real[key], "{key} differs");
+    }
+    let history = |r: &Value| Value::Array(r["messages"].as_array().unwrap()[..r["messages"].as_array().unwrap().len() - 1].to_vec());
+    assert_eq!(history(&keepalive), history(&real), "history before the new message differs");
+    assert!(!real["messages"].to_string().contains("KEEPALIVE"), "the keep-alive must not enter the session");
+    assert!(real["tools"].to_string().contains("mcp__sa_bus__send"), "the bus tools are part of both prefixes");
+}

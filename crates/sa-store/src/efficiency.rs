@@ -22,6 +22,9 @@ pub struct Settings {
     pub lazy_mcp_schemas: bool,
     pub concise_handoffs: bool,
     pub claude_cache_ttl: Ttl,
+    /// Refresh the Claude lead's prompt cache with forked one-line turns while
+    /// it waits longer than the cache lifetime (bounded, see the engine).
+    pub claude_keepalive: bool,
 }
 
 impl Default for Settings {
@@ -31,6 +34,7 @@ impl Default for Settings {
             lazy_mcp_schemas: true,
             concise_handoffs: true,
             claude_cache_ttl: Ttl::Inherit,
+            claude_keepalive: true,
         }
     }
 }

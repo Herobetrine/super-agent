@@ -177,4 +177,16 @@ pub trait Adapter: Send + Sync {
         events: EventSink,
         cancel: CancellationToken,
     ) -> BoxFuture<'static, Result<RunOutcome, AdapterError>>;
+    /// Refresh the provider prompt cache of `request.session_id` without
+    /// changing that session: the request must carry exactly the prefix the
+    /// session's next real turn will send. `None` when unsupported.
+    fn keepalive(
+        &self,
+        _request: RunRequest,
+        _host: Arc<dyn TurnHost>,
+        _events: EventSink,
+        _cancel: CancellationToken,
+    ) -> Option<BoxFuture<'static, Result<RunOutcome, AdapterError>>> {
+        None
+    }
 }

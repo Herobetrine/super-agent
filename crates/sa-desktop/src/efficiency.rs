@@ -142,6 +142,9 @@ impl App {
                         description(ui, "作为 Claude 主会话与内部子请求的默认时长。CLI 已有的显式时长、强制时长或禁用缓存设置优先生效。", &pal);
                         ui.add_space(8.0);
                         description(ui, "1 小时缓存的写入成本较高，实际生效与命中取决于执行端、网关和服务端支持。", &pal);
+                        ui.add_space(12.0);
+                        ui.add(widgets::Check::new(&mut dialog.draft.claude_keepalive, "长等待缓存保温"));
+                        description(ui, "Claude 主控等待协作者超过缓存时长时，在过期前用不保存的分叉会话发一条极短请求，按缓存读取计费以刷新缓存，避免整段上下文过期重写。每次等待最多 10 次，有真实请求后重新计数。", &pal);
                         ui.add_space(8.0);
                         description(ui, "Codex、DeepSeek 等执行端沿用各自的服务端缓存策略。", &pal);
                     });
