@@ -138,7 +138,11 @@ class Sampler:
                 if valid:
                     self.delivery["measured_requests"] += 1
                     self.delivery.update(numbers)
-                    if numbers["full_prompt_bytes"] - numbers["sent_prompt_bytes"] != numbers["saved_bytes"]:
+                    # The engine reports saturating savings. Recovery references
+                    # can legitimately make a delivery larger than its snapshot.
+                    difference = numbers["full_prompt_bytes"] - numbers["sent_prompt_bytes"]
+                    self.delivery["overhead_bytes"] += max(0, -difference)
+                    if max(0, difference) != numbers["saved_bytes"]:
                         self.delivery["inconsistent_requests"] += 1
                 records.append(dict(base, record="delivery", mode=mode, bytes=numbers, complete=valid))
             elif kind == "native":

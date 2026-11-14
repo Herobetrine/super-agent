@@ -93,6 +93,22 @@ class WatchRunTests(unittest.TestCase):
         self.assertEqual(delivery["saved_bytes"], 1800)
         self.assertNotIn("DO-NOT-LEAK", json.dumps([records, delivery]))
 
+    def test_recovery_overhead_is_measured_without_false_inconsistency(self):
+        sizes = dict(full_prompt_bytes=78534, sent_prompt_bytes=79202, saved_bytes=0)
+        self.event(dict(sizes, recovery_delivery=True), kind="running")
+        self.sampler.poll()
+        summary = self.sampler.summary()
+        self.assertEqual(summary["delivery"]["overhead_bytes"], 668)
+        self.assertEqual(summary["delivery"]["sent_prompt_bytes"], 79202)
+        self.assertEqual(summary["delivery"]["saved_bytes"], 0)
+        self.assertNotIn("delivery_byte_inconsistency", summary["alert_candidates"])
+        # A positive savings claim for a larger delivery remains inconsistent.
+        self.event(dict(sizes, saved_bytes=1, recovery_delivery=True), kind="running", turn=2)
+        self.sampler.poll()
+        summary = self.sampler.summary()
+        self.assertEqual(summary["delivery"]["inconsistent_requests"], 1)
+        self.assertIn("delivery_byte_inconsistency", summary["alert_candidates"])
+
     def test_legacy_delivery_flags_keep_existing_modes(self):
         flags = [{}, {"incremental": True}, {"incremental": False},
                  {"recovery_delivery": False, "incremental": True},
