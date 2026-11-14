@@ -417,6 +417,20 @@ pub(crate) async fn run_server(
 }
 
 // agy retains legacy model IDs alongside standard ACP config options. Keep
+/// ACP `McpServer` entries for this turn: the collaboration bus when granted.
+/// The token travels in the session request over stdio, not on a command line.
+fn bus_servers(req: &RunRequest) -> Value {
+    match &req.bus {
+        Some(bus) => json!([{
+            "type": "http",
+            "name": crate::common::BUS_SERVER,
+            "url": bus.url,
+            "headers": [{"name": "Authorization", "value": format!("Bearer {}", bus.token)}],
+        }]),
+        None => json!([]),
+    }
+}
+
 // those fields using SDK untyped requests rather than dropping them in the
 // standard session response schema.
 async fn native_session(
@@ -430,10 +444,10 @@ async fn native_session(
         }
         (
             "session/load",
-            json!({"sessionId":sid,"cwd":req.cwd,"mcpServers":[]}),
+            json!({"sessionId":sid,"cwd":req.cwd,"mcpServers":bus_servers(req)}),
         )
     } else {
-        ("session/new", json!({"cwd":req.cwd,"mcpServers":[]}))
+        ("session/new", json!({"cwd":req.cwd,"mcpServers":bus_servers(req)}))
     };
     let session = connection
         .send_request(sdk::UntypedMessage::new(method, params)?)
@@ -496,7 +510,7 @@ async fn configure_native(
     let loaded = connection
         .send_request(sdk::UntypedMessage::new(
             "session/load",
-            json!({"sessionId":sid,"cwd":req.cwd,"mcpServers":[]}),
+            json!({"sessionId":sid,"cwd":req.cwd,"mcpServers":bus_servers(req)}),
         )?)
         .block_task()
         .await?;

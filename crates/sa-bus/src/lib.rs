@@ -33,6 +33,7 @@ const ROSTER_LIMIT: i64 = 100;
 const INSTRUCTIONS: &str = "Super Agent collaboration bus for the current ticket. Use it while you work instead of waiting for turn-end reports: \
 call `roster` to see who else works on this ticket, `send` to message a collaborator (or `lead`/`parent`) when you need input or have news they depend on, \
 `inbox` to read messages addressed to you, and `publish` to share an intermediate result (commit, artifact, test numbers) as soon as it exists. \
+`tools` lists the MCP tools the operator enabled for this ticket and `call` runs one of them; name a server and tool in `tools` to read its full input schema first. \
 Every result reports your unread count; read your inbox when it is not zero, before long operations and before you finish.";
 
 /// Identity behind one bearer token.
@@ -57,6 +58,8 @@ impl Grantee {
 struct Shared {
     db: Db,
     grants: Mutex<HashMap<String, Grantee>>,
+    /// Ticket MCP tools proxied by `tools`/`call`; `None` hides them.
+    ext: Option<sa_ext::ProjectExtensions>,
 }
 
 /// The running bus. Dropping it stops the listener.
@@ -68,10 +71,11 @@ pub struct CollabBus {
 
 impl CollabBus {
     /// Bind `127.0.0.1:<random>` and serve. Requires a Tokio runtime.
-    pub async fn start(data_dir: &Path) -> Result<Arc<Self>> {
+    pub async fn start(data_dir: &Path, ext: Option<sa_ext::ProjectExtensions>) -> Result<Arc<Self>> {
         let shared = Arc::new(Shared {
             db: Db::open(data_dir).context("协作总线无法打开工单库")?,
             grants: Mutex::default(),
+            ext,
         });
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?;
         let url = format!("http://127.0.0.1:{}/mcp", listener.local_addr()?.port());
@@ -143,6 +147,26 @@ impl sa_engine::services::Bus for CollabBus {
 struct Handler(Arc<Shared>);
 
 impl Handler {
+    /// `tools`/`call`: ticket MCP tools, outside the journal transaction
+    /// because a call awaits the remote server.
+    async fn extension(&self, caller: &Grantee, name: &str, args: &Value, cancel: &CancellationToken) -> Result<Value> {
+        ensure!(self.0.db.with(|q| q.live(caller.who()))?, "本轮已结束，协作总线不再接受该任务的调用");
+        let ext = self.0.ext.as_ref().ok_or_else(|| anyhow!("本工作台未启用 MCP 与技能服务"))?;
+        let direct = sa_ext::DirectCaller { ticket: caller.ticket, job: caller.job, turn: caller.turn };
+        let text = |key: &str| args.get(key).and_then(Value::as_str);
+        let mut out = if name == "tools" {
+            ext.catalog_for(&direct, text("server"), text("tool"))?
+        } else {
+            let (Some(server), Some(tool)) = (text("server"), text("tool")) else {
+                return Err(anyhow!("`call` 需要 server 和 tool"));
+            };
+            let arguments = args.get("arguments").cloned().unwrap_or_else(|| json!({}));
+            json!({"result": ext.call_direct(&direct, server, tool, &arguments, cancel).await?})
+        };
+        out["unread"] = json!(self.0.db.with(|q| unread(q, caller))?);
+        Ok(out)
+    }
+
     fn caller(&self, context: &RequestContext<RoleServer>) -> Option<Grantee> {
         let parts = context.extensions.get::<http::request::Parts>()?;
         let header = parts.headers.get(http::header::AUTHORIZATION)?.to_str().ok()?;
@@ -186,6 +210,23 @@ pub fn tools() -> Vec<Tool> {
             schema(json!({"type":"object","properties":{},"additionalProperties":false})),
         ),
         Tool::new(
+            "tools",
+            "List the MCP tools the operator enabled for this ticket (Super Agent extensions), with description previews. Pass `server` and `tool` to get that tool's full description and input schema before calling it.",
+            schema(json!({"type":"object","properties":{
+                "server":{"type":"string","description":"Server id from a previous listing"},
+                "tool":{"type":"string","description":"Tool name from a previous listing"}
+            },"additionalProperties":false})),
+        ),
+        Tool::new(
+            "call",
+            "Call one MCP tool from `tools` and return its result within your turn. Available on full-access and auto tasks.",
+            schema(json!({"type":"object","properties":{
+                "server":{"type":"string"},
+                "tool":{"type":"string"},
+                "arguments":{"type":"object","description":"Arguments matching the tool's input schema"}
+            },"required":["server","tool"],"additionalProperties":false})),
+        ),
+        Tool::new(
             "publish",
             "Publish an intermediate result so the operator and collaborators see it now. Reusing an `id` within this turn with a different summary is rejected.",
             schema(json!({"type":"object","properties":{
@@ -222,7 +263,10 @@ impl ServerHandler for Handler {
             return Err(ErrorData::invalid_request("协作总线令牌无效或本轮已结束", None));
         };
         let args = Value::Object(request.arguments.unwrap_or_default());
-        let outcome = self.0.db.tx(|q| call(q, &caller, &request.name, &args));
+        let outcome = match request.name.as_ref() {
+            "tools" | "call" => self.extension(&caller, &request.name, &args, &context.ct).await,
+            name => self.0.db.tx(|q| call(q, &caller, name, &args)),
+        };
         let result = match outcome {
             Ok(value) => CallToolResult::success(vec![ContentBlock::text(value.to_string())]),
             Err(error) => CallToolResult::error(vec![ContentBlock::text(error.to_string())]),
@@ -321,7 +365,7 @@ fn send(q: &Q, caller: &Grantee, args: &Value) -> Result<Value> {
 fn inbox(q: &Q, caller: &Grantee) -> Result<Value> {
     let notes = q.notes(caller.job, true)?;
     let seqs: Vec<i64> = notes.iter().filter_map(|n| n["seq"].as_i64()).collect();
-    q.accept(caller.who(), &seqs)?;
+    q.accept_via(caller.who(), &seqs, "bus")?;
     let messages: Vec<Value> = notes
         .iter()
         .map(|n| json!({"seq": n["seq"], "from": n["sender"], "body": n["body"]}))

@@ -295,6 +295,12 @@ impl Q<'_> {
 
     /// `accept(job, seqs)` body (S:284-301); call inside a transaction.
     pub fn accept(&self, who: Who, seqs: &[i64]) -> Result<()> {
+        self.accept_via(who, seqs, "native")
+    }
+
+    /// [`accept`](Self::accept) recording how the notes reached the turn
+    /// (`native` steering or the collaboration bus `inbox`).
+    pub fn accept_via(&self, who: Who, seqs: &[i64], via: &str) -> Result<()> {
         if !self.live(who)? {
             return Ok(());
         }
@@ -309,7 +315,7 @@ impl Q<'_> {
             }
         }
         if !accepted.is_empty() {
-            self.log(who, "note.accepted", &json!({"seqs": accepted, "via": "native"}))?;
+            self.log(who, "note.accepted", &json!({"seqs": accepted, "via": via}))?;
         }
         Ok(())
     }

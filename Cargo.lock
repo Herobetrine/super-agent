@@ -3368,6 +3368,7 @@ dependencies = [
  "hyper-util",
  "rmcp",
  "sa-engine",
+ "sa-ext",
  "serde_json",
  "tempfile",
  "tokio",

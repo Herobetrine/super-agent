@@ -907,6 +907,25 @@ fn policy(provider: &str, model: &str, boundary: &str, r: &DsRoute, spec: Value)
     out
 }
 
+/// `dsh-mcp-client` entry for the collaboration bus. `url` is a loopback
+/// address written as a JSON (and therefore YAML) string.
+fn bus_entry(url: &str) -> String {
+    format!(
+        "- id: mcp-sa-bus
+  name: '@deepseek-ai/dsh-mcp-client'
+  config:
+    serverName: {server}
+    transport: streamable-http
+    url: {url}
+    headers:
+      Authorization: !!js '`Bearer ${{process.env.{token}}}`'
+",
+        server = crate::common::BUS_SERVER,
+        url = json!(url),
+        token = crate::common::BUS_TOKEN_ENV,
+    )
+}
+
 const ALLOWED_MODEL_FIELDS: [&str; 7] = [
     "id",
     "name",
@@ -1080,7 +1099,15 @@ async fn run(
     if let Some((name, key)) = call_key {
         env.set(name, key);
     }
-    let policy_text = policy(&s.provider, &s.model, boundary, &r, spec);
+    let mut policy_text = policy(&s.provider, &s.model, boundary, &r, spec);
+    // Prototype scope: full-access turns mount the collaboration bus through
+    // DSH's own MCP client; the token is read from the child environment.
+    if boundary == "danger-full-access"
+        && let Some(bus) = &req.bus
+    {
+        policy_text.push_str(&bus_entry(&bus.url));
+        env.set(crate::common::BUS_TOKEN_ENV, bus.token.clone());
+    }
     let temp = tempfile::Builder::new()
         .prefix("superagent-dsh-")
         .tempdir_in(&sys.temp)

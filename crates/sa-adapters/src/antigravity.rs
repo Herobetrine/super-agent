@@ -498,7 +498,13 @@ async fn run(
         .exe
         .clone()
         .ok_or_else(|| route_gone("本机未安装所选原生执行端"))?;
-    if !req.images.is_empty() {
+    // `--settings` rejects `mcpServers`; only ACP `session/new` mounts a server
+    // for one session. The ACP path is wired for the Google account source.
+    let bus = high
+        && req.bus.is_some()
+        && s.provider == "google"
+        && image_account_settings(&native_settings(&sys)).is_ok();
+    if !req.images.is_empty() || bus {
         // ACP reads permissions from its actual settings file. Root
         // --settings overrides are not propagated into the ACP server.
         // Reuse the same persistent root as text turns for session continuity.

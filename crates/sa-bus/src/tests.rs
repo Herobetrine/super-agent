@@ -106,7 +106,7 @@ async fn http_round_trip_requires_a_live_grant() {
     use rmcp::transport::StreamableHttpClientTransport;
     use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
     let fx = fixture();
-    let bus = CollabBus::start(fx.dir.path()).await.unwrap();
+    let bus = CollabBus::start(fx.dir.path(), None).await.unwrap();
     let grant = bus.grant(1, 2, 3, "codex").unwrap();
     let connect = |token: String| {
         let config = StreamableHttpClientTransportConfig::with_uri(bus.url().to_string()).auth_header(token);
@@ -115,7 +115,7 @@ async fn http_round_trip_requires_a_live_grant() {
     let client = connect(grant.token.clone()).await.unwrap();
     assert!(client.peer_info().unwrap().instructions.as_deref().unwrap().contains("collaboration bus"));
     let names: Vec<String> = client.list_all_tools().await.unwrap().into_iter().map(|t| t.name.to_string()).collect();
-    assert_eq!(names, ["roster", "send", "inbox", "publish"]);
+    assert_eq!(names, ["roster", "send", "inbox", "tools", "call", "publish"]);
     let call = |name: &'static str, args: Value| {
         let mut params = rmcp::model::CallToolRequestParams::new(name);
         params.arguments = args.as_object().cloned();
@@ -129,4 +129,28 @@ async fn http_round_trip_requires_a_live_grant() {
     let denied = call("roster", json!({})).await;
     assert!(denied.is_err(), "a revoked token must be refused");
     client.cancel().await.unwrap();
+}
+
+/// The bus adds tool definitions and instructions to every harness's prompt
+/// prefix. They must be identical across turns, grants and tickets, or each
+/// turn would miss the provider prompt cache.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prompt_visible_definitions_are_byte_stable_across_grants() {
+    use rmcp::ServiceExt;
+    use rmcp::transport::StreamableHttpClientTransport;
+    use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
+    let fx = fixture();
+    let bus = CollabBus::start(fx.dir.path(), None).await.unwrap();
+    let mut seen = vec![];
+    for (ticket, job, turn, agent) in [(1, 2, 3, "codex"), (1, 3, 1, "antigravity"), (2, 4, 1, "codex")] {
+        let grant = bus.grant(ticket, job, turn, agent).unwrap();
+        let config = StreamableHttpClientTransportConfig::with_uri(bus.url().to_string()).auth_header(grant.token.clone());
+        let client = ().serve(StreamableHttpClientTransport::from_config(config)).await.unwrap();
+        let tools = serde_json::to_string(&client.list_all_tools().await.unwrap()).unwrap();
+        let instructions = client.peer_info().unwrap().instructions.clone().unwrap();
+        assert!(!tools.contains(&grant.token) && !instructions.contains(&grant.token));
+        seen.push((tools, instructions));
+        client.cancel().await.unwrap();
+    }
+    assert!(seen.windows(2).all(|w| w[0] == w[1]), "definitions must not vary per grant");
 }

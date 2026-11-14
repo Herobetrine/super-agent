@@ -35,8 +35,18 @@
 | `send` | `to`（任务编号，或 `lead` / `parent`），`body` | 以调用者身份写入目标任务的信箱。目标正在运行时，支持轮中插入的执行端会立即收到；目标在等待时会被唤醒 |
 | `inbox` | 无 | 返回调用者未读的消息并标记已读 |
 | `publish` | `id`，`summary` | 发布阶段性成果，等同 `SA_PROGRESS`，界面与其他协作者可立即看到 |
+| `tools` | 可选 `server`、`tool` | 列出本工单已授权、当前可用的 MCP 工具（描述只给预览）；指定服务与工具时返回完整描述和参数 schema |
+| `call` | `server`，`tool`，`arguments` | 在调用者本轮内同步调用一个已授权工具并返回结果 |
 
 每个工具结果都附带调用者当前的未读数，提示 agent 读取，避免反复空轮询。
+
+### 工具开放给所有 agent
+
+此前 MCP 工具只进入主控的上下文（`project_extensions.mcp` 仅在根任务填入），子任务无法使用；技能正文已对所有任务下发。总线的 `tools` / `call` 让每个挂载总线的任务都能用工单授权的工具，检查与 `SA_TOOL` 相同：工单授权范围、服务启用且版本未变、工作目录范围、私有连接池；调用记录为调用任务名下的 `mcp.started` / `mcp.result`（`via: bus`）。区别是结果在本轮内直接返回，不写 `SA_TOOL` 回执、不触发额外一轮。总线没有审批通道，因此只在完全访问 / 自动档位允许 `call`；其他档位仍由主控用 `SA_TOOL` 走审批。
+
+### 缓存命中
+
+总线进入各执行端提示前缀的只有固定的 6 个工具定义和一段说明。它们不含令牌、任务号、未读数等每轮变化的数据，测试会逐字节比较不同任务、不同工单拿到的定义。工单的 MCP 工具不逐个注册成执行端工具（那会让工具目录变化直接改变每个 agent 的前缀，也会在目录很大时占满上下文），而是通过固定的 `tools` / `call` 按需查询，与平台“按需读取 MCP 参数”的做法一致。令牌放在 HTTP 请求头里，不进入提示。
 
 第 2 阶段计划：`ask` / `reply`（带超时的同步问答与循环等待检测）、`claim` / `release`（文件声明与冲突通知）。
 
@@ -56,11 +66,11 @@
 
 - **Claude Code 2.1.323**：MCP 工具默认被延迟到工具搜索之后，模型看不到就不会用；服务配置加 `"alwaysLoad": true`、工具加 `_meta` 的 `anthropic/alwaysLoad` 后，总线工具直接出现在模型请求里。令牌用 `headers` 中的 `${SA_BUS_TOKEN}` 从子进程环境展开。`--mcp-config '{"mcpServers":{"sa_bus":{"type":"http","url":…,"headers":{…}}}}'` 可在 `--strict-mcp-config` 下挂载，工具名为 `mcp__sa_bus__<tool>`。`--safe-mode` 会关闭全部 MCP，因此受限档位（当前使用 `--safe-mode`）无法挂载；去掉 `--safe-mode`、保留 `--tools` 限制与 `--setting-sources ""` 时可以挂载。`dontAsk` 权限模式下需要 `--allowedTools mcp__sa_bus__*` 放行。
 - **Codex 0.169.0**：`-c mcp_servers.sa_bus.url="…"` 被识别为 `streamable_http`，支持 `bearer_token_env_var` 从子进程环境读取令牌。Codex 把整个服务作为一个 `namespace` 工具（`mcp__sa_bus`，内含 `roster`/`send`/`inbox`/`publish`）发给模型，并用服务的 `instructions` 作为命名空间说明，因此总线引导文字能直接送达模型。
-- **agy**：受限档位当前禁止 `mcp(*)`，需要单独放行总线（第 3 阶段）。
-- **DeepSeek Harness**：MCP 配置方式待核实（第 3 阶段）。
-- **ACP 服务**：`session/new` 的 `mcpServers` 参数原生支持（第 3 阶段）。
+- **agy**：`--settings` 拒绝 `mcpServers`（`unknown setting`），`agy mcp add` 会写入用户的 `~/.gemini/config/mcp_config.json`，都不适合按次挂载。完全访问 / 自动档位、Google 账号来源的轮次改走已有的 `agy acp` 通道，在 `session/new` / `session/load` 的 `mcpServers` 中传入总线（令牌放在 stdio 上的请求里，不上命令行）。API 与 ADC 来源的 ACP 认证尚未接入，这些来源暂不挂载。agy 通过通用的 `call_mcp_tool` 调用 MCP 工具，init 中不逐个列出工具名。
+- **DeepSeek Harness 0.2.2-rc.1**：在平台本就生成的 `--patch` 策略文件中追加 `@deepseek-ai/dsh-mcp-client` 条目（`transport: streamable-http`，`Authorization` 头用 `!!js` 从子进程环境读取令牌）。工具名同样是 `mcp__sa_bus__<tool>`，服务说明会进入系统提示。
+- **通用 ACP 服务**：协议支持 `mcpServers`，平台的通用 ACP 执行端尚未传入（后续）。
 
-第 1 阶段原型只在**完全访问 / 自动**档位为 Claude 与 Codex 挂载总线。受限档位是否为总线去掉 `--safe-mode` 需要单独评估：`--safe-mode` 还关闭了其他扩展点，总线本身不触碰文件系统，但改动该参数会改变受限档位的安全边界。
+当前只在**完全访问 / 自动**档位挂载总线（Claude、Codex、DeepSeek Harness、Google 账号来源的 agy）。受限档位是否为总线去掉 `--safe-mode` 需要单独评估：`--safe-mode` 还关闭了其他扩展点，总线本身不触碰文件系统，但改动该参数会改变受限档位的安全边界。
 
 ## 安全
 
@@ -89,9 +99,13 @@
   - +16.2 s 工作者 `inbox` 读到；
   - +19.3 s 工作者 `publish` 结果。
   两轮分别在 40 s、41 s 内结束，工作者最终回复正确暗号。一次完整问答约 16 s，全部发生在两个任务各自的轮中，没有经过轮末回报或主控转派。延迟主要由轮询间隔（提示词中的 `sleep 5`）和单步模型响应时间决定。
+- **跨执行端实测（计费，2026-11-14）**：通用配对测试 `live_pair_exchanges_a_code_word`，用 `SA_LIVE_BUS_KEEPER` / `SA_LIVE_BUS_WORKER` 指定执行端、来源和模型（格式见测试源码），宿主与引擎一样把未读消息交给执行端做轮中推送。
+  - Claude 持有者 ↔ Codex 工作者（都用大核桃 `deepseek-v4.1-flash`，Codex 经自定义供应商直连大核桃的 Responses 接口）：+0.0 s Codex `send`，+8.1 s Claude 读到，+13.8 s Claude 回复，+14.2 s Codex 收到（距回复 0.4 s，与 `turn/steer` 轮中推送一致；当时 `inbox` 与推送的已读记录尚未区分，现在分别记为 `via: bus` / `via: native`），+52.0 s Codex 发布结果。两轮分别用时 59 s、146 s，工作者回复正确暗号。
+  - Claude 持有者 ↔ DeepSeek Harness 工作者：DeepSeek Harness 经 `dsh-mcp-client` 连上总线并发出请求（发送者 `deepseek (#2)`），但从启动到第一次 `send` 用了约 11 分钟，持有者已按提示结束轮询，测试被手动终止。挂载已验证，协作往返未验证。
+  - agy：当天 agy 无法完成请求，未实测；ACP 挂载只有离线编译与代码路径，没有真实验证。
 - 同一天先用 `gemini-4-hydrogen` 实测失败：上游返回 500、404、429（额度耗尽）和超时，两个任务都停在第一次模型请求，与总线无关。
 
-未验证：Codex 与 Claude 跨执行端的真实协作（Codex 需经 CC Switch 路由到支持的模型）；由主控派工产生的真实工单中，模型是否会在没有明确指令时主动使用总线；更长任务中的消息量与 Token 成本。
+未验证：agy 与 DeepSeek Harness 的完整协作往返；由主控派工产生的真实工单中，模型是否会在没有明确指令时主动使用总线；更长任务中的消息量与 Token 成本。
 
 ## 验证计划
 

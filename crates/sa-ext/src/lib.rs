@@ -24,8 +24,10 @@ pub mod mcp;
 pub mod skills;
 pub mod validate;
 
+mod direct;
 mod directory;
 mod invoke;
+pub use direct::DirectCaller;
 mod pool;
 
 use anyhow::{Result, bail, ensure};

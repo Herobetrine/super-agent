@@ -58,7 +58,7 @@ impl Inner {
         self.db.with(|q| current(q, a))
     }
 
-    fn binding(
+    pub(crate) fn binding(
         &self,
         a: &InvokeArgs,
         server: &str,
@@ -68,7 +68,7 @@ impl Inner {
     }
 
     /// Store an oversized result as an immutable object (X:358-366).
-    fn store_object(&self, raw: &str) -> Result<Value> {
+    pub(crate) fn store_object(&self, raw: &str) -> Result<Value> {
         let sha256 = digest(raw);
         let folder = self.data_dir.join("context-objects");
         std::fs::create_dir_all(&folder)?;

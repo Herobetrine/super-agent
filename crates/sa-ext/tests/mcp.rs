@@ -1160,3 +1160,50 @@ async fn changing_ticket_directory_during_approval_cannot_issue_a_call() {
     f.engine.close().await;
     f.ext.close();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bus_callers_reach_ticket_tools_from_any_task_within_their_turn() {
+    use sa_ext::DirectCaller;
+    let f = fx(Arc::new(|_| "unused".into()));
+    let server = f.stdio_server();
+    f.ext.probe(&server).await.unwrap();
+    let (ticket, root) = f.ticket("full", json!({"skills": [], "servers": [server]})).await;
+    // A running child task: before the bus only the root saw MCP tools.
+    let child = f
+        .engine
+        .db()
+        .with(|q| {
+            q.run(
+                "INSERT INTO jobs(ticket,parent,agent,body,writing,depth,turn,state) VALUES(?,?,'codex','child',0,1,1,'running')",
+                &[&ticket, &root],
+            )?;
+            Ok(q.conn().last_insert_rowid())
+        })
+        .unwrap();
+    let caller = DirectCaller { ticket, job: child, turn: 1 };
+    let listed = f.ext.catalog_for(&caller, None, None).unwrap();
+    let names: Vec<&str> = listed["tools"].as_array().unwrap().iter().filter_map(|t| t["tool"].as_str()).collect();
+    assert!(names.contains(&"challenge"));
+    assert!(listed["tools"][0].get("input_schema").is_none(), "listing stays a short preview");
+    let one = f.ext.catalog_for(&caller, Some(&server), Some("challenge")).unwrap();
+    assert!(one["tools"][0]["input_schema"].is_object());
+    let cancel = CancellationToken::new();
+    let result = f.ext.call_direct(&caller, &server, "challenge", &json!({}), &cancel).await.unwrap();
+    assert_eq!(result, json!({"content": [{"type": "text", "text": SECRET}]}));
+    assert!(f.ext.call_direct(&caller, &server, "not-granted", &json!({}), &cancel).await.is_err());
+    let events = f.sql("SELECT kind,job,payload FROM events WHERE kind LIKE 'mcp.%' ORDER BY seq");
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[1]["job"], json!(child));
+    assert!(events[1]["payload"].as_str().unwrap().contains(r#""via":"bus""#));
+    // An ended turn and a read-only ticket are refused.
+    let stale = DirectCaller { ticket, job: child, turn: 2 };
+    assert!(f.ext.call_direct(&stale, &server, "challenge", &json!({}), &cancel).await.is_err());
+    let (readonly, readonly_root) = f.ticket("readonly", json!({"skills": [], "servers": [server]})).await;
+    f.run_job(readonly_root);
+    let reader = DirectCaller { ticket: readonly, job: readonly_root, turn: 1 };
+    assert!(f.ext.catalog_for(&reader, None, None).is_err());
+    assert!(f.ext.call_direct(&reader, &server, "challenge", &json!({}), &cancel).await.is_err());
+    assert_eq!(f.calls(".calls").as_deref(), Some("1\n"));
+    f.engine.close().await;
+    f.ext.close();
+}

@@ -115,7 +115,7 @@ async fn claude_full_access_turn_sends_through_the_bus() {
         Ok(())
     })
     .unwrap();
-    let bus = CollabBus::start(data.path()).await.unwrap();
+    let bus = CollabBus::start(data.path(), None).await.unwrap();
     let grant = bus.grant(1, 2, 1, "claude");
 
     let home = tempfile::tempdir().unwrap();
@@ -239,7 +239,7 @@ async fn codex_full_access_turn_sends_through_the_bus() {
         Ok(())
     })
     .unwrap();
-    let bus = CollabBus::start(data.path()).await.unwrap();
+    let bus = CollabBus::start(data.path(), None).await.unwrap();
     let grant = bus.grant(1, 2, 1, "codex");
     let (port, seen) = responses();
     let home = tempfile::tempdir().unwrap();
@@ -286,83 +286,195 @@ async fn codex_full_access_turn_sends_through_the_bus() {
     assert_eq!(notes[0]["sender"], "codex (#2)");
 }
 
-/// Billable: two real Claude turns on one CC Switch source talk over the bus.
-/// Opt-in: `SA_LIVE_BUS=<CC Switch source label>,<model>`, e.g.
-/// `大核桃 · claude,gemini-4-hydrogen`. Prints the journal timeline.
+/// Engine-like host: hands unread mailbox notes to adapters that can steer
+/// them into a running turn (Codex `turn/steer`) and records acceptance.
+struct DbHost {
+    db: Arc<Db>,
+    job: i64,
+}
+
+impl TurnHost for DbHost {
+    fn approve(&self, _action: Value) -> BoxFuture<'static, bool> {
+        Box::pin(async { true })
+    }
+    fn pending_notes(&self) -> Vec<Value> {
+        self.db
+            .with(|q| q.notes(self.job, true))
+            .unwrap_or_default()
+            .into_iter()
+            .map(|n| json!({"seq": n["seq"], "sender": n["sender"], "body": n["body"]}))
+            .collect()
+    }
+    fn accept_notes(&self, seqs: &[i64]) {
+        let who = sa_engine::db::Who { ticket: 1, id: self.job, turn: 1 };
+        let _ = self.db.tx(|q| q.accept(who, seqs));
+    }
+}
+
+/// `<agent>|<catalog source label or id>|<model>` or
+/// `<agent>|custom=<base_url>=<KEY_ENV>|<model>`.
+struct Side {
+    agent: String,
+    adapter: Arc<dyn Adapter>,
+    provider: String,
+    model: String,
+}
+
+async fn side(spec: &str) -> Side {
+    let mut parts = spec.splitn(3, '|');
+    let (agent, source, model) = (
+        parts.next().unwrap(),
+        parts.next().expect("source"),
+        parts.next().expect("model"),
+    );
+    let mut sys = Sys::from_process();
+    // This test may run inside another Claude session; keep its session wiring out.
+    sys.retain(|k| {
+        let k = k.to_ascii_uppercase();
+        !k.starts_with("CLAUDE_CODE_") && !k.starts_with("ANTHROPIC_")
+    });
+    let (label, customs) = match source.strip_prefix("custom=") {
+        Some(rest) => {
+            let (base_url, key_env) = rest.rsplit_once('=').expect("custom=<base_url>=<KEY_ENV>");
+            let provider = sa_store::providers::CustomProvider {
+                id: "live-bus".into(),
+                agent: agent.into(),
+                name: "live-bus".into(),
+                base_url: base_url.into(),
+                key_env: key_env.into(),
+                models: vec![model.into()],
+                enabled: true,
+            };
+            ("live-bus".to_string(), vec![provider])
+        }
+        None => (source.to_string(), vec![]),
+    };
+    let registry = sa_adapters::custom::registry(customs);
+    let adapter: Arc<dyn Adapter> = match agent {
+        "claude" => Arc::new(Claude::with_registry(sys, registry)),
+        "codex" => Arc::new(sa_adapters::codex::Codex::with_registry(sys, registry)),
+        "deepseek" => Arc::new(sa_adapters::deepseek::DeepSeek::with_registry(sys, registry)),
+        "antigravity" => Arc::new(sa_adapters::antigravity::Antigravity::new(sys)),
+        other => panic!("unsupported agent {other}"),
+    };
+    let catalog = adapter.catalog().await.unwrap().value;
+    let provider = catalog["providers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| {
+            p["id"] == label.as_str()
+                || p["label"] == label.as_str()
+                || p["label"].as_str().is_some_and(|l| l.starts_with(&format!("{label} ")))
+        })
+        .unwrap_or_else(|| panic!("source {label} not found for {agent}"))["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    Side {
+        agent: agent.into(),
+        adapter,
+        provider,
+        model: model.into(),
+    }
+}
+
+/// Billable: two real harness turns exchange a code word over the bus.
+/// Opt-in: `SA_LIVE_BUS_KEEPER` and `SA_LIVE_BUS_WORKER`, each in the
+/// [`side`] format, e.g. `claude|大核桃 · claude|deepseek-v4.1-flash`.
+/// Prints the journal timeline.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn live_two_claude_turns_exchange_a_code_word() {
-    let Ok(spec) = std::env::var("SA_LIVE_BUS") else {
-        eprintln!("set SA_LIVE_BUS=<source label>,<model> for a billable bus collaboration run");
+async fn live_pair_exchanges_a_code_word() {
+    let (Ok(keeper), Ok(worker)) = (
+        std::env::var("SA_LIVE_BUS_KEEPER"),
+        std::env::var("SA_LIVE_BUS_WORKER"),
+    ) else {
+        eprintln!("set SA_LIVE_BUS_KEEPER and SA_LIVE_BUS_WORKER for a billable bus collaboration run");
         return;
     };
-    let (label, model) = spec.split_once(',').expect("label,model");
+    let (keeper, worker) = (side(&keeper).await, side(&worker).await);
     let data = tempfile::tempdir().unwrap();
     let work = tempfile::tempdir().unwrap();
-    let db = Db::open(data.path()).unwrap();
+    let db = Arc::new(Db::open(data.path()).unwrap());
     db.with(|q| {
-        q.conn().execute_batch(
-            "INSERT INTO tickets(id,goal,cwd,writes,lead,created) VALUES(1,'bus live test','c',0,'claude',0);
-             INSERT INTO jobs(id,ticket,parent,agent,body,writing,depth,turn,state,role) VALUES
+        q.conn().execute(
+            "INSERT INTO tickets(id,goal,cwd,writes,lead,created) VALUES(1,'bus live test','c',0,'claude',0)",
+            [],
+        )?;
+        q.conn().execute(
+            "INSERT INTO jobs(id,ticket,parent,agent,body,writing,depth,turn,state,role) VALUES
                (1,1,NULL,'claude','lead',0,0,1,'waiting','lead'),
-               (2,1,1,'claude','worker',0,1,1,'running','worker'),
-               (3,1,1,'claude','keeper',0,1,1,'running','keeper');",
+               (2,1,1,?1,'worker',0,1,1,'running','worker'),
+               (3,1,1,?2,'keeper',0,1,1,'running','keeper')",
+            [&worker.agent, &keeper.agent],
         )?;
         Ok(())
     })
     .unwrap();
-    let bus = CollabBus::start(data.path()).await.unwrap();
-    let mut sys = Sys::from_process();
-    // This test may run inside another Claude session; keep its session wiring out.
-    sys.retain(|k| !k.to_ascii_uppercase().starts_with("CLAUDE_CODE_") && !k.to_ascii_uppercase().starts_with("ANTHROPIC_"));
-    let adapter = Arc::new(Claude::new(sys));
-    let catalog = adapter.catalog().await.unwrap().value;
-    let provider = catalog["providers"].as_array().unwrap().iter()
-        .find(|p| p["label"] == label)
-        .unwrap_or_else(|| panic!("source {label} not found"))["id"].as_str().unwrap().to_string();
+    let bus = CollabBus::start(data.path(), None).await.unwrap();
     let keeper_prompt = "You are task #3 in a multi-agent ticket and you hold the code word TANGERINE-42. \
         Another task will ask you for it over the collaboration bus (the sa_bus MCP tools). \
         Loop: call sa_bus `inbox`; if no request arrived, run the shell command `sleep 5` and check again, at most 12 times. \
+        A message may also be delivered to you directly while you work. \
         When a message asks for the code word, call sa_bus `send` with `to` set to the sender's task number and the body `CODE WORD: TANGERINE-42`, then stop and reply `delivered`.";
     let worker_prompt = "You are task #2 in a multi-agent ticket. Task #3 holds a code word you need. \
         Use the collaboration bus (the sa_bus MCP tools): call `send` with to=3 asking for the code word, \
         then call `inbox`; if the answer has not arrived, run the shell command `sleep 5` and call `inbox` again, at most 12 times. \
+        A reply may also be delivered to you directly while you work. \
         When you have it, call `publish` with id `codeword` and the code word as summary, then reply with the code word only.";
-    let run = |job: i64, prompt: &'static str| {
-        let adapter = adapter.clone();
+    let run = |side: &Side, job: i64, prompt: &'static str| {
+        let adapter = side.adapter.clone();
+        let host = Arc::new(DbHost { db: db.clone(), job });
         let request = RunRequest {
             ticket: 1,
             job,
             turn: 1,
-            agent: "claude".into(),
+            agent: side.agent.clone(),
             prompt: prompt.into(),
             images: vec![],
             cwd: work.path().into(),
-            route: Route { provider: provider.clone(), model: model.into(), mode: "cli".into(), reasoning_effort: None },
+            route: Route {
+                provider: side.provider.clone(),
+                model: side.model.clone(),
+                mode: "cli".into(),
+                reasoning_effort: None,
+            },
             profile: "full".into(),
             writable: true,
             session_id: None,
-            bus: bus.grant(1, job, 1, "claude"),
+            bus: bus.grant(1, job, 1, &side.agent),
         };
         async move {
             let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
             let started = std::time::Instant::now();
-            let outcome = adapter.run(request, Arc::new(Host), tx, CancellationToken::new()).await;
+            let outcome = adapter.run(request, host, tx, CancellationToken::new()).await;
             (outcome.map(|o| o.text).map_err(|e| e.message), started.elapsed())
         }
     };
-    let keeper = run(3, keeper_prompt);
-    let worker = async {
+    let keeper_run = run(&keeper, 3, keeper_prompt);
+    let worker_run = async {
         // Let the keeper start polling first, as a running collaborator would.
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-        run(2, worker_prompt).await
+        run(&worker, 2, worker_prompt).await
     };
-    let ((keeper_out, keeper_time), (worker_out, worker_time)) = tokio::join!(keeper, worker);
-    eprintln!("KEEPER {keeper_time:?} {keeper_out:?}");
-    eprintln!("WORKER {worker_time:?} {worker_out:?}");
-    let timeline = db.with(|q| q.all("SELECT seq,ts,job,kind,payload FROM events ORDER BY seq", &[])).unwrap();
+    let ((keeper_out, keeper_time), (worker_out, worker_time)) = tokio::join!(keeper_run, worker_run);
+    eprintln!("KEEPER {} {keeper_time:?} {keeper_out:?}", keeper.agent);
+    eprintln!("WORKER {} {worker_time:?} {worker_out:?}", worker.agent);
+    let timeline = db
+        .with(|q| q.all("SELECT seq,ts,job,kind,payload FROM events ORDER BY seq", &[]))
+        .unwrap();
     let t0 = timeline.first().and_then(|r| r["ts"].as_f64()).unwrap_or_default();
     for row in &timeline {
-        eprintln!("EVENT +{:.1}s job={} {} {}", row["ts"].as_f64().unwrap_or_default() - t0, row["job"], row["kind"].as_str().unwrap_or_default(), row["payload"].as_str().unwrap_or_default());
+        eprintln!(
+            "EVENT +{:.1}s job={} {} {}",
+            row["ts"].as_f64().unwrap_or_default() - t0,
+            row["job"],
+            row["kind"].as_str().unwrap_or_default(),
+            row["payload"].as_str().unwrap_or_default()
+        );
     }
-    assert!(worker_out.as_deref().is_ok_and(|t| t.contains("TANGERINE-42")), "worker did not obtain the code word");
+    assert!(
+        worker_out.as_deref().is_ok_and(|t| t.contains("TANGERINE-42")),
+        "worker did not obtain the code word"
+    );
 }

@@ -18,6 +18,7 @@ http = "1"
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio", "service"] }
 sa-engine = { path = "../sa-engine" }
+sa-ext = { path = "../sa-ext" }
 
 [dev-dependencies]
 tempfile.workspace = true

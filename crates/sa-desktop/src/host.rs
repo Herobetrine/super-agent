@@ -430,7 +430,7 @@ impl Host {
                     let bus = if std::env::var("SA_COLLAB_BUS").is_ok_and(|v| v == "0") {
                         None
                     } else {
-                        sa_bus::CollabBus::start(&dir).await.ok()
+                        sa_bus::CollabBus::start(&dir, Some(ext.clone())).await.ok()
                     };
                     let engine = match open_engine(&dir, adapters.clone(), &for_thread, &ext, bus) {
                         Ok(e) => e,
