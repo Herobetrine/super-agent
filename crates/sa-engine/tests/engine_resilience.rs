@@ -264,3 +264,57 @@ async fn pass_through_runner_keeps_the_legacy_auto_root_retry() {
     assert_eq!(retries[0]["after_seconds"], json!(2));
     assert_eq!(fx.all("SELECT seq FROM events WHERE kind='turn.retry_scheduled'").len(), 0);
 }
+
+fn native_exhausted() -> AdapterError {
+    let mut error = classify::from_http_status(503, None);
+    error.code = Some("native:retry_exhausted:http:503".into());
+    error
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn native_retry_exhausted_stops_legacy_and_resilient_auto_roots() {
+    for legacy in [true, false] {
+        let options = if legacy {
+            EngineOptions { runner: Arc::new(PassThroughRunner::default()), ..quiet() }
+        } else {
+            let mut rotation = HashMap::new();
+            rotation.insert("claude".into(), vec![route("test-local", "default"), route("other", "foreign")]);
+            EngineOptions { rotation: Arc::new(StaticRotation(rotation)), ..resilient(fast()) }
+        };
+        let fx = Fx::with(script(|_| async { Err(native_exhausted()) }), t1_catalog(), options);
+        let ticket = fx.begin(CreateParams::new("fixture", &fx.project).profile("auto")).await;
+        fx.finish(ticket, "failed").await;
+        for _ in 0..4 { fx.engine.step(); }
+        assert_eq!(fx.shared.count(|_| true), 1, "legacy={legacy}");
+        assert_eq!(fx.int("SELECT count(*) FROM events WHERE kind IN ('auto.retry','turn.retry_scheduled','route.rotated','turn.route_wait')"), 0);
+        assert_eq!(fx.int("SELECT count(*) FROM events WHERE kind='turn.gave_up'"), i64::from(!legacy));
+        assert_eq!(fx.int("SELECT count(*) FROM events WHERE kind='failed'"), 1);
+        fx.engine.close().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn resilient_native_retry_exhausted_child_reports_failure_without_retry_or_rotation() {
+    let mut rotation = HashMap::new();
+    rotation.insert("deepseek".into(), vec![route("test-local", "default"), route("other", "foreign")]);
+    let fx = Fx::with(script(|c| async move {
+        if c.depth() > 0 {
+            return Err(native_exhausted());
+        }
+        if c.turn() == 1 {
+            return Ok(send(json!({})));
+        }
+        Ok("native exhausted receipt retained".into())
+    }), t1_catalog(), EngineOptions {
+        rotation: Arc::new(StaticRotation(rotation)), ..resilient(fast())
+    });
+    let ticket = fx.begin(fx.params()).await;
+    fx.finish(ticket, "partial").await;
+    assert_eq!(fx.shared.count(|c| c.packet["depth"] == 1), 1);
+    assert_eq!(fx.int("SELECT count(*) FROM events WHERE kind IN ('auto.retry','turn.retry_scheduled','route.rotated','turn.route_wait')"), 0);
+    let failures = payloads(&fx, "SELECT payload FROM events WHERE kind='turn.gave_up'");
+    assert_eq!(failures.len(), 1);
+    assert_eq!(failures[0]["code"], "native:retry_exhausted:http:503");
+    assert_eq!(fx.int("SELECT count(*) FROM jobs WHERE parent IS NOT NULL AND state='failed'"), 1);
+    fx.engine.close().await;
+}

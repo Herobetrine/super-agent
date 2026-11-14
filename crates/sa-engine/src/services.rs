@@ -116,7 +116,7 @@ impl Snapshotter for FsSnapshotter {
 
 fn snapshot_files(project: &Path, names: &[String], directory: &Path) -> Result<Value> {
     ensure!(names.len() <= 16, "单次最多附加 16 个文件");
-    let root = project.canonicalize()?;
+    let root = project.canonicalize().context("附件项目目录无法读取")?;
     fs::create_dir_all(directory)?;
     let mut total = 0usize;
     let mut manifest = vec![];
@@ -128,7 +128,15 @@ fn snapshot_files(project: &Path, names: &[String], directory: &Path) -> Result<
                 && !name.contains(':'),
             "只接受项目内相对路径"
         );
-        let path = root.join(rel).canonicalize()?;
+        let path = root.join(rel).canonicalize().map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                anyhow::anyhow!(
+                    "附件不存在或链接目标缺失：{name}。SA_SEND.files 仅接受已存在的输入附件；新建文件的输出路径请写在 body 中，不要加入 files。"
+                )
+            } else {
+                anyhow::anyhow!("附件路径无法解析：{name}（{error}）")
+            }
+        })?;
         ensure!(
             path.starts_with(&root) && path.is_file(),
             "附件位于项目外或并非普通文件"

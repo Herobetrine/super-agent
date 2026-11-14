@@ -11,7 +11,7 @@ use std::{path::PathBuf, sync::Arc, time::Duration};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-pub const AGENTS: [&str; 4] = ["codex", "claude", "deepseek", "antigravity"];
+pub const AGENTS: [&str; 5] = ["codex", "claude", "deepseek", "antigravity", "acp"];
 
 /// `{provider, model, mode}` selection (spec §6.4).
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -118,6 +118,12 @@ pub struct AdapterError {
 }
 
 impl AdapterError {
+    /// The native harness already exhausted its own bounded retries. This
+    /// trusted adapter code prevents multiplying the same failed work again.
+    pub fn native_retry_exhausted(&self) -> bool {
+        self.code.as_deref().is_some_and(|c| c.starts_with("native:retry_exhausted:"))
+    }
+
     pub fn new(class: ErrorClass, message: impl Into<String>) -> Self {
         Self {
             class,
@@ -148,6 +154,13 @@ pub struct Catalog {
 pub trait Adapter: Send + Sync {
     fn agent(&self) -> &'static str;
     fn catalog(&self) -> BoxFuture<'static, anyhow::Result<Catalog>>;
+    /// Refresh capabilities for an already selected execution route. Adapters
+    /// may narrow discovery while preserving live source and model validation.
+    /// `None` preserves the engine's shared full-catalog fallback. Complete
+    /// delegation menus and manual refreshes continue to use `catalog`.
+    fn catalog_for_route(&self, _route: Route) -> Option<BoxFuture<'static, anyhow::Result<Catalog>>> {
+        None
+    }
     fn run(
         &self,
         request: RunRequest,

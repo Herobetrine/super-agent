@@ -40,7 +40,11 @@ impl Codex {
         Self::with_registry(sys, custom::registry(vec![]))
     }
 
-    pub fn with_registry(sys: Sys, registry: Registry) -> Self {
+    pub fn with_registry(mut sys: Sys, registry: Registry) -> Self {
+        // The desktop's registered-Core launch context does not belong to an
+        // independently spawned CLI. Keep this override local to Codex so its
+        // discovery probes and turns use the same sandbox-capable environment.
+        sys.remove("CODEX_WINDOWS_REGISTERED_CORE");
         Self { sys, registry }
     }
 }
@@ -812,6 +816,41 @@ fn request_key(id: &Value) -> String {
 mod tests {
     use super::*;
     use std::sync::Mutex as StdMutex;
+
+    #[test]
+    fn independent_cli_drops_only_registered_core_context() {
+        let original = Sys::new(
+            vec![
+                ("CODEX_WINDOWS_REGISTERED_CORE".into(), "1".into()),
+                (
+                    "CODEX_WINDOWS_SANDBOX_PACKAGE_FAMILY".into(),
+                    "test-family".into(),
+                ),
+                ("CODEX_HOME".into(), "test-home".into()),
+                ("PATH".into(), "test-path".into()),
+                ("PROVIDER_KEY".into(), "test-credential".into()),
+            ],
+            "test-home".into(),
+            "test-temp".into(),
+        );
+        let codex = Codex::new(original.clone());
+        assert_eq!(original.get("CODEX_WINDOWS_REGISTERED_CORE"), Some("1"));
+        assert_eq!(codex.sys.get("CODEX_WINDOWS_REGISTERED_CORE"), None);
+        let expected: Vec<_> = original
+            .vars()
+            .iter()
+            .filter(|(key, _)| key != "CODEX_WINDOWS_REGISTERED_CORE")
+            .cloned()
+            .collect();
+        assert_eq!(codex.sys.vars(), expected);
+        assert_eq!(codex.sys.home, original.home);
+        assert_eq!(codex.sys.temp, original.temp);
+        let restricted = policy("readonly", false).unwrap();
+        assert_eq!(
+            (restricted.sandbox, restricted.review),
+            ("read-only", "never")
+        );
+    }
 
     /// Fake app-server (T: adapters-codex.test.cjs peer).
     const PEER: &str = r#"

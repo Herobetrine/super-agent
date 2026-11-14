@@ -1,5 +1,6 @@
 //! Native input blocks for documented Codex app-server and Claude stream-JSON
-//! protocols. Only validated snapshot bytes enter these blocks.
+//! protocols; Antigravity uses verified ACP image capabilities. Only validated
+//! snapshot bytes enter these blocks.
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use sa_engine::{
@@ -97,7 +98,7 @@ mod tests {
             check(&req)
                 .unwrap_err()
                 .message
-                .contains("Codex 或 Claude Code")
+                .contains("Codex、Claude Code 或 Antigravity")
         );
         req.images.clear();
         assert!(check(&req).is_ok());

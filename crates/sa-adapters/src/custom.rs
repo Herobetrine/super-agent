@@ -10,6 +10,7 @@
 use crate::common::local_host;
 use crate::sys::Sys;
 use anyhow::{Result, anyhow, bail};
+use futures::{StreamExt, stream};
 pub use sa_store::providers::CustomProvider;
 use sa_store::providers::{MAX_MODELS, ROUTE_PREFIX, valid_model_id, validate};
 use serde_json::{Map, Value, json};
@@ -330,14 +331,26 @@ pub async fn refresh(
         .flat_map(|p| p["models"].as_array().into_iter().flatten().cloned())
         .collect();
     merge(catalog, customs, sys);
-    for p in customs {
+    let probes: Vec<_> = customs
+        .iter()
+        .filter(|p| {
+            catalog["providers"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|row| row["id"] == p.route_id() && row["custom"] == true)
+        })
+        .map(|p| async move { (p, probe_catalog(p, sys, cancel).await) })
+        .collect();
+    let results = stream::iter(probes).buffered(4).collect::<Vec<_>>().await;
+    for (p, result) in results {
         let Some(row) = catalog["providers"].as_array_mut().and_then(|ps| {
             ps.iter_mut()
                 .find(|r| r["id"] == p.route_id() && r["custom"] == true)
         }) else {
             continue;
         };
-        match probe_catalog(p, sys, cancel).await {
+        match result {
             Ok(mut models) => {
                 crate::catalog::supplement(&mut models, &metadata);
                 if p.agent == "claude" {
@@ -390,6 +403,167 @@ mod tests {
             models: vec!["m-a".into(), "m-b".into()],
             enabled: true,
         }
+    }
+
+    /// Neither origin responds until both requests have arrived. A sequential
+    /// refresh therefore times out instead of passing through a timing threshold.
+    async fn paired_catalogs(
+        responses: [(u16, Value); 2],
+    ) -> ([String; 2], tokio::task::JoinHandle<[String; 2]>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::{TcpListener, TcpStream};
+
+        async fn receive(listener: TcpListener) -> (TcpStream, String) {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                let mut byte = [0];
+                assert_eq!(socket.read(&mut byte).await.unwrap(), 1);
+                request.push(byte[0]);
+                assert!(request.len() < 16 * 1024);
+            }
+            (socket, String::from_utf8(request).unwrap())
+        }
+
+        let first = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let second = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bases = [
+            format!("http://{}", first.local_addr().unwrap()),
+            format!("http://{}", second.local_addr().unwrap()),
+        ];
+        let server = tokio::spawn(async move {
+            let ((first, first_request), (second, second_request)) =
+                tokio::join!(receive(first), receive(second));
+            // Respond in reverse registry order to exercise result association.
+            for (mut socket, (status, body)) in [
+                (second, responses[1].clone()),
+                (first, responses[0].clone()),
+            ] {
+                let body = body.to_string();
+                let response = format!(
+                    "HTTP/1.1 {status} Fixture\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+            [first_request, second_request]
+        });
+        (bases, server)
+    }
+
+    #[tokio::test]
+    async fn refresh_probes_concurrently_preserving_order_auth_and_capabilities() {
+        let (bases, server) = paired_catalogs([
+            (
+                200,
+                json!({"data": [{"id": "shared", "reasoningEfforts": []}]}),
+            ),
+            (200, json!({"data": [{"id": "shared"}]})),
+        ])
+        .await;
+        let first = provider("claude", &bases[0], "FIRST_KEY");
+        let mut second = provider("deepseek", &bases[1], "SECOND_KEY");
+        second.id = "gw2".into();
+        let customs = [first, second];
+        let mut catalog = json!({"providers": [{
+            "id": "native", "models": [{
+                "id": "shared", "reasoningEfforts": ["high", "unsupported"],
+                "defaultReasoningEffort": "unsupported"
+            }]
+        }]});
+        let sys = sys(&[
+            ("FIRST_KEY", "first-fixture"),
+            ("SECOND_KEY", "second-fixture"),
+        ]);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            refresh(&mut catalog, &customs, &sys, &CancellationToken::new()),
+        )
+        .await
+        .expect("both catalog requests must arrive before either response");
+        let requests = server.await.unwrap();
+        assert!(requests[0].starts_with("GET /v1/models?limit=1000 "));
+        assert!(
+            requests[0]
+                .to_ascii_lowercase()
+                .contains("authorization: bearer first-fixture")
+        );
+        assert!(requests[0].contains("x-api-key: first-fixture"));
+        assert!(!requests[0].contains("second-fixture"));
+        assert!(requests[1].starts_with("GET /models "));
+        assert!(
+            requests[1]
+                .to_ascii_lowercase()
+                .contains("authorization: bearer second-fixture")
+        );
+        assert!(!requests[1].contains("first-fixture"));
+        let rows = catalog["providers"].as_array().unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[1]["id"], "sa-gw1");
+        assert_eq!(rows[2]["id"], "sa-gw2");
+        assert_eq!(rows[1]["models"][0]["reasoningEfforts"], json!([]));
+        assert_eq!(rows[2]["models"][0]["reasoningEfforts"], json!(["high"]));
+        assert!(rows[2]["models"][0].get("defaultReasoningEffort").is_none());
+        for row in &rows[1..] {
+            assert_eq!(row["available"], true);
+            assert_eq!(row["catalog_complete"], true);
+            assert_eq!(row["detail"], "供应商在线完整模型目录");
+        }
+    }
+
+    #[tokio::test]
+    async fn refresh_keeps_failed_origin_saved_models_separate_from_success() {
+        let (bases, server) = paired_catalogs([
+            (401, json!({"error": "fixture auth failure"})),
+            (200, json!({"data": [{"id": "online-success"}]})),
+        ])
+        .await;
+        let mut first = provider("codex", &bases[0], "FIRST_KEY");
+        first.models = vec!["saved-failed".into()];
+        let mut second = provider("codex", &bases[1], "SECOND_KEY");
+        second.id = "gw2".into();
+        second.models = vec!["saved-success".into()];
+        let customs = [first, second];
+        let mut catalog = json!({"providers": []});
+        let sys = sys(&[
+            ("FIRST_KEY", "first-fixture"),
+            ("SECOND_KEY", "second-fixture"),
+        ]);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            refresh(&mut catalog, &customs, &sys, &CancellationToken::new()),
+        )
+        .await
+        .expect("both catalog requests must arrive before either response");
+        let requests = server.await.unwrap();
+        assert!(
+            requests[0]
+                .to_ascii_lowercase()
+                .contains("authorization: bearer first-fixture")
+        );
+        assert!(!requests[0].contains("second-fixture"));
+        assert!(
+            requests[1]
+                .to_ascii_lowercase()
+                .contains("authorization: bearer second-fixture")
+        );
+        assert!(!requests[1].contains("first-fixture"));
+        let rows = catalog["providers"].as_array().unwrap();
+        assert_eq!(rows[0]["id"], "sa-gw1");
+        assert_eq!(
+            rows[0]["models"],
+            json!([{"id": "saved-failed", "label": "saved-failed"}])
+        );
+        assert_eq!(rows[0]["defaultModel"], "saved-failed");
+        assert_eq!(rows[0]["catalog_complete"], false);
+        assert_eq!(rows[0]["catalogError"], true);
+        assert!(rows[0]["detail"].as_str().unwrap().contains("已保存型号"));
+        assert_eq!(rows[1]["id"], "sa-gw2");
+        assert_eq!(rows[1]["models"][0]["id"], "online-success");
+        assert_eq!(rows[1]["catalog_complete"], true);
+        assert!(rows[1].get("catalogError").is_none());
+        assert!(!catalog.to_string().contains("first-fixture"));
+        assert!(!catalog.to_string().contains("second-fixture"));
     }
 
     #[test]

@@ -1,6 +1,7 @@
 //! Super Agent ticket journal (SQLite) access.
 
 mod activity;
+pub mod efficiency;
 mod harness_activity;
 pub mod journal;
 pub mod knowledge;
@@ -11,6 +12,7 @@ pub mod providers;
 pub mod schema;
 pub mod store;
 pub mod usage;
+pub mod evaluation;
 
 pub use model::*;
 pub use schema::{STUDIO_PLAN, TICKET_META};

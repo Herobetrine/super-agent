@@ -44,6 +44,9 @@ impl Default for RetryLimits {
 impl RetryLimits {
     /// Retries allowed for this failure on the same route (0 = permanent).
     pub fn for_error(&self, error: &AdapterError) -> u32 {
+        if error.native_retry_exhausted() {
+            return 0;
+        }
         match error.class {
             ErrorClass::Network | ErrorClass::RateLimited | ErrorClass::Overloaded => self.transient,
             ErrorClass::ProcessCrashed => self.crash,
@@ -288,6 +291,9 @@ impl Policy {
             Self::record(inner, agent, route, &snapshot, change, now);
         }
 
+        if error.native_retry_exhausted() {
+            return Recovery::GiveUp { class, attempts: ledger.failures };
+        }
         let limit = self.limits.for_error(error);
         let exhausted = ledger.route_failures > limit;
         let route_level = matches!(
@@ -463,5 +469,23 @@ mod tests {
         assert_eq!(limits.for_error(&e), 3);
         e.code = Some(CODE_ROUTE_NOT_CONFIGURED.into());
         assert_eq!(limits.for_error(&e), 0);
+    }
+
+    #[test]
+    fn native_exhaustion_stops_replay_and_rotation_without_hiding_overload() {
+        let policy = Policy::new(ResilienceConfig::default(), ResilienceOptions::default());
+        let route = Route { provider: "fixture".into(), model: "image-model".into(),
+            mode: "cli".into(), reasoning_effort: None };
+        let alternate = Route { model: "alternate".into(), ..route.clone() };
+        let mut error = AdapterError::new(ErrorClass::Overloaded, "native overload");
+        error.http_status = Some(503);
+        assert!(matches!(policy.decide(&mut TurnLedger::default(), "antigravity", &route,
+            &error, &[], 0.0), Recovery::Retry { .. }));
+        error.code = Some("native:retry_exhausted:agy:attempts:4".into());
+        assert_eq!(RetryLimits::default().for_error(&error), 0);
+        assert_eq!(policy.decide(&mut TurnLedger::default(), "antigravity", &route,
+            &error, &[route.clone(), alternate], 1.0),
+            Recovery::GiveUp { class: ErrorClass::Overloaded, attempts: 1 });
+        assert_eq!(error.http_status, Some(503));
     }
 }

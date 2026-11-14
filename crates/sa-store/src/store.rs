@@ -294,6 +294,7 @@ impl Store {
                             agent_routes: Value::Null,
                             allow_lead_routing: truthy_int(r, 8)?,
                             state: r.get(9)?,
+                            pause_status: None,
                         },
                         r.get::<_, String>(7)?,
                     ))
@@ -304,6 +305,11 @@ impl Store {
             bail!("工单不存在");
         };
         detail.agent_routes = json(&routes)?;
+        if self.has_table("ticket_pause")? {
+            detail.pause_status = conn.query_row(
+                "SELECT state FROM ticket_pause WHERE ticket=?", [ticket], |r| r.get(0),
+            ).optional()?;
+        }
 
         let (total_jobs, running_peers): (i64, i64) = conn.query_row(
             "SELECT count(*) totalJobs,

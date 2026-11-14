@@ -11,6 +11,7 @@ pub fn agent_name(agent: &str) -> String {
         "claude" => "Claude Code".into(),
         "deepseek" => "DeepSeek".into(),
         "antigravity" => "Antigravity".into(),
+        "acp" => "ACP 执行端".into(),
         "" => "执行者".into(),
         other => other.into(),
     }
@@ -54,6 +55,7 @@ pub fn agent_monogram(agent: &str) -> &'static str {
         "claude" => "CC",
         "deepseek" => "DS",
         "antigravity" => "AG",
+        "acp" => "ACP",
         _ => "·",
     }
 }

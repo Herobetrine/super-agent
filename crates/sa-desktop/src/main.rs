@@ -5,9 +5,13 @@
 mod app;
 mod cli;
 mod composer;
+mod control;
 mod conversation;
 mod data;
 mod demo;
+mod efficiency;
+#[cfg(test)]
+mod efficiency_tests;
 mod extensions;
 mod feed;
 mod files;
@@ -29,6 +33,9 @@ mod usage;
 mod ui_tests;
 mod widgets;
 mod worker;
+mod workflow;
+#[cfg(test)]
+mod workflow_tests;
 
 use std::sync::{Arc, Mutex};
 

@@ -21,11 +21,12 @@ use crate::dispatch::{self, CmdError};
 use crate::guides;
 use crate::job::{JobCtx, envelope};
 use crate::knowledge;
+use crate::pause::{self, PauseStatus};
 use crate::protocol::{self as p, END_SQL, digest, stringify};
 use crate::resilience::{Health, HealthTransition, Recovery, ResilienceConfig, TurnLedger, TurnResult, classify};
 use crate::runner::{NoRotation, ResilientRunner, RotationSource, TurnRunner};
 use crate::services::{Extensions, FsSnapshotter, Snapshotter, realpath};
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Result, anyhow, bail, ensure};
 use futures::FutureExt;
 use futures::future::{BoxFuture, Shared, join_all};
 use regex::Regex;
@@ -67,6 +68,8 @@ pub struct EngineOptions {
     pub rotation: Arc<dyn RotationSource>,
     pub extensions: Option<Arc<dyn Extensions>>,
     pub snapshotter: Arc<dyn Snapshotter>,
+    /// Current context delivery preferences, shared with the desktop host.
+    pub efficiency: sa_store::efficiency::Shared,
     /// Admission interval (80 ms in the JS engine).
     pub tick: Duration,
 }
@@ -78,6 +81,7 @@ impl Default for EngineOptions {
             rotation: Arc::new(NoRotation),
             extensions: None,
             snapshotter: Arc::new(FsSnapshotter),
+            efficiency: sa_store::efficiency::shared(Default::default()),
             tick: Duration::from_millis(80),
         }
     }
@@ -86,6 +90,8 @@ impl Default for EngineOptions {
 /// `create(params)` input (S:85-143, ST:299-317).
 #[derive(Clone, Debug, Default)]
 pub struct CreateParams {
+    /// Operator-selected historical root reply. No native session is copied.
+    pub checkpoint: Option<(i64,i64)>,
     pub goal: String,
     pub cwd: PathBuf,
     /// Default `deepseek`.
@@ -132,6 +138,12 @@ impl CreateParams {
 
 type CatalogFuture = Shared<BoxFuture<'static, Result<Value, String>>>;
 
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum CatalogKey {
+    Full(String),
+    Selected(String, Route),
+}
+
 struct Slot {
     ticket: i64,
     cancel: CancellationToken,
@@ -142,17 +154,18 @@ struct Slot {
 #[derive(Default)]
 struct Sched {
     active: HashMap<i64, Slot>,
-    writer: Option<i64>,
+    /// Maintenance leases also prevent admission while validating/integrating.
+    maintenance: Vec<String>,
     timer: Option<JoinHandle<()>>,
 }
 
 pub(crate) struct Inner {
     pub(crate) db: Db,
-    data_dir: PathBuf,
+    pub(crate) data_dir: PathBuf,
     adapters: HashMap<String, Arc<dyn Adapter>>,
     opts: EngineOptions,
     sched: Mutex<Sched>,
-    catalogs: Mutex<HashMap<String, CatalogFuture>>,
+    catalogs: Mutex<HashMap<CatalogKey, CatalogFuture>>,
     started: AtomicBool,
     stopping: AtomicBool,
     fault: Mutex<Option<String>>,
@@ -177,6 +190,7 @@ pub struct Turn {
     menus: Mutex<Map<String, Value>>,
     pub(crate) cancel: CancellationToken,
     timed_out: AtomicBool,
+    loop_detected: AtomicBool,
     pub(crate) tool_follow: AtomicBool,
     /// `SA_MEMO` lines seen in this turn's final reply.
     pub(crate) memos: AtomicUsize,
@@ -351,6 +365,13 @@ impl Engine {
 
     /// `close()` (E:40-54): abort running turns, wait for them, close the DB.
     pub async fn close(&self) {
+        self.quiesce().await;
+        self.inner.db.close();
+    }
+
+    /// Stop admissions and model execution while retaining the journal for
+    /// tracked maintenance tasks to persist their final receipts.
+    pub async fn quiesce(&self) {
         let inner = &self.inner;
         inner.stopping.store(true, Ordering::SeqCst);
         let tasks: Vec<JoinHandle<()>> = {
@@ -369,7 +390,6 @@ impl Engine {
         for t in tasks {
             let _ = t.await;
         }
-        inner.db.close();
     }
 
     /// `cancel({ticket})` (E:63-73).
@@ -397,6 +417,27 @@ impl Engine {
         Ok(())
     }
 
+    /// Finish the current root turn, drain its children and make at most one
+    /// final consolidation turn before blocking further ticket admissions.
+    pub fn request_pause_after_handoff(&self, ticket: i64) -> Result<PauseStatus> {
+        let _sched = lock(&self.inner.sched);
+        self.inner.db.tx(|q| pause::request(q, ticket))
+    }
+
+    /// Explicitly remove the durable admission gate. Follow-up messages and
+    /// job retries retain the gate until this operation is called.
+    pub fn resume_paused(&self, ticket: i64) -> Result<PauseStatus> {
+        let _sched = lock(&self.inner.sched);
+        self.inner.db.tx(|q| pause::resume(q, ticket))
+    }
+
+    pub fn pause_status(&self, ticket: i64) -> Result<PauseStatus> {
+        self.inner.db.with(|q| {
+            q.root(ticket)?;
+            pause::status(q, ticket)
+        })
+    }
+
     /// `decide({id, allow})` (E:74-87).
     pub fn decide(&self, id: i64, allow: bool) -> Result<()> {
         self.inner.db.tx(|q| {
@@ -420,6 +461,108 @@ impl Engine {
     /// retain their route and native session.
     pub fn set_lead_routing(&self, ticket: i64, enabled: bool) -> Result<()> {
         self.inner.db.tx(|q| q.set_lead_routing(ticket, enabled))
+    }
+
+    pub fn isolated_writers(&self, ticket: i64) -> Result<bool> {
+        self.inner.db.with(|q| q.exists("SELECT 1 FROM workspace_policy WHERE ticket=? AND isolated=1", &[&ticket]))
+    }
+    pub fn checkpoints(&self,ticket:i64)->Result<Vec<Value>> {
+        self.inner.db.with(|q|crate::checkpoints::list(q,ticket))
+    }
+    pub fn bind_scm(&self,job:i64,url:&str)->Result<()> {
+        self.inner.db.tx(|q|crate::scm::bind(q,job,url))
+    }
+    pub fn scm_bindings(&self,ticket:i64)->Result<Vec<Value>> {
+        self.inner.db.with(|q|crate::scm::bindings(q,ticket))
+    }
+    pub async fn refresh_scm(&self,job:i64)->Result<bool> {
+        let (url,cwd)=self.inner.db.with(|q| {
+            let r=q.one("SELECT b.url,t.cwd FROM scm_bindings b JOIN jobs j ON j.id=b.job JOIN tickets t ON t.id=j.ticket WHERE b.job=?",&[&job])?.ok_or_else(||anyhow!("任务尚未绑定 PR"))?;
+            Ok((str_of(&r,"url").to_string(),PathBuf::from(str_of(&r,"cwd"))))
+        })?;
+        let observation=crate::scm::fetch(&url,&cwd).await?;
+        self.inner.db.tx(|q|crate::scm::apply(q,job,&observation))
+    }
+    pub async fn fork_checkpoint(&self,ticket:i64,seq:i64,goal:String)->Result<i64> {
+        let source=self.inner.db.with(|q|q.one("SELECT * FROM tickets WHERE id=?",&[&ticket]))?.ok_or_else(||anyhow!("工单不存在"))?;
+        let mut params=CreateParams::new(goal,str_of(&source,"cwd")).lead(str_of(&source,"lead")).profile(str_of(&source,"permission_profile"));
+        params.selections=Some(parse(Some(str_of(&source,"agent_routes"))));
+        params.allow_lead_routing=Some(int_of(&source,"allow_lead_routing")!=0);
+        params.checkpoint=Some((ticket,seq));
+        // Do not accidentally apply changed global extension defaults.
+        if self.inner.opts.extensions.is_some(){params.extensions=Some(json!({"skills":[],"servers":[]}));}
+        self.create(params).await
+    }
+
+    pub fn set_isolated_writers(&self, ticket: i64, enabled: bool) -> Result<()> {
+        self.inner.db.tx(|q| {
+            let root = q.root(ticket)?;
+            q.run("INSERT INTO workspace_policy(ticket,isolated) VALUES(?,?) ON CONFLICT(ticket) DO UPDATE SET isolated=excluded.isolated", &[&ticket,&i64::from(enabled)])?;
+            q.log(who_of(&root), "workspace.policy", &json!({"isolated_writers":enabled}))?;
+            Ok(())
+        })
+    }
+
+    pub fn workspaces(&self, ticket: i64) -> Result<Vec<crate::workspaces::Workspace>> {
+        self.inner.db.with(|q| {
+            q.all("SELECT job FROM job_workspaces WHERE ticket=? ORDER BY job", &[&ticket])?.iter()
+                .map(|r| crate::workspaces::get(q, int_of(r,"job"))?.ok_or_else(|| anyhow!("工作区不存在"))).collect()
+        })
+    }
+
+    /// Operator-only operation. Hold scheduler leases through all blocking Git
+    /// work, including if the caller stops awaiting the result.
+    pub async fn validate_workspace(&self, job: i64, command: Vec<String>) -> Result<()> {
+        self.workspace_operation(job, Some(command)).await
+    }
+    pub async fn integrate_workspace(&self, job: i64) -> Result<()> {
+        self.workspace_operation(job, None).await
+    }
+    async fn workspace_operation(&self, job: i64, command: Option<Vec<String>>) -> Result<()> {
+        let inner = self.inner.clone();
+        tokio::task::spawn_blocking(move || {
+            let (workspace, keys) = {
+                let mut sched = lock(&inner.sched);
+                let w = inner.db.with(|q| crate::workspaces::get(q, job))?.ok_or_else(|| anyhow!("工作区不存在"))?;
+                let keys = vec![crate::workspaces::scope(&w.path), crate::workspaces::scope(&w.source)];
+                let busy = sched.active.values().any(|s| keys.iter().any(|k| crate::workspaces::overlaps(k, &crate::workspaces::scope(&s.turn.job.cwd))))
+                    || sched.maintenance.iter().any(|s| keys.iter().any(|k| crate::workspaces::overlaps(k,s)));
+                if busy { bail!("相关工作区仍有任务运行，请停止或等待后再验证/合入"); }
+                sched.maintenance.extend(keys.clone());
+                (w,keys)
+            };
+            struct Lease(Arc<Inner>, Vec<String>);
+            impl Drop for Lease { fn drop(&mut self) { lock(&self.0.sched).maintenance.retain(|k| !self.1.contains(k)); } }
+            let _lease = Lease(inner.clone(), keys);
+            // Invalidate the previous receipt before a new attempt, including
+            // spawn failures/timeouts and process crashes during validation.
+            inner.db.tx(|q| {
+                let mut pending=workspace.clone();
+                pending.state=if command.is_some(){"validating"}else{"integrating"}.into();
+                pending.validation["passed"]=json!(false);
+                pending.detail="操作进行中；中断后需重新验证".into();
+                crate::workspaces::save(q,&pending)
+            })?;
+            let result = match &command {
+                Some(argv) => crate::workspaces::validate(&workspace, argv),
+                None => crate::workspaces::integrate(&workspace, &inner.data_dir),
+            };
+            inner.db.tx(|q| {
+                let root = q.root(workspace.ticket)?;
+                match &result {
+                    Ok(w) => {
+                        crate::workspaces::save(q,w)?;
+                        q.log(who_of(&root), "workspace.result", &json!({"job":job,"state":w.state,"detail":w.detail,"validation":w.validation}))?;
+                    }
+                    Err(e) => {
+                        q.run("UPDATE job_workspaces SET state='failed',detail=? WHERE job=?",&[&e.to_string(),&job])?;
+                        q.log(who_of(&root), "workspace.error", &json!({"job":job,"reason":e.to_string()}))?;
+                    }
+                }
+                Ok(())
+            })?;
+            result.map(|_| ())
+        }).await.map_err(|_| anyhow!("工作区操作异常"))?
     }
 
     /// `create(params)` (S:85-143); returns the ticket id.
@@ -449,6 +592,7 @@ impl Engine {
         };
         let manifest = inner.snapshot(&dir_text, &params.files).await?;
         inner.db.tx(|q| {
+            let checkpoint=params.checkpoint.map(|(ticket,seq)|crate::checkpoints::capture(q,ticket,seq)).transpose()?;
             let defaults = q.one("SELECT routes FROM route_defaults WHERE singleton=1", &[])?;
             let raw = match &params.selections {
                 Some(s) => s.clone(),
@@ -472,6 +616,10 @@ impl Engine {
             )?;
             if let (Some(x), Some(prepared)) = (&inner.opts.extensions, &extensions) {
                 x.bind(q.conn(), ticket, prepared)?;
+            }
+            if let (Some((source,seq)),Some(context))=(params.checkpoint,&checkpoint) {
+                let context=stringify(context);
+                q.run("INSERT INTO ticket_branches VALUES(?,?,?,?,?)",&[&ticket,&source,&seq,&context,&digest(&context)])?;
             }
             if profile == "auto" {
                 q.run("INSERT INTO continuous_runs(ticket) VALUES(?)", &[&ticket])?;
@@ -601,6 +749,7 @@ impl Engine {
     /// `retry({job})` (S:204-219): same logical turn, receipts kept.
     pub fn retry(&self, id: i64) -> Result<()> {
         self.inner.db.tx(|q| {
+            ensure!(!q.exists("SELECT 1 FROM job_workspaces WHERE job=? AND state='merged'", &[&id])?,"该工作区已合入，请创建新任务继续修改");
             let job = q.one("SELECT * FROM jobs WHERE id=?", &[&id])?;
             let Some(job) = job.filter(|j| matches!(str_of(j, "state"), "failed" | "interrupted")) else {
                 bail!("只能重试失败或中断的任务");
@@ -905,26 +1054,42 @@ impl Inner {
         let mut aborts = vec![];
         let admitted = self.db.tx(|q| {
             q.wake()?;
+            pause::reconcile(q)?;
             let queued = "SELECT j.*,t.cwd,t.claude_route,t.follow_config,t.agent_routes,t.allow_lead_routing,t.writes,
         t.permission_profile AS ticket_profile,coalesce(j.permission_override,t.permission_profile) AS profile,
         t.auto_cycles,r.route AS bound_route,c.ticket AS continuous_ticket,coalesce(c.boundary_job,0) AS floor
         FROM jobs j JOIN tickets t ON t.id=j.ticket LEFT JOIN native_routes r ON r.job=j.id
         LEFT JOIN continuous_runs c ON c.ticket=j.ticket
-        WHERE j.state='queued' AND j.ready_after<=? AND j.writing=? ORDER BY j.id LIMIT ?";
+        WHERE j.state='queued' AND j.ready_after<=? AND j.writing=?
+        AND NOT EXISTS(SELECT 1 FROM ticket_pause p WHERE p.ticket=j.ticket
+          AND (j.parent IS NOT NULL OR p.state='paused' OR p.state='draining'))
+        ORDER BY j.id LIMIT ?";
             let time = now();
             let mut candidates = q.all(queued, &[&time, &0, &(READS_PER_SLICE as i64)])?;
-            if sched.writer.is_none() {
-                candidates.extend(q.all(queued, &[&time, &1, &1])?);
-            }
+            candidates.extend(q.all(queued, &[&time, &1, &256])?);
             candidates.sort_by_key(|r| int_of(r, "id"));
             let plan = q.exists("SELECT 1 FROM sqlite_master WHERE type='table' AND name='studio_plan'", &[])?;
             let mut slots = vec![];
+            let mut occupied: Vec<String> = sched.active.values().filter(|s| s.turn.job.writing)
+                .map(|s| crate::workspaces::scope(&s.turn.job.cwd)).chain(sched.maintenance.iter().cloned()).collect();
             for row in candidates {
                 let mut job = JobCtx::from_row(&row);
+                if let Some(w) = crate::workspaces::get(q,job.id)? {
+                    if w.state == "merged" { continue; }
+                    job.cwd = w.path;
+                } else if let Some(row)=q.one("SELECT cwd FROM job_directories WHERE job=?",&[&job.id])? {
+                    job.cwd=str_of(&row,"cwd").into();
+                }
                 if sched.active.contains_key(&job.id) {
                     continue;
                 }
+                let key = crate::workspaces::scope(&job.cwd);
+                if sched.maintenance.iter().any(|s| crate::workspaces::overlaps(s,&key))
+                    || (job.writing && occupied.iter().any(|s| crate::workspaces::overlaps(s,&key))) { continue; }
                 if let Some(until) = self.route_blocked(&job, time) {
+                    if pause::after_failure(q, &job, "交接时执行路由熔断，暂停后续恢复尝试。")? {
+                        continue;
+                    }
                     if let Some(ids) = self.failover(q, &job, "circuit_open")? {
                         aborts.extend(ids);
                         continue;
@@ -943,6 +1108,18 @@ impl Inner {
                     q.run("UPDATE tickets SET auto_cycles=auto_cycles+1 WHERE id=?", &[&job.ticket])?;
                 }
                 let mut packet = envelope(q, &job, health.clone())?;
+                if job.is_root() && let Some(control) = pause::resumed_control(q, job.ticket)? {
+                    packet.insert("pause_control".into(), control);
+                }
+                if job.is_root() && pause::consolidating(q, job.ticket)? {
+                    packet.insert("pause_after_handoff".into(), json!({
+                        "consolidation": true,
+                        "instruction": "用户已请求暂停。这是最后一次交接轮，请汇总已完成工作、验证证据、未完成事项和下一步，然后结束本轮。平台已禁止新派工，恢复前不会再启动轮次。"
+                    }));
+                }
+                packet.insert("execution_directory".into(),json!(job.cwd));
+                packet.insert("isolated_writers".into(),json!(q.exists("SELECT 1 FROM workspace_policy WHERE ticket=? AND isolated=1", &[&job.ticket])?));
+                if let Some(w) = crate::workspaces::get(q,job.id)? { packet.insert("workspace".into(),serde_json::to_value(w)?); }
                 if plan {
                     let rows = q.all("SELECT id,body,done FROM studio_plan WHERE ticket=? ORDER BY id", &[&job.ticket])?;
                     packet.insert("plan".into(), Value::Array(rows.into_iter().map(Value::Object).collect()));
@@ -958,6 +1135,7 @@ impl Inner {
                     .and_then(Value::as_array)
                     .cloned()
                     .unwrap_or_default();
+                if job.writing { occupied.push(key); }
                 slots.push(Turn {
                     inner: Arc::downgrade(self),
                     job,
@@ -966,6 +1144,7 @@ impl Inner {
                     menus: Mutex::new(Map::new()),
                     cancel: CancellationToken::new(),
                     timed_out: AtomicBool::new(false),
+                    loop_detected: AtomicBool::new(false),
                     tool_follow: AtomicBool::new(false),
                     memos: AtomicUsize::new(0),
                     route: Mutex::new(None),
@@ -983,9 +1162,6 @@ impl Inner {
         for turn in admitted {
             let turn = Arc::new(turn);
             let id = turn.job.id;
-            if turn.job.writing {
-                sched.writer = Some(id);
-            }
             let inner = self.clone();
             let t = turn.clone();
             // The task's cleanup waits for the scheduler lock held here, so
@@ -996,9 +1172,6 @@ impl Inner {
                 }
                 let mut s = lock(&inner.sched);
                 s.active.remove(&t.job.id);
-                if s.writer == Some(t.job.id) {
-                    s.writer = None;
-                }
             });
             sched.active.insert(
                 id,
@@ -1022,25 +1195,45 @@ impl Inner {
 
     /// `catalogRequest(name)` (E:207-215): one in-flight probe per harness.
     fn catalog(self: &Arc<Self>, name: &str) -> CatalogFuture {
+        self.catalog_request(name, None)
+    }
+
+    fn catalog_request(self: &Arc<Self>, name: &str, route: Option<Route>) -> CatalogFuture {
+        let key = match &route {
+            Some(route) => CatalogKey::Selected(name.into(), route.clone()),
+            None => CatalogKey::Full(name.into()),
+        };
         let mut map = lock(&self.catalogs);
-        if let Some(f) = map.get(name) {
+        if let Some(f) = map.get(&key) {
             return f.clone();
         }
-        let adapter = self.adapters.get(name).cloned();
+        let probe = match self.adapters.get(name) {
+            Some(adapter) => match route {
+                Some(route) => match adapter.catalog_for_route(route) {
+                    Some(probe) => Some(probe),
+                    None => {
+                        drop(map);
+                        return self.catalog(name);
+                    }
+                },
+                None => Some(adapter.catalog()),
+            },
+            None => None,
+        };
         let weak = Arc::downgrade(self);
-        let key = name.to_string();
+        let completed_key = key.clone();
         let fut: BoxFuture<'static, Result<Value, String>> = Box::pin(async move {
-            let r = match adapter {
-                Some(a) => a.catalog().await.map(|c| c.value).map_err(|e| e.to_string()),
+            let r = match probe {
+                Some(probe) => probe.await.map(|c| c.value).map_err(|e| e.to_string()),
                 None => Err("执行端不可用".to_string()),
             };
             if let Some(inner) = weak.upgrade() {
-                lock(&inner.catalogs).remove(&key);
+                lock(&inner.catalogs).remove(&completed_key);
             }
             r
         });
         let shared = fut.shared();
-        map.insert(name.to_string(), shared.clone());
+        map.insert(key, shared.clone());
         shared
     }
 
@@ -1118,11 +1311,21 @@ impl Inner {
         let job = &turn.job;
         let primary = job.primary();
         turn.ensure_current()?;
+        if let Some(w) = self.db.with(|q| crate::workspaces::get(q,job.id))? {
+            let w=crate::workspaces::identity(&w)?;
+            self.db.tx(|q|crate::workspaces::save(q,&w))?;
+            let data = self.data_dir.clone();
+            let ready = tokio::task::spawn_blocking(move || crate::workspaces::provision(&w,&data)).await
+                .map_err(|_| anyhow!("工作区准备异常"))??;
+            self.db.tx(|q| crate::workspaces::save(q,&ready))?;
+            turn.packet().insert("workspace".into(),json!(ready));
+        }
         let (route, fresh) = self.execution_route(turn).await?;
         if fresh && let Some(until) = self.opts.runner.admission_blocked_until(&job.agent, &route, now()) {
             return Err(TurnError::Wait(until));
         }
-        let mut guide = guides::BASE.to_string();
+        let efficiency = self.opts.efficiency.read().unwrap_or_else(|e| e.into_inner()).clone();
+        let mut guide = guides::base(efficiency.concise_handoffs);
         if primary {
             guide.push('\n');
             guide.push_str(guides::CONTINUOUS);
@@ -1132,6 +1335,9 @@ impl Inner {
         }
         guide.push_str(guides::KNOWLEDGE);
         let mut packet = turn.packet().clone();
+        packet.insert("collaboration_preferences".into(), json!({
+            "concise_handoffs": efficiency.concise_handoffs,
+        }));
         if primary && packet.get("autonomy").and_then(|a| a.get("phase")).and_then(Value::as_str) == Some("discover") {
             guide.push_str(guides::DISCOVERY);
         }
@@ -1169,16 +1375,76 @@ impl Inner {
         if !images.is_empty() && !crate::images::supports_native_images(&job.agent) {
             return Err(anyhow!(crate::images::UNSUPPORTED).into());
         }
-        let mut prompt = format!("{guide}\n{}", stringify(&Value::Object(packet.clone())));
-        if prompt.len() > MAX_PROMPT_BYTES {
-            packet = context::compact(&packet, &guide, &self.data_dir, MAX_PROMPT_BYTES)?;
+        // Keep the admission/enrichment snapshot separate from the delivery
+        // view. Reports used by commit_reply must retain every known child.
+        let snapshot = packet.clone();
+        let snapshot_sha256 = digest(&stringify(&context::sort_keys(&Value::Object(snapshot.clone()))));
+        let lazy_mcp_schemas = efficiency.lazy_mcp_schemas && p::is_full(&job.profile);
+        // Recovery files live outside the project. Restricted harness policies
+        // have no confirmed read grant there, so they retain complete prompts.
+        let baseline = if efficiency.incremental_context && p::is_full(&job.profile) {
+            self.db.with(|q| context::delivery::baseline(q, job.id, job.session.as_deref(), &route))?
+                .filter(|baseline| baseline.lazy_mcp_schemas == lazy_mcp_schemas)
+        } else {
+            None
+        };
+        let incremental = baseline.as_ref().is_some_and(|baseline| !baseline.needs_recovery);
+        let recovery_delivery = baseline.as_ref().is_some_and(|baseline| baseline.needs_recovery);
+        let full_context = if baseline.is_some() {
+            Some(context::archive(&snapshot, &self.data_dir)?)
+        } else { None };
+        let full_prompt_bytes = guide.len() + 1 + stringify(&Value::Object(snapshot.clone())).len();
+        let delivered_guide = if let Some(baseline) = baseline {
+            let (delta, delivered_guide) = if recovery_delivery {
+                context::delivery::recovery(&packet, &guide, &baseline, full_context.as_ref().expect("archived continuation"))
+            } else {
+                context::delivery::delta(&packet, &guide, &baseline)
+            };
+            packet = delta;
+            delivered_guide
+        } else {
+            guide.clone()
+        };
+        let deferred_schemas = lazy_mcp_schemas && context::delivery::defer_mcp_schemas(&mut packet, &snapshot);
+        if let Some(reference) = full_context {
+            packet.insert("full_context".into(), reference);
+        } else if deferred_schemas {
+            packet.insert("full_context".into(), context::archive(&snapshot, &self.data_dir)?);
+        }
+        let mut prompt = format!("{delivered_guide}\n{}", stringify(&Value::Object(packet.clone())));
+        let compacted = prompt.len() > MAX_PROMPT_BYTES;
+        if compacted {
+            // Preserve the original recovery target when compacting a lazy
+            // view, reserving room for its exact reference and lookup guide.
+            let mut full_view = snapshot.clone();
+            let reserved = if deferred_schemas {
+                context::delivery::defer_mcp_schemas(&mut full_view, &snapshot);
+                json!({"full_context":packet["full_context"],"mcp_schema_lookup":full_view["mcp_schema_lookup"]})
+            } else {
+                json!({})
+            };
+            let reserve_bytes = if deferred_schemas { stringify(&reserved).len() } else { 0 };
+            packet = context::compact(&full_view, &guide, &self.data_dir, MAX_PROMPT_BYTES.saturating_sub(reserve_bytes))?;
+            if deferred_schemas {
+                packet.insert("full_context".into(), reserved["full_context"].clone());
+                packet.insert("mcp_schema_lookup".into(), reserved["mcp_schema_lookup"].clone());
+            }
             prompt = format!("{guide}\n{}", stringify(&Value::Object(packet.clone())));
         }
         turn.ensure_current()?;
-        self.db.tx(|q| {
+        let snapshot_seq = self.db.tx(|q| {
+            let snapshot_seq = q.log(job.who(), "context.snapshot", &Value::Object(snapshot.clone()))?;
             q.log(job.who(), "input", &Value::Object(packet.clone()))?;
-            q.log(job.who(), "running", &json!({"guide": guide, "prompt_sha256": digest(&prompt)}))?;
-            Ok(())
+            q.log(job.who(), "running", &json!({
+                "guide": if compacted { &guide } else { &delivered_guide },
+                "prompt_sha256": digest(&prompt), "snapshot_seq": snapshot_seq,
+                "snapshot_sha256": snapshot_sha256, "incremental": incremental && !compacted,
+                "recovery_delivery": recovery_delivery && !compacted,
+                "full_prompt_bytes": full_prompt_bytes, "sent_prompt_bytes": prompt.len(),
+                "saved_bytes": full_prompt_bytes.saturating_sub(prompt.len()),
+                "lazy_mcp_schemas": deferred_schemas,
+            }))?;
+            Ok(snapshot_seq)
         })?;
         if prompt.len() > MAX_PROMPT_BYTES {
             return Err(anyhow!("输入超过 6 MiB 上限，请拆分任务").into());
@@ -1252,6 +1518,11 @@ impl Inner {
         if !rest.is_empty() {
             self.absorb(turn, rest, &route, &mut stream).await;
         }
+        // A journal/control failure may have cancelled the native task. Keep
+        // the original internal error instead of its cancellation response.
+        if let Some(fatal) = stream.fatal.take() {
+            return Err(fatal.into());
+        }
         let outcome = match result {
             Ok(TurnResult::Done(outcome)) => outcome,
             Ok(TurnResult::Failed(e)) => return Err(TurnError::Adapter(e)),
@@ -1270,8 +1541,26 @@ impl Inner {
         turn.ensure_current()?;
         self.opts.runner.on_success(&job.agent, &route);
         self.db.tx(|q| {
+            if !q.live(job.who())? { return Ok(()); }
             self.log_transitions(q, job.who())?;
-            self.commit_reply(q, turn, &outcome.text, outcome.session_id.as_deref(), &stream.invalid)
+            // These hints were available to the currently running adapter.
+            // Expire only our own hints when that turn successfully replies,
+            // so an unread correction cannot schedule a paid continuation.
+            for seq in &stream.correction_notes {
+                q.run(
+                    "UPDATE mailbox SET consumed_turn=? WHERE seq=? AND target=? AND consumed_turn IS NULL",
+                    &[&job.turn, seq, &job.id],
+                )?;
+            }
+            self.commit_reply(q, turn, &outcome.text, outcome.session_id.as_deref(), &stream.invalid)?;
+            let same_session = !(incremental || recovery_delivery) || outcome.session_id == job.session;
+            context::delivery::acknowledge(q, job.who(), &route, json!({
+                "snapshot_seq": snapshot_seq, "snapshot_sha256": snapshot_sha256,
+                "guide_sha256": digest(&guide), "complete": !compacted && same_session,
+                "lazy_mcp_schemas": lazy_mcp_schemas,
+                "full_context": packet.get("full_context"),
+                "recovery_delivery": recovery_delivery && !compacted,
+            }))
         })?;
         Ok(())
     }
@@ -1293,7 +1582,8 @@ impl Inner {
             }
         };
         let mut memo: HashMap<String, Result<Value, String>> = HashMap::new();
-        if job.is_root() {
+        let full_menus = job.is_root() || job.primary();
+        if full_menus {
             let probes = AGENTS.iter().map(|name| {
                 let f = self.catalog(name);
                 async move { (*name, f.await) }
@@ -1328,9 +1618,22 @@ impl Inner {
         };
         let bound = parse(job.bound_route.as_deref());
         let fresh = !p::truthy_value(&bound);
-        let cat = match memo.remove(&job.agent) {
-            Some(r) => r,
-            None => self.catalog(&job.agent).await,
+        // A collaborator with a complete fixed route needs live validation of
+        // that route. Defaults still require full discovery to resolve them.
+        let fixed_route = if full_menus {
+            None
+        } else if !fresh {
+            Some(bound.clone())
+        } else if p::truthy_value(&selected_execution) {
+            Some(selected_execution.clone())
+        } else {
+            pick(&job.agent, None)
+        };
+        let selected_probe = fixed_route.as_ref().and_then(|value| p::route(Some(value)).ok());
+        let cat = match (memo.remove(&job.agent), selected_probe) {
+            (Some(r), _) => r,
+            (None, Some(route)) => self.catalog_request(&job.agent, Some(route)).await,
+            (None, None) => self.catalog(&job.agent).await,
         }
         .map_err(|e| route_error(crate::resilience::CODE_ROUTE_PROBE_FAILED, e))?;
         let picked = if fresh {
@@ -1386,6 +1689,9 @@ impl Inner {
             }
             for (kind, data) in &journal {
                 let seq = q.log(job.who(), kind, data)?;
+                if kind == "native" {
+                    context::delivery::record_compaction(q, job.who(), job.admission, seq, data)?;
+                }
                 if kind == "native"
                     && job.continuous
                     && let Some(proof) = p::tools_proof(data)
@@ -1416,6 +1722,16 @@ impl Inner {
             }
         }
         for (kind, data) in journal {
+            if kind == "native" && let Some(signal)=st.detector.observe(&job.agent,&data) {
+                let stop=signal==crate::stuck::Signal::Stop;
+                let message=if stop {"工具操作与结果持续重复，已停止本轮以避免空转；请调整策略后重试。"} else {"检测到重复操作与相同结果，请改变方法或说明等待的外部条件。"};
+                let _=self.db.tx(|q| {
+                    q.log(job.who(),if stop {"turn.loop_stopped"} else {"turn.loop_warning"},&json!({"reason":message}))?;
+                    if !stop { platform_note(q,job,job.id,message)?; }
+                    Ok(())
+                });
+                if stop {turn.loop_detected.store(true,Ordering::SeqCst);turn.cancel.cancel();}
+            }
             if kind == "message.boundary" {
                 let line = std::mem::take(&mut st.pending);
                 if !line.is_empty() {
@@ -1454,18 +1770,86 @@ impl Inner {
             return;
         };
         let tag = line.split(' ').next().unwrap_or_default().to_string();
-        if streaming && matches!(err, CmdError::Syntax(_)) {
-            let _ = self.db.with(|q| q.log(job.who(), "protocol.preview_invalid", &json!({"tag": tag})));
-        } else if job.primary() {
-            let reason = err.message();
-            let _ = self.db.with(|q| q.log(job.who(), "auto.protocol", &json!({"tag": tag, "reason": reason})));
-            match st.invalid.iter_mut().find(|(t, _)| *t == tag) {
-                Some(entry) => entry.1 = reason,
-                None => st.invalid.push((tag, reason)),
-            }
-        } else {
+        if matches!(err, CmdError::Other(_)) {
             st.fatal = Some(err.into_anyhow());
+            turn.cancel.cancel();
+            return;
         }
+        let saved = if streaming && matches!(err, CmdError::Syntax(_)) {
+            self.db
+                .with(|q| q.log(job.who(), "protocol.preview_invalid", &json!({"tag": tag})))
+                .map(|_| None)
+        } else {
+            let reason = err.message();
+            if job.primary() {
+                match st.invalid.iter_mut().find(|(t, _)| *t == tag) {
+                    Some(entry) => entry.1 = reason.clone(),
+                    None => st.invalid.push((tag.clone(), reason.clone())),
+                }
+            }
+            self.reject_command(turn, cleaned, &tag, &reason, streaming)
+        };
+        match saved {
+            Ok(Some(seq)) => st.correction_notes.push(seq),
+            Ok(None) => {}
+            Err(error) => {
+                st.fatal = Some(error);
+                turn.cancel.cancel();
+            }
+        }
+    }
+
+    /// Rejections are durable receipts, independent of subsequent valid
+    /// commands. The transaction also makes parent notification idempotent.
+    fn reject_command(
+        &self,
+        turn: &Turn,
+        line: &str,
+        tag: &str,
+        reason: &str,
+        streaming: bool,
+    ) -> Result<Option<i64>> {
+        let job = &turn.job;
+        let command_sha256 = digest(line);
+        let logical = job.logical();
+        let command: Value = line
+            .split_once(' ')
+            .and_then(|(_, body)| serde_json::from_str(body).ok())
+            .unwrap_or(Value::Null);
+        let id = command.get("id")
+            .filter(|id| p::valid_text(Some(id), 96))
+            .cloned()
+            .unwrap_or(Value::Null);
+        self.db.tx(|q| {
+            if !q.live(job.who())? || q.exists(
+                "SELECT 1 FROM events WHERE job=? AND kind='protocol.rejected' AND json_extract(payload,'$.logical_turn')=? AND json_extract(payload,'$.command_sha256')=? LIMIT 1",
+                &[&job.id, &logical, &command_sha256],
+            )? {
+                return Ok(None);
+            }
+            let receipt = json!({
+                "tag": tag, "id": id, "logical_turn": logical,
+                "command_sha256": command_sha256, "reason": reason, "executed": false,
+            });
+            q.log(job.who(), "protocol.rejected", &receipt)?;
+            if job.primary() {
+                q.log(job.who(), "auto.protocol", &json!({"tag": tag, "reason": reason}))?;
+            }
+            let body = format!("任务 #{} 的 {} 指令被拒绝。该指令未执行，其他工作仍可继续。请依据原因修正控制消息，保留并报告已经完成的业务成果。\n{}",
+                job.id, tag, stringify(&receipt));
+            if let Some(parent) = job.parent
+                && q.exists(
+                    "SELECT 1 FROM jobs WHERE id=? AND ticket=? AND state IN ('queued','running','waiting')",
+                    &[&parent, &job.ticket],
+                )?
+            {
+                platform_note(q, job, parent, &body)?;
+            }
+            if streaming && !job.primary() {
+                return platform_note(q, job, job.id, &body).map(Some);
+            }
+            Ok(None)
+        })
     }
 
     /// `commitReply(ctx, result, reports, primary, invalid)` (E:409-485).
@@ -1587,6 +1971,9 @@ impl Inner {
             "reply",
             &json!({"text": text, "sha256": digest(text), "session": session, "state": state}),
         )?;
+        let ids:Vec<i64>=turn.packet().get("scm_feedback").and_then(Value::as_array).into_iter().flatten().filter_map(|v|v["id"].as_i64()).collect();
+        crate::scm::acknowledge(q,job.id,&ids,job.turn)?;
+        pause::after_reply(q, job, outstanding)?;
         Ok(())
     }
 
@@ -1601,6 +1988,19 @@ impl Inner {
         let reason = if timed_out { TIMEOUT_REASON.to_string() } else { err.message() };
         if self.stopping.load(Ordering::SeqCst) {
             return q.interrupt(who, &job.ticket_profile);
+        }
+        if job.is_root() && pause::status(q, job.ticket)? != PauseStatus::Running {
+            let error = match err {
+                TurnError::Adapter(error) => json!({"class": class_name(error.class), "code": error.code, "http_status": error.http_status}),
+                _ => json!({}),
+            };
+            q.log(who, "turn.pause_error", &json!({"reason": reason, "error": error, "timed_out": timed_out}))?;
+        }
+        if pause::after_failure(q, job, &reason)? {
+            return Ok(());
+        }
+        if turn.loop_detected.load(Ordering::SeqCst) {
+            return self.give_up(q,job,"工具操作与结果持续重复，已停止空转；请调整方法后重试。");
         }
         let auto_root = job.auto_root();
         if auto_root && job.continuous && q.followed_after(job.ticket, job.admission)? {
@@ -1668,13 +2068,16 @@ impl Inner {
                 return self.recover(q, job, &route, e, decision, ledger.failures);
             }
         }
+        if let TurnError::Adapter(e) = err && e.native_retry_exhausted() {
+            return self.give_up(q, job, &reason);
+        }
         if auto_root && (timed_out || TRANSIENT.is_match(&reason)) {
             let attempts = q.int(
                 "SELECT count(*) AS n FROM events WHERE job=? AND kind='auto.retry' AND seq>
         coalesce((SELECT max(seq) FROM events WHERE job=? AND kind IN ('reply','user.follow')),0)",
                 &[&job.id, &job.id],
             )?;
-            if job.continuous || attempts < 2 {
+            if (job.continuous && pause::status(q, job.ticket)? == PauseStatus::Running) || attempts < 2 {
                 let delay = 2f64.powi((attempts + 1).min(9) as i32).min(300.0);
                 q.interrupt(who, &job.ticket_profile)?;
                 q.run("UPDATE jobs SET ready_after=? WHERE id=?", &[&(now() + delay), &job.id])?;
@@ -1729,11 +2132,7 @@ impl Inner {
             tried.push(str_of(&prev, "agent").to_string());
             cursor = int_of(&prev, "original");
         }
-        let menus = q
-            .one(
-                "SELECT payload FROM events WHERE ticket=? AND job=? AND kind='input' ORDER BY seq DESC LIMIT 1",
-                &[&job.ticket, &parent],
-            )?
+        let menus = context::delivery::full_input(q, parent, i64::MAX)?
             .and_then(|r| parse(Some(str_of(&r, "payload"))).get("delegate_models").cloned())
             .and_then(|d| match d {
                 Value::Object(m) if !m.is_empty() => Some(m),
@@ -1866,6 +2265,7 @@ impl Inner {
                     resume_session.as_deref().map(Some)
                 };
                 self.requeue(q, job, at + delay.as_secs_f64(), session, "turn.retry_scheduled", json!({
+                    "reason": err.message,
                     "class": class_name(err.class),
                     "attempt": attempt,
                     "max": max,
@@ -1883,6 +2283,7 @@ impl Inner {
                 )?;
                 // A different upstream cannot resume the old native session.
                 self.requeue(q, job, at + delay.as_secs_f64(), Some(None), "route.rotated", json!({
+                    "error_message": err.message,
                     "from": route_json(route),
                     "to": route_json(&to),
                     "reason": class_name(reason),
@@ -1892,6 +2293,7 @@ impl Inner {
                 notice(q, delay.as_secs_f64())
             }
             Recovery::WaitForRoute { until_secs } => self.requeue(q, job, until_secs, None, "turn.route_wait", json!({
+                "reason": err.message,
                 "until": p::seconds_json(until_secs),
                 "class": class_name(err.class),
                 "route": route_json(route),
@@ -1899,7 +2301,8 @@ impl Inner {
             Recovery::GiveUp { class, attempts } => {
                 // A continuous project keeps retrying transient failures,
                 // bounded per hour (spec §9.2 A).
-                if job.primary() && classify::is_retryable(class) {
+                if job.primary() && classify::is_retryable(class) && !err.native_retry_exhausted()
+                    && pause::status(q, job.ticket)? == PauseStatus::Running {
                     let recent = q.int(
                         "SELECT count(*) FROM events WHERE job=? AND kind IN ('turn.retry_scheduled','route.rotated') AND ts>?",
                         &[&job.id, &(at - 3600.0)],
@@ -1966,6 +2369,12 @@ fn ledger(q: &Q, job: i64) -> Result<TurnLedger> {
 
 /// Early wake of the parent after a child's first failed attempt (spec §9.2
 /// F). `source=NULL` keeps it outside the 128-note budget.
+fn platform_note(q: &Q, job: &JobCtx, target: i64, body: &str) -> Result<i64> {
+    let seq=q.log(job.who(),"note",&json!({"job":target,"sender":"platform","body":body,"sha256":digest(body)}))?;
+    q.run("INSERT INTO mailbox(seq,target,source,source_turn,msgkey) VALUES(?,?,NULL,NULL,NULL)",&[&seq,&target])?;
+    Ok(seq)
+}
+
 fn notify_parent(q: &Q, job: &JobCtx, class: ErrorClass, attempt: u32, until: f64) -> Result<()> {
     let Some(parent) = job.parent else { return Ok(()) };
     let open = q.exists(
@@ -2012,12 +2421,14 @@ fn log_transition(q: &Q, who: Who, t: &HealthTransition) -> Result<()> {
 }
 
 /// Per-turn stream state: the unterminated delta tail, primary protocol
-/// errors (by tag, first-insertion order) and the first fatal error.
+/// errors, expiring correction hints and the first internal failure.
 #[derive(Default)]
 struct Stream {
     pending: String,
     invalid: Vec<(String, String)>,
     fatal: Option<anyhow::Error>,
+    correction_notes: Vec<i64>,
+    detector: crate::stuck::Detector,
 }
 
 /// `approve(ctx, action)` (E:88-125).
@@ -2112,6 +2523,101 @@ impl TurnHost for Host {
         }
         if let Some(inner) = turn.inner.upgrade() {
             let _ = inner.db.tx(|q| q.accept(turn.job.who(), seqs));
+        }
+    }
+}
+
+#[cfg(test)]
+mod catalog_tests {
+    use super::*;
+    use crate::adapter::{Catalog, EventSink, RunOutcome};
+
+    struct ProbeAdapter {
+        selected: bool,
+        calls: AtomicUsize,
+    }
+
+    impl Adapter for ProbeAdapter {
+        fn agent(&self) -> &'static str {
+            "antigravity"
+        }
+
+        fn catalog(&self) -> BoxFuture<'static, Result<Catalog>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async {
+                Ok(Catalog {
+                    value: json!({"full":true}),
+                })
+            })
+        }
+
+        fn catalog_for_route(&self, route: Route) -> Option<BoxFuture<'static, Result<Catalog>>> {
+            if !self.selected {
+                return None;
+            }
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Some(Box::pin(async move {
+                Ok(Catalog {
+                    value: route_json(&route),
+                })
+            }))
+        }
+
+        fn run(
+            &self,
+            _: RunRequest,
+            _: Arc<dyn TurnHost>,
+            _: EventSink,
+            _: CancellationToken,
+        ) -> BoxFuture<'static, Result<RunOutcome, AdapterError>> {
+            panic!("catalog test must not execute models")
+        }
+    }
+
+    #[tokio::test]
+    async fn selected_catalog_shares_inflight_and_preserves_full_fallback() {
+        for selected in [false, true] {
+            let data = tempfile::tempdir().unwrap();
+            let adapter = Arc::new(ProbeAdapter {
+                selected,
+                calls: AtomicUsize::new(0),
+            });
+            let engine =
+                Engine::open(data.path(), vec![adapter.clone()], EngineOptions::default()).unwrap();
+            let route = Route {
+                provider: "google".into(),
+                model: "model-a".into(),
+                mode: "cli".into(),
+                reasoning_effort: Some("low".into()),
+            };
+            let first = engine
+                .inner
+                .catalog_request("antigravity", Some(route.clone()));
+            let second = engine
+                .inner
+                .catalog_request("antigravity", Some(route.clone()));
+            let mut other = route.clone();
+            other.reasoning_effort = Some("high".into());
+            let third = engine.inner.catalog_request("antigravity", Some(other));
+            assert_eq!(
+                adapter.calls.load(Ordering::SeqCst),
+                if selected { 2 } else { 1 }
+            );
+            let (first, second, third) = tokio::join!(first, second, third);
+            assert_eq!(first.as_ref().unwrap(), second.as_ref().unwrap());
+            if selected {
+                assert_ne!(first.unwrap(), third.unwrap());
+            }
+            engine
+                .inner
+                .catalog_request("antigravity", Some(route))
+                .await
+                .unwrap();
+            assert_eq!(
+                adapter.calls.load(Ordering::SeqCst),
+                if selected { 3 } else { 2 }
+            );
+            engine.close().await;
         }
     }
 }

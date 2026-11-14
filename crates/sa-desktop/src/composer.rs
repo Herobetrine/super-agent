@@ -2,8 +2,9 @@
 //! notes, stop, approvals, retries and plan items (the write paths of
 //! `desktop/ui/studio.js` and `desktop/ui/panels.js`).
 //!
-//! Actions go to the scheduler [`Host`](crate::host::Host) and run in
-//! submission order; outcomes come back through [`App::poll_host`].
+//! Routine actions go to the scheduler [`Host`](crate::host::Host) in
+//! submission order; maintenance operations may complete independently.
+//! Outcomes come back through [`App::poll_host`].
 
 use crate::app::App;
 use crate::host::{self, Action, ActionKind};
@@ -23,16 +24,23 @@ pub const LEADS: [&str; 4] = ["deepseek", "codex", "claude", "antigravity"];
 pub const PROFILES: [&str; 5] = ["readonly", "ask", "partial", "full", "auto"];
 const MAX_ATTACHMENTS: usize = 16;
 
-const RISK_PREFIX: &str = "参与者可用当前系统用户权限读取凭据、修改或删除项目外文件、运行命令并对外发送数据。";
-const RISK_AUTO: &str = "自动模式不设累计轮数上限，会在阶段完成后继续搜寻和调用模型，可能反复产生费用。";
+const RISK_PREFIX: &str =
+    "参与者可用当前系统用户权限读取凭据、修改或删除项目外文件、运行命令并对外发送数据。";
+const RISK_AUTO: &str =
+    "自动模式不设累计轮数上限，会在阶段完成后继续搜寻和调用模型，可能反复产生费用。";
 const RISK_FULL: &str = "本次会话不会逐项询问审批。";
-const RISK_SUFFIX: &str = "仅在信任的项目和环境中授予此权限。软件按原样提供，在适用法律允许的范围内不提供担保。";
+const RISK_SUFFIX: &str =
+    "仅在信任的项目和环境中授予此权限。软件按原样提供，在适用法律允许的范围内不提供担保。";
 
 pub enum Confirm {
     /// Switch the draft permission to `full` or `auto`.
     Profile(String),
     /// Resume a stopped continuous ticket with a new instruction.
-    Resume { ticket: i64, body: String, files: Vec<String> },
+    Resume {
+        ticket: i64,
+        body: String,
+        files: Vec<String>,
+    },
 }
 
 pub struct Composer {
@@ -61,6 +69,9 @@ pub struct Composer {
     last_body: Option<String>,
     last_attachments: Option<Vec<String>>,
     last_create_context: Option<(u64, Option<PathBuf>)>,
+    /// A fork is independent of composer text/attachments and remembers its
+    /// source view so a late response cannot steal focus from another ticket.
+    pending_fork: Option<(u64, i64)>,
     last_plan: Option<String>,
     pub focus: bool,
     /// When the current message first appeared (success notices fade out).
@@ -84,7 +95,9 @@ impl Composer {
         Self {
             draft: String::new(),
             project,
-            lead: lead.filter(|l| LEADS.contains(&l.as_str())).unwrap_or_else(|| "deepseek".into()),
+            lead: lead
+                .filter(|l| LEADS.contains(&l.as_str()))
+                .unwrap_or_else(|| "deepseek".into()),
             profile: "readonly".into(),
             attachments: Vec::new(),
             target: None,
@@ -98,6 +111,7 @@ impl Composer {
             last_body: None,
             last_attachments: None,
             last_create_context: None,
+            pending_fork: None,
             last_plan: None,
             focus: false,
             shown: None,
@@ -123,9 +137,13 @@ impl Composer {
                 if let Event::Ime(ime) = event {
                     composing = true;
                     match ime {
-                        egui::ImeEvent::Enabled | egui::ImeEvent::Preedit(_) => self.ime_active = true,
+                        egui::ImeEvent::Enabled | egui::ImeEvent::Preedit(_) => {
+                            self.ime_active = true
+                        }
                         egui::ImeEvent::Commit(text) if text == "\n" || text == "\r" => {}
-                        egui::ImeEvent::Commit(_) | egui::ImeEvent::Disabled => self.ime_active = false,
+                        egui::ImeEvent::Commit(_) | egui::ImeEvent::Disabled => {
+                            self.ime_active = false
+                        }
                     }
                 }
             }
@@ -155,8 +173,19 @@ impl Current {
     }
 }
 
-fn round_button(ui: &mut Ui, ic: &str, label: &str, fill: Color32, fg: Color32, enabled: bool) -> Response {
-    let sense = if enabled { Sense::click() } else { Sense::hover() };
+fn round_button(
+    ui: &mut Ui,
+    ic: &str,
+    label: &str,
+    fill: Color32,
+    fg: Color32,
+    enabled: bool,
+) -> Response {
+    let sense = if enabled {
+        Sense::click()
+    } else {
+        Sense::hover()
+    };
     let (rect, resp) = ui.allocate_exact_size(Vec2::splat(34.0), sense);
     resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, label));
     if ui.is_rect_visible(rect) {
@@ -169,7 +198,13 @@ fn round_button(ui: &mut Ui, ic: &str, label: &str, fill: Color32, fg: Color32, 
         };
         let p = ui.painter();
         p.circle_filled(rect.center(), 17.0, fill);
-        p.text(rect.center(), Align2::CENTER_CENTER, ic, theme::body(17.0), fg);
+        p.text(
+            rect.center(),
+            Align2::CENTER_CENTER,
+            ic,
+            theme::body(17.0),
+            fg,
+        );
     }
     if enabled {
         resp.on_hover_cursor(egui::CursorIcon::PointingHand)
@@ -201,7 +236,9 @@ impl App {
             ticket,
             loaded: ticket.is_none() || snap.is_some(),
             state: snap.map(|s| s.ticket.state.clone()).unwrap_or_default(),
-            profile: snap.map(|s| s.ticket.permission_profile.clone()).unwrap_or_default(),
+            profile: snap
+                .map(|s| s.ticket.permission_profile.clone())
+                .unwrap_or_default(),
             lead: snap.map(|s| s.ticket.lead.clone()).unwrap_or_default(),
             cwd: snap.map(|s| s.ticket.cwd.clone()).unwrap_or_default(),
             target_active,
@@ -218,8 +255,19 @@ impl App {
             self.composer.message = Some(("只读观察模式不能修改工单".into(), true));
             return;
         };
+        let fork_context = if let Action::ForkCheckpoint { ticket, .. } = &action {
+            if self.composer.pending_fork.is_some() {
+                self.composer.message = Some(("正在建立分支，请等待完成。".into(), false));
+                return;
+            }
+            Some((self.epoch, *ticket))
+        } else {
+            None
+        };
         match &action {
-            Action::Create { goal, .. } | Action::Follow { body: goal, .. } | Action::Note { body: goal, .. } => {
+            Action::Create { goal, .. }
+            | Action::Follow { body: goal, .. }
+            | Action::Note { body: goal, .. } => {
                 self.composer.last_body = Some(goal.clone());
             }
             Action::PlanAdd { body, .. } => self.composer.last_plan = Some(body.clone()),
@@ -232,6 +280,9 @@ impl App {
             self.composer.last_create_context = Some((self.epoch, cwd.clone()));
         }
         if host.submit(action) {
+            if fork_context.is_some() {
+                self.composer.pending_fork = fork_context;
+            }
             self.composer.pending += 1;
             self.composer.message = None;
         } else {
@@ -278,25 +329,62 @@ impl App {
         for o in outcomes {
             self.composer.pending = self.composer.pending.saturating_sub(1);
             let ok = o.result.is_ok();
-            let same_create_context = self.composer.last_create_context.as_ref()
-                .is_some_and(|(epoch, project)| *epoch == self.epoch && project == &self.composer.project);
-            let sent = ok && matches!(o.kind, ActionKind::Create | ActionKind::Follow | ActionKind::Note)
-                && (o.kind != ActionKind::Create || same_create_context);
+            let same_fork_context = if o.kind == ActionKind::Fork {
+                self.composer
+                    .pending_fork
+                    .take()
+                    .is_some_and(|(epoch, source)| {
+                        epoch == self.epoch
+                            && self.view.as_ref().is_some_and(|view| view.id == source)
+                    })
+            } else {
+                false
+            };
+            let same_create_context =
+                self.composer
+                    .last_create_context
+                    .as_ref()
+                    .is_some_and(|(epoch, project)| {
+                        *epoch == self.epoch && project == &self.composer.project
+                    });
+            let sent =
+                ok && matches!(
+                    o.kind,
+                    ActionKind::Create | ActionKind::Follow | ActionKind::Note
+                ) && (o.kind != ActionKind::Create || same_create_context);
             if sent && self.composer.last_body.as_deref() == Some(self.composer.draft.as_str()) {
                 self.composer.draft.clear();
             }
-            if sent && matches!(o.kind, ActionKind::Create | ActionKind::Follow)
+            if sent
+                && matches!(o.kind, ActionKind::Create | ActionKind::Follow)
                 && self.composer.last_attachments.as_ref() == Some(&self.composer.attachments)
             {
                 self.composer.attachments.clear();
             }
             match (o.kind, o.result) {
                 (ActionKind::Create, Ok(id)) => {
-                    if let Some(id) = id && same_create_context {
+                    if let Some(id) = id
+                        && same_create_context
+                    {
                         let unsent = std::mem::take(&mut self.composer.attachments);
                         self.select(Some(id));
                         self.composer.attachments = unsent;
                     }
+                }
+                (ActionKind::Fork, Ok(Some(id))) => {
+                    if same_fork_context {
+                        let attachments = std::mem::take(&mut self.composer.attachments);
+                        self.select(Some(id));
+                        self.composer.attachments = attachments;
+                        self.composer.message = Some((format!("已建立分支 #{id}。"), false));
+                    } else {
+                        self.composer.message =
+                            Some((format!("已建立分支 #{id}，可在会话列表打开。"), false));
+                    }
+                }
+                (ActionKind::Fork, Ok(None)) => {
+                    self.composer.message =
+                        Some(("分支创建未返回工单编号，请刷新会话列表核对。".into(), true));
                 }
                 (ActionKind::Note, Ok(_)) => {
                     self.composer.target = None;
@@ -309,16 +397,22 @@ impl App {
                     self.composer.message = Some(("已重新排队该任务。".into(), false));
                 }
                 (ActionKind::Decide { allow }, Ok(_)) => {
-                    let text = if allow { "已允许本次请求。" } else { "已拒绝本次请求。" };
+                    let text = if allow {
+                        "已允许本次请求。"
+                    } else {
+                        "已拒绝本次请求。"
+                    };
                     self.composer.message = Some((text.into(), false));
                 }
                 (ActionKind::Plan, Ok(_)) => {
-                    if self.composer.last_plan.as_deref() == Some(self.composer.plan_draft.as_str()) {
+                    if self.composer.last_plan.as_deref() == Some(self.composer.plan_draft.as_str())
+                    {
                         self.composer.plan_draft.clear();
                     }
                 }
                 (ActionKind::Follow, Ok(_)) => {}
                 (ActionKind::Routes, r) => self.routes_saved(r.map(|_| ())),
+                (ActionKind::Efficiency, r) => self.efficiency_saved(r.map(|_| ())),
                 (ActionKind::Knowledge, r) => self.knowledge_saved(r.map(|_| ())),
                 (ActionKind::Providers, r) => self.providers_saved(r.map(|_| ())),
                 (ActionKind::Meta, Ok(_)) => {}
@@ -334,11 +428,20 @@ impl App {
             return;
         }
         if self.composer.target.is_some() && !self.composer.attachments.is_empty() {
-            self.composer.message = Some(("请将附件发给主控，或先移除附件再发送定向留言".into(), true));
+            self.composer.message =
+                Some(("请将附件发给主控，或先移除附件再发送定向留言".into(), true));
             return;
         }
-        let lead = if cur.ticket.is_some() { &cur.lead } else { &self.composer.lead };
-        if self.composer.attachments.iter().any(|path| sa_engine::images::is_image_name(path))
+        let lead = if cur.ticket.is_some() {
+            &cur.lead
+        } else {
+            &self.composer.lead
+        };
+        if self
+            .composer
+            .attachments
+            .iter()
+            .any(|path| sa_engine::images::is_image_name(path))
             && !sa_engine::images::supports_native_images(lead)
         {
             self.composer.message = Some((sa_engine::images::UNSUPPORTED.into(), true));
@@ -363,7 +466,11 @@ impl App {
                     body,
                 },
                 None if cur.stopped() => {
-                    self.composer.confirm = Some(Confirm::Resume { ticket, body, files: self.composer.attachments.clone() });
+                    self.composer.confirm = Some(Confirm::Resume {
+                        ticket,
+                        body,
+                        files: self.composer.attachments.clone(),
+                    });
                     return;
                 }
                 None => Action::Follow {
@@ -387,6 +494,7 @@ impl App {
                 Ok(real) if real.is_dir() => {
                     if self.composer.project.as_ref() != Some(&real) {
                         self.composer.attachments.clear();
+                        self.composer.extensions = None;
                     }
                     self.composer.project = Some(real);
                 }
@@ -410,7 +518,9 @@ impl App {
             idx.root = root.to_path_buf();
             idx.files = None;
             let dir = root.to_path_buf();
-            idx.pending = Some(crate::ops::Pending::spawn(ctx, move || crate::files::scan(&dir)));
+            idx.pending = Some(crate::ops::Pending::spawn(ctx, move || {
+                crate::files::scan(&dir)
+            }));
         }
     }
 
@@ -428,7 +538,8 @@ impl App {
                 if self.composer.attachments.len() < MAX_ATTACHMENTS {
                     self.composer.attachments.push(rel.clone());
                 } else {
-                    self.composer.message = Some((format!("图片已保存为 {rel}，单次最多附加 16 个文件"), true));
+                    self.composer.message =
+                        Some((format!("图片已保存为 {rel}，单次最多附加 16 个文件"), true));
                     return;
                 }
                 self.composer.message = Some((format!("已保存粘贴的图片：{rel}"), false));
@@ -441,7 +552,13 @@ impl App {
     /// Files dropped on the window: a folder becomes the draft's project,
     /// files inside the project are attached.
     pub fn take_dropped_files(&mut self, ctx: &egui::Context) {
-        let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect());
+        let dropped: Vec<PathBuf> = ctx.input(|i| {
+            i.raw
+                .dropped_files
+                .iter()
+                .filter_map(|f| f.path.clone())
+                .collect()
+        });
         if dropped.is_empty() || !self.writable() {
             return;
         }
@@ -453,6 +570,7 @@ impl App {
             if let Ok(real) = sa_engine::services::realpath(&dropped[0]) {
                 if self.composer.project.as_ref() != Some(&real) {
                     self.composer.attachments.clear();
+                    self.composer.extensions = None;
                 }
                 self.composer.project = Some(real);
             }
@@ -465,7 +583,9 @@ impl App {
         match host::relative_files(&project, &dropped) {
             Ok(rel) => {
                 for r in rel {
-                    if !self.composer.attachments.contains(&r) && self.composer.attachments.len() < MAX_ATTACHMENTS {
+                    if !self.composer.attachments.contains(&r)
+                        && self.composer.attachments.len() < MAX_ATTACHMENTS
+                    {
                         self.composer.attachments.push(r);
                     }
                 }
@@ -476,13 +596,18 @@ impl App {
 
     fn attachment_project(&self) -> Option<PathBuf> {
         match &self.view {
-            Some(view) => view.snap.as_ref().map(|snapshot| PathBuf::from(&snapshot.ticket.cwd)),
+            Some(view) => view
+                .snap
+                .as_ref()
+                .map(|snapshot| PathBuf::from(&snapshot.ticket.cwd)),
             None => self.composer.project.clone(),
         }
     }
 
     pub(crate) fn pick_attachments(&mut self) {
-        let Some(project) = self.attachment_project() else { return };
+        let Some(project) = self.attachment_project() else {
+            return;
+        };
         let Some(files) = rfd::FileDialog::new()
             .set_title("选择要附加的项目文件")
             .set_directory(&project)
@@ -542,7 +667,14 @@ impl App {
                     (icon::CHECK_CIRCLE, pal.ok.fg)
                 };
                 ui.label(RichText::new(ic).font(theme::body(14.0)).color(color));
-                ui.add(Label::new(RichText::new(text).font(theme::body(theme::SMALL)).color(color)).wrap());
+                ui.add(
+                    Label::new(
+                        RichText::new(text)
+                            .font(theme::body(theme::SMALL))
+                            .color(color),
+                    )
+                    .wrap(),
+                );
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if widgets::icon_button(ui, icon::X, 20.0, pal.mute, pal.hover, false)
                         .on_hover_text("关闭提示")
@@ -552,6 +684,50 @@ impl App {
                     }
                 });
             });
+            ui.add_space(6.0);
+        }
+
+        let pause_status = self.view.as_ref().and_then(|v| v.snap.as_ref())
+            .and_then(|s| s.ticket.pause_status.clone());
+        if let Some(ticket) = cur.ticket
+            && (in_flight || pause_status.is_some())
+        {
+            let mut action = None;
+            ui.horizontal_wrapped(|ui| {
+                let (label, hint) = match pause_status.as_deref() {
+                    Some("paused") => ("已暂停后续调度", "可补充指令；点击恢复调度后才会继续执行。"),
+                    Some("draining") => ("等待当前工作完成交接", "正在执行的操作会继续，已有协作者完成后由主控收拢交接。"),
+                    Some("handoff") => ("等待主控完成本轮交接", "保留当前操作；收齐已有回报后的最终交接轮禁止新派工。"),
+                    _ => ("", "保留当前操作，等待协作者完成并由主控交接后暂停后续调度。"),
+                };
+                if !label.is_empty() {
+                    ui.label(RichText::new(label).color(pal.mute)).on_hover_text(hint);
+                }
+                let enabled = self.writable() && !busy;
+                match pause_status.as_deref() {
+                    Some("paused") => {
+                        if ui.add_enabled(enabled, egui::Button::new("恢复调度")).clicked() {
+                            action = Some(Action::ResumePaused { ticket });
+                        }
+                    }
+                    Some("draining" | "handoff") => {
+                        if ui.add_enabled(enabled, egui::Button::new("取消暂停请求"))
+                            .on_hover_text("恢复正常调度；正在进行的交接轮仍会完成。")
+                            .clicked()
+                        {
+                            action = Some(Action::ResumePaused { ticket });
+                        }
+                    }
+                    _ => {
+                        if ui.add_enabled(enabled, egui::Button::new("交接后暂停"))
+                            .on_hover_text(hint).clicked()
+                        {
+                            action = Some(Action::PauseAfterHandoff { ticket });
+                        }
+                    }
+                }
+            });
+            if let Some(action) = action { self.submit(action); }
             ui.add_space(6.0);
         }
 
@@ -909,7 +1085,9 @@ impl App {
 
     /// High-risk permission and resume confirmations.
     pub fn confirm_dialog(&mut self, ctx: &egui::Context) {
-        let Some(confirm) = &self.composer.confirm else { return };
+        let Some(confirm) = &self.composer.confirm else {
+            return;
+        };
         let pal = self.pal.clone();
         let (title, text, ok) = match confirm {
             Confirm::Profile(p) => (
@@ -943,7 +1121,9 @@ impl App {
                         .color(pal.warn.fg),
                 );
                 ui.add_space(10.0);
-                ui.add(Label::new(RichText::new(text).font(theme::body(13.5)).color(pal.ink)).wrap());
+                ui.add(
+                    Label::new(RichText::new(text).font(theme::body(13.5)).color(pal.ink)).wrap(),
+                );
                 ui.add_space(16.0);
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     ui.spacing_mut().item_spacing.x = 8.0;
@@ -959,13 +1139,19 @@ impl App {
             decision = Some(false);
         }
         let Some(yes) = decision else { return };
-        let Some(confirm) = self.composer.confirm.take() else { return };
+        let Some(confirm) = self.composer.confirm.take() else {
+            return;
+        };
         if !yes {
             return;
         }
         match confirm {
             Confirm::Profile(p) => self.composer.profile = p,
-            Confirm::Resume { ticket, body, files } => self.submit(Action::Follow {
+            Confirm::Resume {
+                ticket,
+                body,
+                files,
+            } => self.submit(Action::Follow {
                 ticket,
                 body,
                 resume: true,
@@ -984,23 +1170,33 @@ mod keyboard_tests {
     fn harness(data: &std::path::Path, project: &std::path::Path) -> Harness<'static, App> {
         let data = data.to_path_buf();
         let project = project.to_path_buf();
-        Harness::builder().with_size(egui::vec2(1280.0, 860.0)).build_eframe(move |cc| {
-            crate::theme::install_fonts(&cc.egui_ctx);
-            let ctx = cc.egui_ctx.clone();
-            let host = host::Host::start_with(data.clone(), host::tests::fakes, move || ctx.request_repaint())
+        Harness::builder()
+            .with_size(egui::vec2(1280.0, 860.0))
+            .build_eframe(move |cc| {
+                crate::theme::install_fonts(&cc.egui_ctx);
+                let ctx = cc.egui_ctx.clone();
+                let host = host::Host::start_with(data.clone(), host::tests::fakes, move || {
+                    ctx.request_repaint()
+                })
                 .map_err(|e| format!("{e:#}"));
-            let worker = crate::worker::spawn(crate::data::StoreSource::opener(data.clone()), cc.egui_ctx.clone());
-            let opts = crate::cli::Options { data: Some(data), ..Default::default() };
-            let mut app = App::new(cc, opts, worker, Arc::new(Mutex::new(None)), host);
-            app.composer.project = Some(project.clone());
-            app.composer.index = Some(FileIndex {
-                root: project,
-                files: Some(Ok(vec!["zh-one.txt".into(), "zh-two.txt".into()])),
-                pending: None,
-            });
-            app.composer.draft = "@".into();
-            app
-        })
+                let worker = crate::worker::spawn(
+                    crate::data::StoreSource::opener(data.clone()),
+                    cc.egui_ctx.clone(),
+                );
+                let opts = crate::cli::Options {
+                    data: Some(data),
+                    ..Default::default()
+                };
+                let mut app = App::new(cc, opts, worker, Arc::new(Mutex::new(None)), host);
+                app.composer.project = Some(project.clone());
+                app.composer.index = Some(FileIndex {
+                    root: project,
+                    files: Some(Ok(vec!["zh-one.txt".into(), "zh-two.txt".into()])),
+                    pending: None,
+                });
+                app.composer.draft = "@".into();
+                app
+            })
     }
 
     fn assert_not_selected_or_sent(h: &Harness<'_, App>) {
@@ -1025,7 +1221,13 @@ mod keyboard_tests {
         assert_eq!(h.state().composer.pending, 0);
         assert_eq!(h.state().composer.draft, "描述这张图");
         assert_eq!(h.state().composer.attachments, ["截图.PNG"]);
-        assert!(h.state().composer.message.as_ref().is_some_and(|(text, error)| *error && text.contains("Codex")));
+        assert!(
+            h.state()
+                .composer
+                .message
+                .as_ref()
+                .is_some_and(|(text, error)| *error && text.contains("Codex"))
+        );
     }
 
     fn ime_and_enter(h: &mut Harness<'_, App>, ime: egui::ImeEvent) {

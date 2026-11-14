@@ -116,7 +116,7 @@ async fn rejected_image_follow_leaves_state_manifest_and_journal_unchanged() {
     fx.finish(unsupported, "done").await;
     let seq = fx.int("SELECT max(seq) FROM events");
     let err = fx.engine.follow_with_files(unsupported, "看图", false, &["原图.png".into()]).await.unwrap_err();
-    assert!(err.to_string().contains("Codex 或 Claude Code"));
+    assert!(err.to_string().contains("Codex、Claude Code 或 Antigravity"));
     assert_eq!(fx.int("SELECT max(seq) FROM events"), seq);
     assert_eq!(root_state(&fx.engine, unsupported), "done");
     // Snapshot validation may succeed, but a disallowed state transition
@@ -173,7 +173,7 @@ async fn unsupported_image_harness_fails_before_adapter_execution() {
     fx.finish(id, "failed").await;
     assert_eq!(fx.shared.count(|_| true), 0);
     let result = fx.all("SELECT result FROM jobs WHERE parent IS NULL");
-    assert!(result[0]["result"].as_str().unwrap().contains("Codex 或 Claude Code"));
+    assert!(result[0]["result"].as_str().unwrap().contains("Codex、Claude Code 或 Antigravity"));
     fx.engine.close().await;
 }
 

@@ -232,6 +232,64 @@ fn snapshot_projects_visible_payloads_and_ticket_state() {
 }
 
 #[test]
+fn rejected_control_is_visible_and_redacted_without_failing_the_root() {
+    let dir = tempfile::tempdir().unwrap();
+    let _studio = Store::open(dir.path()).unwrap();
+    let conn = writer(dir.path());
+    let job = create_ticket(&conn, "C:/proj", "review", "codex");
+    conn.execute("UPDATE jobs SET state='running' WHERE id=?", [job.id])
+        .unwrap();
+    let mut reader = Store::open_read_only(dir.path()).unwrap();
+    let before = reader.snapshot(job.ticket, 0).unwrap();
+    let rejection = log(
+        &conn,
+        job,
+        "protocol.rejected",
+        &json!({
+            "tag": "SA_SEND", "id": "PRIVATE-ID", "logical_turn": 1,
+            "command_sha256": "PRIVATE-HASH", "reason": "PRIVATE-REASON",
+            "command": "PRIVATE-COMMAND", "executed": false,
+            "summary": "PRIVATE-SUMMARY", "status": "deny"
+        }),
+    );
+    let expected = json!({
+        "label": "控制指令被拒绝，该指令未执行", "category": "task", "state": "running"
+    });
+
+    let incremental = reader.snapshot(job.ticket, before.cursor).unwrap();
+    assert_eq!(incremental.ticket.state, "running");
+    assert_eq!(incremental.events.len(), 1);
+    let event = &incremental.events[0];
+    assert_eq!((event.seq, event.kind.as_str()), (rejection, "activity"));
+    assert_eq!((event.job, event.turn), (Some(job.id), Some(1)));
+    assert_eq!(event.agent.as_deref(), Some("codex"));
+    assert_eq!(event.payload, expected);
+
+    conn.execute("UPDATE jobs SET state='done',result='业务成果' WHERE id=?", [job.id])
+        .unwrap();
+    log(&conn, job, "reply", &json!({"text": "业务成果", "state": "done"}));
+    let completed = reader.snapshot(job.ticket, 0).unwrap();
+    assert_eq!(completed.ticket.state, "done");
+    assert_eq!(completed.jobs[0].state, "done");
+    assert_eq!(completed.jobs[0].result.as_deref(), Some("业务成果"));
+    let projected: Vec<_> = completed.events.iter().filter(|e| e.seq == rejection).collect();
+    assert_eq!(projected.len(), 1);
+    assert_eq!(projected[0].kind, "activity");
+    assert_eq!(projected[0].payload, expected);
+    let page = reader.activity_page(job.ticket, None).unwrap();
+    let activity = page.events.iter().find(|e| e.seq == rejection).unwrap();
+    assert_eq!(activity.kind, "activity");
+    assert_eq!(activity.payload, expected);
+    for serialized in [
+        serde_json::to_string(&incremental).unwrap(),
+        serde_json::to_string(&completed).unwrap(),
+        serde_json::to_string(&page).unwrap(),
+    ] {
+        assert!(!serialized.contains("PRIVATE-"), "rejection payload leaked");
+    }
+}
+
+#[test]
 fn latest_window_keeps_newest_180_events() {
     let dir = tempfile::tempdir().unwrap();
     let mut store = Store::open(dir.path()).unwrap();

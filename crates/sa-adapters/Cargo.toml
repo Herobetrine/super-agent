@@ -1,6 +1,6 @@
 [package]
 name = "sa-adapters"
-description = "Super Agent harness adapters: Codex app-server, Claude Code, DeepSeek Harness, Antigravity CLI"
+description = "Super Agent harness adapters: Codex, Claude Code, DeepSeek Harness, Antigravity and ACP"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -14,7 +14,8 @@ sha2.workspace = true
 tempfile.workspace = true
 rusqlite.workspace = true
 tokio = { workspace = true, features = ["net"] }
-tokio-util.workspace = true
+tokio-util = { workspace = true, features = ["compat"] }
+agent-client-protocol = "=5.0.0"
 futures.workspace = true
 regex = "1"
 base64 = "0.22"

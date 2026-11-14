@@ -7,7 +7,7 @@
 
 use crate::mcp::{self, CANCELLED};
 use crate::validate::nonempty;
-use crate::{Inner, ProjectExtensions, scope_in};
+use crate::{Inner, ProjectExtensions, directory, scope_in};
 use anyhow::{Result, anyhow, ensure};
 use sa_engine::db::{Q, Who};
 use sa_engine::protocol::{digest, stringify};
@@ -30,11 +30,27 @@ fn current(q: &Q, a: &InvokeArgs) -> Result<bool> {
 }
 
 /// `binding()` (X:328-331): the server row at the bound revision, if enabled.
-fn binding(q: &Q, server: &str, revision: &str) -> Result<Option<Map<String, Value>>> {
-    q.one(
+fn binding(
+    q: &Q,
+    a: &InvokeArgs,
+    server: &str,
+    revision: &str,
+) -> Result<Option<Map<String, Value>>> {
+    ensure!(!a.cwd.is_empty(), "MCP 调用缺少工作目录");
+    let cwd = directory::ticket_directory(q, a.ticket)?;
+    let requested = directory::real_directory(std::path::Path::new(&a.cwd))?;
+    ensure!(cwd == requested, "MCP 调用工作目录与工单不一致");
+    let row = q.one(
         "SELECT * FROM studio_servers WHERE id=? AND enabled AND revision=?",
         &[&server, &revision],
-    )
+    )?;
+    if let Some(row) = &row {
+        ensure!(
+            directory::available(row, Some(&cwd)),
+            "此 MCP 服务在当前工作目录不可用"
+        );
+    }
+    Ok(row)
 }
 
 impl Inner {
@@ -42,8 +58,13 @@ impl Inner {
         self.db.with(|q| current(q, a))
     }
 
-    fn binding(&self, server: &str, revision: &str) -> Result<Option<Map<String, Value>>> {
-        self.db.with(|q| binding(q, server, revision))
+    fn binding(
+        &self,
+        a: &InvokeArgs,
+        server: &str,
+        revision: &str,
+    ) -> Result<Option<Map<String, Value>>> {
+        self.db.with(|q| binding(q, a, server, revision))
     }
 
     /// Store an oversized result as an immutable object (X:358-366).
@@ -121,6 +142,7 @@ impl ProjectExtensions {
         };
         let revision = allowed["revision"].as_str().unwrap_or_default().to_string();
         let label = allowed["name"].as_str().unwrap_or_default().to_string();
+        inner.binding(&a, server, &revision)?;
         ensure!(!a.cancel.is_cancelled(), CANCELLED);
         ensure!(inner.current(&a)?, "旧轮次已停止");
         inner.db.with(|q| {
@@ -137,38 +159,42 @@ impl ProjectExtensions {
         let mut issued = false;
         let mut returned = false;
         let outcome: Result<Value> = async {
-            ensure!(inner.binding(server, &revision)?.is_some(), "MCP 服务已禁用或已更改");
+            ensure!(inner.binding(&a, server, &revision)?.is_some(), "MCP 服务已禁用或已更改");
             if !matches!(a.profile.as_str(), "full" | "auto") {
                 let action = json!({"tool": format!("MCP {label} / {tool}"), "arguments": args, "detail": DETAIL});
                 ensure!((a.approve)(action).await, "用户未批准调用");
             }
             ensure!(!a.cancel.is_cancelled(), CANCELLED);
             ensure!(inner.current(&a)?, "旧轮次已停止");
-            let Some(row) = inner.binding(server, &revision)? else {
+            let Some(row) = inner.binding(&a, server, &revision)? else {
                 return Err(anyhow!("MCP 服务已禁用或已更改"));
             };
             let config = mcp::ServerConfig::from_row(&row)?;
-            let client = mcp::connect(&config, &a.cancel).await?;
+            let mut lease = inner.pool.acquire(a.ticket, server, &revision, &a.cwd, &config, &a.cancel).await?;
+            let revoked = lease.revoked();
             let called = async {
                 ensure!(!a.cancel.is_cancelled(), CANCELLED);
                 ensure!(
-                    inner.current(&a)? && inner.binding(server, &revision)?.is_some(),
+                    inner.current(&a)? && inner.binding(&a, server, &revision)?.is_some(),
                     "指令或服务授权已改变"
                 );
                 inner
                     .db
                     .with(|q| q.log(who, "mcp.started", &json!({"id": id, "server": server, "tool": tool})))?;
                 issued = true;
-                mcp::call_tool(&client, tool, args, &a.cancel).await
+                tokio::select! {
+                    biased;
+                    () = revoked.cancelled() => Err(anyhow!("MCP 连接授权已撤销")),
+                    result = mcp::call_tool(lease.client(), tool, args, &a.cancel) => result,
+                }
             }
             .await;
-            if a.cancel.is_cancelled() {
-                // Dropping the connection stops the server (stdin close,
-                // then a job-object kill) without delaying the turn.
-                drop(client);
-            } else {
-                mcp::close(client).await;
+            // Only a returned protocol result may retain the connection. A
+            // transport failure/timeout/cancellation never retries the tool.
+            if called.is_ok() && !a.cancel.is_cancelled() && !revoked.is_cancelled() {
+                lease.keep();
             }
+            drop(lease);
             let result = called?;
             returned = true;
             Ok(result)
@@ -192,7 +218,11 @@ impl ProjectExtensions {
                 }
             }
             Err(e) => (
-                if issued && !returned { "uncertain" } else { "error" },
+                if issued && !returned {
+                    "uncertain"
+                } else {
+                    "error"
+                },
                 json!({"error": e.to_string()}),
             ),
         };

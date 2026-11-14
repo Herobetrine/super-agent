@@ -155,7 +155,7 @@ Studio's UI-visible subset is listed in ST:15-40.
   5. If ≥8 jobs were admitted, schedule another `tick()` on `setImmediate` (E:200-205). Reader concurrency is unbounded; T1 runs 80 readers plus 1 writer at once.
 
 ### 2.3 Writer serialization
-- **One declared writer runs at a time, process-wide and across tickets.** This is enforced by the in-memory `writer` slot (E:25, 151, 188, 197). T1 "declared writers serialize across tickets" checks it.
+- **Historical baseline: one declared writer runs at a time, process-wide and across tickets.** This was enforced by the in-memory `writer` slot (E:25, 151, 188, 197). T1 "declared writers serialize across tickets" checks overlapping project directories. The Rust update of 2026-11-09 uses canonical directory overlap instead: unrelated directories and isolated Git worktrees may write concurrently; the same/nested directory remains serialized. Operator validation/integration leases both the source and isolated directory. See [community integration](community-integration.md) and `tests/workspaces.rs` for the current behavior; the numbered JavaScript algorithm above remains a historical reference.
 - Readers always run concurrently.
 - `writing` means a declared write, not an OS capability. A full or auto child dispatched with `write:false` is a "reader" but still has full OS access (G:39-41).
 
@@ -324,16 +324,19 @@ T1 asserts recovery runs only on `start()`, not in the constructor.
 - All submissions go through one serial promise queue per turn.
 - `SA_GOAL`, `SA_NEXT`, `SA_FINISH`, `SA_LEARN` and `SA_EXHAUSTED` are parsed **only from the final `result.text`**, inside commitReply (PR:91-125), and only for an auto root.
 
-**Error routing** (E:282-289):
+**Error routing** (Rust update, 2026-11-14; replaces historical E:282-289):
 - streaming plus `SyntaxError` (bad JSON) → `protocol.preview_invalid {tag}`; the final pass gets another chance.
-- otherwise, if continuous primary → `invalid.set(tag, msg)` plus `auto.protocol {tag, reason}`. The turn is not failed; the errors become a correction hint.
-- otherwise → `fatal = err`, and the job fails with that message after the queue drains (E:392).
+- Explicit parameter and authority checks produce a typed `CmdError::Rejected`; final JSON syntax errors use the same rejection path. Log `protocol.rejected {tag,id,logical_turn,command_sha256,reason,executed:false}`, deduplicated by job, logical turn and exact command hash. The rejected command does not execute; later valid controls and the authoritative final reply remain eligible for commit.
+- Notify an active parent in the same transaction. A non-primary streaming issuer receives a current-turn correction note. At a successful reply, consume only this physical turn's still-unread correction notes so they cannot cause an extra paid continuation; business notes are untouched. A final-only rejection does not add a self-note.
+- A continuous primary additionally retains `invalid.set(tag,msg)` and `auto.protocol {tag,reason}` so its existing autonomous correction contract still applies.
+- Database, filesystem and extension/internal failures retain their original error type. Set `fatal`, cancel the native turn immediately, and report the original error rather than the resulting cancellation. Failure to save a rejection receipt is also fatal; it is never silently swallowed.
+- Progress views show a fixed label for `protocol.rejected`; command bodies and arbitrary rejection payload fields remain outside the operational projection. The label does not change the job's state to failed.
 
 Lines that do not match the tag regex are ignored. `command()` also ignores lines with no space (D:177-183).
 
 ### 4.2 Per-command rules
 
-**SA_PROGRESS** (D:126-175). Errors never fail the job.
+**SA_PROGRESS** (D:126-175). Validation errors do not fail the job; journal failures remain fatal.
 - Skipped silently if aborted, not live, or a ticket-level `user.follow` exists after this job's admission. **That applies to child jobs too** (T1 cancel/follow tests).
 - Validation:
   - Bad JSON → `protocol.progress_invalid {reason:'invalid_json'}`.
@@ -342,7 +345,7 @@ Lines that do not match the tag regex are ignored. `command()` also ignores line
 - On acceptance: log `job.progress {id, summary}` and insert the receipt. The summary is stored verbatim, including surrounding spaces.
 
 **SA_SEND** (D:5-124):
-- `check()` throws (fatal or auto.protocol) on:
+- `check()` returns a typed rejection (see §4.1) on:
   - a non-object;
   - any of the keys `provider`, `mode`, `selection`, `route`, `route_override`, `permission_override` (`'不可通过派工更换供应商或执行端'`);
   - invalid fields (`'派工参数无效'`): `id` must be validText ≤96; `to` must be in AGENTS; `body` must be validText; `write` must be a boolean (default false); `role` must be a string ≤120 (default ''); `files` must be an array (default []).
@@ -363,7 +366,7 @@ Lines that do not match the tag regex are ignored. `command()` also ignores line
 **SA_NOTE** (D:224-227, S:220-272):
 - `id` must be validText ≤96, otherwise `'无效的信件 ID'`.
 - `recordNote(ticket, cmd.job, cmd.body, sourceJob, id)`: `dest` must be a safe positive integer and `body` must be validText.
-- Dedupe: `(source, source_turn=logical, msgkey)`. An existing row whose job or body differs throws `'同一 SA_NOTE ID 的内容不一致'`; an identical one returns the old seq.
+- Dedupe: `(source, source_turn=logical, msgkey)`. An existing row whose job or body differs returns a typed rejection `'同一 SA_NOTE ID 的内容不一致'`; an identical one returns the old seq. Invalid IDs, destinations or bodies likewise use the typed rejection path for agent controls; user APIs still return the error to their caller.
 - Rejections, logged as `note.rejected` with `reason` and a mailbox row with `target=NULL`, without throwing:
   - the receiver is not in the same ticket, or its state is not queued, running or waiting;
   - the budget is exceeded: the count of agent-sourced mailbox rows with a non-null target in the ticket is ≥128. For continuous tickets only the unconsumed rows whose target job is not terminal count.
@@ -530,6 +533,7 @@ The new boundary hides older children from `reports`/`roster` via `floor`, and t
 - `packet.delegate_models = ctx.catalog` is always set.
 - Resolve `selected`. **If `options(cat_of_own_agent, selected)` is null, throw `'所选供应商、模型或执行端当前不可用'`.** The engine never substitutes another upstream (E:252-255).
 - Persist `native_routes` and log `route.requested`.
+- Rust port: roots and primaries retain complete delegation menus. A non-root, non-primary whose bound, selected or assigned route is already complete may request route-scoped live discovery. Catalog defaults and legacy selection still require the complete catalog. Adapters without this capability retain the original shared full-catalog path. In-flight sharing keys distinguish a full harness catalog from a selected harness plus complete `Route` (including source and effort); completed probes are removed, with no cross-turn TTL cache.
 - `options()` (PR:33-66) requires all of:
   - `cat.available` is not false;
   - exactly one mode row matching `selected.mode`, with `available===true` and allowing the provider;
@@ -545,6 +549,7 @@ The new boundary hides older children from `reports`/`roster` via `floor`, and t
 
 ### 7.1 Engine → `adapters` object
 - `catalog(agent)` → Promise<Catalog>.
+- Rust `Adapter::catalog_for_route(route)` optionally returns a selected-catalog future; default `None` makes the engine use its existing full-catalog in-flight sharing. AGY uses selected-source discovery and probes only an explicitly requested effort, then performs normal live validation again at execution. Manual catalog refresh remains complete.
 - `catalogRevision(agent)`: a fingerprint of the files the adapter reads (AI:16-18).
 - `run(agent, options)` → Promise<{text, sessionId}>. Validated in AI:19-51:
   - prompt is non-empty;
@@ -661,7 +666,7 @@ Other harnesses never consume notes mid-turn. T1 checks that host acceptance is 
 16. (T2:71) Continuous flow: work SA_LEARN+FINISH leads to a milestone. In discover, SA_GOAL+NEXT without a tool proof is rejected; after a proof it is accepted. A restart mid-run preserves `learning`. In the second milestone, EXHAUSTED without a proof is rejected, then accepted after one. Totals: 2 milestones, 1 exhausted, 1 discovered, 1 `job.progress`.
 17. (T2:114) Continuous ignores `auto_cycles=200`. A cancelled root stays `cancelled` after restart; `follow` without `resume` throws, and with `resume:true` the root becomes `queued`.
 18. (T2:138) Engine close during a streamed SA_SEND and SA_PROGRESS, then restart: the child is not re-dispatched (1 child call, 1 `send`), progress is not duplicated, and a note queued before the restart is delivered byte-exact.
-19. (T2:178) On `ask` tickets, a SA_SEND with a disabled model, a foreign model, `permission_profile:'full'` or a `provider` key fails the root before any child executes.
+19. (T2:178, updated Rust contract) On `ask` tickets, a SA_SEND with a disabled model, a foreign model, `permission_profile:'full'` or a `provider` key is rejected before any child executes. The ordinary root's reply is preserved with a rejection receipt; internal engine errors still fail the root.
 20. (T2:195) On an auto ticket, a child with narrowed `ask` profile calling `approve` gets false immediately and one `approval.unattended_decline` is logged. A user note wakes the waiting parent while the child is still running.
 21. (T2:230) A streamed SA_TOOL does not invoke. The final SA_TOOL invokes once, with `profile=full` and an integer `admission`. A new receipt forces a turn 2 whose `mcp_results` show it. `project_extensions.skills` is present.
 22. (T2:269) A readonly-narrowed child's grandchild runs with `profile=readonly`, `writable=false` and `allow_lead_routing=false`.

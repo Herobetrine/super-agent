@@ -45,6 +45,10 @@ impl Db {
         // Additive Rust-port table; the Node engine ignores it.
         conn.execute_batch(sa_store::knowledge::SCHEMA)?;
         conn.execute_batch(SCHEMA)?;
+        conn.execute_batch(crate::pause::SCHEMA)?;
+        conn.execute_batch(crate::workspaces::SCHEMA)?;
+        conn.execute_batch(crate::scm::SCHEMA)?;
+        conn.execute_batch(crate::checkpoints::SCHEMA)?;
         conn.set_prepared_statement_cache_capacity(256);
         Ok(Self {
             conn: Mutex::new(Some(conn)),
@@ -321,7 +325,7 @@ impl Q<'_> {
     ) -> Result<i64> {
         let dest = match p::safe_int(dest) {
             Some(d) if d > 0 && p::valid_text(body, usize::MAX) => d,
-            _ => return Err(anyhow!("收件任务或正文无效")),
+            _ => return Err(crate::dispatch::rejected("收件任务或正文无效")),
         };
         let body = body.and_then(Value::as_str).unwrap_or_default();
         let turn = source.map(|s| s.logical);
@@ -336,7 +340,7 @@ impl Q<'_> {
                 if p::safe_int(payload.get("job")) != Some(dest)
                     || payload.get("body").and_then(Value::as_str) != Some(body)
                 {
-                    return Err(anyhow!("同一 SA_NOTE ID 的内容不一致"));
+                    return Err(crate::dispatch::rejected("同一 SA_NOTE ID 的内容不一致"));
                 }
                 return Ok(old["seq"].as_i64().unwrap_or_default());
             }

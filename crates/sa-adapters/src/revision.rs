@@ -126,6 +126,7 @@ pub fn watch_paths(sys: &Sys, agent: &str) -> Vec<PathBuf> {
         "claude" => claude_paths(sys),
         "deepseek" => deepseek::watch_paths(sys),
         "antigravity" => antigravity_paths(sys),
+        "acp" => vec![crate::acp::config_path(sys)],
         _ => vec![],
     }
 }

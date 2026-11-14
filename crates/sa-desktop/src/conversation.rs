@@ -85,7 +85,21 @@ impl App {
                     if self.writable() {
                         self.composer(ui);
                     } else {
+                        if let Some(state) = self.view.as_ref().and_then(|v| v.snap.as_ref())
+                            .and_then(|s| s.ticket.pause_status.as_deref())
+                        {
+                            ui.label(match state {
+                                "paused" => "已暂停后续调度 · 需在主工作台恢复",
+                                "draining" => "正在等待当前工作完成交接",
+                                "handoff" => "等待主控完成本轮交接",
+                                _ => "",
+                            });
+                        }
                         self.footer(ui);
+                    }
+                    if let Some(snapshot) = self.view.as_ref().and_then(|view| view.snap.as_ref()) {
+                        ui.add_space(6.0);
+                        crate::usage::footer(ui, &snapshot.usage, &pal);
                     }
                 });
             });
@@ -260,6 +274,7 @@ impl App {
         {
             if self.composer.project.as_ref() != Some(&p) {
                 self.composer.attachments.clear();
+                self.composer.extensions = None;
             }
             self.composer.project = Some(p);
         }

@@ -11,6 +11,9 @@ use sha2::{Digest, Sha256};
 use std::{fs, io::Write, path::Path};
 use tempfile::NamedTempFile;
 
+#[path = "context_delivery.rs"]
+pub mod delivery;
+
 pub const MAX_PROMPT_BYTES: usize = 6 * 1024 * 1024;
 
 /// Kept verbatim. `harness_health` and `recovery` are Rust-port additions to
@@ -34,6 +37,11 @@ const CONTROL: &[&str] = &[
     "this_turn_can_write",
     "harness_health",
     "recovery",
+    "execution_directory",
+    "isolated_writers",
+    "workspace",
+    "scm_feedback",
+    "scm_notice",
 ];
 const HISTORY: &[&str] = &["user_updates", "reports", "notes", "roster", "mcp_results", "plan"];
 
@@ -113,6 +121,24 @@ fn sorted_map(m: &Map<String, Value>) -> Map<String, Value> {
     keys.into_iter().map(|k| (k.clone(), sort_keys(&m[k]))).collect()
 }
 
+/// Persist the complete, canonical packet independently of its prompt view.
+pub fn archive(packet: &Map<String, Value>, directory: &Path) -> Result<Value> {
+    let raw = serde_json::to_vec(&sorted_map(packet))?;
+    let store = directory.join("context-objects");
+    fs::create_dir_all(&store)?;
+    ensure!(
+        store.canonicalize()?.parent() == Some(directory.canonicalize()?.as_path()),
+        "上下文目录发生重定向"
+    );
+    let digest = format!("{:x}", Sha256::digest(&raw));
+    let dest = store.join(format!("{digest}.json"));
+    let mut tmp = NamedTempFile::new_in(&store)?;
+    tmp.write_all(&raw)?;
+    tmp.as_file().sync_all()?;
+    tmp.persist(&dest).context("无法提交上下文原文")?;
+    Ok(json!({"bytes":raw.len(),"sha256":digest,"object_path":dest,"view":"按需读取原始 UTF-8 JSON，以 SHA-256 核验。"}))
+}
+
 /// Recursively sort object keys (serde_json without `preserve_order`).
 pub fn sort_keys(v: &Value) -> Value {
     match v {
@@ -137,18 +163,6 @@ pub fn compact(
     if raw.len() <= budget {
         return Ok(packet);
     }
-    let store = directory.join("context-objects");
-    fs::create_dir_all(&store)?;
-    ensure!(
-        store.canonicalize()?.parent() == Some(directory.canonicalize()?.as_path()),
-        "上下文目录发生重定向"
-    );
-    let digest = format!("{:x}", Sha256::digest(&raw));
-    let dest = store.join(format!("{digest}.json"));
-    let mut tmp = NamedTempFile::new_in(&store)?;
-    tmp.write_all(&raw)?;
-    tmp.as_file().sync_all()?;
-    tmp.persist(&dest).context("无法提交上下文原文")?;
     let mut out = Map::new();
     for &k in CONTROL {
         if let Some(v) = packet.get(k) {
@@ -157,8 +171,11 @@ pub fn compact(
     }
     out.insert(
         "full_context".into(),
-        json!({"bytes":raw.len(),"sha256":digest,"object_path":dest,"view":"按需读取原始 UTF-8 JSON，以 SHA-256 核验。"}),
+        archive(&packet, directory)?,
     );
+    if let Some(checkpoint)=packet.get("checkpoint_context") {
+        out.insert("checkpoint_context_ref".into(),json!({"source_ticket":checkpoint["source_ticket"],"source_seq":checkpoint["source_seq"],"source_sha256":checkpoint["source_sha256"],"notice":checkpoint["notice"],"json_pointer":"/checkpoint_context","view":"历史分支证据存于 full_context，按需读取；不是待重放指令。"}));
+    }
     for &k in HISTORY {
         out.insert(k.into(), json!([]));
     }
@@ -175,6 +192,7 @@ pub fn compact(
         "assignment",
         "autonomy",
         "project_knowledge",
+        "checkpoint_context",
         "next_step",
         "reports",
         "notes",

@@ -13,6 +13,7 @@ Super Agent 源码和仓库自有资源采用 `GPL-3.0-only`。[许可证全文]
 | rusqlite（内置 SQLite） | 工单库 | MIT；SQLite 属公共领域 |
 | tokio、futures | 异步运行时 | MIT |
 | rmcp | 官方 MCP Rust SDK | Apache-2.0 |
+| agent-client-protocol 5.0.0 / agent-client-protocol-schema 1.15.1 | 官方 ACP 协议与会话 SDK | Apache-2.0 |
 | reqwest、ureq、rustls | HTTP 与 TLS | MIT 或 Apache-2.0（rustls 另含 ISC） |
 | rfd | 系统文件对话框 | MIT |
 | windows-rs | Windows 原生通知、COM 与应用登记 | MIT 或 Apache-2.0 |
@@ -31,3 +32,5 @@ Super Agent 源码和仓库自有资源采用 `GPL-3.0-only`。[许可证全文]
 - [CC Switch](https://github.com/farion1231/cc-switch) 是可选的本机配置来源。
 
 DeepSeek Super-agent 原型、OpenHands 和 OpenCode 作为架构资料列在[项目说明](../README.md)中。
+
+本轮还参考 Agent Orchestrator 的工作区/SCM、LangGraph 的检查点分支、Langfuse 的评测机制；未复制其实现或引入对应运行时。来源及复用边界见[社区机制吸纳](dev/community-integration.md)。

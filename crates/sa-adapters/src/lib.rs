@@ -10,7 +10,7 @@ use std::sync::Arc;
 pub use custom::{Registry, probe_models, registry};
 pub use revision::{catalog_revision, catalog_revision_with};
 
-/// All four harness adapters bound to one environment snapshot, in
+/// Native harnesses and the configured ACP adapter bound to one environment snapshot, in
 /// `AGENTS` order; pass to [`sa_engine::Engine::open`].
 pub fn all(sys: sys::Sys) -> Vec<Arc<dyn Adapter>> {
     all_with(sys, registry(vec![]))
@@ -18,22 +18,35 @@ pub fn all(sys: sys::Sys) -> Vec<Arc<dyn Adapter>> {
 
 /// [`all`] with operator-managed custom providers. The registry is read on
 /// every `catalog()`/`run()`, so edits apply without rebuilding adapters.
-/// Antigravity has no custom endpoint support and ignores it.
+/// Antigravity has no custom endpoint support and ignores it. ACP reads its
+/// own operator configuration on every catalog refresh and turn.
 pub fn all_with(sys: sys::Sys, registry: Registry) -> Vec<Arc<dyn Adapter>> {
+    all_with_efficiency(sys, registry, sa_store::efficiency::shared(Default::default()))
+}
+
+/// [`all_with`] with live operator context/cache preferences.
+pub fn all_with_efficiency(
+    sys: sys::Sys,
+    registry: Registry,
+    efficiency: sa_store::efficiency::Shared,
+) -> Vec<Arc<dyn Adapter>> {
     vec![
         Arc::new(codex::Codex::with_registry(sys.clone(), registry.clone())),
-        Arc::new(claude::Claude::with_registry(sys.clone(), registry.clone())),
+        Arc::new(claude::Claude::with_efficiency(sys.clone(), registry.clone(), efficiency)),
         Arc::new(deepseek::DeepSeek::with_registry(sys.clone(), registry)),
-        Arc::new(antigravity::Antigravity::new(sys)),
+        Arc::new(antigravity::Antigravity::new(sys.clone())),
+        Arc::new(acp::Acp::new(sys)),
     ]
 }
 
 pub mod antigravity;
+pub mod acp;
 pub mod claude;
 pub mod codex;
 pub mod codex_config;
 pub mod common;
 pub mod catalog;
+mod cache_policy;
 mod images;
 pub mod custom;
 pub mod deepseek;

@@ -67,8 +67,9 @@ async fn new_continuous_goal_must_follow_a_real_inspection() {
                 c.prove();
                 return Ok(done());
             }
-            assert_eq!(c.packet["autonomy"]["learning"], json!("remember exact bytes"));
-            if c.packet["autonomy"]["milestone"] == json!(1) {
+            let full_packet = c.full_packet();
+            assert_eq!(full_packet["autonomy"]["learning"], json!("remember exact bytes"));
+            if full_packet["autonomy"]["milestone"] == json!(1) {
                 if pr.fetch_add(1, Ordering::SeqCst) == 0 {
                     return Ok(format!(
                         "{}\n{later}",
@@ -219,11 +220,17 @@ async fn disabled_models_provider_injection_and_escalation_are_rejected() {
     }
     fx.engine.start().unwrap();
     let ids: Vec<i64> = commands.lock().unwrap().keys().copied().collect();
-    fx.until(|| ids.iter().all(|i| root_state(&fx.engine, *i) == "failed")).await;
+    fx.until(|| ids.iter().all(|i| root_state(&fx.engine, *i) == "done")).await;
     assert_eq!(fx.shared.count(|c| c.packet["depth"].as_i64() > Some(0)), 0);
-    let mut reasons: Vec<String> = ids
+    for id in &ids {
+        assert_eq!(fx.engine.root(*id).unwrap()["result"], json!(commands.lock().unwrap()[id]));
+    }
+    let receipts = payloads(&fx, "SELECT payload FROM events WHERE kind='protocol.rejected'");
+    assert_eq!(receipts.len(), ids.len());
+    assert!(receipts.iter().all(|r| r["executed"] == false));
+    let mut reasons: Vec<String> = receipts
         .iter()
-        .map(|i| fx.engine.root(*i).unwrap()["result"].as_str().unwrap().to_string())
+        .map(|r| r["reason"].as_str().unwrap().to_string())
         .collect();
     reasons.sort();
     let mut expected = vec![
@@ -335,7 +342,7 @@ async fn mcp_effects_are_final_only_and_need_another_turn_for_receipts() {
         script(move |c| {
             let (inv, rec) = (inv.clone(), rec.clone());
             async move {
-                assert_eq!(c.packet["project_extensions"]["skills"][0]["name"], json!("fixture"));
+                assert_eq!(c.full_packet()["project_extensions"]["skills"][0]["name"], json!("fixture"));
                 if c.turn() == 1 {
                     let command = cmd(
                         "SA_TOOL",

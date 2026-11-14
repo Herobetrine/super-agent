@@ -15,8 +15,9 @@ use std::sync::LazyLock;
 pub const MAX_SKILL_BYTES: u64 = 128 * 1024;
 pub const IMPORTED: &str = "已导入";
 
-static FRONT_MATTER: LazyLock<regex::Regex> =
-    LazyLock::new(|| regex::Regex::new(r"^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)").expect("valid regex"));
+static FRONT_MATTER: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)").expect("valid regex")
+});
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Skill {
@@ -53,15 +54,22 @@ impl Skill {
 pub fn read_skill(folder: &Path, source: &str, imported: bool) -> Result<Skill> {
     let dir = realpath(folder).context("技能目录不存在或无法访问")?;
     let filename = realpath(&dir.join("SKILL.md")).context("技能目录中没有 SKILL.md")?;
-    ensure!(filename.parent() == Some(dir.as_path()), "技能入口重定向到了其他目录");
-    ensure!(filename.metadata()?.len() <= MAX_SKILL_BYTES, "技能入口超过 128 KiB");
+    ensure!(
+        filename.parent() == Some(dir.as_path()),
+        "技能入口重定向到了其他目录"
+    );
+    ensure!(
+        filename.metadata()?.len() <= MAX_SKILL_BYTES,
+        "技能入口超过 128 KiB"
+    );
     let raw = std::fs::read(&filename)?;
     let text = String::from_utf8_lossy(&raw);
     let body = text.strip_prefix('\u{feff}').unwrap_or(&text).to_string();
     let Some(meta) = FRONT_MATTER.captures(&body) else {
         bail!("未找到 SKILL.md 的 YAML 元数据");
     };
-    let header: serde_yaml::Value = serde_yaml::from_str(&meta[1]).context("SKILL.md 的 YAML 元数据无效")?;
+    let header: serde_yaml::Value =
+        serde_yaml::from_str(&meta[1]).context("SKILL.md 的 YAML 元数据无效")?;
     let (Some(serde_yaml::Value::String(name)), Some(serde_yaml::Value::String(description))) =
         (header.get("name"), header.get("description"))
     else {
@@ -123,7 +131,7 @@ impl SkillHomes {
 pub struct Catalog(Vec<Skill>);
 
 impl Catalog {
-    fn set(&mut self, skill: Skill) {
+    pub(crate) fn set(&mut self, skill: Skill) {
         match self.0.iter_mut().find(|s| s.id == skill.id) {
             Some(slot) => *slot = skill,
             None => self.0.push(skill),
@@ -209,8 +217,14 @@ mod tests {
         };
         assert_eq!(err("no front matter"), "未找到 SKILL.md 的 YAML 元数据");
         assert_eq!(err("---\nname: x\n---\n"), "技能缺少名称或说明");
-        assert_eq!(err("---\nname: '  '\ndescription: d\n---\n"), "技能缺少名称或说明");
-        assert_eq!(err("---\nname: 3\ndescription: d\n---\n"), "技能缺少名称或说明");
+        assert_eq!(
+            err("---\nname: '  '\ndescription: d\n---\n"),
+            "技能缺少名称或说明"
+        );
+        assert_eq!(
+            err("---\nname: 3\ndescription: d\n---\n"),
+            "技能缺少名称或说明"
+        );
         assert_eq!(err("---\n- a\n---\n"), "技能缺少名称或说明");
         assert_eq!(
             err(&format!(
@@ -242,17 +256,29 @@ mod tests {
         let outside = tmp.path().join("outside");
         write_skill(&outside, &skill("imported"));
 
-        let names = |c: &Catalog| c.iter().map(|s| (s.name.clone(), s.source.clone())).collect::<Vec<_>>();
+        let names = |c: &Catalog| {
+            c.iter()
+                .map(|s| (s.name.clone(), s.source.clone()))
+                .collect::<Vec<_>>()
+        };
         let global = scan(&homes, None, &[]);
         assert_eq!(
             names(&global),
-            [("codex-a", "Codex"), ("user-b", "用户"), ("claude-c", "Claude")]
-                .map(|(a, b)| (a.to_string(), b.to_string()))
+            [
+                ("codex-a", "Codex"),
+                ("user-b", "用户"),
+                ("claude-c", "Claude")
+            ]
+            .map(|(a, b)| (a.to_string(), b.to_string()))
         );
         // A re-imported home skill keeps its position and becomes `已导入`.
         let imports = vec![
             outside.to_string_lossy().into_owned(),
-            homes.home.join(".agents/skills/b").to_string_lossy().into_owned(),
+            homes
+                .home
+                .join(".agents/skills/b")
+                .to_string_lossy()
+                .into_owned(),
             tmp.path().join("gone").to_string_lossy().into_owned(),
         ];
         let all = scan(&homes, Some(&project), &imports);

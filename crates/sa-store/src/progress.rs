@@ -44,6 +44,10 @@ pub(crate) const VISIBLE: &[&str] = &[
     "turn.retry_scheduled",
     "turn.route_wait",
     "turn.gave_up",
+    "turn.loop_warning",
+    "turn.loop_stopped",
+    "workspace.result",
+    "workspace.error",
     "route.rotated",
     "harness.health",
 ];
@@ -56,6 +60,10 @@ fn stage(kind: &str) -> Option<(&'static str, &'static str, &'static str)> {
         "turn.admitted" => ("调度器已接单", "run", "running"),
         "route.requested" => ("已选择执行端和模型", "run", "running"),
         "input" => ("已准备本轮上下文", "run", "running"),
+        "turn.loop_warning" => ("重复操作，建议改变方法", "run", "running"),
+        "turn.loop_stopped" => ("已停止重复空转", "run", "failed"),
+        "workspace.result" => ("工作区验证或合入已返回", "task", "completed"),
+        "workspace.error" => ("工作区操作未完成", "task", "failed"),
         "running" => ("已开始执行本轮", "run", "running"),
         "adapter.permission" => ("已应用执行权限", "run", "running"),
         "adapter.route" => ("已绑定执行路由", "run", "running"),
@@ -81,6 +89,7 @@ fn stage(kind: &str) -> Option<(&'static str, &'static str, &'static str)> {
         "auto.retry" => ("已安排延后重试", "task", "running"),
         "auto.backoff" => ("等待退避后继续", "task", "running"),
         "auto.protocol" => ("控制指令需要修正", "task", "running"),
+        "protocol.rejected" => ("控制指令被拒绝，该指令未执行", "task", "running"),
         "routes.changed" => ("已更新工单模型绑定", "run", "running"),
         "failed" => ("任务执行失败", "run", "failed"),
         "cancelled" => ("任务已取消", "run", "stopped"),
@@ -256,6 +265,11 @@ mod tests {
     fn stage_labels_and_overrides() {
         assert_eq!(act("plan.add", None).label, "已添加计划项");
         assert_eq!(act("reply", None).state, "completed");
+        let rejection = act("protocol.rejected", None);
+        assert_eq!(
+            (rejection.label.as_str(), rejection.category, rejection.state),
+            ("控制指令被拒绝，该指令未执行", "task", "running")
+        );
         let deny = act("approval.decision", Some("deny"));
         assert_eq!(
             (deny.label.as_str(), deny.state),

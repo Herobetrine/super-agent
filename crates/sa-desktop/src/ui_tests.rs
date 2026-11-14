@@ -49,7 +49,12 @@ fn until(h: &mut Harness<'_, App>, what: &str, cond: impl Fn(&App) -> bool) {
     let dump = app.host.as_ref().map(|host| {
         host.engine()
             .db()
-            .with(|q| q.all("SELECT ticket,job,kind,substr(payload,1,160) p FROM events ORDER BY seq", &[]))
+            .with(|q| {
+                q.all(
+                    "SELECT ticket,job,kind,substr(payload,1,160) p FROM events ORDER BY seq",
+                    &[],
+                )
+            })
             .unwrap()
     });
     panic!(
@@ -72,11 +77,204 @@ fn kinds(app: &App, ticket: i64) -> Vec<String> {
         .unwrap()
         .engine()
         .db()
-        .with(|q| q.all("SELECT kind FROM events WHERE ticket=? ORDER BY seq", &[&ticket]))
+        .with(|q| {
+            q.all(
+                "SELECT kind FROM events WHERE ticket=? ORDER BY seq",
+                &[&ticket],
+            )
+        })
         .unwrap()
         .into_iter()
         .map(|r| r["kind"].as_str().unwrap_or_default().to_string())
         .collect()
+}
+
+fn fork_source(h: &mut Harness<'_, App>, project: &std::path::Path) -> (i64, i64) {
+    h.state_mut().composer.project = Some(sa_engine::services::realpath(project).unwrap());
+    h.state_mut().composer.lead = "codex".into();
+    h.state_mut().composer.routes = Some(serde_json::json!({"codex":{
+        "provider":"test-local", "model":"default", "mode":"cli", "reasoning_effort":"high"
+    }}));
+    h.run_steps(4);
+    h.get_by_label("输入框").focus();
+    h.get_by_label("输入框").type_text("生成供分支测试的终稿");
+    h.run_steps(2);
+    h.key_press(egui::Key::Enter);
+    until(h, "fork source completed", |a| root_state(a) == "done");
+    let ticket = h.state().view.as_ref().unwrap().id;
+    let seq = h
+        .state()
+        .host
+        .as_ref()
+        .unwrap()
+        .checkpoints(ticket)
+        .unwrap()[0]["seq"]
+        .as_i64()
+        .unwrap();
+    (ticket, seq)
+}
+
+fn ticket_count(app: &App) -> usize {
+    app.host
+        .as_ref()
+        .unwrap()
+        .engine()
+        .db()
+        .with(|q| q.all("SELECT id FROM tickets", &[]))
+        .unwrap()
+        .len()
+}
+
+#[test]
+fn handoff_pause_clicks_keep_active_work_and_require_explicit_resume() {
+    let data = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let mut h = harness(data.path(), "ask");
+    h.state_mut().composer.project = Some(project.path().to_path_buf());
+    h.run_steps(3);
+    h.get_by_label("输入框").focus();
+    h.get_by_label("输入框").type_text("完成当前检查后交接");
+    h.run_steps(2);
+    h.key_press(egui::Key::Enter);
+    until(&mut h, "approval", |app| app.view.as_ref().and_then(|v| v.snap.as_ref())
+        .is_some_and(|s| !s.approvals.is_empty()));
+    let ticket = h.state().view.as_ref().unwrap().id;
+    h.run_steps(3);
+    h.get_by_role_and_label(Role::Button, "交接后暂停").click();
+    until(&mut h, "pause requested", |app| app.view.as_ref().and_then(|v| v.snap.as_ref())
+        .is_some_and(|s| s.ticket.pause_status.as_deref() == Some("handoff")));
+    assert_eq!(root_state(h.state()), "running");
+    h.state_mut().inspector_open = true;
+    h.state_mut().tab = Tab::Approvals;
+    h.run_steps(3);
+    h.get_by_label("允许本次请求").click();
+    until(&mut h, "paused after reply", |app| app.view.as_ref().and_then(|v| v.snap.as_ref())
+        .is_some_and(|s| s.ticket.pause_status.as_deref() == Some("paused")));
+    assert_ne!(root_state(h.state()), "running");
+    assert!(kinds(h.state(), ticket).iter().any(|k| k == "reply"));
+    assert!(!kinds(h.state(), ticket).iter().any(|k| k == "cancelled"));
+
+    // A follow-up remains queued behind the gate until the explicit button.
+    h.state_mut().inspector_open = false;
+    h.run_steps(3);
+    h.get_by_label("输入框").focus();
+    h.get_by_label("输入框").type_text("后续检查");
+    h.run_steps(2);
+    h.key_press(egui::Key::Enter);
+    until(&mut h, "queued behind pause", |app| root_state(app) == "queued" && app.composer.pending == 0);
+    h.run_steps(3);
+    h.get_by_role_and_label(Role::Button, "恢复调度").click();
+    until(&mut h, "resumed approval", |app| app.view.as_ref().and_then(|v| v.snap.as_ref())
+        .is_some_and(|s| s.ticket.pause_status.is_none() && !s.approvals.is_empty()));
+    h.state_mut().inspector_open = true;
+    h.state_mut().tab = Tab::Approvals;
+    h.run_steps(3);
+    h.get_by_label("允许本次请求").click();
+    until(&mut h, "resumed reply", |app| root_state(app) == "done");
+}
+
+#[test]
+fn workflow_fork_runs_through_host_selects_result_and_keeps_source_policy() {
+    use egui_kittest::kittest::NodeT;
+    let data = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let mut h = harness(data.path(), "partial");
+    let (source, seq) = fork_source(&mut h, project.path());
+    let policy = |app: &App, ticket| {
+        app.host
+            .as_ref()
+            .unwrap()
+            .engine()
+            .db()
+            .with(|q| {
+                q.one(
+                    "SELECT lead,permission_profile,agent_routes FROM tickets WHERE id=?",
+                    &[&ticket],
+                )
+            })
+            .unwrap()
+            .unwrap()
+    };
+    let original = policy(h.state(), source);
+    assert_eq!(original["permission_profile"], "partial");
+    assert_eq!(original["lead"], "codex");
+    h.state_mut().composer.draft = "尚未提交的独立草稿".into();
+    h.state_mut().composer.attachments = vec!["unsent.txt".into()];
+    h.state_mut().inspector_open = true;
+    h.state_mut().tab = Tab::Collab;
+    h.run_steps(3);
+    h.get_by_label("从历史检查点分支").click();
+    h.run_steps(2);
+    h.get_by_role(Role::ComboBox).click();
+    h.run_steps(2);
+    h.get_by_label(&format!("第 1 轮 · 检查点 #{seq}")).click();
+    h.run_steps(2);
+    let input = h
+        .get_all_by_role(Role::MultilineTextInput)
+        .find(|n| n.accesskit_node().label().as_deref() != Some("输入框"))
+        .unwrap();
+    input.focus();
+    input.type_text("核对另一种实现");
+    h.run_steps(2);
+    h.get_by_label("建立分支…").click();
+    h.run_steps(2);
+    h.get_by_label("取消分支").click();
+    h.run_steps(2);
+    assert_eq!(ticket_count(h.state()), 1);
+    assert_eq!(h.state().view.as_ref().unwrap().id, source);
+    h.get_by_label("建立分支…").click();
+    h.run_steps(2);
+    h.get_by_label("确认沿用权限并启动").click();
+    until(&mut h, "fork selected", |a| {
+        a.view.as_ref().is_some_and(|v| v.id != source)
+    });
+    let fork = h.state().view.as_ref().unwrap().id;
+    assert_eq!(ticket_count(h.state()), 2);
+    assert_eq!(
+        h.state().composer.message,
+        Some((format!("已建立分支 #{fork}。"), false))
+    );
+    assert_eq!(h.state().composer.draft, "尚未提交的独立草稿");
+    assert_eq!(h.state().composer.attachments, ["unsent.txt"]);
+    assert_eq!(policy(h.state(), fork), original);
+    assert_eq!(policy(h.state(), source), original);
+    until(&mut h, "fork completed", |a| root_state(a) == "done");
+    let route = h.state().host.as_ref().unwrap().engine().db().with(|q| q.one(
+        "SELECT route FROM native_routes WHERE job=(SELECT id FROM jobs WHERE ticket=? AND parent IS NULL)", &[&fork]
+    )).unwrap().unwrap();
+    let route: Value = serde_json::from_str(route["route"].as_str().unwrap()).unwrap();
+    assert_eq!(route["model"], "default");
+    assert_eq!(route["reasoning_effort"], "high");
+}
+
+#[test]
+fn fork_outcome_after_navigation_preserves_focus_and_prevents_duplicate_submission() {
+    let data = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let mut h = harness(data.path(), "partial");
+    let (source, seq) = fork_source(&mut h, project.path());
+    let action = || crate::host::Action::ForkCheckpoint {
+        ticket: source,
+        seq,
+        goal: "另一个分支".into(),
+    };
+    h.state_mut().submit(action());
+    h.state_mut().submit(action());
+    assert_eq!(h.state().composer.pending, 1);
+    // Navigate before polling the receipt, even if the host has already finished.
+    h.state_mut().new_conversation();
+    h.state_mut().composer.draft = "新会话草稿".into();
+    until(&mut h, "late fork receipt", |a| a.composer.pending == 0);
+    assert!(h.state().view.is_none());
+    assert_eq!(ticket_count(h.state()), 2);
+    assert_eq!(h.state().composer.draft, "新会话草稿");
+    assert!(
+        h.state()
+            .composer
+            .message
+            .as_ref()
+            .is_some_and(|(text, error)| !error && text.contains("可在会话列表打开"))
+    );
 }
 
 #[test]
@@ -86,7 +284,11 @@ fn composer_sends_follows_up_approves_and_edits_the_plan() {
     let mut h = harness(data.path(), "ask");
     h.state_mut().composer.project = Some(sa_engine::services::realpath(project.path()).unwrap());
     h.run_steps(4);
-    assert!(h.state().writable(), "host error: {:?}", h.state().host_error);
+    assert!(
+        h.state().writable(),
+        "host error: {:?}",
+        h.state().host_error
+    );
 
     // Type the goal into the composer and press Enter.
     let editor = h.get_by_label("输入框");
@@ -101,7 +303,10 @@ fn composer_sends_follows_up_approves_and_edits_the_plan() {
 
     // The `ask` turn waits for the operator: approve it from the panel.
     until(&mut h, "pending approval", |a| {
-        a.view.as_ref().and_then(|v| v.snap.as_ref()).is_some_and(|s| !s.approvals.is_empty())
+        a.view
+            .as_ref()
+            .and_then(|v| v.snap.as_ref())
+            .is_some_and(|s| !s.approvals.is_empty())
     });
     h.state_mut().inspector_open = true;
     h.state_mut().tab = Tab::Approvals;
@@ -115,10 +320,18 @@ fn composer_sends_follows_up_approves_and_edits_the_plan() {
         .unwrap()
         .engine()
         .db()
-        .with(|q| q.one("SELECT result FROM jobs WHERE ticket=? AND parent IS NULL", &[&ticket]))
+        .with(|q| {
+            q.one(
+                "SELECT result FROM jobs WHERE ticket=? AND parent IS NULL",
+                &[&ticket],
+            )
+        })
         .unwrap()
         .unwrap();
-    assert!(reply["result"].as_str().unwrap().ends_with("approved"), "{reply:?}");
+    assert!(
+        reply["result"].as_str().unwrap().ends_with("approved"),
+        "{reply:?}"
+    );
 
     // Plan: add an item with Enter, then tick it.
     h.state_mut().tab = Tab::Plan;
@@ -129,11 +342,17 @@ fn composer_sends_follows_up_approves_and_edits_the_plan() {
     h.run_steps(1);
     h.key_press(egui::Key::Enter);
     until(&mut h, "plan item", |a| {
-        a.view.as_ref().and_then(|v| v.snap.as_ref()).is_some_and(|s| s.plan.len() == 1)
+        a.view
+            .as_ref()
+            .and_then(|v| v.snap.as_ref())
+            .is_some_and(|s| s.plan.len() == 1)
     });
     h.get_by_label("标记为已完成 核对附件").click();
     until(&mut h, "plan done", |a| {
-        a.view.as_ref().and_then(|v| v.snap.as_ref()).is_some_and(|s| s.plan.first().is_some_and(|p| p.done))
+        a.view
+            .as_ref()
+            .and_then(|v| v.snap.as_ref())
+            .is_some_and(|s| s.plan.first().is_some_and(|p| p.done))
     });
 
     // Follow-up through the send button.
@@ -144,7 +363,10 @@ fn composer_sends_follows_up_approves_and_edits_the_plan() {
     h.get_by_role_and_label(Role::Button, "发送").click();
     // Every `ask` turn requests approval again; deny this one.
     until(&mut h, "second approval", |a| {
-        a.view.as_ref().and_then(|v| v.snap.as_ref()).is_some_and(|s| !s.approvals.is_empty())
+        a.view
+            .as_ref()
+            .and_then(|v| v.snap.as_ref())
+            .is_some_and(|s| !s.approvals.is_empty())
     });
     h.state_mut().tab = Tab::Approvals;
     h.run_steps(2);
@@ -154,7 +376,14 @@ fn composer_sends_follows_up_approves_and_edits_the_plan() {
     });
 
     let k = kinds(h.state(), ticket);
-    for want in ["user", "approval.request", "approval.decision", "plan.add", "plan.done", "user.follow"] {
+    for want in [
+        "user",
+        "approval.request",
+        "approval.decision",
+        "plan.add",
+        "plan.done",
+        "user.follow",
+    ] {
         assert!(k.iter().any(|x| x == want), "missing {want}: {k:?}");
     }
     let decisions: Vec<Value> = h
@@ -164,7 +393,12 @@ fn composer_sends_follows_up_approves_and_edits_the_plan() {
         .unwrap()
         .engine()
         .db()
-        .with(|q| q.all("SELECT decision FROM approvals WHERE ticket=? ORDER BY id", &[&ticket]))
+        .with(|q| {
+            q.all(
+                "SELECT decision FROM approvals WHERE ticket=? ORDER BY id",
+                &[&ticket],
+            )
+        })
         .unwrap()
         .into_iter()
         .map(|mut r| r.remove("decision").unwrap())
@@ -177,10 +411,18 @@ fn composer_sends_follows_up_approves_and_edits_the_plan() {
         .unwrap()
         .engine()
         .db()
-        .with(|q| q.one("SELECT result FROM jobs WHERE ticket=? AND parent IS NULL", &[&ticket]))
+        .with(|q| {
+            q.one(
+                "SELECT result FROM jobs WHERE ticket=? AND parent IS NULL",
+                &[&ticket],
+            )
+        })
         .unwrap()
         .unwrap();
-    assert!(last["result"].as_str().unwrap().ends_with("denied"), "{last:?}");
+    assert!(
+        last["result"].as_str().unwrap().ends_with("denied"),
+        "{last:?}"
+    );
 }
 
 fn ticket_routes(app: &App, ticket: i64) -> Value {
@@ -206,14 +448,21 @@ fn model_dialog_saves_defaults_and_ticket_routes() {
 
     // Defaults: pin DeepSeek's route explicitly.
     h.state_mut().open_models(crate::models::Scope::Defaults);
-    until(&mut h, "deepseek catalog", |a| a.models.as_ref().is_some_and(|d| !d.needs("deepseek")));
+    until(&mut h, "deepseek catalog", |a| {
+        a.models.as_ref().is_some_and(|d| !d.needs("deepseek"))
+    });
     h.run_steps(2);
     h.get_by_label("跟随本机适配器默认配置").click();
     h.run_steps(2);
     h.get_by_label("保存选择").click();
-    until(&mut h, "defaults saved", |a| a.models.is_none() && a.composer.pending == 0);
+    until(&mut h, "defaults saved", |a| {
+        a.models.is_none() && a.composer.pending == 0
+    });
     let route = serde_json::json!({"provider": "test-local", "model": "default", "mode": "cli"});
-    assert_eq!(h.state().host.as_ref().unwrap().defaults(), serde_json::json!({"deepseek": route}));
+    assert_eq!(
+        h.state().host.as_ref().unwrap().defaults(),
+        serde_json::json!({"deepseek": route})
+    );
 
     // A new conversation inherits the defaults.
     let editor = h.get_by_label("输入框");
@@ -223,23 +472,37 @@ fn model_dialog_saves_defaults_and_ticket_routes() {
     h.key_press(egui::Key::Enter);
     until(&mut h, "done", |a| root_state(a) == "done");
     let ticket = h.state().view.as_ref().unwrap().id;
-    assert_eq!(ticket_routes(h.state(), ticket), serde_json::json!({"deepseek": route}));
+    assert_eq!(
+        ticket_routes(h.state(), ticket),
+        serde_json::json!({"deepseek": route})
+    );
 
     // The finished ticket's routes: also pin Codex.
-    h.state_mut().open_models(crate::models::Scope::Ticket(ticket));
-    until(&mut h, "dialog", |a| a.models.as_ref().is_some_and(|d| !d.needs("deepseek")));
+    h.state_mut()
+        .open_models(crate::models::Scope::Ticket(ticket));
+    until(&mut h, "dialog", |a| {
+        a.models.as_ref().is_some_and(|d| !d.needs("deepseek"))
+    });
     h.get_by_label("Codex").click();
-    until(&mut h, "codex catalog", |a| a.models.as_ref().is_some_and(|d| !d.needs("codex")));
+    until(&mut h, "codex catalog", |a| {
+        a.models.as_ref().is_some_and(|d| !d.needs("codex"))
+    });
     h.run_steps(2);
     h.get_by_label("跟随本机适配器默认配置").click();
     h.run_steps(2);
     h.get_by_label("保存选择").click();
-    until(&mut h, "routes saved", |a| a.models.is_none() && a.composer.pending == 0);
+    until(&mut h, "routes saved", |a| {
+        a.models.is_none() && a.composer.pending == 0
+    });
     assert_eq!(
         ticket_routes(h.state(), ticket),
         serde_json::json!({"deepseek": route, "codex": route})
     );
-    assert!(kinds(h.state(), ticket).iter().any(|k| k == "routes.changed"));
+    assert!(
+        kinds(h.state(), ticket)
+            .iter()
+            .any(|k| k == "routes.changed")
+    );
 }
 
 #[test]
@@ -259,8 +522,17 @@ fn knowledge_tab_lists_adds_and_archives_project_entries() {
     // The finished root recorded its progress automatically.
     h.state_mut().inspector_open = true;
     h.state_mut().tab = Tab::Knowledge;
-    let entries = |a: &App| a.knowledge.entries.as_ref().and_then(|r| r.as_ref().ok()).cloned().unwrap_or_default();
-    until(&mut h, "progress entry", |a| entries(a).iter().any(|e| e.kind == "progress"));
+    let entries = |a: &App| {
+        a.knowledge
+            .entries
+            .as_ref()
+            .and_then(|r| r.as_ref().ok())
+            .cloned()
+            .unwrap_or_default()
+    };
+    until(&mut h, "progress entry", |a| {
+        entries(a).iter().any(|e| e.kind == "progress")
+    });
 
     let field = h.get_by_label("知识条目输入");
     field.focus();
@@ -268,13 +540,21 @@ fn knowledge_tab_lists_adds_and_archives_project_entries() {
     h.run_steps(2);
     h.get_by_label("添加条目").click();
     until(&mut h, "operator entry", |a| {
-        entries(a).iter().any(|e| e.agent.as_deref() == Some("operator") && e.body == "构建只用 scripts/cargo.cjs")
+        entries(a).iter().any(|e| {
+            e.agent.as_deref() == Some("operator") && e.body == "构建只用 scripts/cargo.cjs"
+        })
     });
     assert!(h.state().knowledge.draft.is_empty());
-    let id = entries(h.state()).iter().find(|e| e.agent.as_deref() == Some("operator")).unwrap().id;
+    let id = entries(h.state())
+        .iter()
+        .find(|e| e.agent.as_deref() == Some("operator"))
+        .unwrap()
+        .id;
     h.run_steps(2);
     h.get_by_label(&format!("归档条目 #{id}")).click();
-    until(&mut h, "archived", |a| entries(a).iter().any(|e| e.id == id && e.archived));
+    until(&mut h, "archived", |a| {
+        entries(a).iter().any(|e| e.id == id && e.archived)
+    });
     let ticket = h.state().view.as_ref().unwrap().id;
     let k = kinds(h.state(), ticket);
     assert!(k.iter().any(|x| x == "knowledge.add"), "{k:?}");
@@ -292,7 +572,11 @@ fn providers_dialog_saves_custom_providers_and_rotation() {
     h.run_steps(2);
     for (role, label, text) in [
         (Role::TextInput, "名称", "公司网关"),
-        (Role::TextInput, "接口地址", "https://gateway.example.com/v1"),
+        (
+            Role::TextInput,
+            "接口地址",
+            "https://gateway.example.com/v1",
+        ),
         (Role::TextInput, "密钥环境变量", "SA_TEST_GATEWAY_KEY"),
         (Role::TextInput, "模型", "model-a"),
     ] {
@@ -303,15 +587,23 @@ fn providers_dialog_saves_custom_providers_and_rotation() {
     }
     h.get_by_label("保存供应商").click();
     until(&mut h, "provider saved", |a| {
-        a.host.as_ref().unwrap().providers().len() == 1 && a.providers.as_ref().is_some_and(|d| d.form.is_none())
+        a.host.as_ref().unwrap().providers().len() == 1
+            && a.providers.as_ref().is_some_and(|d| d.form.is_none())
     });
     let p = h.state().host.as_ref().unwrap().providers().remove(0);
-    assert_eq!((p.agent.as_str(), p.name.as_str(), p.key_env.as_str()), ("claude", "公司网关", "SA_TEST_GATEWAY_KEY"));
+    assert_eq!(
+        (p.agent.as_str(), p.name.as_str(), p.key_env.as_str()),
+        ("claude", "公司网关", "SA_TEST_GATEWAY_KEY")
+    );
     assert_eq!(p.models, vec!["model-a".to_string()]);
     // Nothing secret is stored: only the variable name.
     let stored: String = rusqlite::Connection::open(data.path().join(sa_store::DB_FILE))
         .unwrap()
-        .query_row("SELECT group_concat(base_url||key_env||models) FROM studio_providers", [], |r| r.get(0))
+        .query_row(
+            "SELECT group_concat(base_url||key_env||models) FROM studio_providers",
+            [],
+            |r| r.get(0),
+        )
         .unwrap();
     assert!(stored.contains("SA_TEST_GATEWAY_KEY"));
 
@@ -341,7 +633,9 @@ fn providers_dialog_saves_custom_providers_and_rotation() {
         .insert("claude".into(), vec![first.clone(), second]);
     h.run_steps(2);
     h.get_by_label("保存轮换设置").click();
-    until(&mut h, "rotation saved", |a| a.host.as_ref().unwrap().rotation().enabled);
+    until(&mut h, "rotation saved", |a| {
+        a.host.as_ref().unwrap().rotation().enabled
+    });
     let rot = h.state().host.as_ref().unwrap().rotation();
     assert_eq!(rot.order["claude"].len(), 2);
     let source = crate::host::DbRotation(std::sync::Arc::new(std::sync::RwLock::new(rot)));
@@ -353,19 +647,30 @@ fn providers_dialog_saves_custom_providers_and_rotation() {
     h.get_by_label("自定义供应商").click();
     h.run_steps(3);
     assert!(
-        h.state().providers.as_ref().is_some_and(|d| d.page == crate::providers::Page::Providers),
+        h.state()
+            .providers
+            .as_ref()
+            .is_some_and(|d| d.page == crate::providers::Page::Providers),
         "dialog closed or page unchanged"
     );
     h.get_by_label("删除供应商 公司网关").click();
-    until(&mut h, "provider removed", |a| a.host.as_ref().unwrap().providers().is_empty());
-    assert_eq!(h.state().host.as_ref().unwrap().rotation().order["claude"].len(), 1);
+    until(&mut h, "provider removed", |a| {
+        a.host.as_ref().unwrap().providers().is_empty()
+    });
+    assert_eq!(
+        h.state().host.as_ref().unwrap().rotation().order["claude"].len(),
+        1
+    );
 }
 
 /// The `sa-ext` fixture MCP server next to this test binary (built by
 /// `cargo build --workspace`), if present.
 fn fixture_mcp() -> Option<std::path::PathBuf> {
     let deps = std::env::current_exe().ok()?.parent()?.to_path_buf();
-    let exe = deps.parent()?.join(format!("sa-ext-fixture-mcp{}", std::env::consts::EXE_SUFFIX));
+    let exe = deps.parent()?.join(format!(
+        "sa-ext-fixture-mcp{}",
+        std::env::consts::EXE_SUFFIX
+    ));
     exe.is_file().then_some(exe)
 }
 
@@ -380,10 +685,21 @@ fn extensions_dialog_grants_skills_and_probed_mcp_servers() {
     .unwrap();
     let mut h = harness(data.path(), "readonly");
     h.run_steps(4);
-    let skill_id = h.state().host.as_ref().unwrap().ext().import_skill(skill.path()).unwrap();
+    let skill_id = h
+        .state()
+        .host
+        .as_ref()
+        .unwrap()
+        .ext()
+        .import_skill(skill.path())
+        .unwrap();
 
     h.get_by_label("MCP 与技能").click();
-    let loaded = |a: &App| a.extensions.as_ref().is_some_and(|d| matches!(d.data, Some(Ok(_))));
+    let loaded = |a: &App| {
+        a.extensions
+            .as_ref()
+            .is_some_and(|d| matches!(d.data, Some(Ok(_))))
+    };
     until(&mut h, "extension list", loaded);
     h.run_steps(3);
     // The machine's own skills are listed too: filter down to the test skill.
@@ -403,9 +719,14 @@ fn extensions_dialog_grants_skills_and_probed_mcp_servers() {
         h.get_by_label("添加服务").click();
         h.run_steps(3);
         let args = serde_json::to_string(&[secret.display().to_string()]).unwrap();
-        for (label, text) in [("服务名称", "proof"), ("可执行程序", &*exe.display().to_string()), ("启动参数", &*args)] {
+        for (label, text) in [
+            ("服务名称", "proof"),
+            ("可执行程序", &*exe.display().to_string()),
+            ("启动参数", &*args),
+        ] {
             if label == "启动参数"
-                && let Some(crate::extensions::View::Edit(f)) = h.state_mut().extensions.as_mut().map(|d| &mut d.view)
+                && let Some(crate::extensions::View::Edit(f)) =
+                    h.state_mut().extensions.as_mut().map(|d| &mut d.view)
             {
                 // Replace the initial "[]".
                 f.args.clear();
@@ -424,7 +745,10 @@ fn extensions_dialog_grants_skills_and_probed_mcp_servers() {
         until(&mut h, "server saved", |a| {
             a.extensions.as_ref().is_some_and(|d| {
                 matches!(d.view, crate::extensions::View::List)
-                    && d.data.as_ref().and_then(|r| r.as_ref().ok()).is_some_and(|v| v["servers"].as_array().is_some_and(|s| s.len() == 1))
+                    && d.data
+                        .as_ref()
+                        .and_then(|r| r.as_ref().ok())
+                        .is_some_and(|v| v["servers"].as_array().is_some_and(|s| s.len() == 1))
             })
         });
         h.run_steps(3);
@@ -432,29 +756,169 @@ fn extensions_dialog_grants_skills_and_probed_mcp_servers() {
         h.run_steps(3);
         h.get_by_label("连接并读取工具").click();
         until(&mut h, "probe", |a| {
-            a.extensions.as_ref().is_some_and(|d| matches!(&d.view, crate::extensions::View::Probe { result: Some(_), .. }))
+            a.extensions.as_ref().is_some_and(|d| {
+                matches!(
+                    &d.view,
+                    crate::extensions::View::Probe {
+                        result: Some(_),
+                        ..
+                    }
+                )
+            })
         });
-        if let Some(crate::extensions::View::Probe { result: Some(r), .. }) = h.state().extensions.as_ref().map(|d| &d.view) {
+        if let Some(crate::extensions::View::Probe {
+            result: Some(r), ..
+        }) = h.state().extensions.as_ref().map(|d| &d.view)
+        {
             let tools = r.as_ref().expect("probe ok");
-            assert!(tools.as_array().unwrap().iter().any(|t| t["name"] == "challenge"), "{tools}");
+            assert!(
+                tools
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|t| t["name"] == "challenge"),
+                "{tools}"
+            );
         }
         h.run_steps(2);
         h.get_by_label("返回列表").click();
         until(&mut h, "list after probe", |a| {
-            loaded(a) && a.extensions.as_ref().is_some_and(|d| matches!(d.view, crate::extensions::View::List))
+            loaded(a)
+                && a.extensions
+                    .as_ref()
+                    .is_some_and(|d| matches!(d.view, crate::extensions::View::List))
         });
         h.run_steps(3);
         h.get_by_label("选择 proof").click();
         h.run_steps(2);
     } else {
-        eprintln!("sa-ext-fixture-mcp not built; MCP part skipped (run `cargo build --workspace` first)");
+        eprintln!(
+            "sa-ext-fixture-mcp not built; MCP part skipped (run `cargo build --workspace` first)"
+        );
     }
 
     h.get_by_label("保存授权").click();
     until(&mut h, "defaults saved", |a| a.extensions.is_none());
     let defaults = h.state().host.as_ref().unwrap().ext().defaults().unwrap();
-    assert_eq!(defaults["skills"], serde_json::json!([skill_id]), "{defaults}");
-    assert_eq!(defaults["servers"].as_array().unwrap().len(), usize::from(fixture.is_some()), "{defaults}");
+    assert_eq!(
+        defaults["skills"],
+        serde_json::json!([skill_id]),
+        "{defaults}"
+    );
+    assert_eq!(
+        defaults["servers"].as_array().unwrap().len(),
+        usize::from(fixture.is_some()),
+        "{defaults}"
+    );
+}
+
+#[test]
+fn extensions_directory_scope_editor_defaults_and_draft_isolation() {
+    let data = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let other = tempfile::tempdir().unwrap();
+    let fixture = fixture_mcp().expect("build workspace MCP fixture before this UI test");
+    let secret = data.path().join("directory-mcp-secret");
+    std::fs::write(&secret, "directory-proof").unwrap();
+    let mut h = harness(data.path(), "readonly");
+    h.run_steps(4);
+    h.state_mut().composer.project = Some(project.path().to_path_buf());
+    let loaded = |a: &App| a.extensions.as_ref().is_some_and(|d| matches!(d.data, Some(Ok(_))));
+    h.state_mut().open_extensions(crate::extensions::ExtScope::Defaults);
+    until(&mut h, "directory extension list", loaded);
+    h.run_steps(3);
+    h.get_by_role_and_label(Role::TextInput, "搜索技能或来源").type_text("directory-proof");
+    h.run_steps(3);
+    h.get_by_label("MCP 服务 0").click();
+    h.run_steps(3);
+    h.get_by_label("添加服务").click();
+    h.run_steps(3);
+    h.get_by_label("指定工作目录").click();
+    h.run_steps(3);
+    for (label, text) in [
+        ("服务名称", "directory-proof".to_string()),
+        ("服务适用目录", other.path().display().to_string()),
+        ("可执行程序", fixture.display().to_string()),
+    ] {
+        let input = h.get_by_role_and_label(Role::TextInput, label);
+        input.focus();
+        input.type_text(&text);
+        h.run_steps(2);
+    }
+    if let Some(crate::extensions::View::Edit(f)) = h.state_mut().extensions.as_mut().map(|d| &mut d.view) {
+        f.args = serde_json::to_string(&[secret.display().to_string()]).unwrap();
+    }
+    h.run_steps(3);
+    h.get_by_label("保存服务").click();
+    until(&mut h, "directory server saved", |a| {
+        a.extensions.as_ref().is_some_and(|d| matches!(d.view, crate::extensions::View::List)
+            && d.data.as_ref().and_then(|v| v.as_ref().ok()).is_some_and(|v| v["servers"].as_array().is_some_and(|s| s.len() == 1)))
+    });
+    let ext = h.state().host.as_ref().unwrap().ext();
+    let initial = ext.list(None).unwrap()["servers"][0].clone();
+    let id = initial["id"].as_str().unwrap().to_string();
+    assert_eq!(std::path::Path::new(initial["scopeRoot"].as_str().unwrap()), sa_engine::services::realpath(other.path()).unwrap());
+    h.run_steps(3);
+    h.get_by_label("编辑 directory-proof").click();
+    h.run_steps(3);
+    if let Some(crate::extensions::View::Edit(f)) = h.state_mut().extensions.as_mut().map(|d| &mut d.view) {
+        assert!(f.directory_only);
+        f.scope_root.clear();
+    }
+    h.run_steps(1);
+    let input = h.get_by_role_and_label(Role::TextInput, "服务适用目录");
+    input.focus();
+    input.type_text(&project.path().display().to_string());
+    h.run_steps(3);
+    h.get_by_label("保存服务").click();
+    until(&mut h, "edited directory server saved", |a| loaded(a)
+        && a.extensions.as_ref().is_some_and(|d| matches!(d.view, crate::extensions::View::List)));
+    let row = ext.list(None).unwrap()["servers"][0].clone();
+    assert_eq!(row["id"].as_str(), Some(id.as_str()));
+    assert_eq!(std::path::Path::new(row["scopeRoot"].as_str().unwrap()), sa_engine::services::realpath(project.path()).unwrap());
+    // Probe a local fixture only. No model request or external service is used.
+    let mut enabled = row;
+    enabled["enabled"] = serde_json::json!(true);
+    ext.save_server(&enabled).unwrap();
+    h.state().host.as_ref().unwrap().runtime().block_on(ext.probe(&id)).unwrap();
+    h.state_mut().open_extensions(crate::extensions::ExtScope::Defaults);
+    until(&mut h, "global defaults list", loaded);
+    h.run_steps(3);
+    h.get_by_role_and_label(Role::TextInput, "搜索技能或来源").type_text("directory-proof");
+    h.run_steps(3);
+    h.get_by_label("MCP 服务 1").click();
+    h.run_steps(3);
+    assert!(h.state().extensions.as_ref().unwrap().servers.is_empty());
+    h.get_by_label("选择 directory-proof").click();
+    h.run_steps(2);
+    assert!(h.state().extensions.as_ref().unwrap().servers.is_empty(), "directory server cannot enter global defaults");
+    h.get_by_label("工作目录默认授权").click();
+    until(&mut h, "directory defaults mode", loaded);
+    h.run_steps(3);
+    h.get_by_label("使用当前草稿目录").click();
+    h.run_steps(2);
+    h.get_by_label("载入目录默认授权").click();
+    until(&mut h, "directory defaults loaded", loaded);
+    h.run_steps(3);
+    h.get_by_label("选择 directory-proof").click();
+    h.run_steps(2);
+    assert_eq!(h.state().extensions.as_ref().unwrap().servers, vec![id.clone()]);
+    h.get_by_label("保存授权").click();
+    until(&mut h, "directory defaults saved", |a| a.extensions.is_none());
+    assert_eq!(ext.defaults_for(Some(project.path())).unwrap()["servers"], serde_json::json!([id.clone()]));
+    assert_eq!(ext.defaults().unwrap()["servers"], serde_json::json!([]));
+    for (cwd, expected) in [(project.path(), vec![id.clone()]), (other.path(), vec![])] {
+        h.state_mut().composer.project = Some(cwd.to_path_buf());
+        h.state_mut().open_extensions(crate::extensions::ExtScope::Draft);
+        until(&mut h, "draft directory defaults", loaded);
+        h.run_steps(3);
+        let dialog = h.state().extensions.as_ref().unwrap();
+        assert!(dialog.follow);
+        assert_eq!(dialog.servers, expected);
+        h.get_by_label("保存授权").click();
+        h.run_steps(3);
+        assert!(h.state().composer.extensions.is_none(), "following defaults remains directory-sensitive at ticket creation");
+    }
 }
 
 #[test]
@@ -471,15 +935,25 @@ fn command_palette_and_shortcuts() {
     h.key_press(egui::Key::Enter);
     h.run_steps(3);
     assert!(h.state().palette.is_none());
-    assert!(h.state().providers.is_some(), "Enter runs the filtered command");
+    assert!(
+        h.state().providers.is_some(),
+        "Enter runs the filtered command"
+    );
     h.state_mut().providers = None;
     h.run_steps(2);
     let open = h.state().inspector_open;
     h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::J);
     h.run_steps(2);
-    assert_ne!(h.state().inspector_open, open, "Ctrl+J toggles the inspector");
+    assert_ne!(
+        h.state().inspector_open,
+        open,
+        "Ctrl+J toggles the inspector"
+    );
     let dark = h.state().dark;
-    h.key_press_modifiers(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, egui::Key::L);
+    h.key_press_modifiers(
+        egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+        egui::Key::L,
+    );
     h.run_steps(2);
     assert_ne!(h.state().dark, dark, "Ctrl+Shift+L toggles the theme");
 }
@@ -491,8 +965,14 @@ fn second_window_on_an_owned_journal_is_a_read_only_observer() {
     let mut h = harness(data.path(), "readonly");
     h.run_steps(4);
     assert!(!h.state().writable());
-    assert_eq!(h.state().host_error.as_deref(), Some(sa_engine::owner::BUSY));
-    assert!(h.query_by_label("输入框").is_none(), "observer must not show the composer");
+    assert_eq!(
+        h.state().host_error.as_deref(),
+        Some(sa_engine::owner::BUSY)
+    );
+    assert!(
+        h.query_by_label("输入框").is_none(),
+        "observer must not show the composer"
+    );
 }
 
 /// Billable: `SA_LIVE_UI=1`. One read-only DeepSeek turn created from the
@@ -513,9 +993,16 @@ fn live_composer_turn_with_real_deepseek() {
         .build_eframe(move |cc| {
             crate::theme::install_fonts(&cc.egui_ctx);
             let ctx = cc.egui_ctx.clone();
-            let host = Host::start(dir.clone(), move || ctx.request_repaint()).map_err(|e| format!("{e:#}"));
-            let worker = worker::spawn(crate::data::StoreSource::opener(dir.clone()), cc.egui_ctx.clone());
-            let opts = Options { data: Some(dir), ..Default::default() };
+            let host = Host::start(dir.clone(), move || ctx.request_repaint())
+                .map_err(|e| format!("{e:#}"));
+            let worker = worker::spawn(
+                crate::data::StoreSource::opener(dir.clone()),
+                cc.egui_ctx.clone(),
+            );
+            let opts = Options {
+                data: Some(dir),
+                ..Default::default()
+            };
             App::new(cc, opts, worker, Arc::new(Mutex::new(None)), host)
         });
     h.state_mut().composer.project = Some(sa_engine::services::realpath(project.path()).unwrap());
@@ -530,10 +1017,17 @@ fn live_composer_turn_with_real_deepseek() {
     loop {
         h.step();
         let state = root_state(h.state());
-        if matches!(state.as_str(), "done" | "failed" | "partial" | "interrupted" | "cancelled") {
+        if matches!(
+            state.as_str(),
+            "done" | "failed" | "partial" | "interrupted" | "cancelled"
+        ) {
             break;
         }
-        assert!(Instant::now() < end, "timed out; message={:?}", h.state().composer.message);
+        assert!(
+            Instant::now() < end,
+            "timed out; message={:?}",
+            h.state().composer.message
+        );
         std::thread::sleep(Duration::from_millis(100));
     }
     let ticket = h.state().view.as_ref().unwrap().id;
@@ -544,10 +1038,19 @@ fn live_composer_turn_with_real_deepseek() {
         .unwrap()
         .engine()
         .db()
-        .with(|q| q.one("SELECT state,result FROM jobs WHERE ticket=? AND parent IS NULL", &[&ticket]))
+        .with(|q| {
+            q.one(
+                "SELECT state,result FROM jobs WHERE ticket=? AND parent IS NULL",
+                &[&ticket],
+            )
+        })
         .unwrap()
         .unwrap();
-    eprintln!("state={} matched={}", row["state"], row["result"].as_str().map(str::trim) == Some(nonce.as_str()));
+    eprintln!(
+        "state={} matched={}",
+        row["state"],
+        row["result"].as_str().map(str::trim) == Some(nonce.as_str())
+    );
     assert_eq!(row["state"], "done");
     assert_eq!(row["result"].as_str().map(str::trim), Some(nonce.as_str()));
     drop(h);
@@ -577,17 +1080,36 @@ fn sidebar_rename_pin_and_archive() {
     h.state_mut().rename = Some((ticket, "周报整理".into()));
     h.run_steps(3);
     h.get_by_label("保存").click();
-    until(&mut h, "renamed", |a| row(a).and_then(|r| r.title).as_deref() == Some("周报整理"));
-    h.state_mut().submit(crate::host::Action::TicketMeta { ticket, title: None, pinned: Some(true), archived: None });
+    until(&mut h, "renamed", |a| {
+        row(a).and_then(|r| r.title).as_deref() == Some("周报整理")
+    });
+    h.state_mut().submit(crate::host::Action::TicketMeta {
+        ticket,
+        title: None,
+        pinned: Some(true),
+        archived: None,
+    });
     until(&mut h, "pinned", |a| row(a).is_some_and(|r| r.pinned));
-    h.state_mut().submit(crate::host::Action::TicketMeta { ticket, title: None, pinned: None, archived: Some(true) });
+    h.state_mut().submit(crate::host::Action::TicketMeta {
+        ticket,
+        title: None,
+        pinned: None,
+        archived: Some(true),
+    });
     until(&mut h, "archived", |a| row(a).is_some_and(|r| r.archived));
     h.run_steps(3);
     // Archived rows are hidden until the toggle is used.
     assert!(h.query_by_label("显示已归档（1）").is_some());
     // An empty title restores the goal.
-    h.state_mut().submit(crate::host::Action::TicketMeta { ticket, title: Some(String::new()), pinned: None, archived: None });
-    until(&mut h, "title cleared", |a| row(a).is_some_and(|r| r.title.is_none()));
+    h.state_mut().submit(crate::host::Action::TicketMeta {
+        ticket,
+        title: Some(String::new()),
+        pinned: None,
+        archived: None,
+    });
+    until(&mut h, "title cleared", |a| {
+        row(a).is_some_and(|r| r.title.is_none())
+    });
 }
 
 #[test]
@@ -602,11 +1124,21 @@ fn live_badge_and_failover_toggle() {
     h.key_press(egui::Key::Enter);
     // The `ask` fake waits on an approval: the lead's live badge says so.
     until(&mut h, "approval badge", |a| {
-        a.view.as_ref().and_then(|v| v.snap.as_ref()).is_some_and(|s| !s.approvals.is_empty())
+        a.view
+            .as_ref()
+            .and_then(|v| v.snap.as_ref())
+            .is_some_and(|s| !s.approvals.is_empty())
     });
     h.state_mut().inspector_open = true;
     h.state_mut().tab = Tab::Collab;
-    let root = h.state().view.as_ref().and_then(|v| v.snap.as_ref()).unwrap().jobs[0].id;
+    let root = h
+        .state()
+        .view
+        .as_ref()
+        .and_then(|v| v.snap.as_ref())
+        .unwrap()
+        .jobs[0]
+        .id;
     let mut badge = None;
     for _ in 0..80 {
         h.step();
@@ -620,7 +1152,9 @@ fn live_badge_and_failover_toggle() {
     let ticket = h.state().view.as_ref().unwrap().id;
     h.run_steps(2);
     h.get_by_label("只读子任务的执行端不可用时自动改派").click();
-    until(&mut h, "failover on", |a| a.host.as_ref().unwrap().failover(ticket));
+    until(&mut h, "failover on", |a| {
+        a.host.as_ref().unwrap().failover(ticket)
+    });
 }
 
 #[test]
@@ -637,15 +1171,28 @@ fn at_mention_attaches_project_files() {
     editor.focus();
     editor.type_text("检查 @mai");
     until(&mut h, "suggestions", |a| {
-        a.composer.index.as_ref().and_then(|i| i.files.as_ref()).is_some_and(|f| f.is_ok())
+        a.composer
+            .index
+            .as_ref()
+            .and_then(|i| i.files.as_ref())
+            .is_some_and(|f| f.is_ok())
     });
     h.run_steps(3);
-    assert!(h.query_by_label("src/main.rs").is_some(), "suggestion row shown");
+    assert!(
+        h.query_by_label("src/main.rs").is_some(),
+        "suggestion row shown"
+    );
     h.key_press(egui::Key::Enter);
     h.run_steps(3);
-    assert_eq!(h.state().composer.attachments, vec!["src/main.rs".to_string()]);
+    assert_eq!(
+        h.state().composer.attachments,
+        vec!["src/main.rs".to_string()]
+    );
     assert_eq!(h.state().composer.draft, "检查 ");
-    assert!(h.state().view.is_none(), "Enter picked the file instead of sending");
+    assert!(
+        h.state().view.is_none(),
+        "Enter picked the file instead of sending"
+    );
 }
 
 #[test]
@@ -653,7 +1200,9 @@ fn existing_conversation_accepts_a_dropped_image_and_shows_usage() {
     let data = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
     let picture = project.path().join("截图.PNG");
-    image::RgbImage::new(3, 2).save_with_format(&picture, image::ImageFormat::Png).unwrap();
+    image::RgbImage::new(3, 2)
+        .save_with_format(&picture, image::ImageFormat::Png)
+        .unwrap();
     let expected = std::fs::read(&picture).unwrap();
     let mut h = harness(data.path(), "readonly");
     h.state_mut().composer.project = Some(sa_engine::services::realpath(project.path()).unwrap());
@@ -666,14 +1215,24 @@ fn existing_conversation_accepts_a_dropped_image_and_shows_usage() {
     until(&mut h, "initial reply", |app| root_state(app) == "done");
     let ticket = h.state().view.as_ref().unwrap().id;
 
-    h.input_mut().dropped_files.push(egui::DroppedFile { path: Some(picture.clone()), ..Default::default() });
+    h.input_mut().dropped_files.push(egui::DroppedFile {
+        path: Some(picture.clone()),
+        ..Default::default()
+    });
     h.run_steps(3);
     assert_eq!(h.state().composer.attachments, ["截图.PNG"]);
     h.get_by_label("输入框").focus();
     h.get_by_label("输入框").type_text("看看新图片");
     h.run_steps(2);
     h.key_press(egui::Key::Enter);
-    until(&mut h, "image follow-up", |app| root_state(app) == "done" && kinds(app, ticket).iter().filter(|kind| *kind == "reply").count() == 2);
+    until(&mut h, "image follow-up", |app| {
+        root_state(app) == "done"
+            && kinds(app, ticket)
+                .iter()
+                .filter(|kind| *kind == "reply")
+                .count()
+                == 2
+    });
     assert!(h.state().composer.attachments.is_empty());
     let row = h.state().host.as_ref().unwrap().engine().db().with(|q| {
         q.one("SELECT manifest FROM job_files WHERE job=(SELECT id FROM jobs WHERE ticket=? AND parent IS NULL)", &[&ticket])
@@ -681,10 +1240,15 @@ fn existing_conversation_accepts_a_dropped_image_and_shows_usage() {
     let manifest: Value = serde_json::from_str(row["manifest"].as_str().unwrap()).unwrap();
     assert_eq!(manifest[0]["name"], "截图.PNG");
     std::fs::write(picture, "changed after delivery").unwrap();
-    assert_eq!(std::fs::read(manifest[0]["object_path"].as_str().unwrap()).unwrap(), expected);
+    assert_eq!(
+        std::fs::read(manifest[0]["object_path"].as_str().unwrap()).unwrap(),
+        expected
+    );
 
-    h.get_by_label("令牌用量").click();
     h.run_steps(3);
+    assert!(h.get_by_label("令牌用量").rect().top() >= h.get_by_label("输入框").rect().bottom());
+    h.get_by_label("令牌用量").hover();
+    h.run_steps(40);
     assert!(h.query_by_label("执行端已报告用量").is_some());
 }
 
@@ -699,9 +1263,13 @@ fn create_receipt_preserves_attachments_added_after_send() {
         h.state_mut().composer.project = Some(project.path().to_path_buf());
         h.run_steps(3);
         h.state_mut().submit(crate::host::Action::Create {
-            goal: "initial request".into(), cwd: Some(project.path().to_path_buf()),
-            lead: "claude".into(), profile: "readonly".into(), files: vec!["first.txt".into()],
-            selections: None, extensions: None,
+            goal: "initial request".into(),
+            cwd: Some(project.path().to_path_buf()),
+            lead: "claude".into(),
+            profile: "readonly".into(),
+            files: vec!["first.txt".into()],
+            selections: None,
+            extensions: None,
             allow_lead_routing: None,
         });
         if change_project {
@@ -726,10 +1294,13 @@ fn model_picker_searches_complete_catalog_and_saves_declared_effort() {
     let models: Vec<Value> = (0..2500).map(|n| serde_json::json!({
         "id":format!("model-{n:04}"), "reasoningEfforts":["low","high"], "defaultReasoningEffort":"low"
     })).collect();
-    h.state_mut().models.as_mut().unwrap().answer("deepseek", Ok(serde_json::json!({
-        "default":{"mode":"cli","provider":"fixture","model":"model-0000"},
-        "modes":[{"id":"cli"}], "providers":[{"id":"fixture","models":models}]
-    })));
+    h.state_mut().models.as_mut().unwrap().answer(
+        "deepseek",
+        Ok(serde_json::json!({
+            "default":{"mode":"cli","provider":"fixture","model":"model-0000"},
+            "modes":[{"id":"cli"}], "providers":[{"id":"fixture","models":models}]
+        })),
+    );
     h.run_steps(3);
     assert!(h.query_by_label("共 2500 个模型，可在列表中搜索").is_some());
     h.get_by_role_and_label(Role::ComboBox, "模型").click();
@@ -758,41 +1329,74 @@ fn model_picker_opens_custom_providers_and_preserves_unsaved_choices() {
     let mut h = harness(data.path(), "readonly");
     h.run_steps(3);
     h.state_mut().open_models(crate::models::Scope::Draft);
-    until(&mut h, "model catalog", |a| a.models.as_ref().is_some_and(|d| !d.needs("deepseek")));
+    until(&mut h, "model catalog", |a| {
+        a.models.as_ref().is_some_and(|d| !d.needs("deepseek"))
+    });
     h.run_steps(3);
     h.get_by_label("跟随本机适配器默认配置").click();
     h.run_steps(3);
     h.get_by_label("Codex").click();
-    until(&mut h, "codex catalog", |a| a.models.as_ref().is_some_and(|d| !d.needs("codex")));
+    until(&mut h, "codex catalog", |a| {
+        a.models.as_ref().is_some_and(|d| !d.needs("codex"))
+    });
     h.run_steps(3);
     h.get_by_label("跟随本机适配器默认配置").click();
     h.get_by_label("交给主控选择协作者模型和思考强度").click();
     h.run_steps(3);
-    h.get_by_role_and_label(Role::Button, "自定义供应商").click();
+    h.get_by_role_and_label(Role::Button, "自定义供应商")
+        .click();
     h.run_steps(3);
-    assert!(h.state().models.as_ref().is_some_and(|d| d.scope == crate::models::Scope::Draft && !d.allow_lead_routing));
+    assert!(
+        h.state()
+            .models
+            .as_ref()
+            .is_some_and(|d| d.scope == crate::models::Scope::Draft && !d.allow_lead_routing)
+    );
     assert!(h.state().providers.is_some());
     h.get_by_label("添加供应商").click();
     h.run_steps(3);
-    assert_eq!(h.state().providers.as_ref().unwrap().form.as_ref().unwrap().agent, "codex");
-    for (label, text) in [("名称", "完整目录测试"), ("接口地址", "http://127.0.0.1:34999/v1")] {
+    assert_eq!(
+        h.state()
+            .providers
+            .as_ref()
+            .unwrap()
+            .form
+            .as_ref()
+            .unwrap()
+            .agent,
+        "codex"
+    );
+    for (label, text) in [
+        ("名称", "完整目录测试"),
+        ("接口地址", "http://127.0.0.1:34999/v1"),
+    ] {
         h.get_by_role_and_label(Role::TextInput, label).focus();
-        h.get_by_role_and_label(Role::TextInput, label).type_text(text);
+        h.get_by_role_and_label(Role::TextInput, label)
+            .type_text(text);
         h.run_steps(2);
     }
     // Exercise the form's complete probe-result entry point without a live endpoint.
-    h.state_mut().providers.as_mut().unwrap().probed(Ok((0..2500).map(|n| format!("remote-{n:04}")).collect()));
+    h.state_mut()
+        .providers
+        .as_mut()
+        .unwrap()
+        .probed(Ok((0..2500).map(|n| format!("remote-{n:04}")).collect()));
     h.run_steps(3);
     assert!(h.query_by_label("2500 个模型 · 每行一个模型 ID").is_some());
     h.get_by_label("保存供应商").click();
-    until(&mut h, "custom provider saved", |a| a.providers.as_ref().is_some_and(|d| d.form.is_none()) && a.host.as_ref().unwrap().providers().len() == 1);
+    until(&mut h, "custom provider saved", |a| {
+        a.providers.as_ref().is_some_and(|d| d.form.is_none())
+            && a.host.as_ref().unwrap().providers().len() == 1
+    });
     let saved = h.state().host.as_ref().unwrap().providers().remove(0);
     assert_eq!(saved.agent, "codex");
     assert_eq!(saved.models.len(), 2500);
     assert_eq!(saved.models.last().unwrap(), "remote-2499");
     h.run_steps(3);
     h.get_by_label("返回模型选择").click();
-    until(&mut h, "returned model catalog", |a| a.providers.is_none() && a.models.as_ref().is_some_and(|d| !d.needs("codex")));
+    until(&mut h, "returned model catalog", |a| {
+        a.providers.is_none() && a.models.as_ref().is_some_and(|d| !d.needs("codex"))
+    });
     h.run_steps(3);
     h.get_by_label("保存选择").click();
     h.run_steps(3);
@@ -808,9 +1412,14 @@ fn custom_provider_entry_survives_catalog_failure_and_palette_search() {
     let mut h = harness(data.path(), "readonly");
     h.run_steps(3);
     h.state_mut().open_models(crate::models::Scope::Draft);
-    h.state_mut().models.as_mut().unwrap().answer("deepseek", Err("目录暂时不可用".into()));
+    h.state_mut()
+        .models
+        .as_mut()
+        .unwrap()
+        .answer("deepseek", Err("目录暂时不可用".into()));
     h.run_steps(3);
-    h.get_by_role_and_label(Role::Button, "自定义供应商").click();
+    h.get_by_role_and_label(Role::Button, "自定义供应商")
+        .click();
     h.run_steps(3);
     assert!(h.state().providers.is_some());
     h.get_by_label("返回模型选择").click();
@@ -837,7 +1446,9 @@ fn lead_routing_policy_roundtrips_defaults_draft_and_active_ticket() {
     h.get_by_label(POLICY).click();
     h.run_steps(3);
     h.get_by_label("保存选择").click();
-    until(&mut h, "default policy saved", |a| a.models.is_none() && !a.host.as_ref().unwrap().allow_lead_routing_default());
+    until(&mut h, "default policy saved", |a| {
+        a.models.is_none() && !a.host.as_ref().unwrap().allow_lead_routing_default()
+    });
     drop(h);
     let mut h = harness(data.path(), "ask");
     h.state_mut().composer.project = Some(project.path().to_path_buf());
@@ -850,25 +1461,59 @@ fn lead_routing_policy_roundtrips_defaults_draft_and_active_ticket() {
     h.get_by_label("保存选择").click();
     h.run_steps(3);
     assert_eq!(h.state().composer.allow_lead_routing, Some(true));
-    assert!(!h.state().host.as_ref().unwrap().allow_lead_routing_default());
+    assert!(
+        !h.state()
+            .host
+            .as_ref()
+            .unwrap()
+            .allow_lead_routing_default()
+    );
     h.get_by_label("输入框").focus();
-    h.get_by_label("输入框").type_text("保持审批等待以测试实时策略");
+    h.get_by_label("输入框")
+        .type_text("保持审批等待以测试实时策略");
     h.run_steps(2);
     h.key_press(egui::Key::Enter);
-    until(&mut h, "active approval", |a| a.view.as_ref().and_then(|v| v.snap.as_ref()).is_some_and(|s| !s.approvals.is_empty()));
+    until(&mut h, "active approval", |a| {
+        a.view
+            .as_ref()
+            .and_then(|v| v.snap.as_ref())
+            .is_some_and(|s| !s.approvals.is_empty())
+    });
     let ticket = h.state().view.as_ref().unwrap().id;
-    assert!(h.state().view.as_ref().unwrap().snap.as_ref().unwrap().ticket.allow_lead_routing);
+    assert!(
+        h.state()
+            .view
+            .as_ref()
+            .unwrap()
+            .snap
+            .as_ref()
+            .unwrap()
+            .ticket
+            .allow_lead_routing
+    );
     let routes_before = ticket_routes(h.state(), ticket);
-    h.state_mut().open_models(crate::models::Scope::Ticket(ticket));
+    h.state_mut()
+        .open_models(crate::models::Scope::Ticket(ticket));
     h.run_steps(3);
     assert!(h.state().models.as_ref().unwrap().allow_lead_routing);
     h.get_by_label(POLICY).click();
     h.run_steps(3);
     h.get_by_label("保存选择").click();
-    until(&mut h, "live policy saved", |a| a.models.is_none() && a.view.as_ref().and_then(|v| v.snap.as_ref()).is_some_and(|s| !s.ticket.allow_lead_routing));
+    until(&mut h, "live policy saved", |a| {
+        a.models.is_none()
+            && a.view
+                .as_ref()
+                .and_then(|v| v.snap.as_ref())
+                .is_some_and(|s| !s.ticket.allow_lead_routing)
+    });
     assert_eq!(ticket_routes(h.state(), ticket), routes_before);
-    assert!(kinds(h.state(), ticket).iter().any(|kind| kind == "lead_routing.changed"));
-    h.state_mut().open_models(crate::models::Scope::Ticket(ticket));
+    assert!(
+        kinds(h.state(), ticket)
+            .iter()
+            .any(|kind| kind == "lead_routing.changed")
+    );
+    h.state_mut()
+        .open_models(crate::models::Scope::Ticket(ticket));
     h.run_steps(3);
     assert!(!h.state().models.as_ref().unwrap().allow_lead_routing);
 }
