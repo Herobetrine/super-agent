@@ -48,7 +48,8 @@ fn restore(old: &Baseline, view: &Map<String, Value>) -> Map<String, Value> {
     }
     for (name, value) in view {
         if matches!(name.as_str(), "context_delivery" | "full_context") { continue; }
-        match meta["array_modes"][name].as_str() {
+        let array_mode = &meta["array_modes"][name];
+        match array_mode.as_str().or_else(|| array_mode["mode"].as_str()) {
             Some("append") => packet.get_mut(name).unwrap().as_array_mut().unwrap()
                 .extend(value.as_array().unwrap().clone()),
             Some("upsert") => {
@@ -61,7 +62,19 @@ fn restore(old: &Baseline, view: &Map<String, Value>) -> Map<String, Value> {
                         rows.push(row.clone());
                     }
                 }
+                if array_mode.is_object() {
+                    assert_eq!(name, "project_knowledge");
+                    let removed = array_mode["removed_ids"].as_array().unwrap();
+                    rows.retain(|row| !removed.contains(&row["id"]));
+                    let ordered: Vec<_> = array_mode["order"].as_array().unwrap().iter()
+                        .map(|id| rows.iter().find(|row| row["id"] == *id).unwrap().clone())
+                        .collect();
+                    assert_eq!(ordered.len(), rows.len());
+                    *rows = ordered;
+                }
             }
+            Some(mode) => panic!("unknown array mode {mode}"),
+            None if !array_mode.is_null() => panic!("invalid array mode {array_mode}"),
             _ if meta["object_modes"].get(name).is_some() => {
                 let fields = packet.get_mut(name).unwrap().as_object_mut().unwrap();
                 for key in meta["object_modes"][name]["removed_fields"].as_array().unwrap() {
@@ -126,16 +139,119 @@ fn removals_rewrites_and_guide_changes_are_explicit() {
     assert!(guide.starts_with("new guide\n"));
 }
 
+#[test]
+fn knowledge_changes_preserve_whole_entries_selection_removals_and_order() {
+    let rows: Vec<_> = (1..=4).map(|id| json!({
+        "id":id,"body":format!("knowledge {id} {}", "完整内容🧭".repeat(200)),"relevance":1,
+    })).collect();
+    let old = Baseline {
+        packet:object(json!({"project_knowledge":rows})), guide_sha256:digest("guide"),
+        snapshot_sha256:"sha".into(), reply:"reply".into(), lazy_mcp_schemas:false, needs_recovery:false,
+    };
+    let mut added = rows.clone();
+    added.push(json!({"id":5,"body":"new full entry\n末行","relevance":2}));
+    let mut changed = rows.clone();
+    changed[1]["relevance"] = json!(9);
+    changed[1]["new_field"] = json!({"complete":"追加字段全文"});
+    let removed = vec![rows[0].clone(), rows[2].clone(), rows[3].clone()];
+    let reordered = vec![rows[3].clone(), rows[0].clone(), rows[2].clone(), rows[1].clone()];
+    for (name, current, expected_changes, removed_ids) in [
+        ("added", added.clone(), json!([added[4]]), json!([])),
+        ("changed", changed.clone(), json!([changed[1]]), json!([])),
+        ("removed", removed, json!([]), json!([2])),
+        ("reordered", reordered, json!([]), json!([])),
+    ] {
+        let next = object(json!({"project_knowledge":current,"previous_reply":"reply"}));
+        let (view, guide) = delivery::delta(&next, "guide", &old);
+        assert_eq!(view["project_knowledge"], expected_changes, "{name}");
+        let mode = &view["context_delivery"]["array_modes"]["project_knowledge"];
+        assert_eq!(mode["mode"], "upsert", "{name}");
+        assert_eq!(mode["removed_ids"], removed_ids, "{name}");
+        assert_eq!(mode["order"], json!(current.iter().map(|row| row["id"].clone()).collect::<Vec<_>>()));
+        assert!(guide.contains("当前知识选集"));
+        assert_eq!(restore(&old, &view), next, "{name}");
+        let mut full_view = view.clone();
+        full_view.insert("project_knowledge".into(), json!(current));
+        full_view["context_delivery"]["array_modes"].as_object_mut().unwrap().remove("project_knowledge");
+        let full_guide = delivery::delta(&old.packet, "guide", &old).1;
+        assert!(guide.len() + stringify(&json!(view)).len() < full_guide.len() + stringify(&json!(full_view)).len());
+    }
+    assert_eq!(old.packet["project_knowledge"], json!(rows));
+}
+
+#[test]
+fn knowledge_invalid_ids_and_unsaved_metadata_fall_back_to_whole_replacement() {
+    let rows = json!([
+        {"id":1,"body":"stable".repeat(1000)},
+        {"id":2,"body":"other".repeat(1000)},
+    ]);
+    for invalid in [Value::Null, json!("2"), json!(2.5), json!(0), json!(-1), json!(1), json!(u64::MAX)] {
+        for invalid_in_baseline in [false, true] {
+            let mut before = rows.clone();
+            let mut current = json!([rows[1],rows[0]]);
+            if invalid_in_baseline { before[1]["id"] = invalid.clone(); }
+            else { current[0]["id"] = invalid.clone(); }
+            let old = Baseline {
+                packet:object(json!({"project_knowledge":before})), guide_sha256:digest("guide"),
+                snapshot_sha256:"sha".into(), reply:"reply".into(), lazy_mcp_schemas:false, needs_recovery:false,
+            };
+            let next = object(json!({"project_knowledge":current,"previous_reply":"reply"}));
+            let (view, _) = delivery::delta(&next, "guide", &old);
+            assert_eq!(view["project_knowledge"], current);
+            assert!(view["context_delivery"]["array_modes"].get("project_knowledge").is_none());
+            assert_eq!(restore(&old, &view), next);
+        }
+    }
+    for before in [
+        json!([{"body":"missing ID"},rows[0]]),
+        json!([false,rows[0]]),
+        json!([{"id":1,"body":"x".repeat(60)},{"id":2,"body":"y".repeat(60)}]),
+    ] {
+        let mut current = before.as_array().unwrap().clone();
+        current.reverse();
+        let old = Baseline {
+            packet:object(json!({"project_knowledge":before})), guide_sha256:digest("guide"),
+            snapshot_sha256:"sha".into(), reply:"reply".into(), lazy_mcp_schemas:false, needs_recovery:false,
+        };
+        let next = object(json!({"project_knowledge":current,"previous_reply":"reply"}));
+        let (view, guide) = delivery::delta(&next, "guide", &old);
+        assert_eq!(view["project_knowledge"], json!(current));
+        assert!(view["context_delivery"]["array_modes"].get("project_knowledge").is_none());
+        assert!(!guide.contains("array_modes.project_knowledge"));
+        assert_eq!(restore(&old, &view), next);
+    }
+    let old = Baseline {
+        packet:object(json!({"project_knowledge":rows})), guide_sha256:digest("guide"),
+        snapshot_sha256:"sha".into(), reply:"reply".into(), lazy_mcp_schemas:false, needs_recovery:false,
+    };
+    for current in [json!([]), json!({"legacy":"whole value"})] {
+        let next = object(json!({"project_knowledge":current,"previous_reply":"reply"}));
+        let (view, _) = delivery::delta(&next, "guide", &old);
+        assert_eq!(view["project_knowledge"], current);
+        assert!(view["context_delivery"]["array_modes"].get("project_knowledge").is_none());
+        assert_eq!(restore(&old, &view), next);
+    }
+    let next = object(json!({"previous_reply":"reply"}));
+    let (view, _) = delivery::delta(&next, "guide", &old);
+    assert_eq!(view["context_delivery"]["removed_fields"], json!(["project_knowledge"]));
+    assert_eq!(restore(&old, &view), next);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn engine_replay_reduces_bytes_and_survives_restart_with_verified_full_archive() {
     let extensions = Arc::new(TestExtensions(Mutex::new(json!({"skills":["retained skill\n".repeat(30_000)],"mcp":[]}))));
     let options = || sa_engine::EngineOptions { extensions:Some(extensions.clone()), ..quiet() };
     let mut fx = Fx::with(script(|_| async { Ok("successful reply".into()) }), t1_catalog(), options());
+    for id in 1..=3 {
+        fx.engine.add_knowledge(fx.project.to_str().unwrap(), "memory", &format!("stable {id} {}", "x".repeat(700)), None).unwrap();
+    }
     let ticket = fx.begin(fx.params().profile("full")).await;
     fx.finish(ticket, "done").await;
     let root = fx.engine.root(ticket).unwrap()["id"].as_i64().unwrap();
     let initial = fx.shared.calls(|c| (c.req.turn == 1).then(|| c.packet.clone())).pop().unwrap();
     assert_eq!(initial["project_extensions"]["skills"], extensions.0.lock().unwrap()["skills"]);
+    assert_eq!(initial["project_knowledge"].as_array().unwrap().len(), 3);
+    fx.engine.add_knowledge(fx.project.to_str().unwrap(), "memory", "fresh knowledge after success", None).unwrap();
     fx.restart(options()).await;
     fx.engine.follow(ticket, "继续", false).unwrap();
     fx.engine.start().unwrap();
@@ -144,6 +260,9 @@ async fn engine_replay_reduces_bytes_and_survives_restart_with_verified_full_arc
     assert_eq!(call["context_delivery"]["mode"], "delta");
     assert!(call.get("project_extensions").is_none());
     assert!(call.get("delegate_models").is_none());
+    assert_eq!(call["context_delivery"]["array_modes"]["project_knowledge"]["mode"], "upsert");
+    assert!(call["project_knowledge"].as_array().unwrap().iter().any(|row| row["body"] == "fresh knowledge after success"));
+    assert!(call["project_knowledge"].as_array().unwrap().iter().all(|row| !row["body"].as_str().unwrap().starts_with("stable ")));
     assert!(initial["delegate_models"].as_object().is_some_and(|models| !models.is_empty()));
     let full = &call["full_context"];
     let raw = std::fs::read(full["object_path"].as_str().unwrap()).unwrap();
@@ -152,6 +271,9 @@ async fn engine_replay_reduces_bytes_and_survives_restart_with_verified_full_arc
     assert_eq!(original["user_updates"], json!(["继续"]));
     assert_eq!(original["job"], root);
     assert_eq!(original["project_extensions"]["skills"], initial["project_extensions"]["skills"]);
+    for entry in initial["project_knowledge"].as_array().unwrap() {
+        assert!(original["project_knowledge"].as_array().unwrap().contains(entry));
+    }
     assert!(call.get("previous_reply").is_none());
     let checkpoint = fx.engine.db().with(|q| {
         let seq = q.int("SELECT max(seq) FROM events WHERE kind='reply'", &[])?;
@@ -159,9 +281,11 @@ async fn engine_replay_reduces_bytes_and_survives_restart_with_verified_full_arc
     }).unwrap();
     assert_eq!(checkpoint["input"]["project_extensions"], original["project_extensions"]);
     assert_eq!(checkpoint["input"]["delegate_models"], original["delegate_models"]);
+    assert_eq!(checkpoint["input"]["project_knowledge"], original["project_knowledge"]);
     let full_input = fx.engine.db().with(|q| delivery::full_input(q, root, i64::MAX)).unwrap().unwrap();
     let failover_context: Value = serde_json::from_str(full_input["payload"].as_str().unwrap()).unwrap();
     assert_eq!(failover_context["delegate_models"], original["delegate_models"]);
+    assert_eq!(failover_context["project_knowledge"], original["project_knowledge"]);
     assert!(failover_context["delegate_models"].as_object().is_some_and(|models| !models.is_empty()));
     let metrics = payloads(&fx, "SELECT payload FROM events WHERE kind='running' ORDER BY seq DESC LIMIT 1").pop().unwrap();
     assert!(metrics["sent_prompt_bytes"].as_u64().unwrap() * 100 < metrics["full_prompt_bytes"].as_u64().unwrap());
@@ -184,14 +308,22 @@ async fn failed_request_does_not_consume_incremental_updates() {
             let attempt = n.fetch_add(1, Ordering::SeqCst);
             if attempt == 1 {
                 assert_eq!(c.packet["user_updates"], json!(["must replay"]));
+                assert_eq!(c.packet["context_delivery"]["array_modes"]["project_knowledge"]["mode"], "upsert");
                 return Err(AdapterError::new(ErrorClass::Protocol, "fixture failure"));
             }
-            if attempt == 2 { assert_eq!(c.packet["user_updates"], json!(["must replay"])); }
+            if attempt == 2 {
+                assert_eq!(c.packet["user_updates"], json!(["must replay"]));
+                assert_eq!(c.packet["context_delivery"]["array_modes"]["project_knowledge"]["mode"], "upsert");
+            }
             Ok("success".into())
         }
     }), t1_catalog());
+    for id in 1..=3 {
+        fx.engine.add_knowledge(fx.project.to_str().unwrap(), "memory", &format!("stable {id} {}", "x".repeat(700)), None).unwrap();
+    }
     let ticket = fx.begin(fx.params().profile("full")).await;
     fx.finish(ticket, "done").await;
+    fx.engine.add_knowledge(fx.project.to_str().unwrap(), "memory", "must replay knowledge", None).unwrap();
     fx.engine.follow(ticket, "must replay", false).unwrap();
     fx.finish(ticket, "failed").await;
     assert_eq!(fx.int("SELECT count(*) FROM events WHERE kind='context.delivered'"), 1);
@@ -199,6 +331,10 @@ async fn failed_request_does_not_consume_incremental_updates() {
     fx.engine.retry(root).unwrap();
     fx.finish(ticket, "done").await;
     assert_eq!(fx.int("SELECT count(*) FROM events WHERE kind='context.delivered'"), 2);
+    let attempts = fx.shared.calls(|c| (c.req.turn == 2).then(|| c.packet["project_knowledge"].clone()));
+    assert_eq!(attempts.len(), 2);
+    assert_eq!(attempts[0], attempts[1]);
+    assert!(attempts[1].as_array().unwrap().iter().any(|entry| entry["body"] == "must replay knowledge"));
     fx.engine.close().await;
 }
 
@@ -206,6 +342,9 @@ async fn failed_request_does_not_consume_incremental_updates() {
 async fn session_change_corrupt_snapshot_and_restricted_profile_replay_full_input() {
     for mode in ["session", "route", "corrupt", "restricted"] {
         let fx = Fx::new(script(|_| async { Ok("success".into()) }), t1_catalog());
+        for id in 1..=3 {
+            fx.engine.add_knowledge(fx.project.to_str().unwrap(), "memory", &format!("stable {id} {}", "x".repeat(700)), None).unwrap();
+        }
         let profile = if mode == "restricted" { "readonly" } else { "full" };
         let ticket = fx.begin(fx.params().profile(profile)).await;
         fx.finish(ticket, "done").await;
@@ -224,6 +363,7 @@ async fn session_change_corrupt_snapshot_and_restricted_profile_replay_full_inpu
         assert!(packet.get("context_delivery").is_none(), "{mode}");
         assert_eq!(packet["previous_reply"], "success");
         assert!(packet["harness_capabilities"].is_object());
+        assert!(packet["project_knowledge"].as_array().unwrap().len() >= 3);
         fx.engine.close().await;
     }
 }
@@ -246,7 +386,8 @@ async fn same_session_native_compaction_establishes_self_contained_recovery_epoc
                     assert_eq!(c.packet["context_delivery"]["mode"], "recovery");
                     assert!(c.packet["harness_capabilities"].is_object());
                     assert_eq!(c.packet["history_index"]["source"], c.packet["full_context"]);
-                    read_archive(&c.packet);
+                    assert_eq!(c.packet["project_knowledge"], read_archive(&c.packet)["project_knowledge"]);
+                    assert!(c.packet["project_knowledge"].as_array().unwrap().len() >= 3);
                 }
                 if c.turn() == 4 {
                     assert_eq!(c.packet["context_delivery"]["mode"], "delta");
@@ -254,6 +395,9 @@ async fn same_session_native_compaction_establishes_self_contained_recovery_epoc
                 Ok("success".into())
             }
         }), t1_catalog());
+        for id in 1..=3 {
+            fx.engine.add_knowledge(fx.project.to_str().unwrap(), "memory", &format!("stable {id} {}", "x".repeat(700)), None).unwrap();
+        }
         let ticket = fx.begin(fx.params().profile("full")).await;
         fx.finish(ticket, "done").await;
         for update in ["first follow", "second follow", "third follow"] {
@@ -394,6 +538,7 @@ fn recovery_is_self_contained_with_bounded_exact_history_and_full_current_work()
     let mut packet = object(json!({
         "permission_profile":"full","goal":"完整目标","objective":"完整当前目标","assignment":"完整分工",
         "harness_capabilities":{"codex":{"write_project":true}},"project_extensions":{"skills":["完整技能"]},
+        "project_knowledge":[{"id":1,"body":"完整相关知识".repeat(200)}],
         "reports":reports,"notes":[
             {"seq":1,"sender":"codex (#1)","body":"old child note"},
             {"seq":2,"sender":"user","body":"仍须遵守的用户要求"},
@@ -410,7 +555,7 @@ fn recovery_is_self_contained_with_bounded_exact_history_and_full_current_work()
     let archive = sa_engine::context::archive(&packet, dir.path()).unwrap();
     let (view, guide) = delivery::recovery(&packet, "guide", &old, &archive);
     assert!(guide.starts_with("guide\n"));
-    for field in ["permission_profile","goal","objective","assignment","harness_capabilities","project_extensions","user_updates","plan","decisions"] {
+    for field in ["permission_profile","goal","objective","assignment","harness_capabilities","project_extensions","project_knowledge","user_updates","plan","decisions"] {
         assert_eq!(view[field], packet[field], "{field}");
     }
     assert_eq!(view["reports"], json!([packet["reports"][79],packet["reports"][80],packet["reports"][81]]));
@@ -596,6 +741,105 @@ fn replay_compacted_production_turns_without_models_or_database_writes() {
     }
     conn.execute_batch("ROLLBACK").unwrap();
     std::fs::write(output, serde_json::to_vec_pretty(&metrics).unwrap()).unwrap();
+}
+
+#[test]
+#[ignore = "requires explicitly supplied read-only production snapshot replay paths"]
+fn replay_production_knowledge_delta_includes_all_metadata_and_guide_costs() {
+    let database = std::env::var("SA_CONTEXT_REPLAY_DB").expect("read-only database path");
+    let output = std::env::var("SA_CONTEXT_REPLAY_OUTPUT").expect("numeric receipt path");
+    let conn = rusqlite::Connection::open_with_flags(database, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+    conn.execute_batch("PRAGMA query_only=ON; BEGIN").unwrap();
+    let read_event = |seq: i64| -> Value {
+        let (payload, sha): (String, String) = conn.query_row(
+            "SELECT payload,sha256 FROM events WHERE seq=?", [seq], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        assert_eq!(digest(&payload), sha);
+        serde_json::from_str(&payload).unwrap()
+    };
+    let mut metrics = Vec::new();
+    for turn in [16, 17] {
+        let snapshot_seq: i64 = conn.query_row(
+            "SELECT seq FROM events WHERE ticket=7 AND job=100 AND turn=? AND kind='context.snapshot' ORDER BY seq LIMIT 1",
+            [turn], |row| row.get(0),
+        ).unwrap();
+        let previous_receipt_seq: i64 = conn.query_row(
+            "SELECT max(seq) FROM events WHERE job=100 AND seq<? AND kind='context.delivered'",
+            [snapshot_seq], |row| row.get(0),
+        ).unwrap();
+        let receipt = read_event(previous_receipt_seq);
+        assert_eq!(receipt["complete"], true);
+        let previous = read_event(receipt["snapshot_seq"].as_i64().unwrap());
+        assert_eq!(previous, read_archive(&receipt));
+        assert_eq!(digest(&stringify(&sa_engine::context::sort_keys(&previous))), receipt["snapshot_sha256"]);
+        let reply = read_event(receipt["reply_seq"].as_i64().unwrap());
+        assert_eq!(reply["session"], receipt["session"]);
+        let old = Baseline {
+            packet:object(previous), guide_sha256:receipt["guide_sha256"].as_str().unwrap().into(),
+            snapshot_sha256:receipt["snapshot_sha256"].as_str().unwrap().into(),
+            reply:reply["text"].as_str().unwrap().into(), lazy_mcp_schemas:true, needs_recovery:false,
+        };
+        let running_seq: i64 = conn.query_row(
+            "SELECT seq FROM events WHERE job=100 AND turn=? AND kind='running' ORDER BY seq LIMIT 1",
+            [turn], |row| row.get(0),
+        ).unwrap();
+        let running = read_event(running_seq);
+        assert_eq!(running["incremental"], true);
+        assert_eq!(running["recovery_delivery"], false);
+        let input_seq: i64 = conn.query_row(
+            "SELECT seq FROM events WHERE job=100 AND turn=? AND kind='input' ORDER BY seq LIMIT 1",
+            [turn], |row| row.get(0),
+        ).unwrap();
+        let original_wire = read_event(input_seq);
+        let current = read_event(snapshot_seq);
+        assert_eq!(current, read_archive(&original_wire));
+        assert_eq!(digest(&stringify(&sa_engine::context::sort_keys(&current))), running["snapshot_sha256"]);
+        // Locate the actual full guide by its recorded digest, including guides
+        // previously followed by a delta/recovery addendum. Never export it.
+        let guide_sha = original_wire["context_delivery"]["guide_sha256"].as_str().unwrap();
+        let mut statement = conn.prepare("SELECT json_extract(payload,'$.guide') FROM events WHERE job=100 AND kind='running' AND seq<=? ORDER BY seq DESC").unwrap();
+        let guide = statement.query_map([running_seq], |row| row.get::<_, String>(0)).unwrap()
+            .map(Result::unwrap).find_map(|candidate| {
+                if digest(&candidate) == guide_sha { return Some(candidate); }
+                candidate.match_indices('\n').find_map(|(end, _)|
+                    (digest(&candidate[..end]) == guide_sha).then(|| candidate[..end].to_string()))
+            }).expect("hash-verified original guide");
+        let packet = object(current);
+        let (mut view, delivered_guide) = delivery::delta(&packet, &guide, &old);
+        assert_eq!(restore(&old, &view), packet);
+        assert_eq!(view.get("reports"), original_wire.get("reports"));
+        delivery::defer_mcp_schemas(&mut view, &packet);
+        view.insert("full_context".into(), original_wire["full_context"].clone());
+        let mut legacy_view = view.clone();
+        legacy_view.insert("project_knowledge".into(), packet["project_knowledge"].clone());
+        legacy_view["context_delivery"]["array_modes"].as_object_mut().unwrap().remove("project_knowledge");
+        assert_eq!(json!(legacy_view), original_wire);
+        let old_guide = running["guide"].as_str().unwrap();
+        assert!(delivered_guide.starts_with(old_guide));
+        let old_bytes = old_guide.len() + 1 + stringify(&json!(legacy_view)).len();
+        assert_eq!(json!(old_bytes), running["sent_prompt_bytes"]);
+        let new_bytes = delivered_guide.len() + 1 + stringify(&json!(view)).len();
+        let full_knowledge_bytes = stringify(&packet["project_knowledge"]).len();
+        let changed_knowledge_bytes = stringify(&view["project_knowledge"]).len();
+        let added_metadata_bytes = stringify(&view["context_delivery"]["array_modes"]).len()
+            - stringify(&legacy_view["context_delivery"]["array_modes"]).len();
+        let added_guide_bytes = delivered_guide.len() - old_guide.len();
+        assert_eq!(old_bytes - new_bytes, full_knowledge_bytes - changed_knowledge_bytes - added_metadata_bytes - added_guide_bytes);
+        assert!(old_bytes - new_bytes > 11_000);
+        metrics.push(json!({
+            "ticket":7,"job":100,"turn":turn,"snapshot_seq":snapshot_seq,
+            "baseline_receipt_seq":previous_receipt_seq,"snapshot_sha256":running["snapshot_sha256"],
+            "receipt_and_archive_hashes_verified":true,
+            "old_sent_prompt_bytes":old_bytes,"new_sent_prompt_bytes":new_bytes,"net_saved_bytes":old_bytes-new_bytes,
+            "full_knowledge_bytes":full_knowledge_bytes,"changed_knowledge_bytes":changed_knowledge_bytes,
+            "added_metadata_bytes":added_metadata_bytes,"added_guide_bytes":added_guide_bytes,
+            "knowledge_changes":view["project_knowledge"].as_array().unwrap().len(),
+            "selection_removed_ids":view["context_delivery"]["array_modes"]["project_knowledge"]["removed_ids"],
+            "selection_order":view["context_delivery"]["array_modes"]["project_knowledge"]["order"],
+        }));
+    }
+    conn.execute_batch("ROLLBACK").unwrap();
+    std::fs::write(output, serde_json::to_vec_pretty(&json!({"read_only":true,"model_calls":0,"turns":metrics})).unwrap()).unwrap();
 }
 
 #[test]

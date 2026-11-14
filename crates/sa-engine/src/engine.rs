@@ -138,6 +138,12 @@ impl CreateParams {
 
 type CatalogFuture = Shared<BoxFuture<'static, Result<Value, String>>>;
 
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum CatalogKey {
+    Full(String),
+    Selected(String, Route),
+}
+
 struct Slot {
     ticket: i64,
     cancel: CancellationToken,
@@ -159,7 +165,7 @@ pub(crate) struct Inner {
     adapters: HashMap<String, Arc<dyn Adapter>>,
     opts: EngineOptions,
     sched: Mutex<Sched>,
-    catalogs: Mutex<HashMap<String, CatalogFuture>>,
+    catalogs: Mutex<HashMap<CatalogKey, CatalogFuture>>,
     started: AtomicBool,
     stopping: AtomicBool,
     fault: Mutex<Option<String>>,
@@ -1189,25 +1195,45 @@ impl Inner {
 
     /// `catalogRequest(name)` (E:207-215): one in-flight probe per harness.
     fn catalog(self: &Arc<Self>, name: &str) -> CatalogFuture {
+        self.catalog_request(name, None)
+    }
+
+    fn catalog_request(self: &Arc<Self>, name: &str, route: Option<Route>) -> CatalogFuture {
+        let key = match &route {
+            Some(route) => CatalogKey::Selected(name.into(), route.clone()),
+            None => CatalogKey::Full(name.into()),
+        };
         let mut map = lock(&self.catalogs);
-        if let Some(f) = map.get(name) {
+        if let Some(f) = map.get(&key) {
             return f.clone();
         }
-        let adapter = self.adapters.get(name).cloned();
+        let probe = match self.adapters.get(name) {
+            Some(adapter) => match route {
+                Some(route) => match adapter.catalog_for_route(route) {
+                    Some(probe) => Some(probe),
+                    None => {
+                        drop(map);
+                        return self.catalog(name);
+                    }
+                },
+                None => Some(adapter.catalog()),
+            },
+            None => None,
+        };
         let weak = Arc::downgrade(self);
-        let key = name.to_string();
+        let completed_key = key.clone();
         let fut: BoxFuture<'static, Result<Value, String>> = Box::pin(async move {
-            let r = match adapter {
-                Some(a) => a.catalog().await.map(|c| c.value).map_err(|e| e.to_string()),
+            let r = match probe {
+                Some(probe) => probe.await.map(|c| c.value).map_err(|e| e.to_string()),
                 None => Err("执行端不可用".to_string()),
             };
             if let Some(inner) = weak.upgrade() {
-                lock(&inner.catalogs).remove(&key);
+                lock(&inner.catalogs).remove(&completed_key);
             }
             r
         });
         let shared = fut.shared();
-        map.insert(name.to_string(), shared.clone());
+        map.insert(key, shared.clone());
         shared
     }
 
@@ -1556,7 +1582,8 @@ impl Inner {
             }
         };
         let mut memo: HashMap<String, Result<Value, String>> = HashMap::new();
-        if job.is_root() {
+        let full_menus = job.is_root() || job.primary();
+        if full_menus {
             let probes = AGENTS.iter().map(|name| {
                 let f = self.catalog(name);
                 async move { (*name, f.await) }
@@ -1591,9 +1618,22 @@ impl Inner {
         };
         let bound = parse(job.bound_route.as_deref());
         let fresh = !p::truthy_value(&bound);
-        let cat = match memo.remove(&job.agent) {
-            Some(r) => r,
-            None => self.catalog(&job.agent).await,
+        // A collaborator with a complete fixed route needs live validation of
+        // that route. Defaults still require full discovery to resolve them.
+        let fixed_route = if full_menus {
+            None
+        } else if !fresh {
+            Some(bound.clone())
+        } else if p::truthy_value(&selected_execution) {
+            Some(selected_execution.clone())
+        } else {
+            pick(&job.agent, None)
+        };
+        let selected_probe = fixed_route.as_ref().and_then(|value| p::route(Some(value)).ok());
+        let cat = match (memo.remove(&job.agent), selected_probe) {
+            (Some(r), _) => r,
+            (None, Some(route)) => self.catalog_request(&job.agent, Some(route)).await,
+            (None, None) => self.catalog(&job.agent).await,
         }
         .map_err(|e| route_error(crate::resilience::CODE_ROUTE_PROBE_FAILED, e))?;
         let picked = if fresh {
@@ -2483,6 +2523,101 @@ impl TurnHost for Host {
         }
         if let Some(inner) = turn.inner.upgrade() {
             let _ = inner.db.tx(|q| q.accept(turn.job.who(), seqs));
+        }
+    }
+}
+
+#[cfg(test)]
+mod catalog_tests {
+    use super::*;
+    use crate::adapter::{Catalog, EventSink, RunOutcome};
+
+    struct ProbeAdapter {
+        selected: bool,
+        calls: AtomicUsize,
+    }
+
+    impl Adapter for ProbeAdapter {
+        fn agent(&self) -> &'static str {
+            "antigravity"
+        }
+
+        fn catalog(&self) -> BoxFuture<'static, Result<Catalog>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async {
+                Ok(Catalog {
+                    value: json!({"full":true}),
+                })
+            })
+        }
+
+        fn catalog_for_route(&self, route: Route) -> Option<BoxFuture<'static, Result<Catalog>>> {
+            if !self.selected {
+                return None;
+            }
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Some(Box::pin(async move {
+                Ok(Catalog {
+                    value: route_json(&route),
+                })
+            }))
+        }
+
+        fn run(
+            &self,
+            _: RunRequest,
+            _: Arc<dyn TurnHost>,
+            _: EventSink,
+            _: CancellationToken,
+        ) -> BoxFuture<'static, Result<RunOutcome, AdapterError>> {
+            panic!("catalog test must not execute models")
+        }
+    }
+
+    #[tokio::test]
+    async fn selected_catalog_shares_inflight_and_preserves_full_fallback() {
+        for selected in [false, true] {
+            let data = tempfile::tempdir().unwrap();
+            let adapter = Arc::new(ProbeAdapter {
+                selected,
+                calls: AtomicUsize::new(0),
+            });
+            let engine =
+                Engine::open(data.path(), vec![adapter.clone()], EngineOptions::default()).unwrap();
+            let route = Route {
+                provider: "google".into(),
+                model: "model-a".into(),
+                mode: "cli".into(),
+                reasoning_effort: Some("low".into()),
+            };
+            let first = engine
+                .inner
+                .catalog_request("antigravity", Some(route.clone()));
+            let second = engine
+                .inner
+                .catalog_request("antigravity", Some(route.clone()));
+            let mut other = route.clone();
+            other.reasoning_effort = Some("high".into());
+            let third = engine.inner.catalog_request("antigravity", Some(other));
+            assert_eq!(
+                adapter.calls.load(Ordering::SeqCst),
+                if selected { 2 } else { 1 }
+            );
+            let (first, second, third) = tokio::join!(first, second, third);
+            assert_eq!(first.as_ref().unwrap(), second.as_ref().unwrap());
+            if selected {
+                assert_ne!(first.unwrap(), third.unwrap());
+            }
+            engine
+                .inner
+                .catalog_request("antigravity", Some(route))
+                .await
+                .unwrap();
+            assert_eq!(
+                adapter.calls.load(Ordering::SeqCst),
+                if selected { 3 } else { 2 }
+            );
+            engine.close().await;
         }
     }
 }

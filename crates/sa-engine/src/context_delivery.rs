@@ -20,6 +20,7 @@ const CURRENT: &[&str] = &[
 ];
 const APPEND: &[&str] = &["notes", "user_updates", "mcp_results"];
 const DELTA_GUIDE: &str = "继续同一原生会话。context_delivery.mode=delta 时将本包合并到已确认上下文。未列字段沿用旧值，removed_fields 删除旧字段。array_modes 指定 append 追加、upsert 按 id（roster 按 job）更新。object_modes 指定逐字段合并并按其 removed_fields 删除子字段。其余字段整项替换。reports 只含变化项，不能据此认定其他任务消失。若旧上下文已被压缩或缺失，先按 full_context 读取完整快照；读取失败应明确报告缺失并请求恢复完整上下文。";
+const KNOWLEDGE_DELTA_GUIDE: &str = "array_modes.project_knowledge 对象的 mode=upsert 按 id 全文替换或新增条目，再按 removed_ids 从当前知识选集移出，最后按 order 的完整 id 顺序排列。持久知识库由原有知识管理指令管理。";
 const RECOVERY_GUIDE: &str = "context_delivery.mode=recovery 是独立可读的新上下文起点。当前授权、目标、活跃任务、新增及变更报告、用户要求均在本包。history_index 仅证明历史材料已成功投递，不证明其原文仍在模型上下文。reports 与 notes 仅含本轮保留全文的项目，其余历史见 history_index。需要历史内容时，在内存读取 history_index.source 指定的不可变文件，先核验 bytes 和 sha256，再按条目 pointer 精确读取并核验条目 bytes 和 sha256，只输出需要的字段。不得将整个归档回灌上下文。历史用户信件仍须遵守。后续 delta 可沿用这些索引，需要原文时仍应读取其绑定的归档。";
 
 pub struct Baseline {
@@ -271,8 +272,24 @@ pub fn baseline(q: &Q, job: i64, session: Option<&str>, route: &Route) -> Result
     }))
 }
 
-/// Build a reversible view. Full values of newly received or changed reports
-/// are retained. Non-prefix histories and removals use whole-array replacement.
+/// Candidate knowledge changes retain whole entries and the exact selected order.
+/// Only unique positive database IDs can identify entries across snapshots.
+fn knowledge_delta(rows: &[Value], before: &[Value]) -> Option<(Value, Value)> {
+    let ids = |rows: &[Value]| -> Option<Vec<i64>> {
+        let ids: Vec<_> = rows.iter().map(|row| row.get("id")?.as_i64().filter(|id| *id > 0))
+            .collect::<Option<_>>()?;
+        let unique: std::collections::HashSet<_> = ids.iter().collect();
+        (unique.len() == ids.len()).then_some(ids)
+    };
+    let order = ids(rows)?;
+    let previous = ids(before)?;
+    let removed: Vec<_> = previous.into_iter().filter(|id| !order.contains(id)).collect();
+    let changed: Vec<_> = rows.iter().filter(|row| !before.contains(row)).cloned().collect();
+    Some((json!(changed), json!({"mode":"upsert","removed_ids":removed,"order":order})))
+}
+
+/// Build a reversible view. New and changed reports and knowledge entries stay
+/// complete. Knowledge removals affect only the current selected context.
 pub fn delta(packet: &Map<String, Value>, guide: &str, old: &Baseline) -> (Map<String, Value>, String) {
     let mut out = Map::new();
     let mut modes = Map::new();
@@ -326,6 +343,25 @@ pub fn delta(packet: &Map<String, Value>, guide: &str, old: &Baseline) -> (Map<S
         }
         out.insert(key.clone(), value.clone());
     }
+    let mut knowledge_guide = "";
+    if let Some((rows, before)) = out.get("project_knowledge").and_then(Value::as_array)
+        .zip(old.packet.get("project_knowledge").and_then(Value::as_array))
+        && let Some((changed, mode)) = knowledge_delta(rows, before)
+    {
+        let mut candidate_modes = modes.clone();
+        candidate_modes.insert("project_knowledge".into(), mode);
+        let metadata_bytes = stringify(&Value::Object(candidate_modes.clone())).len()
+            - stringify(&Value::Object(modes.clone())).len();
+        // Include the complete added merge instruction and JSON metadata before
+        // choosing the wire view. Tiny selections remain whole replacements.
+        if stringify(&changed).len() + metadata_bytes + KNOWLEDGE_DELTA_GUIDE.len() + 1
+            < stringify(&json!(rows)).len()
+        {
+            out.insert("project_knowledge".into(), changed);
+            modes = candidate_modes;
+            knowledge_guide = KNOWLEDGE_DELTA_GUIDE;
+        }
+    }
     let removed: Vec<_> = old.packet.keys().filter(|key| !packet.contains_key(*key)).cloned().collect();
     out.insert("context_delivery".into(), json!({
         "version":1,"mode":"delta","baseline_sha256":old.snapshot_sha256,
@@ -333,11 +369,15 @@ pub fn delta(packet: &Map<String, Value>, guide: &str, old: &Baseline) -> (Map<S
         "previous_reply":"最新已成功回复即本会话上一条终稿，省略时沿用该终稿。",
         "indexed_history":"此前 recovery 已索引的历史仅沿用其绑定归档的引用，不假定原文仍在上下文。需要原文时按原 history_index.source 校验并精确读取，也可从当前 full_context 精确查询。"
     }));
-    let delivered_guide = if old.guide_sha256 == digest(guide) {
+    let mut delivered_guide = if old.guide_sha256 == digest(guide) {
         DELTA_GUIDE.to_string()
     } else {
         format!("{guide}\n{DELTA_GUIDE}")
     };
+    if !knowledge_guide.is_empty() {
+        delivered_guide.push('\n');
+        delivered_guide.push_str(knowledge_guide);
+    }
     (out, delivered_guide)
 }
 

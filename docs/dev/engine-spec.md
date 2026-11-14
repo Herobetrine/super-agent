@@ -533,6 +533,7 @@ The new boundary hides older children from `reports`/`roster` via `floor`, and t
 - `packet.delegate_models = ctx.catalog` is always set.
 - Resolve `selected`. **If `options(cat_of_own_agent, selected)` is null, throw `'所选供应商、模型或执行端当前不可用'`.** The engine never substitutes another upstream (E:252-255).
 - Persist `native_routes` and log `route.requested`.
+- Rust port: roots and primaries retain complete delegation menus. A non-root, non-primary whose bound, selected or assigned route is already complete may request route-scoped live discovery. Catalog defaults and legacy selection still require the complete catalog. Adapters without this capability retain the original shared full-catalog path. In-flight sharing keys distinguish a full harness catalog from a selected harness plus complete `Route` (including source and effort); completed probes are removed, with no cross-turn TTL cache.
 - `options()` (PR:33-66) requires all of:
   - `cat.available` is not false;
   - exactly one mode row matching `selected.mode`, with `available===true` and allowing the provider;
@@ -548,6 +549,7 @@ The new boundary hides older children from `reports`/`roster` via `floor`, and t
 
 ### 7.1 Engine → `adapters` object
 - `catalog(agent)` → Promise<Catalog>.
+- Rust `Adapter::catalog_for_route(route)` optionally returns a selected-catalog future; default `None` makes the engine use its existing full-catalog in-flight sharing. AGY uses selected-source discovery and probes only an explicitly requested effort, then performs normal live validation again at execution. Manual catalog refresh remains complete.
 - `catalogRevision(agent)`: a fingerprint of the files the adapter reads (AI:16-18).
 - `run(agent, options)` → Promise<{text, sessionId}>. Validated in AI:19-51:
   - prompt is non-empty;

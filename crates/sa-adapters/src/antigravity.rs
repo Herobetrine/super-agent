@@ -431,6 +431,19 @@ impl Adapter for Antigravity {
         })
     }
 
+    fn catalog_for_route(
+        &self,
+        route: Route,
+    ) -> Option<BoxFuture<'static, anyhow::Result<Catalog>>> {
+        let sys = self.sys.clone();
+        Some(Box::pin(async move {
+            let d = discover(&sys, &CancellationToken::new(), Some(&route))
+                .await
+                .map_err(|e| anyhow::anyhow!(e.message))?;
+            Ok(Catalog { value: d.catalog })
+        }))
+    }
+
     fn run(
         &self,
         request: RunRequest,
@@ -868,6 +881,54 @@ int main(int argc, char **argv) {
     }
 
     #[tokio::test]
+    async fn selected_catalog_refreshes_only_selected_source_and_explicit_effort() {
+        for effort in [None, Some("high")] {
+            let root = tempfile::tempdir().unwrap();
+            let mut sys = fixture_sys(root.path());
+            sys.set("AGY_ADC_AUTH", "true");
+            let adapter = Antigravity::new(sys.clone());
+            let selected = route("google", "model-b", effort);
+            let mut expected = vec![];
+            for _ in 0..2 {
+                let catalog = adapter
+                    .catalog_for_route(selected.clone())
+                    .unwrap()
+                    .await
+                    .unwrap();
+                select(&catalog.value, &selected).unwrap();
+                expected.push("google\tmodels\t@native".to_string());
+                if effort.is_some() {
+                    expected.push("google\teffort\tmodel-b".into());
+                }
+                assert_eq!(calls(root.path()), expected);
+            }
+            sys.set("FAKE_AGY_MODELS", "model-a\tModel A");
+            let catalog = Antigravity::new(sys.clone())
+                .catalog_for_route(selected.clone())
+                .unwrap()
+                .await
+                .unwrap();
+            assert!(select(&catalog.value, &selected).is_err());
+            sys.set(
+                "FAKE_AGY_EFFORT",
+                json!({"command":{"data":{"adjustable":false}}}).to_string(),
+            );
+            let selected = route("google", "model-a", Some("high"));
+            let catalog = Antigravity::new(sys)
+                .catalog_for_route(selected.clone())
+                .unwrap()
+                .await
+                .unwrap();
+            assert!(select(&catalog.value, &selected).is_err());
+            assert!(
+                !calls(root.path())
+                    .iter()
+                    .any(|line| line.contains("\trun\t"))
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn run_only_probes_selected_source_and_explicit_effort() {
         for (source, model, effort) in [
             ("google", "model-b", None),
@@ -947,7 +1008,7 @@ int main(int argc, char **argv) {
         let base = format!("http://{}", listener.local_addr().unwrap());
         let server = std::thread::spawn(move || {
             let mut requests = vec![];
-            for _ in 0..2 {
+            for _ in 0..4 {
                 let (mut socket, _) = listener.accept().unwrap();
                 socket
                     .set_read_timeout(Some(Duration::from_secs(5)))
@@ -996,19 +1057,25 @@ int main(int argc, char **argv) {
                 .into_iter()
                 .find(|row| row.base == base)
                 .unwrap();
+            let selected_route = route(&selected.id, "model-b", None);
+            let catalog = Antigravity::new(sys.clone())
+                .catalog_for_route(selected_route.clone())
+                .unwrap()
+                .await
+                .unwrap();
+            select(&catalog.value, &selected_route).unwrap();
             assert_eq!(
-                run_fixture(sys.clone(), route(&selected.id, "model-b", None))
-                    .await
-                    .unwrap()
-                    .text,
+                run_fixture(sys.clone(), selected_route).await.unwrap().text,
                 "fixture-ok"
             );
         }
         let requests = server.join().unwrap();
-        for (request, token) in requests
-            .iter()
-            .zip(["selected-token-1", "selected-token-2"])
-        {
+        for (request, token) in requests.iter().zip([
+            "selected-token-1",
+            "selected-token-1",
+            "selected-token-2",
+            "selected-token-2",
+        ]) {
             assert!(request.starts_with("GET /v1beta/models?pageSize=1000 "));
             assert!(
                 request
@@ -1030,11 +1097,14 @@ int main(int argc, char **argv) {
             .find(|row| row.base == base)
             .unwrap();
         db.execute("DELETE FROM providers", []).unwrap();
-        assert!(
-            run_fixture(sys, route(&selected.id, "model-b", None))
-                .await
-                .is_err()
-        );
+        let selected_route = route(&selected.id, "model-b", None);
+        let catalog = Antigravity::new(sys.clone())
+            .catalog_for_route(selected_route.clone())
+            .unwrap()
+            .await
+            .unwrap();
+        assert!(select(&catalog.value, &selected_route).is_err());
+        assert!(run_fixture(sys, selected_route).await.is_err());
         assert_eq!(calls(root.path()).len(), 2);
     }
 

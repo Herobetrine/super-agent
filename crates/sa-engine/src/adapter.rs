@@ -154,6 +154,13 @@ pub struct Catalog {
 pub trait Adapter: Send + Sync {
     fn agent(&self) -> &'static str;
     fn catalog(&self) -> BoxFuture<'static, anyhow::Result<Catalog>>;
+    /// Refresh capabilities for an already selected execution route. Adapters
+    /// may narrow discovery while preserving live source and model validation.
+    /// `None` preserves the engine's shared full-catalog fallback. Complete
+    /// delegation menus and manual refreshes continue to use `catalog`.
+    fn catalog_for_route(&self, _route: Route) -> Option<BoxFuture<'static, anyhow::Result<Catalog>>> {
+        None
+    }
     fn run(
         &self,
         request: RunRequest,
