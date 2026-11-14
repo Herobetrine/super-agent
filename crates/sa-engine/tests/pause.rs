@@ -82,6 +82,13 @@ async fn waiting_root_drains_children_and_gets_exactly_one_consolidation() {
     let ticket = fx.begin(fx.params()).await;
     fx.until(|| root_state(&fx.engine, ticket) == "waiting" && fx.shared.count(|c| c.packet["depth"] == 1) == 1).await;
     assert_eq!(fx.engine.request_pause_after_handoff(ticket).unwrap(), PauseStatus::Draining);
+    // The admitted child is not cancelled but is asked to stop at a safe checkpoint.
+    let child = fx.int("SELECT id FROM jobs WHERE parent IS NOT NULL");
+    let wrap_up = |job| fx.engine.notes(job).unwrap().iter()
+        .filter(|note| note["body"].as_str().is_some_and(|body| body.contains("安全收尾"))).count();
+    assert_eq!(wrap_up(child), 1);
+    assert_eq!(fx.engine.request_pause_after_handoff(ticket).unwrap(), PauseStatus::Draining);
+    assert_eq!(wrap_up(child), 1, "a repeated request must not duplicate the notice");
     let root = fx.engine.root(ticket).unwrap()["id"].as_i64().unwrap();
     fx.engine.note(ticket, root, "wake-up must stay behind the gate").unwrap();
     for _ in 0..4 { fx.engine.step(); }
@@ -523,7 +530,12 @@ async fn nested_checkpoint_followup_and_mail_survive_pause_restart_and_resume() 
                 }
                 if c.depth() == 1 {
                     assert_eq!(c.full_packet()["reports"][0]["result"], "nested final receipt");
-                    assert!(c.full_packet()["notes"].as_array().unwrap().iter().any(|n| n["body"] == "deferred instruction"));
+                    let notes = c.full_packet()["notes"].as_array().unwrap().clone();
+                    assert!(notes.iter().any(|n| n["body"] == "deferred instruction"));
+                    // The unconsumed wrap-up notice is followed by its revocation.
+                    let wrap_up = notes.iter().position(|n| n["body"].as_str().is_some_and(|b| b.contains("安全收尾")));
+                    let revoked = notes.iter().position(|n| n["body"].as_str().is_some_and(|b| b.contains("收尾要求已撤销")));
+                    assert!(wrap_up.is_some() && revoked > wrap_up);
                     return Ok("resumed child complete".into());
                 }
                 if c.turn() == 1 {
@@ -545,7 +557,8 @@ async fn nested_checkpoint_followup_and_mail_survive_pause_restart_and_resume() 
     assert_eq!(fx.shared.count(|c| c.packet["depth"] == 1), 1);
     assert_eq!(fx.shared.count(|c| c.packet["depth"] == 0), 2);
     assert_eq!(fx.int("SELECT count(*) FROM jobs WHERE depth=1 AND state='queued'"), 1);
-    assert_eq!(fx.int("SELECT count(*) FROM mailbox WHERE target=(SELECT id FROM jobs WHERE depth=1) AND consumed_turn IS NULL"), 1);
+    // The deferred instruction plus the wrap-up notice this fake turn did not consume.
+    assert_eq!(fx.int("SELECT count(*) FROM mailbox WHERE target=(SELECT id FROM jobs WHERE depth=1) AND consumed_turn IS NULL"), 2);
     fx.restart(quiet()).await;
     fx.engine.start().unwrap();
     for _ in 0..4 { fx.engine.step(); }

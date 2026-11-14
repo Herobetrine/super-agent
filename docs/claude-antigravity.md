@@ -6,6 +6,11 @@
 
 **Claude Code** 分别读取 CC Switch 的 `claude` 和 `claude-desktop` 记录，识别 Anthropic Messages 协议、配置中的模型及 Desktop 的上游模型映射。每个可用来源以自己的端点和配对凭据读取 `/v1/models`，按 `has_more`、`last_id` 和 `after_id` 处理分页。模型能力来自 API 元数据以及本机 initialize 返回的精确型号能力，思考强度通过 `--effort` 传递。Windows 自定义数据库目录来自 CC Switch 的 `app_paths.json` 中的 `app_config_dir_override`。[模型 API](https://platform.claude.com/docs/en/api/models/list) · [模型与强度](https://code.claude.com/docs/en/model-config) · [CC Switch 配置层级](https://github.com/farion1231/cc-switch/blob/main/docs/user-manual/en/5-faq/5.1-config-files.md)
 
+
+**CC Switch 路由与聚合模式。** CC Switch 的 `claude` 应用处于代理模式时（`live-state.json` 中 `mode` 为 `proxy`），平台从 `proxy_config` 读取本地路由地址，向该地址读取模型目录，并把它列为“CC Switch 路由”；开启聚合（Stack）时列为“CC Switch 聚合”。原生 `settings.json` 已指向该地址时复用原来源及其凭据，否则使用 CC Switch 的占位密钥 `PROXY_MANAGED`。模型列表除路由已发布的型号外，还包括默认路由成员的模型（不带前缀，标注“默认路由”）和每个聚合成员的模型（`ccs-claude-<成员键>--<模型>`，标注成员名）。路由规则与 [CC Switch `mode/stack.rs`](https://github.com/farion1231/cc-switch/blob/main/src-tauri/src/mode/stack.rs) 一致：不带前缀的请求发往默认成员，带前缀的请求发往对应成员；成员模型来自该成员自己的目录，CC Switch 不发布也会按原名转发。平台只读取 CC Switch 的数据，不修改其配置。
+
+**本地网关 400 兼容。** Ferryman 等网关的原生分支会拒绝对话中途的 `system` 消息，返回 `Per-turn system messages require upstream per-turn-control support`。经 CC Switch 路由转发到这类成员时也会发生。因此只要所选来源的端点是本机回环地址（CC Switch 路由、直连的本地 Ferryman 或本地自定义供应商），平台都会在本轮的 `CLAUDE_CODE_MODEL_CAPABILITIES` 末尾追加 `*=-mid_conv_system,-per_turn_effort`，保留其他能力设置，不修改全局配置或网关策略。Claude Code 2.1.323 只有两项都关闭时才不再发送对话中途的 `system` 消息和 `per-turn-control` beta；只关 `mid_conv_system`（2.1.317 时的做法）已经无效。CLI 会先规范化模型名再匹配选择器，CC Switch 的前缀 id 也是如此，因此用通配选择器，同时覆盖该进程发往同一网关的辅助模型。这一结论来自对回环假服务的隔离对照，CLI 升级后需要重新验证。
+
 新工单优先采用 CC Switch 中 Claude Desktop 当前选择的供应商。未配置这项选择时，可直接使用原生 CLI 的 `settings.json`、`CLAUDE_CONFIG_DIR` 或进程环境中的配置。官方账号先通过 `claude auth status` 验证，再从 SDK 的 `initialize` 回执取得可用模型。未登录、配置条目损坏或协议无法适配时，列表说明原因。早期工单继续沿用其保存的路由。配置文件、数据库及其 WAL 均包含在 `watch_paths()` 中。
 
 **Antigravity** 从实际安装的 `agy models` 获取账号可见的型号。原生模式优先采用机器明确指定的型号；没有模型设置时使用“跟随 agy 原生默认模型”，启动命令省略 `--model`。明确选择型号则必须匹配实时目录。启用 ADC 的机器可以选择 Google Cloud 账号；有 Gemini 兼容 API 配置或 CC Switch `agy` 供应商记录的机器可以选择对应的本地模型。受限档使用按供应商隔离的配置和会话目录。[Google 认证方式](https://antigravity.google/docs/install?tab=cli) · [CC Switch 对 agy 的配置投影](https://github.com/farion1231/cc-switch/blob/main/src-tauri/src/agy_config.rs)

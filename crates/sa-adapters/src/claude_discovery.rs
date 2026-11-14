@@ -342,3 +342,123 @@ async fn official_and_gateway_probes_overlap_then_merge_their_own_models() {
     assert_eq!(gateway.model_info[0]["reasoningEfforts"], json!([]));
     assert_eq!(http.count(), 1);
 }
+
+impl Fixture {
+    fn proxy(&self, base: &str, state: Value) {
+        let port: i64 = base.rsplit(':').next().unwrap().parse().unwrap();
+        let db =
+            rusqlite::Connection::open(self.data.path().join(".cc-switch/cc-switch.db")).unwrap();
+        db.execute_batch("CREATE TABLE proxy_config(app_type TEXT,listen_address TEXT,listen_port INTEGER,enabled INTEGER)").unwrap();
+        db.execute(
+            "INSERT INTO proxy_config VALUES ('claude','127.0.0.1',?1,1)",
+            [port],
+        )
+        .unwrap();
+        std::fs::write(
+            self.data.path().join(".cc-switch/live-state.json"),
+            json!({"version":1,"apps":{"claude":state}}).to_string(),
+        )
+        .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn aggregation_mode_routes_default_and_prefixed_member_models() {
+    let fixture = Fixture::new();
+    let members = HttpFixture::new(None, false);
+    let listener = HttpFixture::new(None, false);
+    members.release();
+    listener.release();
+    fixture.row("ferry", "claude", config(&members.base, "ANTHROPIC_API_KEY", "f"), "");
+    fixture.row("other", "claude", config(&members.base, "ANTHROPIC_API_KEY", "o"), "");
+    fixture.native(config(&listener.base, "ANTHROPIC_AUTH_TOKEN", "PROXY_MANAGED"));
+    fixture.proxy(
+        &listener.base,
+        json!({"mode":"proxy","proxy_route":"ferry","stack":{"enabled":true,
+            "members":["ferry","other"],"keys":{"api":"other","ferryman":"ferry","gone":"deleted"}}}),
+    );
+    let discovered = discover(&fixture.sys, None, &CancellationToken::new())
+        .await
+        .unwrap();
+    let gateway = discovered
+        .records
+        .iter()
+        .find(|r| r.app == "native")
+        .unwrap();
+    assert!(gateway.reason.is_empty());
+    assert_eq!(gateway.name, "CC Switch 聚合");
+    assert_eq!(
+        gateway.models,
+        ["bearer-PROXY_MANAGED", "key-f", "ccs-claude-api--key-o"]
+    );
+    assert_eq!(gateway.preferred, "key-f");
+    let labels: Vec<&str> = gateway.model_info.iter().filter_map(|m| m["label"].as_str()).collect();
+    assert!(labels.contains(&"key-f（默认路由 · ferry）"));
+    assert!(labels.contains(&"key-o（other）"));
+    let provider = discovered.catalog["providers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["id"] == json!(gateway.id()))
+        .unwrap();
+    assert_eq!(provider["available"], true);
+}
+
+#[tokio::test]
+async fn routing_mode_without_native_pointer_adds_listener_source() {
+    let fixture = Fixture::new();
+    let members = HttpFixture::new(None, false);
+    let listener = HttpFixture::new(None, false);
+    members.release();
+    listener.release();
+    fixture.row("ferry", "claude", config(&members.base, "ANTHROPIC_API_KEY", "f"), "");
+    fixture.proxy(&listener.base, json!({"mode":"proxy","proxy_route":"ferry"}));
+    let discovered = discover(&fixture.sys, None, &CancellationToken::new())
+        .await
+        .unwrap();
+    let gateway = discovered
+        .records
+        .iter()
+        .find(|r| r.app == "cc-switch")
+        .unwrap();
+    assert!(gateway.reason.is_empty());
+    assert_eq!(gateway.name, "CC Switch 路由");
+    assert_eq!(gateway.token.as_deref(), Some("PROXY_MANAGED"));
+    assert_eq!(gateway.models, ["bearer-PROXY_MANAGED", "key-f"]);
+}
+
+#[tokio::test]
+async fn direct_mode_ignores_listener() {
+    let fixture = Fixture::new();
+    let listener = HttpFixture::new(None, false);
+    listener.release();
+    fixture.proxy(&listener.base, json!({"mode":"direct","proxy_route":"ferry"}));
+    let discovered = discover(&fixture.sys, None, &CancellationToken::new())
+        .await
+        .unwrap();
+    assert!(discovered.records.iter().all(|r| r.app != "cc-switch"));
+    assert_eq!(listener.count(), 0);
+}
+
+#[test]
+fn stack_ids_keep_the_one_million_marker_last() {
+    assert_eq!(stack_id("api", "m[1M]"), "ccs-claude-api--m[1M]");
+    assert_eq!(stack_id("api", "m[1m]"), "ccs-claude-api--m[1M]");
+    assert_eq!(stack_id("api", "m"), "ccs-claude-api--m");
+}
+
+#[test]
+fn routed_models_skip_one_million_twins() {
+    let mut rec = Record {
+        models: vec!["ccs-claude-api--m[1M]".into()],
+        ..Default::default()
+    };
+    let source = Record {
+        name: "api".into(),
+        ..Default::default()
+    };
+    add_routed(&mut rec, stack_id("api", "m"), &source, "m", "api");
+    add_routed(&mut rec, stack_id("api", "n"), &source, "n", "api");
+    assert_eq!(rec.models, ["ccs-claude-api--m[1M]", "ccs-claude-api--n"]);
+    assert_eq!(rec.model_info[0]["label"], "n（api）");
+}

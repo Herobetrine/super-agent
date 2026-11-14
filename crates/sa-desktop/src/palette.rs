@@ -247,7 +247,7 @@ impl App {
                             .id_salt("palette-query")
                             .frame(false)
                             .font(theme::body(15.0))
-                            .hint_text("输入命令或会话…")
+                            .hint_text(widgets::hint(ui, "输入命令或会话…"))
                             .desired_width(f32::INFINITY),
                     );
                     r.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::TextEdit, true, "命令搜索"));

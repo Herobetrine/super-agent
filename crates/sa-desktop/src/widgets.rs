@@ -21,7 +21,7 @@ pub fn line_galley(ui: &Ui, text: &str, font: FontId, color: Color32, max_w: f32
 /// Pill-shaped status chip.
 pub fn chip(ui: &mut Ui, text: &str, tone: Tone, size: f32) -> Response {
     let galley = line_galley(ui, text, theme::body(size), tone.fg, 220.0);
-    let pad = vec2(7.0, 2.5);
+    let pad = vec2(8.0, 3.0);
     let (rect, resp) = ui.allocate_exact_size(galley.size() + pad * 2.0, Sense::hover());
     if ui.is_rect_visible(rect) {
         ui.painter()
@@ -73,12 +73,10 @@ pub fn icon_button(
 ) -> Response {
     let (rect, resp) = ui.allocate_exact_size(Vec2::splat(size), Sense::click());
     if ui.is_rect_visible(rect) {
-        let bg = if active || resp.hovered() {
-            hover_bg
-        } else {
-            Color32::TRANSPARENT
-        };
-        ui.painter().rect_filled(rect, CornerRadius::same(8), bg);
+        let t = ui.ctx().animate_bool_with_time(resp.id.with("hover"), active || resp.hovered(), 0.1);
+        if t > 0.0 {
+            ui.painter().rect_filled(rect, CornerRadius::same(8), hover_bg.gamma_multiply(t));
+        }
         ui.painter().text(
             rect.center(),
             Align2::CENTER_CENTER,
@@ -105,8 +103,11 @@ pub fn quiet_button(ui: &mut Ui, icon: &str, text: &str, pal: &Palette, active: 
         let p = ui.painter();
         if active {
             p.rect_filled(rect, CornerRadius::same(8), pal.selected);
-        } else if resp.hovered() {
-            p.rect_filled(rect, CornerRadius::same(8), pal.hover);
+        } else {
+            let t = ui.ctx().animate_bool_with_time(resp.id.with("hover"), resp.hovered(), 0.1);
+            if t > 0.0 {
+                p.rect_filled(rect, CornerRadius::same(8), pal.hover.gamma_multiply(t));
+            }
         }
         p.galley(rect.min + pad, galley, pal.ink);
     }
@@ -150,7 +151,22 @@ pub fn card(pal: &Palette) -> egui::Frame {
         .fill(pal.surface)
         .stroke(Stroke::new(1.0_f32, pal.line_soft))
         .corner_radius(CornerRadius::same(10))
+        .shadow(soft_shadow(pal))
         .inner_margin(egui::Margin::symmetric(12, 10))
+}
+
+/// Barely-there lift for resting cards (none in dark mode, where edges carry it).
+pub fn soft_shadow(pal: &Palette) -> egui::Shadow {
+    if pal.dark {
+        egui::Shadow::NONE
+    } else {
+        egui::Shadow {
+            offset: [0, 1],
+            blur: 4,
+            spread: 0,
+            color: Color32::from_black_alpha(9),
+        }
+    }
 }
 
 /// Tinted callout frame.
@@ -173,6 +189,107 @@ pub fn left_bar(ui: &Ui, rect: Rect, color: Color32) {
         },
         color,
     );
+}
+
+/// Soft fades at the clipped edges of a scroll viewport so content dissolves
+/// into `bg` instead of being cut mid-line. Only the edges that hide content fade.
+pub fn scroll_fades<R>(ui: &Ui, out: &egui::scroll_area::ScrollAreaOutput<R>, bg: Color32) {
+    let max = (out.content_size.y - out.inner_rect.height()).max(0.0);
+    // Scroll content is clipped `clip_rect_margin` beyond the viewport; cover that too.
+    let margin = ui.visuals().clip_rect_margin;
+    let rect = out.inner_rect.expand2(vec2(0.0, margin));
+    let y = out.state.offset.y;
+    let painter = ui.painter().with_clip_rect(rect);
+    let band = |top: f32, h: f32, from_bg_at_top: bool| {
+        let r = Rect::from_min_max(pos2(rect.left(), top), pos2(rect.right(), top + h));
+        let clear = Color32::TRANSPARENT;
+        let (a, b) = if from_bg_at_top { (bg, clear) } else { (clear, bg) };
+        let mut mesh = egui::Mesh::default();
+        mesh.colored_vertex(r.left_top(), a);
+        mesh.colored_vertex(r.right_top(), a);
+        mesh.colored_vertex(r.left_bottom(), b);
+        mesh.colored_vertex(r.right_bottom(), b);
+        mesh.add_triangle(0, 1, 2);
+        mesh.add_triangle(2, 1, 3);
+        painter.add(Shape::mesh(mesh));
+    };
+    // A short solid strip hides the sliver of a half-clipped line; the gradient
+    // after it dissolves the rest.
+    let solid = margin + 2.0;
+    if y > 0.5 {
+        painter.rect_filled(Rect::from_min_max(rect.min, pos2(rect.right(), rect.top() + solid)), 0.0, bg);
+        band(rect.top() + solid, y.clamp(4.0, 12.0), true);
+    }
+    if y < max - 0.5 {
+        let h = (max - y).clamp(4.0, 16.0);
+        painter.rect_filled(Rect::from_min_max(pos2(rect.left(), rect.bottom() - solid), rect.max), 0.0, bg);
+        band(rect.bottom() - solid - h, h, false);
+    }
+}
+
+/// Checkbox with a small rounded-square box, filled with the accent when on.
+/// Drop-in for `egui::Checkbox` (same accessibility role and label).
+pub struct Check<'a> {
+    on: &'a mut bool,
+    text: egui::WidgetText,
+}
+
+impl<'a> Check<'a> {
+    pub fn new(on: &'a mut bool, text: impl Into<egui::WidgetText>) -> Self {
+        Self { on, text: text.into() }
+    }
+}
+
+impl egui::Widget for Check<'_> {
+    fn ui(self, ui: &mut Ui) -> Response {
+        let Check { on, text } = self;
+        let side = 16.0;
+        let gap = 8.0;
+        let wrap = (ui.available_width() - side - gap).max(24.0);
+        let galley = text.into_galley(ui, Some(egui::TextWrapMode::Wrap), wrap, egui::TextStyle::Body);
+        let h = galley.size().y.max(ui.spacing().interact_size.y);
+        let (rect, mut resp) =
+            ui.allocate_exact_size(vec2(side + gap + galley.size().x, h), Sense::click());
+        if resp.clicked() {
+            *on = !*on;
+            resp.mark_changed();
+        }
+        let label = galley.text().to_owned();
+        let enabled = ui.is_enabled();
+        let checked = *on;
+        resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Checkbox, enabled, checked, &label));
+        if ui.is_rect_visible(rect) {
+            let v = ui.visuals();
+            let accent = v.selection.stroke.color;
+            let t = ui.ctx().animate_bool_with_time(resp.id.with("check"), checked, 0.12);
+            // Centre the box on the first text row so wrapped labels stay aligned.
+            let text_top = rect.top() + (h - galley.size().y) / 2.0;
+            let row_h = galley.rows.first().map_or(galley.size().y, |r| r.rect().height());
+            let b = Rect::from_min_size(pos2(rect.left(), text_top + (row_h - side) / 2.0), Vec2::splat(side));
+            let rest = if resp.hovered() { v.widgets.hovered.bg_stroke.color } else { v.widgets.inactive.bg_stroke.color };
+            let fill = v.widgets.inactive.bg_fill.lerp_to_gamma(accent, t);
+            let edge = rest.lerp_to_gamma(accent, t);
+            let p = ui.painter();
+            p.rect(b, CornerRadius::same(4), fill, Stroke::new(1.2_f32, edge), egui::StrokeKind::Inside);
+            if t > 0.0 {
+                let mark = if v.dark_mode { v.panel_fill } else { Color32::WHITE };
+                let c = b.center();
+                p.add(Shape::line(
+                    vec![c + vec2(-3.6, 0.2), c + vec2(-1.0, 2.8), c + vec2(3.8, -2.6)],
+                    Stroke::new(1.8_f32, mark.gamma_multiply(t)),
+                ));
+            }
+            let text_color = v.text_color();
+            p.galley(pos2(b.right() + gap, text_top), galley, text_color);
+        }
+        resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+    }
+}
+
+/// Placeholder text for a `TextEdit`. Plain `&str` hints pick up the global
+/// text override (full ink), so give them the weak text colour explicitly.
+pub fn hint(ui: &Ui, text: &str) -> egui::RichText {
+    egui::RichText::new(text).color(ui.visuals().weak_text_color())
 }
 
 /// Combo box with a Phosphor caret instead of egui's triangle.

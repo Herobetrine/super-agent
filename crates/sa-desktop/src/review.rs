@@ -1100,7 +1100,7 @@ impl ReviewState {
                 if ui
                     .add_enabled(
                         current && detail.complete && self.pending.is_none(),
-                        egui::Checkbox::new(&mut reviewed, "已审阅此版本"),
+                        widgets::Check::new(&mut reviewed, "已审阅此版本"),
                     )
                     .changed()
                 {

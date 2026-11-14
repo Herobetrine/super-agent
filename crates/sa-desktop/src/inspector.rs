@@ -85,7 +85,7 @@ impl App {
             });
         let writable = self.writable();
         let mut action: Option<Action> = None;
-        egui::ScrollArea::vertical()
+        let out = egui::ScrollArea::vertical()
             .id_salt(("inspector", self.tab.key()))
             .auto_shrink([false, false])
             .show(ui, |ui| {
@@ -136,6 +136,7 @@ impl App {
                         }
                     });
             });
+        widgets::scroll_fades(ui, &out, pal.canvas);
         if let Some(a) = action {
             self.submit(a);
         }
@@ -754,7 +755,7 @@ fn plan_tab(ui: &mut Ui, snap: &Snapshot, pal: &Palette, draft: Option<&mut Stri
             ui.add_space(6.0);
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 6.0;
-                let edit = egui::TextEdit::singleline(draft)
+                let edit = egui::TextEdit::singleline(draft).margin(egui::Margin::symmetric(8, 5))
                     .hint_text(RichText::new("添加计划项").color(pal.faint))
                     .font(theme::body(13.0))
                     .char_limit(2000)

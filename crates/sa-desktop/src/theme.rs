@@ -204,6 +204,8 @@ pub fn apply(ctx: &egui::Context, pal: &Palette) {
     };
 
     v.override_text_color = Some(pal.ink);
+    // Placeholder (hint) text, matching the composer and sidebar search hints.
+    v.weak_text_color = Some(pal.faint);
     v.panel_fill = pal.canvas;
     v.window_fill = pal.surface;
     // Text fields read as inset wells on both white cards and the canvas.
@@ -289,7 +291,7 @@ pub fn apply(ctx: &egui::Context, pal: &Palette) {
     .into();
     let s = &mut style.spacing;
     s.item_spacing = Vec2::new(8.0, 6.0);
-    s.button_padding = Vec2::new(10.0, 5.0);
+    s.button_padding = Vec2::new(12.0, 6.0);
     s.interact_size = Vec2::new(28.0, 26.0);
     s.window_margin = Margin::same(14);
     s.menu_margin = Margin::same(8);

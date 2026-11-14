@@ -2,6 +2,7 @@
 use crate::{
     host::{Action, Host},
     theme::Palette,
+    widgets,
 };
 
 #[derive(Default)]
@@ -37,7 +38,7 @@ impl WorkflowState {
             .show(ui, |ui| {
                 let mut enabled = host.isolated_writers(ticket);
                 if ui
-                    .checkbox(&mut enabled, "将后续写入子任务放入独立 Git 工作区")
+                    .add(widgets::Check::new(&mut enabled, "将后续写入子任务放入独立 Git 工作区"))
                     .changed()
                 {
                     action = Some(Action::SetIsolatedWriters { ticket, enabled });
@@ -55,8 +56,8 @@ impl WorkflowState {
                 }
                 ui.label("验证命令（JSON 参数数组）");
                 ui.add(
-                    egui::TextEdit::singleline(&mut self.command)
-                        .hint_text(r#"["git","diff","--check"]"#)
+                    egui::TextEdit::singleline(&mut self.command).margin(egui::Margin::symmetric(8, 5))
+                        .hint_text(widgets::hint(ui, r#"["git","diff","--check"]"#))
                         .desired_width(f32::INFINITY),
                 );
                 ui.small(
@@ -138,7 +139,7 @@ impl WorkflowState {
             egui::ComboBox::from_id_salt(("fork-seq",ticket)).selected_text(self.fork_seq.map(|s|format!("检查点 #{s}")).unwrap_or_else(||"选择历史轮次".into())).show_ui(ui,|ui|{
                 for r in rows {if let Some(seq)=r["seq"].as_i64(){ui.selectable_value(&mut self.fork_seq,Some(seq),format!("第 {} 轮 · 检查点 #{seq}",r["turn"]));}}
             });
-            ui.add(egui::TextEdit::multiline(&mut self.fork_goal).desired_rows(2).hint_text("新分支要尝试的目标"));
+            ui.add(egui::TextEdit::multiline(&mut self.fork_goal).margin(egui::Margin::symmetric(8, 5)).desired_rows(2).hint_text(widgets::hint(ui, "新分支要尝试的目标")));
             ui.small("保留原会话，新分支沿用原权限和模型并重新请求模型；不会回滚文件或重放旧工具，MCP 与技能需重新选择。");
             if ui.add_enabled(self.fork_seq.is_some()&&!self.fork_goal.trim().is_empty(),egui::Button::new("建立分支…")).clicked(){self.fork_confirm=true;}
             if self.fork_confirm {
@@ -154,9 +155,9 @@ impl WorkflowState {
         egui::CollapsingHeader::new("PR 与 CI 反馈").id_salt(("scm",ticket)).show(ui,|ui|{
             ui.small("绑定任务后按需读取 GitHub 检查与评审摘要。新反馈在任务下一次已授权执行时送达；不会自动恢复已停止的任务。");
             ui.horizontal(|ui|{
-                ui.label("任务编号");ui.add(egui::TextEdit::singleline(&mut self.pr_job).desired_width(70.0));
+                ui.label("任务编号");ui.add(egui::TextEdit::singleline(&mut self.pr_job).margin(egui::Margin::symmetric(8, 5)).desired_width(70.0));
             });
-            ui.add(egui::TextEdit::singleline(&mut self.pr_url).desired_width(f32::INFINITY).hint_text("https://github.com/owner/repo/pull/123"));
+            ui.add(egui::TextEdit::singleline(&mut self.pr_url).margin(egui::Margin::symmetric(8, 5)).desired_width(f32::INFINITY).hint_text(widgets::hint(ui, "https://github.com/owner/repo/pull/123")));
             if ui.button("绑定 PR").clicked(){
                 match self.pr_job.trim().parse::<i64>() {
                     Ok(job)=>{action=Some(Action::BindScm{ticket,job,url:self.pr_url.trim().to_owned()});self.error=None;}

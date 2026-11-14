@@ -77,11 +77,28 @@ pub(crate) fn request(q: &Q, ticket: i64) -> Result<PauseStatus> {
     }
     if phase != "paused" && matches!(state, "queued" | "running" | "waiting") {
         q.record_note(ticket, Some(&root["id"]), Some(&json!(
-            "用户请求在小结交接后暂停。请汇总已完成工作、验证证据、未完成事项与下一步。已准入子轮可完成，尚未准入的子轮和排队任务保留至恢复。平台将在活动轮结束后仅允许一次主控交接轮，汇总冻结任务及未处理回报，之后等待用户明确恢复。"
+            "用户请求在小结交接后暂停。请汇总已完成工作、验证证据、未完成事项与下一步。已准入的子轮会收到在安全检查点收尾并回报的通知，尚未准入的子轮和排队任务保留至恢复。平台将在活动轮结束后仅允许一次主控交接轮，汇总冻结任务及未处理回报，之后等待用户明确恢复。"
         )), None, None)?;
     }
+    ask_children_to_wrap_up(q, ticket)?;
     status(q, ticket)
 }
+
+/// Admitted child turns are not cancelled, but without a notice they run their
+/// whole assignment (observed: hours) before the handoff can start. Ask each one,
+/// through the existing mid-turn note path, to stop at its next safe checkpoint.
+fn ask_children_to_wrap_up(q: &Q, ticket: i64) -> Result<()> {
+    let running = q.all(
+        "SELECT id FROM jobs WHERE ticket=? AND parent IS NOT NULL AND state='running' ORDER BY id",
+        &[&ticket],
+    )?;
+    for row in running {
+        q.record_note(ticket, Some(&row["id"]), Some(&json!(CHILD_WRAP_UP)), None, None)?;
+    }
+    Ok(())
+}
+
+const CHILD_WRAP_UP: &str = "用户已请求工单在交接后暂停。请在当前最小可验证步骤完成后安全收尾：不要再启动新的实现、派工、构建、长导出或客户端录制；让在途工具与内部协作者安全结束，保存检查点。然后立即给出最终回报：已完成与未完成事项、已验证与未验证项目、改动位置和精确续跑步骤。不要为赶交接把未执行的工作标成完成。";
 
 pub(crate) fn resume(q: &Q, ticket: i64) -> Result<PauseStatus> {
     let root = q.root(ticket)?;
@@ -90,9 +107,23 @@ pub(crate) fn resume(q: &Q, ticket: i64) -> Result<PauseStatus> {
         if matches!(str_of(&root, "state"), "queued" | "running" | "waiting") {
             q.record_note(ticket, Some(&root["id"]), Some(&json!(RESUME_INSTRUCTION)), None, None)?;
         }
+        // A wrap-up notice that was not consumed mid-turn would otherwise reach
+        // the child's resumed turn as a stale stop request.
+        let stale = q.all(
+            "SELECT DISTINCT m.target AS id FROM mailbox m JOIN events e ON e.seq=m.seq
+             JOIN jobs j ON j.id=m.target WHERE j.ticket=? AND j.parent IS NOT NULL
+             AND m.consumed_turn IS NULL AND j.state IN ('queued','running','waiting')
+             AND json_extract(e.payload,'$.body')=? ORDER BY m.target",
+            &[&ticket, &CHILD_WRAP_UP],
+        )?;
+        for row in stale {
+            q.record_note(ticket, Some(&row["id"]), Some(&json!(CHILD_RESUME)), None, None)?;
+        }
     }
     Ok(PauseStatus::Running)
 }
+
+const CHILD_RESUME: &str = "用户已恢复工单调度，之前的交接暂停收尾要求已撤销。请按你的原任务和最新要求继续工作。";
 
 /// Terminal roots cannot accept mailbox notes. Deliver the durable revocation
 /// with their next ordinary admission, including after a native-session reset.

@@ -114,8 +114,8 @@ fn field(ui: &mut Ui, label: &str, value: &mut String, hint: &str) {
     ui.horizontal(|ui| {
         ui.add_sized([96.0, 24.0], Label::new(RichText::new(label).font(theme::body(13.0))));
         let r = ui.add(
-            egui::TextEdit::singleline(value)
-                .hint_text(hint)
+            egui::TextEdit::singleline(value).margin(egui::Margin::symmetric(8, 5))
+                .hint_text(widgets::hint(ui, hint))
                 .desired_width(ui.available_width()),
         );
         r.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::TextEdit, true, label));
@@ -372,8 +372,8 @@ fn providers_page(
                         .auto_shrink([false, true])
                         .show(ui, |ui| {
                             let r = ui.add(
-                                egui::TextEdit::multiline(&mut f.models)
-                                    .hint_text("每行一个模型 ID")
+                                egui::TextEdit::multiline(&mut f.models).margin(egui::Margin::symmetric(8, 5))
+                                    .hint_text(widgets::hint(ui, "每行一个模型 ID"))
                                     .desired_rows(3)
                                     .desired_width(ui.available_width()),
                             );

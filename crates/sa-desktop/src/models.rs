@@ -243,8 +243,8 @@ fn model_combo(
                 .selected_text(text)
                 .show_ui(ui, |ui| {
                     let response = ui.add(
-                        egui::TextEdit::singleline(query)
-                            .hint_text("搜索模型名称或 ID")
+                        egui::TextEdit::singleline(query).margin(egui::Margin::symmetric(8, 5))
+                            .hint_text(widgets::hint(ui, "搜索模型名称或 ID"))
                             .desired_width(ui.available_width()),
                     );
                     response.widget_info(|| {

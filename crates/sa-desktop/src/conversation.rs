@@ -587,6 +587,7 @@ impl App {
         if let Some(v) = self.view.as_mut() {
             v.open_groups = open_groups;
         }
+        widgets::scroll_fades(ui, &out, pal.surface);
         let max = (out.content_size.y - out.inner_rect.height()).max(0.0);
         let at_bottom = out.state.offset.y >= max - 48.0;
         if !at_bottom && !jump {

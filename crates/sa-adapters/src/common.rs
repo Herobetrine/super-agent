@@ -200,6 +200,43 @@ pub fn cc_rows(sys: &Sys, apps: &[&str]) -> Result<Vec<Map<String, Value>>> {
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
+/// CC Switch local routing listener for one app (`proxy_config`), read-only.
+/// `None` when the table, row or listener is absent or the app is not routed.
+pub fn cc_proxy(sys: &Sys, app: &str) -> Result<Option<String>> {
+    let file = cc_database(sys)?;
+    if !file.is_file() {
+        return Ok(None);
+    }
+    let db = Connection::open_with_flags(
+        &file,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .context("CC Switch 数据库无法打开")?;
+    db.busy_timeout(Duration::from_millis(2000))?;
+    let row = db.query_row(
+        "SELECT listen_address,listen_port,enabled FROM proxy_config WHERE app_type=?",
+        [app],
+        |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?)),
+    );
+    let (address, port, enabled) = match row {
+        Ok(row) => row,
+        Err(rusqlite::Error::QueryReturnedNoRows | rusqlite::Error::SqliteFailure(..)) => {
+            return Ok(None);
+        }
+        Err(e) => return Err(e.into()),
+    };
+    if enabled == 0 || !(1..=65535).contains(&port) {
+        return Ok(None);
+    }
+    // A wildcard listener is still reached through loopback from this machine.
+    let host = match address.trim() {
+        "" | "0.0.0.0" | "localhost" => "127.0.0.1".to_string(),
+        "::" | "::1" | "[::]" | "[::1]" => "[::1]".to_string(),
+        other => other.to_string(),
+    };
+    Ok(Some(format!("http://{host}:{port}")))
+}
+
 /// `fingerprint(prefix, parts)` (AC:90-105): Python-compatible ASCII JSON.
 pub fn fingerprint(prefix: &str, parts: &[Value]) -> String {
     let ascii: Vec<String> = parts

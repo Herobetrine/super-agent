@@ -176,7 +176,7 @@ impl App {
                 ui.add_space(6.0);
             });
 
-        egui::ScrollArea::vertical()
+        let out = egui::ScrollArea::vertical()
             .id_salt("history")
             .auto_shrink([false, false])
             .show(ui, |ui| {
@@ -283,6 +283,7 @@ impl App {
                         }
                     });
             });
+        widgets::scroll_fades(ui, &out, pal.sidebar);
     }
 
     fn search_box(&mut self, ui: &mut Ui) {
@@ -502,7 +503,7 @@ impl App {
                     close = true;
                 }
                 let r = ui.add(
-                    egui::TextEdit::singleline(title)
+                    egui::TextEdit::singleline(title).margin(egui::Margin::symmetric(8, 5))
                         .id_salt("rename-title")
                         .desired_width(f32::INFINITY)
                         .char_limit(200),

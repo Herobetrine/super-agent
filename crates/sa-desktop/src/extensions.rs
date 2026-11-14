@@ -470,7 +470,7 @@ fn list_view(
             });
             if d.defaults_directory {
                 let previous_path = d.defaults_path.clone();
-                let r = ui.add(egui::TextEdit::singleline(&mut d.defaults_path).hint_text("工作目录绝对路径").desired_width(440.0));
+                let r = ui.add(egui::TextEdit::singleline(&mut d.defaults_path).margin(egui::Margin::symmetric(8, 5)).hint_text(widgets::hint(ui, "工作目录绝对路径")).desired_width(440.0));
                 r.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::TextEdit, true, "默认授权工作目录"));
                 ui.horizontal(|ui| {
                     if ui.add_enabled(d.current_project.is_some(), egui::Button::new("使用当前草稿目录")).clicked() {
@@ -540,8 +540,8 @@ fn list_view(
     ui.horizontal(|ui| {
         let placeholder = if d.tab == ExtTab::Skills { "搜索技能或来源" } else { "搜索 MCP 服务" };
         let r = ui.add(
-            egui::TextEdit::singleline(&mut d.query)
-                .hint_text(placeholder)
+            egui::TextEdit::singleline(&mut d.query).margin(egui::Margin::symmetric(8, 5))
+                .hint_text(widgets::hint(ui, placeholder))
                 .background_color(pal.canvas)
                 .desired_width(260.0),
         );
@@ -607,7 +607,7 @@ fn list_view(
                     let list = if servers { &mut d.servers } else { &mut d.skills };
                     let mut on = list.contains(&id);
                     let enabled = !d.locked && !d.follow && !outside && (on || !(missing || inactive || unprobed));
-                    let r = ui.add_enabled(enabled, egui::Checkbox::new(&mut on, RichText::new(&name).strong()));
+                    let r = ui.add_enabled(enabled, widgets::Check::new(&mut on, RichText::new(&name).strong()));
                     let label = format!("选择 {name}");
                     r.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Checkbox, enabled, on, &label));
                     if r.changed() {
@@ -713,11 +713,11 @@ fn edit_view(ui: &mut Ui, d: &mut ExtDialog, pal: &theme::Palette, busy: bool, n
         ui.horizontal(|ui| {
             ui.add_sized([120.0, 24.0], Label::new(RichText::new(label).font(theme::body(13.0))));
             let edit = if multi {
-                egui::TextEdit::multiline(value).desired_rows(3)
+                egui::TextEdit::multiline(value).margin(egui::Margin::symmetric(8, 5)).desired_rows(3)
             } else {
-                egui::TextEdit::singleline(value)
+                egui::TextEdit::singleline(value).margin(egui::Margin::symmetric(8, 5))
             };
-            let r = ui.add(edit.hint_text(hint).desired_width(ui.available_width()));
+            let r = ui.add(edit.hint_text(widgets::hint(ui, hint)).desired_width(ui.available_width()));
             r.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::TextEdit, true, label));
         });
     };

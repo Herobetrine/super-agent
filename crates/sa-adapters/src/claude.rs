@@ -395,8 +395,116 @@ async fn make_record(
 struct Discovery {
     exe: Option<PathBuf>,
     records: Vec<Record>,
-    bound: Value,
     catalog: Value,
+}
+
+/// CC Switch model id that its aggregation ("Stack") mode routes to one member.
+const STACK_PREFIX: &str = "ccs-claude-";
+
+/// CC Switch routing or aggregation mode for Claude Code. Requests go to its
+/// local listener with a placeholder key; unprefixed models reach the default
+/// member and `ccs-claude-<key>--<model>` reaches the member that owns `key`,
+/// even when that model is not in the listener's published catalog.
+/// [CC Switch `mode/stack.rs`](https://github.com/farion1231/cc-switch/blob/main/src-tauri/src/mode/stack.rs)
+struct Gateway {
+    base: String,
+    route: String,
+    /// `(key, provider row)` in membership order; empty in routing-only mode.
+    members: Vec<(String, String)>,
+}
+
+fn gateway(sys: &Sys, state: &Value) -> Option<Gateway> {
+    if state["mode"].as_str() != Some("proxy") {
+        return None;
+    }
+    let base = crate::common::cc_proxy(sys, "claude").ok().flatten()?;
+    let route = state["proxy_route"].as_str().unwrap_or_default().to_string();
+    let stack = &state["stack"];
+    let mut members = vec![];
+    if stack["enabled"] == json!(true) {
+        let listed: Vec<&str> = stack["members"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect();
+        for (key, row) in stack["keys"].as_object().into_iter().flatten() {
+            if let Some(row) = row.as_str().filter(|r| listed.contains(r))
+                && !key.is_empty()
+                && !key.contains("--")
+            {
+                members.push((key.clone(), row.to_string()));
+            }
+        }
+        members.sort_by_key(|(_, row)| listed.iter().position(|m| m == row));
+    }
+    Some(Gateway {
+        base,
+        route,
+        members,
+    })
+}
+
+fn stack_id(key: &str, model: &str) -> String {
+    match model
+        .strip_suffix("[1M]")
+        .or_else(|| model.strip_suffix("[1m]"))
+    {
+        Some(bare) => format!("{STACK_PREFIX}{key}--{bare}[1M]"),
+        None => format!("{STACK_PREFIX}{key}--{model}"),
+    }
+}
+
+fn add_routed(rec: &mut Record, id: String, source: &Record, model: &str, tag: &str) {
+    // `x` and `x[1M]` reach the same upstream model through CC Switch.
+    let bare = |m: &str| m.strip_suffix("[1M]").or_else(|| m.strip_suffix("[1m]")).unwrap_or(m).to_string();
+    if rec.models.iter().any(|m| bare(m) == bare(&id)) || id.encode_utf16().count() >= 200 {
+        return;
+    }
+    let mut info = source
+        .model_info
+        .iter()
+        .find(|m| m["id"] == model)
+        .cloned()
+        .unwrap_or_else(|| json!({"id": model, "label": model}));
+    let label = info["label"].as_str().unwrap_or(model).to_string();
+    info["id"] = json!(id);
+    info["label"] = json!(format!("{label}（{tag}）"));
+    rec.models.push(id);
+    rec.model_info.push(info);
+}
+
+/// Adds every model the gateway can route: the default member's models as
+/// plain ids, then each aggregation member's models with its reserved prefix.
+fn aggregate(rec: &mut Record, gateway: &Gateway, records: &[Record]) {
+    let member = |row: &str| {
+        records
+            .iter()
+            .find(|r| r.app == "claude" && r.row == row && r.reason.is_empty())
+    };
+    rec.name = if gateway.members.is_empty() {
+        "CC Switch 路由".into()
+    } else {
+        "CC Switch 聚合".into()
+    };
+    if let Some(route) = member(&gateway.route) {
+        let tag = format!("默认路由 · {}", route.name);
+        for model in route.models.iter().filter(|m| !m.starts_with(STACK_PREFIX)) {
+            add_routed(rec, model.clone(), route, model, &tag);
+        }
+        let default = route.route()["model"].as_str().unwrap_or_default().to_string();
+        if !rec.models.contains(&rec.preferred) && rec.models.contains(&default) {
+            rec.preferred = default;
+        }
+    }
+    // The default member's models are already listed without a prefix.
+    for (key, row) in gateway.members.iter().filter(|(_, row)| *row != gateway.route) {
+        if let Some(source) = member(row) {
+            for model in &source.models {
+                add_routed(rec, stack_id(key, model), source, model, &source.name);
+            }
+        }
+    }
 }
 
 /// `discover()` (CL:167-266).
@@ -472,6 +580,32 @@ async fn discover(
     let (official, mut records, mut native) =
         tokio::join!(official_probe.clone(), records, native,);
     drop(official_probe);
+    let claude_state = read_json_or(&dir.join("live-state.json"))["apps"]["claude"].clone();
+    if let Some(gateway) = gateway(sys, &claude_state) {
+        // Routing-only mode may publish no models; a reachable listener with an
+        // empty catalog still routes every member model aggregated below.
+        let enrich = |rec: &mut Record| {
+            if rec.catalog_error.is_none() && rec.token.as_deref().is_some_and(|t| !t.is_empty()) {
+                aggregate(rec, &gateway, &records);
+                if !rec.models.is_empty() {
+                    rec.reason.clear();
+                }
+            }
+        };
+        if !native.base.is_empty() && api_base(&native.base) == api_base(&gateway.base) {
+            enrich(&mut native);
+        } else {
+            let cfg = json!({"env": {
+                "ANTHROPIC_BASE_URL": gateway.base,
+                "ANTHROPIC_AUTH_TOKEN": "PROXY_MANAGED",
+            }});
+            let mut rec =
+                make_record("cc-switch", "claude-proxy", "CC Switch 路由", &cfg, &json!({}), &cache, cancel)
+                    .await;
+            enrich(&mut rec);
+            records.push(rec);
+        }
+    }
     if !native.base.is_empty() {
         let matched = records.iter_mut().find(|r| {
             r.app == "claude"
@@ -586,7 +720,7 @@ async fn discover(
         "default": default,
         "legacy_defaults": legacy,
         "modes": modes("Claude Code CLI", exe.is_some()),
-        "detail": "CC Switch 已选直连来源及 Claude 原生配置",
+        "detail": "CC Switch 已选直连来源、路由/聚合模式及 Claude 原生配置",
         "downloads": [
             {"label": "Claude Code 安装", "url": "https://code.claude.com/docs/en/quickstart"},
             {"label": "Claude 桌面版", "url": "https://claude.com/download"}
@@ -595,7 +729,6 @@ async fn discover(
     Ok(Discovery {
         exe,
         records,
-        bound,
         catalog,
     })
 }
@@ -641,12 +774,12 @@ fn strip_1m(m: &str) -> &str {
 }
 
 const MODEL_CAPABILITIES: &str = "CLAUDE_CODE_MODEL_CAPABILITIES";
+const LOCAL_GATEWAY_CAPABILITIES: &str = "*=-mid_conv_system,-per_turn_effort";
 
 fn local_gateway_settings(
     env: &Sys,
     cwd: &Path,
     high: bool,
-    model: &str,
 ) -> Result<Value, AdapterError> {
     let mut capabilities = env.get(MODEL_CAPABILITIES).unwrap_or_default().to_owned();
     // Restricted calls already pass --setting-sources "" and must keep that boundary.
@@ -668,10 +801,13 @@ fn local_gateway_settings(
             }
         }
     }
-    // CLI 2.1.317 merges matching entries per capability in order, including
-    // duplicate exact selectors and wildcards. Append only the selected override
-    // so all other effective capability tokens and unrelated entries survive.
-    let entry = format!("{model}=-mid_conv_system");
+    // The CLI merges matching entries per capability in order, including
+    // duplicate exact selectors and wildcards, so appending one override keeps
+    // every other effective token. CLI 2.1.323 sends in-conversation system
+    // messages unless both capabilities are off, and matches selectors against
+    // a normalized id (CC Switch `ccs-claude-…` ids included). The wildcard also
+    // covers helper models that this process sends to the same gateway.
+    let entry = LOCAL_GATEWAY_CAPABILITIES.to_string();
     let capabilities = capabilities.trim_end_matches(';');
     let merged = if capabilities.is_empty() {
         entry
@@ -764,21 +900,27 @@ async fn run(
                         | "SUPERAGENT_CLAUDE_AUTH_TOKEN"
                 ))
         });
-        let base = api_base(&r.base);
-        env.set("ANTHROPIC_BASE_URL", base.clone());
+        env.set("ANTHROPIC_BASE_URL", api_base(&r.base));
         env.set(&r.auth, r.token.clone().unwrap_or_default());
-        let bound_base = api_base(d.bound["base_url"].as_str().unwrap_or_default());
-        let local = endpoint(&r.base).is_ok_and(|u| local_host(u.host_str().unwrap_or_default()));
-        if bound_base == base && local {
-            let settings = local_gateway_settings(&env, &req.cwd, high, &s.model)?;
-            let capabilities = settings["env"][MODEL_CAPABILITIES]
-                .as_str()
-                .unwrap_or_default();
-            env.set(MODEL_CAPABILITIES, capabilities);
-            // Claude applies settings.env after inherited shell variables. A narrow
-            // per-session override keeps this local gateway compatibility setting effective.
-            args.extend(["--settings".into(), settings.to_string()]);
-        }
+    }
+    // Local gateways (Ferryman, CC Switch routing/aggregation listeners and local
+    // custom providers) may forward to backends that reject per-turn system
+    // messages with HTTP 400, including after the CC Switch listener picks a
+    // member. Disabling that capability for the selected model is lossless.
+    let gateway_base = match &chosen {
+        Some(p) => p.base_url.clone(),
+        None if sdk => String::new(),
+        None => r.base.clone(),
+    };
+    if endpoint(&gateway_base).is_ok_and(|u| local_host(u.host_str().unwrap_or_default())) {
+        let settings = local_gateway_settings(&env, &req.cwd, high)?;
+        let capabilities = settings["env"][MODEL_CAPABILITIES]
+            .as_str()
+            .unwrap_or_default();
+        env.set(MODEL_CAPABILITIES, capabilities);
+        // Claude applies settings.env after inherited shell variables. A narrow
+        // per-session override keeps this local gateway compatibility setting effective.
+        args.extend(["--settings".into(), settings.to_string()]);
     }
     if high {
         env.set("CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST", "1");
@@ -1109,10 +1251,10 @@ mod terminal_tests {
         let project = cwd.parent().unwrap();
         std::fs::create_dir_all(project.join(".claude")).unwrap();
         std::fs::write(project.join(".claude/settings.json"), json!({"env":{MODEL_CAPABILITIES:"unrelated=effort;claude-fable-*=effort,mid_conv_system;claude-fable-5-2=-effort;claude-fable-*=effort"}}).to_string()).unwrap();
-        let settings = local_gateway_settings(&env, &cwd, true, "claude-fable-5-2").unwrap();
+        let settings = local_gateway_settings(&env, &cwd, true).unwrap();
         assert_eq!(
             settings["env"][MODEL_CAPABILITIES],
-            "unrelated=effort;claude-fable-*=effort,mid_conv_system;claude-fable-5-2=-effort;claude-fable-*=effort;claude-fable-5-2=-mid_conv_system"
+            "unrelated=effort;claude-fable-*=effort,mid_conv_system;claude-fable-5-2=-effort;claude-fable-*=effort;*=-mid_conv_system,-per_turn_effort"
         );
         assert_eq!(settings["env"].as_object().unwrap().len(), 1);
         assert!(!settings.to_string().contains("fixture-private"));
@@ -1122,9 +1264,9 @@ mod terminal_tests {
         )
         .unwrap();
         assert_eq!(
-            local_gateway_settings(&env, &cwd, true, "claude-fable-5-2").unwrap()["env"]
+            local_gateway_settings(&env, &cwd, true).unwrap()["env"]
                 [MODEL_CAPABILITIES],
-            "local=effort;claude-fable-5-2=-mid_conv_system"
+            "local=effort;*=-mid_conv_system,-per_turn_effort"
         );
     }
 
@@ -1146,18 +1288,18 @@ mod terminal_tests {
             data.path().into(),
         );
         let error =
-            local_gateway_settings(&env, data.path(), true, "claude-fable-5-2").unwrap_err();
+            local_gateway_settings(&env, data.path(), true).unwrap_err();
         assert!(!error.message.contains("invalid-json-private"));
         assert_eq!(
-            local_gateway_settings(&env, data.path(), false, "claude-fable-5-2").unwrap()["env"]
+            local_gateway_settings(&env, data.path(), false).unwrap()["env"]
                 [MODEL_CAPABILITIES],
-            "shell=effort;claude-fable-5-2=effort;claude-fable-5-2=-mid_conv_system"
+            "shell=effort;claude-fable-5-2=effort;*=-mid_conv_system,-per_turn_effort"
         );
         std::fs::write(
             data.path().join(".claude/settings.json"),
             json!({"env":{MODEL_CAPABILITIES:42}}).to_string(),
         )
         .unwrap();
-        assert!(local_gateway_settings(&env, data.path(), true, "claude-fable-5-2").is_err());
+        assert!(local_gateway_settings(&env, data.path(), true).is_err());
     }
 }

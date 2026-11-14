@@ -109,7 +109,7 @@ impl App {
                 if self.knowledge.pending.is_some() {
                     ui.spinner();
                 }
-                ui.checkbox(&mut self.knowledge.show_archived, "显示已归档");
+                ui.add(widgets::Check::new(&mut self.knowledge.show_archived, "显示已归档"));
             });
         });
         ui.add(
@@ -132,9 +132,9 @@ impl App {
                 .show(ui, |ui| {
                     ui.set_width(ui.available_width());
                     let resp = ui.add(
-                        egui::TextEdit::multiline(&mut self.knowledge.draft)
+                        egui::TextEdit::multiline(&mut self.knowledge.draft).margin(egui::Margin::symmetric(8, 5))
                             .id_salt("knowledge-draft")
-                            .hint_text("记录项目事实、经验或进展（勿含密钥）…")
+                            .hint_text(widgets::hint(ui, "记录项目事实、经验或进展（勿含密钥）…"))
                             .desired_rows(2)
                             .desired_width(f32::INFINITY),
                     );
