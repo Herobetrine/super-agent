@@ -16,7 +16,7 @@ use futures::future::BoxFuture;
 use futures::stream::{self, StreamExt};
 use regex::Regex;
 use sa_engine::adapter::{
-    Adapter, AdapterError, Catalog, ErrorClass, EventSink, RunOutcome, RunRequest, TurnHost,
+    Adapter, AdapterError, Catalog, ErrorClass, EventSink, Route, RunOutcome, RunRequest, TurnHost,
 };
 use sa_engine::resilience::classify::{classified, classify_text, from_http_status};
 use serde_json::{Value, json};
@@ -217,13 +217,23 @@ fn native_models(output: &str) -> Result<Vec<Value>, String> {
 }
 
 /// `discover(signal)` (AG:105-150).
-async fn discover(sys: &Sys, cancel: &CancellationToken) -> Result<Discovery, AdapterError> {
+async fn discover(
+    sys: &Sys,
+    cancel: &CancellationToken,
+    route: Option<&Route>,
+) -> Result<Discovery, AdapterError> {
     let exe = executable(sys);
     let settings = native_settings(sys);
     let mut rows = configured(sys);
     let mut ids = vec!["google"];
     if adc(sys) {
         ids.push("adc");
+    }
+    // Execution admission refreshes only its selected source. The model picker
+    // still obtains every source and every model's effort capabilities.
+    if let Some(route) = route {
+        ids.retain(|id| *id == route.provider);
+        rows.retain(|row| row.id == route.provider);
     }
     let mut providers: Vec<Value> = vec![];
     for id in ids {
@@ -258,6 +268,11 @@ async fn discover(sys: &Sys, cancel: &CancellationToken) -> Result<Discovery, Ad
                     models = stream::iter(models.into_iter().map(|mut model| {
                         let (env, overrides) = (&env, &overrides);
                         async move {
+                            if route.is_some_and(|route| {
+                                route.reasoning_effort.is_none() || model["id"] != route.model
+                            }) {
+                                return model;
+                            }
                             let mut args = vec![
                                 "--settings".into(),
                                 overrides.to_string(),
@@ -409,7 +424,7 @@ impl Adapter for Antigravity {
     fn catalog(&self) -> BoxFuture<'static, anyhow::Result<Catalog>> {
         let sys = self.sys.clone();
         Box::pin(async move {
-            let d = discover(&sys, &CancellationToken::new())
+            let d = discover(&sys, &CancellationToken::new(), None)
                 .await
                 .map_err(|e| anyhow::anyhow!(e.message))?;
             Ok(Catalog { value: d.catalog })
@@ -447,13 +462,15 @@ async fn run(
 ) -> Result<RunOutcome, AdapterError> {
     crate::images::check(&req)?;
     let boundary = scope("antigravity", &req, &host, &cancel, false).await?;
-    let d = discover(&sys, &cancel).await.map_err(|e| {
-        if e.class == ErrorClass::Cancelled {
-            e
-        } else {
-            probe_failed(&e.message)
-        }
-    })?;
+    let d = discover(&sys, &cancel, Some(&req.route))
+        .await
+        .map_err(|e| {
+            if e.class == ErrorClass::Cancelled {
+                e
+            } else {
+                probe_failed(&e.message)
+            }
+        })?;
     let s = select(&d.catalog, &req.route)?;
     let high = boundary == "danger-full-access";
     if !req.images.is_empty() {
@@ -678,6 +695,349 @@ pub(crate) fn native_failure(text: &str) -> AdapterError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct Allow;
+
+    impl TurnHost for Allow {
+        fn approve(&self, _: Value) -> BoxFuture<'static, bool> {
+            Box::pin(async { true })
+        }
+        fn pending_notes(&self) -> Vec<Value> {
+            vec![]
+        }
+        fn accept_notes(&self, _: &[i64]) {}
+    }
+
+    fn fake_cli() -> &'static Path {
+        static FIXTURE: std::sync::OnceLock<(tempfile::TempDir, PathBuf)> =
+            std::sync::OnceLock::new();
+        &FIXTURE
+            .get_or_init(|| {
+                let dir = tempfile::tempdir().unwrap();
+                let source = dir.path().join("agy.c");
+                let exe = dir.path().join(if cfg!(windows) { "agy.exe" } else { "agy" });
+                std::fs::write(
+                    &source,
+                    r#"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <fcntl.h>
+#include <unistd.h>
+#endif
+int main(int argc, char **argv) {
+    const char *model = "@native", *kind = "run";
+    for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "models")) kind = "models";
+        if (!strcmp(argv[i], "/effort")) kind = "effort";
+        if (!strcmp(argv[i], "--model") && i + 1 < argc) {
+            model = argv[++i];
+            if (!strcmp(model, "@native")) return 5;
+        }
+    }
+    char line[1024];
+    int length = snprintf(line, sizeof(line), "%s\t%s\t%s\n", getenv("AGY_ADC_AUTH") ? "adc" : "google", kind, model);
+#ifdef _WIN32
+    HANDLE log = CreateFileA(getenv("FAKE_AGY_LOG"), FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (log == INVALID_HANDLE_VALUE) return 2;
+    DWORD written;
+    WriteFile(log, line, length, &written, NULL);
+    CloseHandle(log);
+#else
+    int log = open(getenv("FAKE_AGY_LOG"), O_WRONLY | O_CREAT | O_APPEND, 0600);
+    if (log < 0) return 2;
+    write(log, line, length);
+    close(log);
+#endif
+    if (!strcmp(kind, "models")) puts(getenv("FAKE_AGY_MODELS"));
+    else if (!strcmp(kind, "effort")) puts(getenv("FAKE_AGY_EFFORT"));
+    else {
+        const char *token = getenv("FAKE_AGY_EXPECT_TOKEN"), *base = getenv("FAKE_AGY_EXPECT_BASE");
+        if (token && (!getenv("GEMINI_API_KEY") || strcmp(token, getenv("GEMINI_API_KEY")))) return 3;
+        if (base && (!getenv("GOOGLE_GEMINI_BASE_URL") || strcmp(base, getenv("GOOGLE_GEMINI_BASE_URL")))) return 4;
+        char input[8192];
+        while (fgets(input, sizeof(input), stdin)) {}
+        puts("{\"event\":\"init\",\"conversation_id\":\"fixture-session\"}");
+        puts("{\"event\":\"result\",\"result\":{\"conversation_id\":\"fixture-session\",\"status\":\"SUCCESS\",\"response\":\"fixture-ok\"}}");
+    }
+    return 0;
+}
+"#,
+                )
+                .unwrap();
+                let compiler = std::env::var_os("CC_x86_64_pc_windows_gnu")
+                    .or_else(|| std::env::var_os("CC"))
+                    .unwrap_or_else(|| if cfg!(windows) { "clang" } else { "cc" }.into());
+                let output = std::process::Command::new(compiler)
+                    .arg(&source)
+                    .arg("-o")
+                    .arg(&exe)
+                    .output()
+                    .expect("the fake agy CLI requires the workspace C compiler");
+                assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+                (dir, exe)
+            })
+            .1
+    }
+
+    fn fixture_sys(root: &Path) -> Sys {
+        let mut sys = Sys::new(vec![], root.to_path_buf(), root.to_path_buf());
+        sys.set("PATH", fake_cli().parent().unwrap().to_string_lossy());
+        if let Some(system_root) = std::env::var_os("SystemRoot") {
+            sys.set("SystemRoot", system_root.to_string_lossy());
+        }
+        sys.set("FAKE_AGY_LOG", root.join("calls.tsv").to_string_lossy());
+        sys.set("FAKE_AGY_MODELS", "model-a\tModel A\nmodel-b\tModel B");
+        sys.set(
+            "FAKE_AGY_EFFORT",
+            json!({"command":{"data":{
+                "adjustable":true,"available":["low","high"],"current":"low"
+            }}})
+            .to_string(),
+        );
+        sys
+    }
+
+    fn route(provider: &str, model: &str, effort: Option<&str>) -> Route {
+        Route {
+            provider: provider.into(),
+            model: model.into(),
+            mode: "cli".into(),
+            reasoning_effort: effort.map(str::to_string),
+        }
+    }
+
+    fn calls(root: &Path) -> Vec<String> {
+        std::fs::read_to_string(root.join("calls.tsv"))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    async fn run_fixture(sys: Sys, route: Route) -> Result<RunOutcome, AdapterError> {
+        let req = RunRequest {
+            ticket: 1,
+            job: 1,
+            turn: 1,
+            agent: "antigravity".into(),
+            prompt: "fixture".into(),
+            images: vec![],
+            cwd: sys.temp.clone(),
+            route,
+            profile: "full".into(),
+            writable: true,
+            session_id: None,
+        };
+        let (events, _rx) = tokio::sync::mpsc::unbounded_channel();
+        Antigravity::new(sys)
+            .run(req, Arc::new(Allow), events, CancellationToken::new())
+            .await
+    }
+
+    #[tokio::test]
+    async fn catalog_refreshes_all_native_sources_and_efforts() {
+        let root = tempfile::tempdir().unwrap();
+        let mut sys = fixture_sys(root.path());
+        sys.set("AGY_ADC_AUTH", "true");
+        let adapter = Antigravity::new(sys);
+        for count in [8, 16] {
+            let catalog = adapter.catalog().await.unwrap().value;
+            assert_eq!(catalog["providers"].as_array().unwrap().len(), 2);
+            assert_eq!(calls(root.path()).len(), count);
+        }
+        let log = calls(root.path());
+        for source in ["google", "adc"] {
+            for action in [
+                "models\t@native",
+                "effort\t@native",
+                "effort\tmodel-a",
+                "effort\tmodel-b",
+            ] {
+                assert_eq!(
+                    log.iter()
+                        .filter(|line| **line == format!("{source}\t{action}"))
+                        .count(),
+                    2
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn run_only_probes_selected_source_and_explicit_effort() {
+        for (source, model, effort) in [
+            ("google", "model-b", None),
+            ("adc", "model-a", None),
+            ("google", "model-b", Some("high")),
+            ("adc", "@native", Some("low")),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let mut sys = fixture_sys(root.path());
+            sys.set("AGY_ADC_AUTH", "true");
+            let outcome = run_fixture(sys, route(source, model, effort))
+                .await
+                .unwrap();
+            assert_eq!(outcome.text, "fixture-ok");
+            let mut expected = vec![format!("{source}\tmodels\t@native")];
+            if effort.is_some() {
+                expected.push(format!("{source}\teffort\t{model}"));
+            }
+            expected.push(format!("{source}\trun\t{model}"));
+            assert_eq!(calls(root.path()), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn run_rechecks_removed_models_and_refuses_unsupported_effort() {
+        let root = tempfile::tempdir().unwrap();
+        let mut sys = fixture_sys(root.path());
+        let selected = route("google", "model-b", None);
+        run_fixture(sys.clone(), selected.clone()).await.unwrap();
+        sys.set("FAKE_AGY_MODELS", "model-a\tModel A");
+        assert!(run_fixture(sys.clone(), selected).await.is_err());
+        assert_eq!(calls(root.path()).len(), 3);
+        sys.set(
+            "FAKE_AGY_EFFORT",
+            json!({"command":{"data":{"adjustable":false}}}).to_string(),
+        );
+        assert!(
+            run_fixture(sys.clone(), route("google", "model-a", Some("high")))
+                .await
+                .is_err()
+        );
+        assert_eq!(calls(root.path()).len(), 5);
+        assert!(
+            run_fixture(sys.clone(), route("missing", "model-a", None))
+                .await
+                .is_err()
+        );
+        assert!(
+            run_fixture(sys, route("adc", "model-a", None))
+                .await
+                .is_err()
+        );
+        assert_eq!(calls(root.path()).len(), 5);
+    }
+
+    #[tokio::test]
+    async fn run_refreshes_only_selected_api_source_with_its_current_credentials() {
+        use std::io::{BufRead, BufReader};
+        use std::net::TcpListener;
+
+        let root = tempfile::tempdir().unwrap();
+        let mut sys = fixture_sys(root.path());
+        let unused = TcpListener::bind("127.0.0.1:0").unwrap();
+        unused.set_nonblocking(true).unwrap();
+        let unused_base = format!("http://{}", unused.local_addr().unwrap());
+        std::fs::create_dir_all(root.path().join(".gemini/antigravity-cli")).unwrap();
+        std::fs::write(
+            root.path().join(SETTINGS_REL),
+            r#"{"modelProvider":"gemini","model":"model-a"}"#,
+        )
+        .unwrap();
+        sys.set("GEMINI_API_KEY", "unused-token");
+        sys.set("GOOGLE_GEMINI_BASE_URL", unused_base);
+        sys.set("AGY_ADC_AUTH", "true");
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let mut requests = vec![];
+            for _ in 0..2 {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut request = String::new();
+                let mut reader = BufReader::new(socket.try_clone().unwrap());
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" {
+                        break;
+                    }
+                    request.push_str(&line);
+                }
+                requests.push(request);
+                let body = r#"{"models":[{"name":"models/model-b","supportedGenerationMethods":["generateContent"]}]}"#;
+                write!(
+                    socket,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+            }
+            requests
+        });
+        std::fs::create_dir_all(root.path().join(".cc-switch")).unwrap();
+        let db = rusqlite::Connection::open(root.path().join(".cc-switch/cc-switch.db")).unwrap();
+        db.execute_batch("CREATE TABLE providers(app_type TEXT,id TEXT,name TEXT,settings_config TEXT,is_current INTEGER)").unwrap();
+        for (index, token) in ["selected-token-1", "selected-token-2"]
+            .into_iter()
+            .enumerate()
+        {
+            let config = json!({"env":{"GEMINI_API_KEY":token,"GOOGLE_GEMINI_BASE_URL":base,"GEMINI_MODEL":"model-b"}}).to_string();
+            if index == 0 {
+                db.execute(
+                    "INSERT INTO providers VALUES ('agy','selected','Selected',?1,0)",
+                    [&config],
+                )
+                .unwrap();
+            } else {
+                db.execute("UPDATE providers SET settings_config=?1", [&config])
+                    .unwrap();
+            }
+            sys.set("FAKE_AGY_EXPECT_TOKEN", token);
+            sys.set("FAKE_AGY_EXPECT_BASE", &base);
+            let selected = configured(&sys)
+                .into_iter()
+                .find(|row| row.base == base)
+                .unwrap();
+            assert_eq!(
+                run_fixture(sys.clone(), route(&selected.id, "model-b", None))
+                    .await
+                    .unwrap()
+                    .text,
+                "fixture-ok"
+            );
+        }
+        let requests = server.join().unwrap();
+        for (request, token) in requests
+            .iter()
+            .zip(["selected-token-1", "selected-token-2"])
+        {
+            assert!(request.starts_with("GET /v1beta/models?pageSize=1000 "));
+            assert!(
+                request
+                    .to_ascii_lowercase()
+                    .contains(&format!("x-goog-api-key: {token}"))
+            );
+            assert!(!request.contains("unused-token"));
+        }
+        assert_eq!(
+            unused.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        assert_eq!(
+            calls(root.path()),
+            ["google\trun\tmodel-b", "google\trun\tmodel-b"]
+        );
+        let selected = configured(&sys)
+            .into_iter()
+            .find(|row| row.base == base)
+            .unwrap();
+        db.execute("DELETE FROM providers", []).unwrap();
+        assert!(
+            run_fixture(sys, route(&selected.id, "model-b", None))
+                .await
+                .is_err()
+        );
+        assert_eq!(calls(root.path()).len(), 2);
+    }
+
     #[test]
     fn image_routes_reject_other_providers_without_falling_back() {
         assert!(image_provider("google").is_ok());

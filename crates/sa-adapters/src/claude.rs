@@ -7,7 +7,8 @@ use crate::common::{
 use crate::custom::{self, CustomProvider, Registry};
 use crate::proc::{Proc, capture, start, stream};
 use crate::sys::Sys;
-use futures::future::{BoxFuture, join_all};
+use futures::FutureExt;
+use futures::future::{BoxFuture, Shared, join_all};
 use regex::Regex;
 use sa_engine::adapter::{
     Adapter, AdapterError, Catalog, ErrorClass, EventSink, RunOutcome, RunRequest, TurnHost,
@@ -193,6 +194,9 @@ async fn first_party(sys: &Sys, exe: Option<&PathBuf>, cancel: &CancellationToke
         return rec;
     };
     let logged_in = status["loggedIn"] == true && status["apiProvider"] == "firstParty";
+    if status["loggedIn"] == false {
+        return rec;
+    }
     let msg = format!(
         "{}\n",
         json!({"type": "control_request", "request_id": "catalog", "request": {"subtype": "initialize"}})
@@ -256,7 +260,8 @@ async fn first_party(sys: &Sys, exe: Option<&PathBuf>, cancel: &CancellationToke
     rec
 }
 
-type ModelCache = Arc<AsyncMutex<HashMap<String, Result<Vec<Value>, String>>>>;
+type ModelProbe = Shared<BoxFuture<'static, Result<Vec<Value>, String>>>;
+type ModelCache = Arc<AsyncMutex<HashMap<(String, String, String), ModelProbe>>>;
 
 /// `makeRecord(app, id, name, cfg, meta, cache)` (CL:102-160).
 #[allow(clippy::too_many_arguments)]
@@ -337,28 +342,31 @@ async fn make_record(
             .filter(|v| !v.is_empty() && v.encode_utf16().count() < 200 && seen.insert(v.clone()))
             .collect();
         {
-            let key = serde_json::to_string(&json!([base, auth, token]))?;
-            let cached = cache.lock().await.get(&key).cloned();
-            let found = if let Some(cached) = cached {
-                cached
-            } else {
-                let mut headers = if auth == "ANTHROPIC_API_KEY" {
-                    vec![("x-api-key".to_string(), token.clone())]
-                } else {
-                    vec![("Authorization".to_string(), format!("Bearer {token}"))]
-                };
-                headers.push(("anthropic-version".into(), "2023-06-01".into()));
-                let found = crate::catalog::fetch(
-                    &format!("{}/v1/models?limit=1000", api_base(&base)),
-                    &headers,
-                    cancel,
-                )
-                .await
-                .map_err(|e| e.to_string());
-                cache.lock().await.insert(key, found.clone());
-                found
+            let url = format!("{}/v1/models?limit=1000", api_base(&base));
+            let key = (url.clone(), auth.to_string(), token.clone());
+            let probe = {
+                let mut probes = cache.lock().await;
+                probes
+                    .entry(key)
+                    .or_insert_with(|| {
+                        let cancel = cancel.clone();
+                        async move {
+                            let mut headers = if auth == "ANTHROPIC_API_KEY" {
+                                vec![("x-api-key".to_string(), token)]
+                            } else {
+                                vec![("Authorization".to_string(), format!("Bearer {token}"))]
+                            };
+                            headers.push(("anthropic-version".into(), "2023-06-01".into()));
+                            crate::catalog::fetch(&url, &headers, &cancel)
+                                .await
+                                .map_err(|e| e.to_string())
+                        }
+                        .boxed()
+                        .shared()
+                    })
+                    .clone()
             };
-            match found {
+            match probe.await {
                 Ok(discovered) => {
                     rec.model_info = discovered.clone();
                     for m in discovered {
@@ -392,17 +400,20 @@ struct Discovery {
 }
 
 /// `discover()` (CL:167-266).
-async fn discover(sys: &Sys, cancel: &CancellationToken) -> anyhow::Result<Discovery> {
-    let exe = executable(sys);
+async fn discover(
+    sys: &Sys,
+    exe: Option<PathBuf>,
+    cancel: &CancellationToken,
+) -> anyhow::Result<Discovery> {
     let dir = sys.home.join(".cc-switch");
     let device = read_json_or(&dir.join("settings.json"));
     let state = read_json_or(&dir.join("live-state.json"))["apps"]["claude-desktop"].clone();
     let bound = read_json_or(&sys.platform_dir().join("claude-route.json"));
-    let official = first_party(sys, exe.as_ref(), cancel).await;
+    let official_probe = first_party(sys, exe.as_ref(), cancel).shared();
     let cache: ModelCache = Arc::default();
     let rows = cc_rows(sys, &["claude", "claude-desktop"])?;
-    let mut records: Vec<Record> = join_all(rows.iter().map(|row| {
-        let (cache, official) = (&cache, &official);
+    let records = join_all(rows.iter().map(|row| {
+        let (cache, official) = (&cache, official_probe.clone());
         async move {
             let app = row["app_type"].as_str().unwrap_or_default();
             let id = match &row["id"] {
@@ -426,17 +437,17 @@ async fn discover(sys: &Sys, cancel: &CancellationToken) -> anyhow::Result<Disco
                     ..Default::default()
                 };
             };
-            let mut r = make_record(app, &id, name, &cfg, &meta, cache, cancel).await;
-            if row["category"] == json!("official") && r.base.is_empty() {
-                r.auth = official.auth.clone();
-                r.models = official.models.clone();
-                r.model_info = official.model_info.clone();
-                r.reason = official.reason.clone();
+            let mut record = make_record(app, &id, name, &cfg, &meta, cache, cancel).await;
+            if row["category"] == json!("official") && record.base.is_empty() {
+                let official = official.await;
+                record.auth = official.auth;
+                record.models = official.models;
+                record.model_info = official.model_info;
+                record.reason = official.reason;
             }
-            r
+            record
         }
-    }))
-    .await;
+    }));
     let cfg = if sys.var("ANTHROPIC_BASE_URL").is_some() {
         let env: serde_json::Map<String, Value> = sys
             .vars()
@@ -448,16 +459,19 @@ async fn discover(sys: &Sys, cancel: &CancellationToken) -> anyhow::Result<Disco
         read_json_or(&native_file(sys))
     };
     let native_path = native_file(sys).to_string_lossy().into_owned();
-    let mut native = make_record(
+    let meta = json!({});
+    let native = make_record(
         "native",
         &native_path,
         "当前 Claude Code 配置",
         &cfg,
-        &json!({}),
+        &meta,
         &cache,
         cancel,
-    )
-    .await;
+    );
+    let (official, mut records, mut native) =
+        tokio::join!(official_probe.clone(), records, native,);
+    drop(official_probe);
     if !native.base.is_empty() {
         let matched = records.iter_mut().find(|r| {
             r.app == "claude"
@@ -595,7 +609,9 @@ impl Adapter for Claude {
         let sys = self.sys.clone();
         let customs = custom::snapshot(&self.registry, "claude");
         Box::pin(async move {
-            let mut value = discover(&sys, &CancellationToken::new()).await?.catalog;
+            let mut value = discover(&sys, executable(&sys), &CancellationToken::new())
+                .await?
+                .catalog;
             custom::refresh(&mut value, &customs, &sys, &CancellationToken::new()).await;
             Ok(Catalog { value })
         })
@@ -677,7 +693,7 @@ async fn run(
     crate::images::check(&req)?;
     let boundary = scope("claude", &req, &host, &cancel, false).await?;
     let high = boundary == "danger-full-access";
-    let mut d = discover(&sys, &cancel)
+    let mut d = discover(&sys, executable(&sys), &cancel)
         .await
         .map_err(|e| probe_failed(&e.to_string()))?;
     custom::refresh(&mut d.catalog, &customs, &sys, &cancel).await;
@@ -977,6 +993,11 @@ fn track_tools(e: &Value, emit: &Emit, open: &mut HashSet<String>) {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "claude_discovery.rs"]
+mod discovery_tests;
+
 #[cfg(test)]
 mod terminal_tests {
     use super::*;
