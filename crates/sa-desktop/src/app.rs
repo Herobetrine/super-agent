@@ -237,6 +237,12 @@ impl App {
         }
         match app.opts.dialog.as_deref() {
             Some("models") => app.open_models(crate::models::Scope::Defaults),
+            Some("advisor") => {
+                app.open_models(crate::models::Scope::Defaults);
+                if let Some(d) = app.models.as_mut() {
+                    d.show_advisor();
+                }
+            }
             Some("providers") => app.open_providers(),
             Some("efficiency") => app.open_efficiency(),
             Some("extensions") => app.open_extensions(crate::extensions::ExtScope::Defaults),

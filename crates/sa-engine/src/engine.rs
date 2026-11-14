@@ -2503,6 +2503,97 @@ pub(crate) async fn approve(turn: Arc<Turn>, action: Value) -> bool {
     false
 }
 
+/// Advisor turns run read-only: no approvals, no notes.
+struct AdviceHost;
+
+impl TurnHost for AdviceHost {
+    fn approve(&self, _action: Value) -> BoxFuture<'static, bool> {
+        Box::pin(async { false })
+    }
+    fn pending_notes(&self) -> Vec<Value> {
+        vec![]
+    }
+    fn accept_notes(&self, _seqs: &[i64]) {}
+}
+
+/// Upper bound of one advisor turn; bus clients wait at most this long.
+const ADVICE_LIMIT: Duration = Duration::from_secs(14 * 60);
+
+impl Engine {
+    /// The advisor a ticket would consult now (override, default or lead).
+    pub fn advisor_for(&self, ticket: i64) -> Result<crate::advice::Advisor> {
+        self.inner.db.with(|q| crate::advice::choose(q, ticket))
+    }
+
+    /// Stored advisor of a scope: a ticket, or the global default (`None`).
+    pub fn advisor_setting(&self, ticket: Option<i64>) -> Result<Option<(String, Route)>> {
+        self.inner.db.with(|q| crate::advice::get(q, ticket))
+    }
+
+    /// Store (or clear with `None`) the advisor of a scope.
+    pub fn set_advisor(&self, ticket: Option<i64>, choice: Option<(&str, &Route)>) -> Result<()> {
+        if let Some((agent, _)) = choice {
+            ensure!(self.inner.adapters.contains_key(agent), "未知的顾问执行端：{agent}");
+        }
+        self.inner.db.tx(|q| crate::advice::set(q, ticket, choice))
+    }
+
+    /// One read-only advisor turn for a running task. Logged on the caller's
+    /// job as `advice.started` / `advice.result`.
+    pub async fn consult(&self, ticket: i64, job: i64, turn: i64, brief: &str, cancel: CancellationToken) -> Result<Value> {
+        let inner = &self.inner;
+        ensure!(!brief.trim().is_empty() && brief.len() <= crate::advice::MAX_BRIEF, "简报为空或超过 {} 字节", crate::advice::MAX_BRIEF);
+        let who = Who { ticket, id: job, turn };
+        let (advisor, cwd) = inner.db.tx(|q| {
+            ensure!(q.live(who)?, "本轮已结束");
+            let cwd = q.one("SELECT cwd FROM tickets WHERE id=?", &[&ticket])?.ok_or_else(|| anyhow!("工单不存在"))?;
+            Ok((crate::advice::choose(q, ticket)?, str_of(&cwd, "cwd").to_string()))
+        })?;
+        let adapter = inner.adapters.get(&advisor.agent).cloned().ok_or_else(|| anyhow!("顾问执行端不可用：{}", advisor.agent))?;
+        let label = json!({"agent": advisor.agent, "provider": advisor.route.provider, "model": advisor.route.model,
+            "reasoning_effort": advisor.route.reasoning_effort, "source": advisor.source});
+        inner.db.with(|q| q.log(who, "advice.started", &json!({"advisor": label, "brief_bytes": brief.len(), "brief_sha256": digest(brief)})))?;
+        let request = RunRequest {
+            ticket,
+            job,
+            turn,
+            agent: advisor.agent.clone(),
+            prompt: format!("{}\n\n{brief}", crate::advice::GUIDE),
+            images: vec![],
+            cwd: PathBuf::from(cwd),
+            route: advisor.route.clone(),
+            profile: "readonly".into(),
+            writable: false,
+            session_id: None,
+            bus: None,
+        };
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        // Native advisor events are not journaled; drain them as they come.
+        let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let started = std::time::Instant::now();
+        let outcome = tokio::select! {
+            r = adapter.run(request, Arc::new(AdviceHost), tx, cancel.clone()) => r.map_err(|e| anyhow!(e.message)),
+            () = tokio::time::sleep(ADVICE_LIMIT) => { cancel.cancel(); Err(anyhow!("顾问超过 {} 分钟未完成", ADVICE_LIMIT.as_secs() / 60)) }
+        };
+        drain.abort();
+        let seconds = (started.elapsed().as_secs_f64() * 10.0).round() / 10.0;
+        let logged = match &outcome {
+            Ok(o) => json!({"state": "done", "seconds": seconds, "advisor": label, "advice": o.text}),
+            Err(e) => json!({"state": "error", "seconds": seconds, "advisor": label, "error": e.to_string()}),
+        };
+        inner.db.with(|q| q.log(who, "advice.result", &logged))?;
+        let o = outcome?;
+        Ok(json!({"advisor": label, "seconds": seconds, "advice": o.text}))
+    }
+}
+
+impl crate::services::Consultant for Engine {
+    fn consult(&self, ticket: i64, job: i64, turn: i64, brief: String, cancel: CancellationToken) -> BoxFuture<'static, Result<Value>> {
+        let engine = self.clone();
+        Box::pin(async move { engine.consult(ticket, job, turn, &brief, cancel).await })
+    }
+}
+
 /// Revokes a turn's bus token on every exit path.
 struct BusLease(Option<Arc<dyn crate::services::Bus>>, Option<String>);
 

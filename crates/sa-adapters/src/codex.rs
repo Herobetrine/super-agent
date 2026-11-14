@@ -305,6 +305,9 @@ async fn run(
             "mcp_servers.{server}.bearer_token_env_var={}",
             json!(crate::common::BUS_TOKEN_ENV)
         ));
+        // `advise` runs a whole advisor turn; Codex defaults to 60 s.
+        args.push("-c".into());
+        args.push(format!("mcp_servers.{server}.tool_timeout_sec={}", crate::common::BUS_TOOL_TIMEOUT_SECS));
         sys.set(crate::common::BUS_TOKEN_ENV, bus.token.clone());
     }
     if cancel.is_cancelled() {

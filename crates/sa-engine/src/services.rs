@@ -69,6 +69,19 @@ pub trait Bus: Send + Sync {
     fn revoke(&self, token: &str);
 }
 
+/// One read-only advisor turn for a running task (`crate::advice`). The
+/// collaboration bus calls it for `advise`; the engine implements it.
+pub trait Consultant: Send + Sync {
+    fn consult(
+        &self,
+        ticket: i64,
+        job: i64,
+        turn: i64,
+        brief: String,
+        cancel: CancellationToken,
+    ) -> BoxFuture<'static, Result<Value>>;
+}
+
 /// Extension service with no skills, no MCP servers and no tools.
 pub struct NoopExtensions;
 

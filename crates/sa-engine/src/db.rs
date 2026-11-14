@@ -46,6 +46,7 @@ impl Db {
         conn.execute_batch(sa_store::knowledge::SCHEMA)?;
         conn.execute_batch(SCHEMA)?;
         conn.execute_batch(crate::pause::SCHEMA)?;
+        conn.execute_batch(crate::advice::SCHEMA)?;
         conn.execute_batch(crate::workspaces::SCHEMA)?;
         conn.execute_batch(crate::scm::SCHEMA)?;
         conn.execute_batch(crate::checkpoints::SCHEMA)?;

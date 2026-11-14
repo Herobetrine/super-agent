@@ -43,7 +43,15 @@ pub struct ModelDialog {
     model_query: String,
     pub warning: Option<String>,
     pub saving: bool,
+    /// Advisor tab: follow the lead, or an explicit harness and route.
+    advisor_follow: bool,
+    advisor_agent: String,
+    advisor_pick: Value,
+    advisor_dirty: bool,
 }
+
+/// Pseudo-agent of the advisor tab in the harness selector.
+const ADVISOR: &str = "advisor";
 
 fn rows<'a>(v: &'a Value, key: &str) -> Vec<&'a Value> {
     v.get(key).and_then(Value::as_array).map(|a| a.iter().collect()).unwrap_or_default()
@@ -400,7 +408,25 @@ impl ModelDialog {
 
     /// Save is allowed when every explicit route is valid in its loaded
     /// catalog; unloaded agents other than the visible one are not blocked.
+    /// Open on the advisor tab (screenshot review aid).
+    pub fn show_advisor(&mut self) {
+        self.agent = ADVISOR.into();
+    }
+
+    fn advisor_savable(&self) -> bool {
+        if self.advisor_follow {
+            return true;
+        }
+        match self.catalogs.get(&self.advisor_agent) {
+            Some(Probe::Ready(c)) => valid(c, &self.advisor_pick),
+            _ => false,
+        }
+    }
+
     fn savable(&self) -> bool {
+        if !self.advisor_savable() {
+            return false;
+        }
         !self.saving
             && (self.locked
                 || self
@@ -458,6 +484,10 @@ impl App {
             Value::String(s) => serde_json::from_str(&s).unwrap_or_default(),
             _ => Map::new(),
         };
+        let advisor = host.advisor_setting(match &scope {
+            Scope::Ticket(id) => Some(*id),
+            _ => None,
+        });
         self.models = Some(ModelDialog {
             scope,
             chosen,
@@ -469,6 +499,10 @@ impl App {
             model_query: String::new(),
             warning: None,
             saving: false,
+            advisor_follow: advisor.is_none(),
+            advisor_agent: advisor.as_ref().map(|(a, _)| a.clone()).unwrap_or_else(|| "claude".into()),
+            advisor_pick: advisor.map(|(_, r)| r).unwrap_or_else(|| json!({})),
+            advisor_dirty: false,
         });
         self.load_catalog(&agent);
     }
@@ -536,6 +570,7 @@ impl App {
         let mut close = false;
         let mut save = false;
         let mut manage_providers = None;
+        let mut switch_catalog: Option<String> = None;
         let modal = egui::Modal::new(egui::Id::new("sa-models"))
             .frame(widgets::modal_frame(&pal))
             .show(ctx, |ui| {
@@ -549,7 +584,7 @@ impl App {
                 ) {
                     close = true;
                 }
-                let names: Vec<String> = AGENTS
+                let mut names: Vec<String> = AGENTS
                     .iter()
                     .map(|a| {
                         if d.chosen.contains_key(*a) {
@@ -559,45 +594,57 @@ impl App {
                         }
                     })
                     .collect();
+                names.push(if d.advisor_follow { "顾问".into() } else { "顾问 ·".into() });
                 let refs: Vec<&str> = names.iter().map(String::as_str).collect();
-                let current = AGENTS.iter().position(|a| *a == d.agent).unwrap_or(0);
-                if let Some(i) = widgets::segmented(ui, &refs, current, &pal) {
-                    switch_to = Some(AGENTS[i].to_string());
-                }
-                ui.horizontal(|ui| {
-                    if widgets::quiet_button(ui, icon::PLUGS, "自定义供应商", &pal, false).clicked()
-                    {
-                        manage_providers = Some(d.agent.clone());
-                    }
-                    ui.label(
-                        RichText::new("添加或管理 API 端点")
-                            .font(theme::body(theme::TINY))
-                            .color(pal.mute),
-                    );
-                });
-                ui.add_enabled_ui(!d.saving, |ui| {
-                    widgets::toggle(
-                        ui,
-                        &mut d.allow_lead_routing,
-                        "交给主控选择协作者模型和思考强度",
-                        &pal,
-                    );
-                });
-                let policy = if d.allow_lead_routing {
-                    "主控使用所选模型；协作者按任务从授权目录选择，下面的配置用于回退。"
+                let current = if d.agent == ADVISOR {
+                    AGENTS.len()
                 } else {
-                    "后续派工使用下面的手动配置。已运行任务继续使用原配置。"
+                    AGENTS.iter().position(|a| *a == d.agent).unwrap_or(0)
                 };
-                ui.add(
-                    Label::new(
-                        RichText::new(policy)
-                            .font(theme::body(theme::SMALL))
-                            .color(pal.mute),
-                    )
-                    .wrap(),
-                );
+                if let Some(i) = widgets::segmented(ui, &refs, current, &pal) {
+                    switch_to = Some(AGENTS.get(i).copied().unwrap_or(ADVISOR).to_string());
+                }
+                if d.agent != ADVISOR {
+                    ui.horizontal(|ui| {
+                        if widgets::quiet_button(ui, icon::PLUGS, "自定义供应商", &pal, false).clicked()
+                        {
+                            manage_providers = Some(d.agent.clone());
+                        }
+                        ui.label(
+                            RichText::new("添加或管理 API 端点")
+                                .font(theme::body(theme::TINY))
+                                .color(pal.mute),
+                        );
+                    });
+                    ui.add_enabled_ui(!d.saving, |ui| {
+                        widgets::toggle(
+                            ui,
+                            &mut d.allow_lead_routing,
+                            "交给主控选择协作者模型和思考强度",
+                            &pal,
+                        );
+                    });
+                    let policy = if d.allow_lead_routing {
+                        "主控使用所选模型；协作者按任务从授权目录选择，下面的配置用于回退。"
+                    } else {
+                        "后续派工使用下面的手动配置。已运行任务继续使用原配置。"
+                    };
+                    ui.add(
+                        Label::new(
+                            RichText::new(policy)
+                                .font(theme::body(theme::SMALL))
+                                .color(pal.mute),
+                        )
+                        .wrap(),
+                    );
+                }
                 ui.add_space(12.0);
                 let agent = d.agent.clone();
+                if agent == ADVISOR {
+                    if let Some(load) = advisor_panel(ui, d, &pal) {
+                        switch_catalog = Some(load);
+                    }
+                } else {
                 match d.catalogs.get(&agent) {
                     None | Some(Probe::Loading) => {
                         ui.horizontal(|ui| {
@@ -767,6 +814,7 @@ impl App {
                         });
                     }
                 }
+                }
                 ui.add_space(12.0);
                 let status = if d.locked {
                     "活动任务的模型保持原配置；交给主控的开关在后续派工生效。".to_string()
@@ -832,6 +880,12 @@ impl App {
                 d.warning = None;
                 d.model_query.clear();
             }
+            // The advisor tab shows the catalog of the advisor's harness.
+            let a = if a == ADVISOR {
+                self.models.as_ref().map(|d| d.advisor_agent.clone()).unwrap_or_default()
+            } else {
+                a
+            };
             if !matches!(
                 self.models.as_ref().and_then(|d| d.catalogs.get(&a)),
                 Some(Probe::Ready(_))
@@ -839,11 +893,19 @@ impl App {
                 self.load_catalog(&a);
             }
         }
+        if let Some(a) = switch_catalog
+            && !matches!(
+                self.models.as_ref().and_then(|d| d.catalogs.get(&a)),
+                Some(Probe::Ready(_))
+            )
+        {
+            self.load_catalog(&a);
+        }
         if refresh {
             let a = self
                 .models
                 .as_ref()
-                .map(|d| d.agent.clone())
+                .map(|d| if d.agent == ADVISOR { d.advisor_agent.clone() } else { d.agent.clone() })
                 .unwrap_or_default();
             if let Some(d) = self.models.as_mut() {
                 d.catalogs.remove(&a);
@@ -865,6 +927,20 @@ impl App {
         };
         let selections = Value::Object(d.chosen.clone());
         let allow_lead_routing = d.allow_lead_routing;
+        let advisor = d.advisor_dirty.then(|| {
+            let ticket = match d.scope {
+                Scope::Ticket(id) => Some(id),
+                _ => None,
+            };
+            let choice = (!d.advisor_follow).then(|| (d.advisor_agent.clone(), d.advisor_pick.clone()));
+            Action::SaveAdvisor { ticket, choice }
+        });
+        if let Some(action) = advisor {
+            self.submit(action);
+        }
+        let Some(d) = self.models.as_mut() else {
+            return;
+        };
         match d.scope.clone() {
             Scope::Draft => {
                 self.composer.routes = Some(selections);
@@ -916,6 +992,100 @@ impl App {
     }
 }
 
+/// Advisor tab: follow the lead, or pick a harness, source, model and effort
+/// from that harness's catalog. Returns a harness whose catalog must load.
+fn advisor_panel(ui: &mut Ui, d: &mut ModelDialog, pal: &theme::Palette) -> Option<String> {
+    let mut load = None;
+    ui.add(
+        Label::new(
+            RichText::new("任何执行端的 agent 都能在工作中途通过协作总线请教顾问。顾问在项目目录中只读运行一轮，查看文件后给出建议，不修改任何内容。")
+                .font(theme::body(theme::SMALL))
+                .color(pal.mute),
+        )
+        .wrap(),
+    );
+    ui.add_space(6.0);
+    let mut follow = d.advisor_follow;
+    widgets::toggle(ui, &mut follow, "跟随主控（沿用主控当前的执行端与模型）", pal);
+    if follow != d.advisor_follow {
+        d.advisor_follow = follow;
+        d.advisor_dirty = true;
+    }
+    let scope = match d.scope {
+        Scope::Ticket(_) => "只用于本会话，下一次请教顾问时生效。",
+        _ => "作为所有未单独设置顾问的会话的默认。",
+    };
+    if d.advisor_follow {
+        ui.add(Label::new(RichText::new(scope).font(theme::body(theme::SMALL)).color(pal.mute)).wrap());
+        return None;
+    }
+    ui.add_space(6.0);
+    let names: Vec<String> = AGENTS.iter().map(|a| agent_name(a)).collect();
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    let current = AGENTS.iter().position(|a| *a == d.advisor_agent).unwrap_or(0);
+    if let Some(i) = widgets::segmented(ui, &refs, current, pal) {
+        d.advisor_agent = AGENTS[i].to_string();
+        d.advisor_pick = json!({});
+        d.advisor_dirty = true;
+    }
+    let agent = d.advisor_agent.clone();
+    match d.catalogs.get(&agent) {
+        None => {
+            load = Some(agent);
+        }
+        Some(Probe::Loading) => {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(RichText::new("正在获取模型目录…").color(pal.mute));
+            });
+        }
+        Some(Probe::Failed(e)) => {
+            ui.add(Label::new(RichText::new(e).color(pal.fail.fg)).wrap());
+        }
+        Some(Probe::Ready(c)) => {
+            let c = c.clone();
+            if pick_str(&d.advisor_pick, "provider").is_empty() {
+                d.advisor_pick = c.get("default").cloned().unwrap_or_else(|| json!({}));
+            }
+            let pick = d.advisor_pick.clone();
+            let mode = pick_str(&pick, "mode").to_string();
+            let provider = pick_str(&pick, "provider").to_string();
+            let modes = rows(&c, "modes");
+            let providers = providers_for(&c, &mode);
+            let models = providers
+                .iter()
+                .find(|p| id_of(p) == provider)
+                .map(|p| rows(p, "models"))
+                .unwrap_or_default();
+            let mut next = None;
+            if let Some(m) = combo(ui, "执行端", "advisor-mode", &modes, &mode, false) {
+                next = Some(retain_supported_effort(&c, &pick, reset(&c, &m, None)));
+            }
+            if let Some(p) = combo(ui, "供应商", "advisor-provider", &providers, &provider, false) {
+                next = Some(retain_supported_effort(&c, &pick, reset(&c, &mode, Some(&p))));
+            }
+            if let Some(m) = model_combo(ui, &models, pick_str(&pick, "model"), false, &mut d.model_query) {
+                next = Some(retain_supported_effort(&c, &pick, json!({"mode": mode, "provider": provider, "model": m})));
+            }
+            let shown_pick = next.as_ref().unwrap_or(&pick);
+            let shown_model = rows(&c, "providers")
+                .into_iter()
+                .find(|p| id_of(p) == pick_str(shown_pick, "provider"))
+                .and_then(|p| rows(p, "models").into_iter().find(|m| id_of(m) == pick_str(shown_pick, "model")));
+            if let Some(p) = effort_combo(ui, shown_model, shown_pick, false) {
+                next = Some(p);
+            }
+            if let Some(n) = next {
+                d.advisor_pick = n;
+                d.advisor_dirty = true;
+            }
+            let note = if valid(&c, &d.advisor_pick) { scope } else { "这个组合不可用，请更换选项或跟随主控。" };
+            ui.add(Label::new(RichText::new(note).font(theme::body(theme::SMALL)).color(pal.mute)).wrap());
+        }
+    }
+    load
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -933,6 +1103,10 @@ mod tests {
             model_query: String::new(),
             warning: None,
             saving: false,
+            advisor_follow: true,
+            advisor_agent: "claude".into(),
+            advisor_pick: json!({}),
+            advisor_dirty: false,
         };
         dialog.answer_for("codex", 1, Ok(json!({"revision":"old"})));
         assert!(dialog.needs("codex"));

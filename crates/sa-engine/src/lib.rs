@@ -10,6 +10,7 @@
 //! - `activity`: live per-job activity and status badges for the UI.
 
 pub mod activity;
+pub mod advice;
 pub mod checkpoints;
 pub mod adapter;
 pub mod autonomy;

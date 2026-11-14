@@ -938,6 +938,11 @@ async fn run(
             }}});
             args.extend(["--mcp-config".into(), config.to_string()]);
             env.set(token, bus.token.clone());
+            // `advise` waits for a whole advisor turn; keep a longer operator value.
+            let wanted = crate::common::BUS_TOOL_TIMEOUT_SECS * 1000;
+            if env.get("MCP_TOOL_TIMEOUT").and_then(|v| v.parse::<u64>().ok()).is_none_or(|v| v < wanted) {
+                env.set("MCP_TOOL_TIMEOUT", wanted.to_string());
+            }
         }
     }
     crate::cache_policy::configure(

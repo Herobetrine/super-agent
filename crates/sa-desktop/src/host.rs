@@ -92,6 +92,11 @@ pub enum Action {
         ticket: i64,
         enabled: bool,
     },
+    /// Advisor of a ticket, or the default (`None`); `choice: None` follows the lead.
+    SaveAdvisor {
+        ticket: Option<i64>,
+        choice: Option<(String, Value)>,
+    },
     SetIsolatedWriters {
         ticket: i64,
         enabled: bool,
@@ -164,7 +169,8 @@ impl Action {
             Action::PlanAdd { .. } | Action::PlanToggle { .. } => ActionKind::Plan,
             Action::SaveDefaults { .. }
             | Action::SaveRoutes { .. }
-            | Action::SetLeadRouting { .. } => ActionKind::Routes,
+            | Action::SetLeadRouting { .. }
+            | Action::SaveAdvisor { .. } => ActionKind::Routes,
             Action::SaveEfficiency { .. } => ActionKind::Efficiency,
             Action::KnowledgeAdd { .. } | Action::KnowledgeArchive { .. } => ActionKind::Knowledge,
             Action::ProviderSave { .. }
@@ -432,13 +438,16 @@ impl Host {
                     } else {
                         sa_bus::CollabBus::start(&dir, Some(ext.clone())).await.ok()
                     };
-                    let engine = match open_engine(&dir, adapters.clone(), &for_thread, &ext, bus) {
+                    let engine = match open_engine(&dir, adapters.clone(), &for_thread, &ext, bus.clone()) {
                         Ok(e) => e,
                         Err(e) => {
                             let _ = ready_tx.send(Err(format!("{e:#}")));
                             return;
                         }
                     };
+                    if let Some(bus) = &bus {
+                        bus.set_consultant(Arc::new(engine.clone()));
+                    }
                     let control = match crate::control::Server::open(&dir) {
                         Ok(server) => server,
                         Err(e) => {
@@ -627,6 +636,15 @@ impl Host {
                     .and_then(|s| serde_json::from_str(s).ok())
             })
             .unwrap_or_else(|| json!({}))
+    }
+
+    /// Stored advisor of a ticket or of the default (`None`): `(agent, route)`.
+    pub fn advisor_setting(&self, ticket: Option<i64>) -> Option<(String, Value)> {
+        self.engine
+            .advisor_setting(ticket)
+            .ok()
+            .flatten()
+            .and_then(|(agent, route)| Some((agent, serde_json::to_value(route).ok()?)))
     }
 
     pub fn allow_lead_routing_default(&self) -> bool {
@@ -849,6 +867,17 @@ async fn execute(engine: &Engine, shared: &Shared, action: Action) -> Result<Opt
         }
         Action::SetLeadRouting { ticket, enabled } => {
             engine.set_lead_routing(ticket, enabled)?;
+            Ok(None)
+        }
+        Action::SaveAdvisor { ticket, choice } => {
+            let choice = match &choice {
+                Some((agent, route)) => Some((
+                    agent.as_str(),
+                    sa_engine::protocol::route(Some(route)).map_err(|e| anyhow::anyhow!("顾问{e}"))?,
+                )),
+                None => None,
+            };
+            engine.set_advisor(ticket, choice.as_ref().map(|(a, r)| (*a, r)))?;
             Ok(None)
         }
         Action::SetIsolatedWriters { ticket, enabled } => {

@@ -122,6 +122,9 @@ pub fn is_file(p: &Path) -> bool {
 pub const BUS_TOKEN_ENV: &str = "SA_BUS_TOKEN";
 /// MCP server name of the collaboration bus inside each harness.
 pub const BUS_SERVER: &str = "sa_bus";
+/// Per-call MCP timeout for the bus: `advise` waits for a whole advisor turn
+/// (the engine caps it at 14 minutes).
+pub const BUS_TOOL_TIMEOUT_SECS: u64 = 15 * 60;
 
 /// CC Switch database path (AC:41-51).
 fn cc_database(sys: &Sys) -> Result<PathBuf> {

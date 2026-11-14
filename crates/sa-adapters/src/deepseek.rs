@@ -916,6 +916,7 @@ fn bus_entry(url: &str) -> String {
   config:
     serverName: {server}
     transport: streamable-http
+    toolCallTimeoutMs: {timeout}
     url: {url}
     headers:
       Authorization: !!js '`Bearer ${{process.env.{token}}}`'
@@ -923,6 +924,7 @@ fn bus_entry(url: &str) -> String {
         server = crate::common::BUS_SERVER,
         url = json!(url),
         token = crate::common::BUS_TOKEN_ENV,
+        timeout = crate::common::BUS_TOOL_TIMEOUT_SECS * 1000,
     )
 }
 

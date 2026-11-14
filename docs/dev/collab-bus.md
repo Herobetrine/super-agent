@@ -33,6 +33,7 @@
 | --- | --- | --- |
 | `roster` | 无 | 列出本工单的任务：编号、上级、执行端、角色、状态、最近一条阶段汇报，并标出调用者自己 |
 | `send` | `to`（任务编号，或 `lead` / `parent`），`body` | 以调用者身份写入目标任务的信箱。目标正在运行时，支持轮中插入的执行端会立即收到；目标在等待时会被唤醒 |
+| `advise` | `brief` | 请教工单的顾问：另一个执行端、另一家模型。顾问在工单项目目录以**只读档位**运行一轮，可读文件、搜代码核实简报，返回建议；最长 14 分钟 |
 | `ask` | `to`，`question`，可选 `wait_seconds` | 发出问题并在本轮内等待对方 `reply`（默认 45 s，最多 55 s，低于 Codex 与 DeepSeek Harness 默认 60 s 的 MCP 工具超时）。超时返回未回答，之后的回答进入收件箱。对方正在等你（或形成等待环）时拒绝，避免双方互相卡住 |
 | `reply` | `question_id`，`body` | 回答发给自己的问题；提问方的 `ask` 立即返回答案，不再在收件箱重复出现 |
 | `inbox` | 无 | 返回调用者未读的消息并标记已读 |
@@ -43,6 +44,16 @@
 | `call` | `server`，`tool`，`arguments` | 在调用者本轮内同步调用一个已授权工具并返回结果 |
 
 每个工具结果都附带调用者当前的未读数，提示 agent 读取，避免反复空轮询。
+
+### 跨执行端顾问
+
+思路同 Anthropic 的 [advisor tool](https://platform.claude.com/docs/en/agents-and-tools/tool-use/advisor-tool)（便宜模型干活、关键处请教强模型），但不限于 Anthropic 模型：任何挂载总线的 agent 都能请教任意执行端上的任意模型。
+
+- **顾问的选择**：工单单独设置 > 全局默认 > 主控当前路由（`native_routes` 中根任务的路由与执行端）。在模型窗口的“顾问”分段设置：默认“跟随主控”，关闭后选择执行端、供应商、模型和思考强度。存储在 `bus_advisor` 表（`global` 或 `ticket:<id>`）。
+- **执行方式**：`Engine::consult` 用现有适配器跑一次性轮次，`profile=readonly`、不挂总线、不续接会话。提示词为固定的 `advice::GUIDE` 加调用方简报，固定前缀利于缓存。调用方各自的对话记录平台拿不到，所以要求调用方写自包含简报；顾问能自己读项目文件弥补。
+- **记录**：调用方任务名下记 `advice.started`（顾问、简报字节数与摘要）与 `advice.result`（耗时、建议正文或错误）。顾问自身的原生事件不入账本，因此顾问的 Token 用量尚未计入工单用量统计。
+- **等待**：一次顾问轮次可能要几分钟。平台为总线设置更长的工具超时：Codex `tool_timeout_sec=900`，DeepSeek Harness `toolCallTimeoutMs=900000`，Claude 在低于该值时设 `MCP_TOOL_TIMEOUT=900000`；引擎对顾问轮次的上限为 14 分钟。agy 的 ACP 通道超时未调整。
+- 与 Anthropic advisor 的区别：后者在一次 API 请求内完成、能看到完整对话但不能用工具；这里是独立的只读轮次，只看到简报但能检查项目。
 
 ### 工具开放给所有 agent
 
@@ -112,6 +123,7 @@
   - `ask` / `reply`、`claim` / `release`：`sa-bus` 单元测试覆盖问答、反向等待拒绝、超时后迟到回答进入收件箱、路径重叠拒绝与通知、轮次结束释放。
   - 引擎测试 `tests/bus.rs`：完全访问轮次拿到令牌和引导，只读轮次没有引导，每个令牌都被吊销。
   - 计费实测 `live_pair_asks_and_replies`（两个 Claude 任务，`dahetao · claude-desktop` 的 `qwen3.8-27b`，测试用干净的 `CLAUDE_CONFIG_DIR`，因为加载全局 MCP / 插件后提示超出该模型上下文）：+0.0 s 工作者 `ask`，+0.1 s 持有者读到，+11.4 s `reply`，+11.7 s 工作者拿到答案，+14.9 s 发布；两轮 27 s / 42 s。这一轮答案同时经 `ask` 返回和 Claude 轮中推送送达（`via: native`），重复了一次；之后改为 `bus-r-*` 回答不参与推送，该修复只有代码与离线测试，没有再次计费验证。随后两次重试中，持有者的首个请求都被上游以“超出上下文”拒绝，工作者按提示超时、催促并向主控报告未收到，属于上游不稳定。
+- **跨执行端顾问（计费，2026-11-15）**：`live_cross_harness_advise`。工作者为 Claude Code（`大核桃 · claude` 的 `deepseek-v4.1-flash`），被要求不能自己读文件；顾问为 Codex（大核桃 Responses 接口直连的 `deepseek-v4.1-flash`）。工作者调用 `advise` 后，顾问只读读取项目中的 `RELEASE_NOTE.txt`，19.5 s 返回“发布码 ORCHID-7731，已读取文件核实”；工作者 27.5 s 回答正确。同一测试先用 `qwen3.8-27b` 作工作者时，上游以“超出上下文”拒绝首个请求。
 - 同一天先用 `gemini-4-hydrogen` 实测失败：上游返回 500、404、429（额度耗尽）和超时，两个任务都停在第一次模型请求，与总线无关。
 
 未验证：agy 与 DeepSeek Harness 的完整协作往返；由主控派工产生的真实工单中，模型是否会在没有明确指令时主动使用总线；更长任务中的消息量与 Token 成本。

@@ -635,3 +635,65 @@ async fn claude_receives_a_note_while_its_tool_runs() {
     let unread = db.with(|q| q.notes(2, true)).unwrap();
     assert!(unread.is_empty(), "the steered note is accepted");
 }
+
+/// Billable: a worker on one harness consults an advisor on another harness
+/// through the bus. The answer is only in a project file, which the read-only
+/// advisor must inspect. Opt-in: `SA_LIVE_BUS_WORKER` and `SA_LIVE_BUS_ADVISOR`
+/// in the [`side`] format.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn live_cross_harness_advise() {
+    let (Ok(worker), Ok(advisor)) = (std::env::var("SA_LIVE_BUS_WORKER"), std::env::var("SA_LIVE_BUS_ADVISOR")) else {
+        eprintln!("set SA_LIVE_BUS_WORKER and SA_LIVE_BUS_ADVISOR for a billable advisor run");
+        return;
+    };
+    let (worker, advisor) = (side(&worker).await, side(&advisor).await);
+    let data = tempfile::tempdir().unwrap();
+    let work = tempfile::tempdir().unwrap();
+    std::fs::write(work.path().join("RELEASE_NOTE.txt"), "Release code: ORCHID-7731\n").unwrap();
+    let engine = sa_engine::Engine::open(data.path(), vec![advisor.adapter.clone()], Default::default()).unwrap();
+    engine
+        .db()
+        .with(|q| {
+            q.conn().execute(
+                "INSERT INTO tickets(id,goal,cwd,writes,lead,created) VALUES(1,'advisor live test',?1,0,'claude',0)",
+                [work.path().to_string_lossy()],
+            )?;
+            q.conn().execute(
+                "INSERT INTO jobs(id,ticket,parent,agent,body,writing,depth,turn,state) VALUES
+                   (1,1,NULL,?1,'lead',0,0,1,'waiting'),(2,1,1,?2,'worker',0,1,1,'running')",
+                [&advisor.agent, &worker.agent],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let route = Route { provider: advisor.provider.clone(), model: advisor.model.clone(), mode: "cli".into(), reasoning_effort: None };
+    engine.set_advisor(Some(1), Some((&advisor.agent, &route))).unwrap();
+    let bus = CollabBus::start(data.path(), None).await.unwrap();
+    bus.set_consultant(Arc::new(engine.clone()));
+    let prompt = "You are task #2. You must report the release code, but you may NOT read any files or run any commands yourself. \
+        Call the collaboration bus tool sa_bus `advise` exactly once with this brief: \
+        `The project directory contains RELEASE_NOTE.txt. Please open it and tell me the exact release code it contains.` \
+        Then reply with the release code only.";
+    let request = RunRequest {
+        ticket: 1,
+        job: 2,
+        turn: 1,
+        agent: worker.agent.clone(),
+        prompt: prompt.into(),
+        images: vec![],
+        cwd: work.path().into(),
+        route: Route { provider: worker.provider.clone(), model: worker.model.clone(), mode: "cli".into(), reasoning_effort: None },
+        profile: "full".into(),
+        writable: true,
+        session_id: None,
+        bus: bus.grant(1, 2, 1, &worker.agent),
+    };
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let started = std::time::Instant::now();
+    let outcome = worker.adapter.run(request, Arc::new(DbHost { db: Arc::new(Db::open(data.path()).unwrap()), job: 2 }), tx, CancellationToken::new()).await;
+    eprintln!("WORKER {} {:?} {:?}", worker.agent, started.elapsed(), outcome.as_ref().map(|o| &o.text).map_err(|e| &e.message));
+    for row in engine.db().with(|q| q.all("SELECT kind,payload FROM events WHERE kind LIKE 'advice.%' ORDER BY seq", &[])).unwrap() {
+        eprintln!("EVENT {} {}", row["kind"].as_str().unwrap_or_default(), &row["payload"].as_str().unwrap_or_default()[..row["payload"].as_str().unwrap_or_default().len().min(400)]);
+    }
+    assert!(outcome.is_ok_and(|o| o.text.contains("ORCHID-7731")), "worker did not get the code through the advisor");
+}

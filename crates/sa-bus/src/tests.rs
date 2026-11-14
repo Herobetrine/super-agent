@@ -115,7 +115,7 @@ async fn http_round_trip_requires_a_live_grant() {
     let client = connect(grant.token.clone()).await.unwrap();
     assert!(client.peer_info().unwrap().instructions.as_deref().unwrap().contains("collaboration bus"));
     let names: Vec<String> = client.list_all_tools().await.unwrap().into_iter().map(|t| t.name.to_string()).collect();
-    assert_eq!(names, ["roster", "send", "ask", "reply", "inbox", "claim", "release", "tools", "call", "publish"]);
+    assert_eq!(names, ["roster", "send", "advise", "ask", "reply", "inbox", "claim", "release", "tools", "call", "publish"]);
     let call = |name: &'static str, args: Value| {
         let mut params = rmcp::model::CallToolRequestParams::new(name);
         params.arguments = args.as_object().cloned();
@@ -249,4 +249,29 @@ async fn claims_refuse_overlaps_notify_the_holder_and_end_with_the_turn() {
     bus.revoke(&worker_grant.token);
     let after = tool(&reviewer, "claim", json!({"paths": ["docs"]})).await;
     assert_eq!(after["value"]["conflicts"], json!([]));
+}
+
+struct EchoConsultant;
+
+impl sa_engine::services::Consultant for EchoConsultant {
+    fn consult(&self, ticket: i64, job: i64, _turn: i64, brief: String, _cancel: CancellationToken) -> futures_util_box::BoxFuture<Result<Value>> {
+        Box::pin(async move { Ok(json!({"advisor": {"agent": "claude"}, "advice": format!("#{job}@{ticket}: {brief}")})) })
+    }
+}
+
+mod futures_util_box {
+    pub type BoxFuture<T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'static>>;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn advise_goes_to_the_consultant_with_the_callers_identity() {
+    let fx = fixture();
+    let bus = CollabBus::start(fx.dir.path(), None).await.unwrap();
+    let worker = client(&bus, &bus.grant(1, 2, 3, "codex").unwrap().token).await;
+    let missing = tool(&worker, "advise", json!({"brief": "help"})).await;
+    assert!(missing["error"] == true, "no consultant yet");
+    bus.set_consultant(Arc::new(EchoConsultant));
+    let advice = tool(&worker, "advise", json!({"brief": "which approach?"})).await;
+    assert_eq!(advice["value"]["advice"], "#2@1: which approach?");
+    assert_eq!(advice["value"]["unread"], 0);
 }

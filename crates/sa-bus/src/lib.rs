@@ -38,6 +38,7 @@ const MAX_CLAIMS: usize = 64;
 const INSTRUCTIONS: &str = "Super Agent collaboration bus for the current ticket. Use it while you work instead of waiting for turn-end reports: \
 call `roster` to see who else works on this ticket, `send` to message a collaborator (or `lead`/`parent`) when you need input or have news they depend on, \
 `inbox` to read messages addressed to you, and `publish` to share an intermediate result (commit, artifact, test numbers) as soon as it exists. \
+Use `advise` with a self-contained brief to get a second opinion from the ticket's advisor model (another harness) before committing to an approach, when stuck, or before declaring the work done. \
 Use `ask` to put a question to one task and wait for its `reply` within your turn. \
 Before editing shared files, `claim` them (and `release` when done) so two tasks do not overwrite each other. \
 `tools` lists the MCP tools the operator enabled for this ticket and `call` runs one of them; name a server and tool in `tools` to read its full input schema first. \
@@ -71,6 +72,8 @@ struct Shared {
     waiting: Mutex<HashMap<i64, i64>>,
     /// Advisory edit claims of running turns, released when the turn ends.
     claims: Mutex<Vec<Claim>>,
+    /// Runs `advise` turns; set once the engine exists.
+    consultant: std::sync::OnceLock<Arc<dyn sa_engine::services::Consultant>>,
 }
 
 #[derive(Clone, Debug)]
@@ -98,6 +101,7 @@ impl CollabBus {
             ext,
             waiting: Mutex::default(),
             claims: Mutex::default(),
+            consultant: std::sync::OnceLock::new(),
         });
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?;
         let url = format!("http://127.0.0.1:{}/mcp", listener.local_addr()?.port());
@@ -131,6 +135,11 @@ impl CollabBus {
 
     pub fn url(&self) -> &str {
         &self.url
+    }
+
+    /// Enable `advise`. The engine is created after the bus, so it is wired here.
+    pub fn set_consultant(&self, consultant: Arc<dyn sa_engine::services::Consultant>) {
+        let _ = self.shared.consultant.set(consultant);
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, Grantee>> {
@@ -175,6 +184,15 @@ impl sa_engine::services::Bus for CollabBus {
 struct Handler(Arc<Shared>);
 
 impl Handler {
+    /// `advise`: one read-only advisor turn on the ticket's advisor route.
+    async fn advise(&self, caller: &Grantee, args: &Value, cancel: &CancellationToken) -> Result<Value> {
+        let consultant = self.0.consultant.get().cloned().ok_or_else(|| anyhow!("本工作台未启用顾问"))?;
+        let brief = args["brief"].as_str().unwrap_or_default().to_string();
+        let mut out = consultant.consult(caller.ticket, caller.job, caller.turn, brief, cancel.clone()).await?;
+        out["unread"] = json!(self.0.db.with(|q| unread(q, caller))?);
+        Ok(out)
+    }
+
     fn waiting(&self) -> std::sync::MutexGuard<'_, HashMap<i64, i64>> {
         self.0.waiting.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -302,6 +320,13 @@ pub fn tools() -> Vec<Tool> {
             },"required":["to","body"],"additionalProperties":false})),
         ),
         Tool::new(
+            "advise",
+            "Consult the ticket's advisor: a stronger model on another harness that reads your brief, inspects the project read-only and returns guidance. Write a self-contained brief: the goal, what you have done and found, the decision or problem, and relevant file paths or evidence. Use it before committing to an approach, when an error keeps recurring, and before declaring the work done. It can take several minutes.",
+            schema(json!({"type":"object","properties":{
+                "brief":{"type":"string","description":"Self-contained brief for the advisor"}
+            },"required":["brief"],"additionalProperties":false})),
+        ),
+        Tool::new(
             "ask",
             "Ask one task a question and wait for its answer within your turn (default 45 s, at most 55 s). The question reaches the other task like `send`; it answers with `reply`. If the wait ends first, the answer later arrives in your inbox. Asking a task that is itself waiting on you is refused.",
             schema(json!({"type":"object","properties":{
@@ -394,6 +419,7 @@ impl ServerHandler for Handler {
         let outcome = match request.name.as_ref() {
             "tools" | "call" => self.extension(&caller, &request.name, &args, &context.ct).await,
             "ask" => self.ask(&caller, &args, &context.ct).await,
+            "advise" => self.advise(&caller, &args, &context.ct).await,
             "claim" | "release" | "roster" => {
                 let mut claims = self.0.claims.lock().unwrap_or_else(|e| e.into_inner());
                 self.0.db.tx(|q| claims_call(q, &caller, &request.name, &args, &mut claims))

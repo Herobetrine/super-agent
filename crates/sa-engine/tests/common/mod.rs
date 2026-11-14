@@ -162,8 +162,12 @@ impl Adapter for Fake {
         events: EventSink,
         cancel: CancellationToken,
     ) -> BoxFuture<'static, Result<RunOutcome, AdapterError>> {
-        let packet: Value = serde_json::from_str(req.prompt.rsplit('\n').next().unwrap_or("null"))
-            .expect("packet JSON");
+        // Scheduled turns end with the JSON envelope; advisor turns are plain text.
+        let packet: Value = if req.prompt.starts_with(sa_engine::advice::GUIDE) {
+            Value::Null
+        } else {
+            serde_json::from_str(req.prompt.rsplit('\n').next().unwrap_or("null")).expect("packet JSON")
+        };
         let job = packet["job"].clone();
         self.shared.calls.lock().unwrap().push(Call {
             name: self.name.into(),
