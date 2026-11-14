@@ -1344,6 +1344,10 @@ impl Inner {
         if primary && packet.get("autonomy").and_then(|a| a.get("phase")).and_then(Value::as_str) == Some("discover") {
             guide.push_str(guides::DISCOVERY);
         }
+        // Adapters mount the bus only on full-access and auto turns.
+        if self.opts.bus.is_some() && matches!(job.profile.as_str(), "full" | "auto") {
+            guide.push_str(guides::BUS);
+        }
         if let Some(ext) = &self.opts.extensions {
             let ctx = ext.context(job.ticket, &job.profile);
             let allow = job.is_root() && !matches!(job.profile.as_str(), "legacy" | "readonly");
@@ -2529,6 +2533,9 @@ impl TurnHost for Host {
             .with(|q| q.notes(turn.job.id, true))
             .unwrap_or_default()
             .into_iter()
+            // A bus `reply` reaches its asker through `ask` (or `inbox` after a
+            // timeout); steering it too would deliver the answer twice.
+            .filter(|n| !n["id"].as_str().is_some_and(|id| id.starts_with("bus-r-")))
             .map(|n| json!({"seq": n["seq"], "sender": n["sender"], "body": n["body"]}))
             .collect()
     }

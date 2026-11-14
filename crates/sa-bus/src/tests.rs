@@ -115,7 +115,7 @@ async fn http_round_trip_requires_a_live_grant() {
     let client = connect(grant.token.clone()).await.unwrap();
     assert!(client.peer_info().unwrap().instructions.as_deref().unwrap().contains("collaboration bus"));
     let names: Vec<String> = client.list_all_tools().await.unwrap().into_iter().map(|t| t.name.to_string()).collect();
-    assert_eq!(names, ["roster", "send", "inbox", "tools", "call", "publish"]);
+    assert_eq!(names, ["roster", "send", "ask", "reply", "inbox", "claim", "release", "tools", "call", "publish"]);
     let call = |name: &'static str, args: Value| {
         let mut params = rmcp::model::CallToolRequestParams::new(name);
         params.arguments = args.as_object().cloned();
@@ -153,4 +153,100 @@ async fn prompt_visible_definitions_are_byte_stable_across_grants() {
         client.cancel().await.unwrap();
     }
     assert!(seen.windows(2).all(|w| w[0] == w[1]), "definitions must not vary per grant");
+}
+
+async fn client(bus: &CollabBus, token: &str) -> rmcp::service::RunningService<rmcp::RoleClient, ()> {
+    use rmcp::ServiceExt;
+    use rmcp::transport::StreamableHttpClientTransport;
+    use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
+    let config = StreamableHttpClientTransportConfig::with_uri(bus.url().to_string()).auth_header(token.to_string());
+    ().serve(StreamableHttpClientTransport::from_config(config)).await.unwrap()
+}
+
+async fn tool(c: &rmcp::service::RunningService<rmcp::RoleClient, ()>, name: &'static str, args: Value) -> Value {
+    let mut params = rmcp::model::CallToolRequestParams::new(name);
+    params.arguments = args.as_object().cloned();
+    let result = c.call_tool(params).await.unwrap();
+    let text = result.content[0].as_text().map(|t| t.text.clone()).unwrap_or_default();
+    json!({"error": result.is_error == Some(true), "value": serde_json::from_str::<Value>(&text).unwrap_or(json!(text))})
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ask_waits_for_the_reply_and_refuses_a_reverse_wait() {
+    let fx = fixture();
+    let bus = CollabBus::start(fx.dir.path(), None).await.unwrap();
+    let worker = client(&bus, &bus.grant(1, 2, 3, "codex").unwrap().token).await;
+    let reviewer = client(&bus, &bus.grant(1, 3, 1, "antigravity").unwrap().token).await;
+    let asking = tokio::spawn(async move {
+        let answer = tool(&worker, "ask", json!({"to": 3, "question": "which frame flickers?", "wait_seconds": 20})).await;
+        (worker, answer)
+    });
+    // The question arrives like any message, with its id.
+    let mut question = None;
+    for _ in 0..40 {
+        let inbox = tool(&reviewer, "inbox", json!({})).await;
+        if let Some(body) = inbox["value"]["messages"][0]["body"].as_str() {
+            question = body.split_whitespace().nth(1).map(str::to_string);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    let question = question.expect("question delivered");
+    // A reverse wait while #2 waits on #3 would deadlock both turns.
+    let reverse = tool(&reviewer, "ask", json!({"to": 2, "question": "and you?", "wait_seconds": 1})).await;
+    assert!(reverse["error"] == true && reverse["value"].as_str().unwrap().contains("互相等待"));
+    let replied = tool(&reviewer, "reply", json!({"question_id": question, "body": "frame 12"})).await;
+    assert_eq!(replied["value"]["to"], 2);
+    let (worker, answer) = asking.await.unwrap();
+    assert_eq!(answer["value"]["answered"], true);
+    assert_eq!(answer["value"]["answer"], "frame 12");
+    assert_eq!(answer["value"]["from"], "antigravity (#3)");
+    // Delivered through `ask`, so it is not repeated in the inbox.
+    assert_eq!(tool(&worker, "inbox", json!({})).await["value"]["messages"], json!([]));
+    assert!(tool(&reviewer, "reply", json!({"question_id": "q0", "body": "x"})).await["error"] == true);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unanswered_ask_times_out_and_the_late_reply_reaches_the_inbox() {
+    let fx = fixture();
+    let bus = CollabBus::start(fx.dir.path(), None).await.unwrap();
+    let worker = client(&bus, &bus.grant(1, 2, 3, "codex").unwrap().token).await;
+    let reviewer = client(&bus, &bus.grant(1, 3, 1, "antigravity").unwrap().token).await;
+    let answer = tool(&worker, "ask", json!({"to": 3, "question": "late?", "wait_seconds": 1})).await;
+    assert_eq!(answer["value"]["answered"], false);
+    let question = answer["value"]["question_id"].as_str().unwrap().to_string();
+    tool(&reviewer, "reply", json!({"question_id": question, "body": "yes"})).await;
+    let inbox = tool(&worker, "inbox", json!({})).await;
+    assert_eq!(inbox["value"]["messages"][0]["body"], "yes");
+    // After the timeout the asker no longer blocks a question in the other direction.
+    let reverse = tool(&reviewer, "ask", json!({"to": 2, "question": "free now?", "wait_seconds": 1})).await;
+    assert_eq!(reverse["value"]["answered"], false);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn claims_refuse_overlaps_notify_the_holder_and_end_with_the_turn() {
+    let fx = fixture();
+    let bus = CollabBus::start(fx.dir.path(), None).await.unwrap();
+    let worker_grant = bus.grant(1, 2, 3, "codex").unwrap();
+    let worker = client(&bus, &worker_grant.token).await;
+    let reviewer = client(&bus, &bus.grant(1, 3, 1, "antigravity").unwrap().token).await;
+    let taken = tool(&worker, "claim", json!({"paths": ["src\\fx", "docs/a.md"]})).await;
+    assert_eq!(taken["value"]["claimed"], json!(["src/fx", "docs/a.md"]));
+    // A file below a claimed directory overlaps; an unrelated path does not.
+    let wanted = tool(&reviewer, "claim", json!({"paths": ["src/fx/Shader.java", "README.md"]})).await;
+    assert_eq!(wanted["value"]["claimed"], json!(["README.md"]));
+    assert_eq!(wanted["value"]["conflicts"][0]["held_by"], 2);
+    let notified = tool(&worker, "inbox", json!({})).await;
+    assert!(notified["value"]["messages"][0]["body"].as_str().unwrap().contains("src/fx/Shader.java"));
+    let roster = tool(&reviewer, "roster", json!({})).await;
+    assert_eq!(roster["value"]["tasks"][1]["claims"], json!(["src/fx", "docs/a.md"]));
+    assert!(tool(&worker, "claim", json!({"paths": ["../outside"]})).await["error"] == true);
+    // Releasing one path frees it for others.
+    tool(&worker, "release", json!({"paths": ["src/fx"]})).await;
+    let retry = tool(&reviewer, "claim", json!({"paths": ["src/fx/Shader.java"]})).await;
+    assert_eq!(retry["value"]["conflicts"], json!([]));
+    // The worker's remaining claim ends with its turn.
+    bus.revoke(&worker_grant.token);
+    let after = tool(&reviewer, "claim", json!({"paths": ["docs"]})).await;
+    assert_eq!(after["value"]["conflicts"], json!([]));
 }

@@ -347,3 +347,78 @@ pub async fn stream(
     }
     Ok(())
 }
+
+/// What [`stream_live`] does after an event.
+pub enum Feed {
+    Continue,
+    /// The turn's terminal event arrived: close stdin so the harness exits.
+    Close,
+}
+
+/// Like [`stream`], but stdin stays open after `input` so `on_tick` (called
+/// about once a second while the process runs) can write further lines into
+/// the live turn. `on_event` closes stdin once the turn is complete.
+pub async fn stream_live(
+    p: &mut Proc,
+    input: &str,
+    cancel: &CancellationToken,
+    mut on_event: impl FnMut(Value) -> Result<Feed, AdapterError>,
+    mut on_tick: impl FnMut() -> Option<String>,
+) -> Result<(), AdapterError> {
+    let mut stdin = p.stdin.take();
+    if let Some(pipe) = stdin.as_mut()
+        && pipe.write_all(input.as_bytes()).await.is_err()
+    {
+        stdin = None;
+    }
+    let stdout = p.stdout.take().ok_or_else(|| protocol_error("原生输出不可读"))?;
+    let mut lines = Lines::new(stdout);
+    let mut tick = tokio::time::interval(Duration::from_secs(1));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let outcome = loop {
+        let next = tokio::select! {
+            r = lines.next() => r,
+            _ = tick.tick(), if stdin.is_some() => {
+                if let (Some(line), Some(pipe)) = (on_tick(), stdin.as_mut())
+                    && pipe.write_all(line.as_bytes()).await.is_err()
+                {
+                    // A broken pipe surfaces through the exit contract.
+                    stdin = None;
+                }
+                continue;
+            }
+            () = cancel.cancelled() => break Err(cancelled()),
+        };
+        match next {
+            Ok(Some(event)) => match on_event(event) {
+                Ok(Feed::Continue) => {}
+                Ok(Feed::Close) => {
+                    if let Some(mut pipe) = stdin.take() {
+                        let _ = pipe.shutdown().await;
+                    }
+                }
+                Err(e) => break Err(e),
+            },
+            Ok(None) => break Ok(()),
+            Err(e) => break Err(e),
+        }
+    };
+    drop(stdin);
+    if let Err(e) = outcome {
+        p.kill_tree().await;
+        p.wait().await;
+        return Err(e);
+    }
+    let code = tokio::select! {
+        c = p.wait() => c,
+        () = cancel.cancelled() => {
+            p.kill_tree().await;
+            p.wait().await;
+            return Err(cancelled());
+        }
+    };
+    if code != Some(0) {
+        return Err(p.exit_error(code));
+    }
+    Ok(())
+}

@@ -974,9 +974,13 @@ async fn run(
         (!sdk).then_some(s.model.as_str()),
         emit,
         &cancel,
+        Some(host),
     )
     .await
 }
+
+/// Longest note written into a live Claude turn (same bound as Codex steering).
+const MAX_STEER_BYTES: usize = 64 * 1024;
 
 /// Consume the native process using the same terminal contract for real and fake CLIs.
 async fn collect_turn(
@@ -986,13 +990,17 @@ async fn collect_turn(
     expected_model: Option<&str>,
     emit: Emit,
     cancel: &CancellationToken,
+    steer: Option<Arc<dyn TurnHost>>,
 ) -> Result<RunOutcome, AdapterError> {
     let mut terminal: Option<Value> = None;
     let mut last_retry: Option<Value> = None;
     let mut assistant_error: Option<AdapterError> = None;
     let mut session: Option<String> = expected_session.map(str::to_owned);
-    let mut open_tools: HashSet<String> = HashSet::new();
-    let streamed = stream(proc, input, cancel, |e| {
+    // Shared with the steering tick: a note written while a tool runs joins
+    // the same turn (Claude Code adds it to the request after the tool
+    // result); a note written between turns would start another turn.
+    let open_tools: std::sync::Mutex<HashSet<String>> = std::sync::Mutex::default();
+    let mut on_event = |e: Value| {
         emit.journal("native", e.clone());
         if e["type"] == json!("stream_event") {
             if e["event"]["delta"]["type"] == json!("text_delta") {
@@ -1002,7 +1010,7 @@ async fn collect_turn(
                 emit.journal("message.boundary", Value::Null);
             }
         }
-        track_tools(&e, &emit, &mut open_tools);
+        track_tools(&e, &emit, &mut open_tools.lock().unwrap_or_else(|e| e.into_inner()));
         if e["type"] == json!("system") && e["subtype"] == json!("init") {
             if let Some(id) = e["session_id"].as_str() {
                 emit.session(id);
@@ -1037,10 +1045,40 @@ async fn collect_turn(
         }
         if e["type"] == json!("result") {
             terminal = Some(e);
+            return Ok(crate::proc::Feed::Close);
         }
-        Ok(())
-    })
-    .await;
+        Ok(crate::proc::Feed::Continue)
+    };
+    let streamed = match &steer {
+        None => stream(proc, input, cancel, |e| on_event(e).map(|_| ())).await,
+        Some(host) => {
+            let mut steered: HashSet<i64> = HashSet::new();
+            let on_tick = || {
+                if open_tools.lock().unwrap_or_else(|e| e.into_inner()).is_empty() {
+                    return None;
+                }
+                let note = host
+                    .pending_notes()
+                    .into_iter()
+                    .find(|n| n["seq"].as_i64().is_some_and(|seq| !steered.contains(&seq)))?;
+                let seq = note["seq"].as_i64()?;
+                steered.insert(seq);
+                let text = format!(
+                    "Same-ticket update from the named sender:\n{}",
+                    serde_json::to_string(&note).unwrap_or_default()
+                );
+                if text.len() > MAX_STEER_BYTES {
+                    return None;
+                }
+                host.accept_notes(&[seq]);
+                Some(format!(
+                    "{}\n",
+                    json!({"type": "user", "message": {"role": "user", "content": text}})
+                ))
+            };
+            crate::proc::stream_live(proc, input, cancel, &mut on_event, on_tick).await
+        }
+    };
     let t = terminal.unwrap_or(Value::Null);
     if let Err(mut err) = streamed {
         // Only a generic process crash may be refined by a completed native error.
@@ -1191,6 +1229,7 @@ mod terminal_tests {
             None,
             Emit(events),
             &CancellationToken::new(),
+            None,
         )
         .await
     }

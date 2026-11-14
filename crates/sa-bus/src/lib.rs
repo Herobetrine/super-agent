@@ -29,10 +29,17 @@ const MAX_BODY: usize = 16_384;
 /// Automated mailbox budget per ticket for bus traffic (`SA_NOTE` keeps 128).
 const BUDGET: i64 = 4_096;
 const ROSTER_LIMIT: i64 = 100;
+/// `ask` waits below the 60 s default MCP tool timeout of Codex and DSH.
+const ASK_DEFAULT_SECS: u64 = 45;
+const ASK_MAX_SECS: u64 = 55;
+/// Paths one task may hold at once.
+const MAX_CLAIMS: usize = 64;
 
 const INSTRUCTIONS: &str = "Super Agent collaboration bus for the current ticket. Use it while you work instead of waiting for turn-end reports: \
 call `roster` to see who else works on this ticket, `send` to message a collaborator (or `lead`/`parent`) when you need input or have news they depend on, \
 `inbox` to read messages addressed to you, and `publish` to share an intermediate result (commit, artifact, test numbers) as soon as it exists. \
+Use `ask` to put a question to one task and wait for its `reply` within your turn. \
+Before editing shared files, `claim` them (and `release` when done) so two tasks do not overwrite each other. \
 `tools` lists the MCP tools the operator enabled for this ticket and `call` runs one of them; name a server and tool in `tools` to read its full input schema first. \
 Every result reports your unread count; read your inbox when it is not zero, before long operations and before you finish.";
 
@@ -60,6 +67,19 @@ struct Shared {
     grants: Mutex<HashMap<String, Grantee>>,
     /// Ticket MCP tools proxied by `tools`/`call`; `None` hides them.
     ext: Option<sa_ext::ProjectExtensions>,
+    /// Asking job → asked job while an `ask` waits; used to refuse cycles.
+    waiting: Mutex<HashMap<i64, i64>>,
+    /// Advisory edit claims of running turns, released when the turn ends.
+    claims: Mutex<Vec<Claim>>,
+}
+
+#[derive(Clone, Debug)]
+struct Claim {
+    ticket: i64,
+    job: i64,
+    agent: String,
+    /// Normalized project-relative path; empty means the whole project.
+    path: String,
 }
 
 /// The running bus. Dropping it stops the listener.
@@ -76,6 +96,8 @@ impl CollabBus {
             db: Db::open(data_dir).context("协作总线无法打开工单库")?,
             grants: Mutex::default(),
             ext,
+            waiting: Mutex::default(),
+            claims: Mutex::default(),
         });
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?;
         let url = format!("http://127.0.0.1:{}/mcp", listener.local_addr()?.port());
@@ -139,7 +161,13 @@ impl sa_engine::services::Bus for CollabBus {
     }
 
     fn revoke(&self, token: &str) {
-        self.lock().remove(token);
+        let ended = self.lock().remove(token);
+        if let Some(ended) = ended {
+            let still = self.lock().values().any(|g| g.job == ended.job);
+            if !still {
+                self.shared.claims.lock().unwrap_or_else(|e| e.into_inner()).retain(|c| c.job != ended.job);
+            }
+        }
     }
 }
 
@@ -147,6 +175,75 @@ impl sa_engine::services::Bus for CollabBus {
 struct Handler(Arc<Shared>);
 
 impl Handler {
+    fn waiting(&self) -> std::sync::MutexGuard<'_, HashMap<i64, i64>> {
+        self.0.waiting.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// `ask`: send a question, then poll the journal for its reply. The wait
+    /// is registered so a reverse question cannot deadlock both turns.
+    async fn ask(&self, caller: &Grantee, args: &Value, cancel: &CancellationToken) -> Result<Value> {
+        let wait = args["wait_seconds"].as_u64().unwrap_or(ASK_DEFAULT_SECS).clamp(1, ASK_MAX_SECS);
+        let question = format!("q{}", uuid::Uuid::new_v4().simple());
+        let dest = {
+            let dest = self.0.db.tx(|q| {
+                ensure!(q.live(caller.who())?, "本轮已结束，协作总线不再接受该任务的调用");
+                target(q, caller, &args["to"])
+            })?;
+            let mut waiting = self.waiting();
+            let mut cursor = dest;
+            while let Some(&next) = waiting.get(&cursor) {
+                ensure!(next != caller.job, "任务 #{dest} 正在等待你的回答，互相等待会卡住双方；请先 `reply` 或改用 `send`");
+                cursor = next;
+            }
+            waiting.insert(caller.job, dest);
+            dest
+        };
+        let outcome = async {
+            let text = args["question"].as_str().unwrap_or_default();
+            ensure!(p::valid_text(args.get("question"), MAX_BODY), "问题为空或超过 {MAX_BODY} 个字符");
+            let body = format!("Question {question} (answer with sa_bus `reply`): {text}");
+            self.0.db.tx(|q| {
+                let source = NoteSource { who: caller.who(), agent: caller.agent.clone(), logical: caller.turn };
+                let key = format!("bus-{question}");
+                let seq = q.record_note_within(caller.ticket, Some(&json!(dest)), Some(&json!(body)), Some(&source), Some(&key), BUDGET)?;
+                ensure!(
+                    q.exists("SELECT 1 FROM mailbox WHERE seq=? AND target IS NOT NULL", &[&seq])?,
+                    "目标任务不属于本工单、已停止收信，或协作消息达到预算"
+                );
+                Ok(())
+            })?;
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(wait);
+            let reply_key = format!("bus-r-{question}");
+            loop {
+                let answer = self.0.db.tx(|q| {
+                    let row = q.one(
+                        "SELECT m.seq,e.payload FROM mailbox m JOIN events e ON e.seq=m.seq WHERE m.target=? AND m.msgkey=?",
+                        &[&caller.job, &reply_key],
+                    )?;
+                    let Some(row) = row else { return Ok(None) };
+                    let seq = int_of(&row, "seq");
+                    q.accept_via(caller.who(), &[seq], "bus")?;
+                    Ok(Some(serde_json::from_str::<Value>(str_of(&row, "payload"))?))
+                })?;
+                if let Some(payload) = answer {
+                    return Ok(json!({"answered": true, "question_id": question, "from": payload["sender"], "answer": payload["body"]}));
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    return Ok(json!({"answered": false, "question_id": question, "detail": "等待超时；回答到达后会进入你的收件箱"}));
+                }
+                tokio::select! {
+                    () = cancel.cancelled() => return Err(anyhow!("调用已取消")),
+                    () = tokio::time::sleep(std::time::Duration::from_millis(500)) => {}
+                }
+            }
+        }
+        .await;
+        self.waiting().remove(&caller.job);
+        let mut out = outcome?;
+        out["unread"] = json!(self.0.db.with(|q| unread(q, caller))?);
+        Ok(out)
+    }
+
     /// `tools`/`call`: ticket MCP tools, outside the journal transaction
     /// because a call awaits the remote server.
     async fn extension(&self, caller: &Grantee, name: &str, args: &Value, cancel: &CancellationToken) -> Result<Value> {
@@ -205,9 +302,40 @@ pub fn tools() -> Vec<Tool> {
             },"required":["to","body"],"additionalProperties":false})),
         ),
         Tool::new(
+            "ask",
+            "Ask one task a question and wait for its answer within your turn (default 45 s, at most 55 s). The question reaches the other task like `send`; it answers with `reply`. If the wait ends first, the answer later arrives in your inbox. Asking a task that is itself waiting on you is refused.",
+            schema(json!({"type":"object","properties":{
+                "to":{"type":["integer","string"],"description":"Task id, `lead` or `parent`"},
+                "question":{"type":"string"},
+                "wait_seconds":{"type":"integer","minimum":1,"maximum":55}
+            },"required":["to","question"],"additionalProperties":false})),
+        ),
+        Tool::new(
+            "reply",
+            "Answer a question you received from `ask`, using the question id shown in that message.",
+            schema(json!({"type":"object","properties":{
+                "question_id":{"type":"string"},
+                "body":{"type":"string"}
+            },"required":["question_id","body"],"additionalProperties":false})),
+        ),
+        Tool::new(
             "inbox",
             "Read and acknowledge the messages addressed to your task that you have not read yet.",
             schema(json!({"type":"object","properties":{},"additionalProperties":false})),
+        ),
+        Tool::new(
+            "claim",
+            "Declare the files or directories you are about to edit (project-relative or absolute paths; a directory covers everything below it). Paths that overlap another running task's claim are not taken; the result names the holder, who is notified. Claims end with `release` or when your turn ends.",
+            schema(json!({"type":"object","properties":{
+                "paths":{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":64}
+            },"required":["paths"],"additionalProperties":false})),
+        ),
+        Tool::new(
+            "release",
+            "Release your claims: the listed paths, or all of them when `paths` is omitted.",
+            schema(json!({"type":"object","properties":{
+                "paths":{"type":"array","items":{"type":"string"}}
+            },"additionalProperties":false})),
         ),
         Tool::new(
             "tools",
@@ -265,6 +393,11 @@ impl ServerHandler for Handler {
         let args = Value::Object(request.arguments.unwrap_or_default());
         let outcome = match request.name.as_ref() {
             "tools" | "call" => self.extension(&caller, &request.name, &args, &context.ct).await,
+            "ask" => self.ask(&caller, &args, &context.ct).await,
+            "claim" | "release" | "roster" => {
+                let mut claims = self.0.claims.lock().unwrap_or_else(|e| e.into_inner());
+                self.0.db.tx(|q| claims_call(q, &caller, &request.name, &args, &mut claims))
+            }
             name => self.0.db.tx(|q| call(q, &caller, name, &args)),
         };
         let result = match outcome {
@@ -275,6 +408,95 @@ impl ServerHandler for Handler {
     }
 }
 
+/// Comparison key: Windows paths are case-insensitive.
+fn key(path: &str) -> String {
+    if cfg!(windows) { path.to_lowercase() } else { path.to_string() }
+}
+
+/// Project-relative, `/`-separated path in its original case.
+fn normalize(project: &str, raw: &str) -> Result<String> {
+    let project = project.trim().replace('\\', "/").trim_end_matches('/').to_string();
+    let mut path = raw.trim().replace('\\', "/");
+    let (pk, k) = (key(&project), key(&path));
+    if !project.is_empty() && (k == pk || k.starts_with(&format!("{pk}/"))) {
+        path = path[project.len()..].to_string();
+    }
+    let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty() && *p != ".").collect();
+    ensure!(!parts.contains(&".."), "声明路径不能包含 ..：{raw}");
+    ensure!(!path.contains(':') || parts.is_empty(), "声明路径不在工单项目内：{raw}");
+    Ok(parts.join("/"))
+}
+
+fn overlaps(a: &str, b: &str) -> bool {
+    let (a, b) = (key(a), key(b));
+    let (a, b) = (a.as_str(), b.as_str());
+    a.is_empty() || b.is_empty() || a == b || a.starts_with(&format!("{b}/")) || b.starts_with(&format!("{a}/"))
+}
+
+/// `claim`, `release` and `roster` (which lists live claims).
+fn claims_call(q: &Q, caller: &Grantee, tool: &str, args: &Value, claims: &mut Vec<Claim>) -> Result<Value> {
+    if tool == "roster" {
+        let mut out = call(q, caller, "roster", args)?;
+        for task in out["tasks"].as_array_mut().into_iter().flatten() {
+            let held: Vec<&str> = claims
+                .iter()
+                .filter(|c| c.ticket == caller.ticket && task["id"].as_i64() == Some(c.job))
+                .map(|c| if c.path.is_empty() { "." } else { c.path.as_str() })
+                .collect();
+            task["claims"] = json!(held);
+        }
+        return Ok(out);
+    }
+    ensure!(q.live(caller.who())?, "本轮已结束，协作总线不再接受该任务的调用");
+    let project = q.one("SELECT cwd FROM tickets WHERE id=?", &[&caller.ticket])?.map(|r| str_of(&r, "cwd").to_string()).unwrap_or_default();
+    let requested: Vec<String> = match args.get("paths") {
+        Some(Value::Array(items)) => items
+            .iter()
+            .map(|p| p.as_str().ok_or_else(|| anyhow!("`paths` 必须是字符串数组")).and_then(|p| normalize(&project, p)))
+            .collect::<Result<_>>()?,
+        None if tool == "release" => vec![],
+        _ => return Err(anyhow!("`paths` 必须是字符串数组")),
+    };
+    let mut out = if tool == "release" {
+        let before = claims.len();
+        claims.retain(|c| c.job != caller.job || (!requested.is_empty() && !requested.iter().any(|r| key(r) == key(&c.path))));
+        json!({"released": before - claims.len()})
+    } else {
+        ensure!(!requested.is_empty(), "`paths` 不能为空");
+        let mut taken = vec![];
+        let mut conflicts = vec![];
+        for path in requested {
+            let holder = claims
+                .iter()
+                .find(|c| c.ticket == caller.ticket && c.job != caller.job && overlaps(&c.path, &path))
+                .cloned();
+            match holder {
+                Some(holder) => {
+                    let body = format!(
+                        "Task #{} ({}) also needs to edit `{}`, which overlaps your claim `{}`. Coordinate with it before either of you changes these files.",
+                        caller.job, caller.agent, if path.is_empty() { "." } else { &path }, if holder.path.is_empty() { "." } else { &holder.path }
+                    );
+                    let source = NoteSource { who: caller.who(), agent: caller.agent.clone(), logical: caller.turn };
+                    let key = format!("bus-{}", uuid::Uuid::new_v4().simple());
+                    q.record_note_within(caller.ticket, Some(&json!(holder.job)), Some(&json!(body)), Some(&source), Some(&key), BUDGET)?;
+                    conflicts.push(json!({"path": path, "held_by": holder.job, "agent": holder.agent, "claim": holder.path}));
+                }
+                None => {
+                    if !claims.iter().any(|c| c.job == caller.job && key(&c.path) == key(&path)) {
+                        ensure!(claims.iter().filter(|c| c.job == caller.job).count() < MAX_CLAIMS, "声明路径超过 {MAX_CLAIMS} 个");
+                        claims.push(Claim { ticket: caller.ticket, job: caller.job, agent: caller.agent.clone(), path: path.clone() });
+                    }
+                    taken.push(path);
+                }
+            }
+        }
+        q.log(caller.who(), "bus.claim", &json!({"claimed": taken, "conflicts": conflicts}))?;
+        json!({"claimed": taken, "conflicts": conflicts})
+    };
+    out["unread"] = json!(unread(q, caller)?);
+    Ok(out)
+}
+
 /// One tool call inside a journal transaction. Errors are caller-visible.
 pub fn call(q: &Q, caller: &Grantee, tool: &str, args: &Value) -> Result<Value> {
     ensure!(q.live(caller.who())?, "本轮已结束，协作总线不再接受该任务的调用");
@@ -282,6 +504,7 @@ pub fn call(q: &Q, caller: &Grantee, tool: &str, args: &Value) -> Result<Value> 
         "roster" => roster(q, caller)?,
         "send" => send(q, caller, args)?,
         "inbox" => inbox(q, caller)?,
+        "reply" => reply(q, caller, args)?,
         "publish" => publish(q, caller, args)?,
         other => return Err(anyhow!("未知的协作总线工具：{other}")),
     };
@@ -360,6 +583,36 @@ fn send(q: &Q, caller: &Grantee, args: &Value) -> Result<Value> {
     let delivered = q.exists("SELECT 1 FROM mailbox WHERE seq=? AND target IS NOT NULL", &[&seq])?;
     ensure!(delivered, "目标任务不属于本工单、已停止收信，或协作消息达到预算");
     Ok(json!({"sent": true, "to": dest, "seq": seq}))
+}
+
+/// Answer an `ask`: the reply goes to the asker under a key its wait loop
+/// looks for, so it is delivered once even if the asker stopped waiting.
+fn reply(q: &Q, caller: &Grantee, args: &Value) -> Result<Value> {
+    let question = args["question_id"].as_str().unwrap_or_default();
+    ensure!(
+        question.starts_with('q') && question.len() <= 64 && question.chars().all(|c| c.is_ascii_alphanumeric()),
+        "无效的问题编号"
+    );
+    ensure!(p::valid_text(args.get("body"), MAX_BODY), "回答为空或超过 {MAX_BODY} 个字符");
+    let asked = q
+        .one(
+            "SELECT source FROM mailbox WHERE target=? AND msgkey=?",
+            &[&caller.job, &format!("bus-{question}")],
+        )?
+        .ok_or_else(|| anyhow!("没有发给你的这个问题"))?;
+    let asker = int_of(&asked, "source");
+    let source = NoteSource { who: caller.who(), agent: caller.agent.clone(), logical: caller.turn };
+    let seq = q.record_note_within(
+        caller.ticket,
+        Some(&json!(asker)),
+        args.get("body"),
+        Some(&source),
+        Some(&format!("bus-r-{question}")),
+        BUDGET,
+    )?;
+    let delivered = q.exists("SELECT 1 FROM mailbox WHERE seq=? AND target IS NOT NULL", &[&seq])?;
+    ensure!(delivered, "提问的任务已停止收信，或协作消息达到预算");
+    Ok(json!({"replied": true, "to": asker, "seq": seq}))
 }
 
 fn inbox(q: &Q, caller: &Grantee) -> Result<Value> {
