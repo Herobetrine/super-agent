@@ -121,7 +121,10 @@ class Sampler:
                 numbers = {name: integer(value.get(name)) for name in names}
                 valid = all(n is not None for n in numbers.values())
                 self.delivery["requests"] += 1
-                mode = "delta" if value.get("incremental") is True else "full"
+                if value.get("recovery_delivery") is True:
+                    mode = "recovery"
+                else:
+                    mode = "delta" if value.get("incremental") is True else "full"
                 self.delivery[mode + "_requests"] += 1
                 if valid:
                     self.delivery["measured_requests"] += 1

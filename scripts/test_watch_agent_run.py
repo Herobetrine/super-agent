@@ -74,6 +74,41 @@ class WatchRunTests(unittest.TestCase):
         self.assertEqual(summary["claude_terminal"]["complete_samples"], 2)
         self.assertIsNone(summary["claude_terminal"]["cache_read_fraction"])
 
+    def test_recovery_delivery_is_separate_from_full_and_delta(self):
+        sizes = dict(full_prompt_bytes=1000, sent_prompt_bytes=100, saved_bytes=900)
+        self.event(dict(sizes, recovery_delivery=True, incremental=False,
+                        guide="DO-NOT-LEAK"), kind="running")
+        # Recovery takes precedence even if a producer supplies both flags.
+        self.event(dict(sizes, recovery_delivery=True, incremental=True), kind="running")
+        records, _ = self.sampler.poll()
+        delivery = self.sampler.summary()["delivery"]
+        self.assertEqual([row["mode"] for row in records], ["recovery", "recovery"])
+        self.assertEqual(delivery["requests"], 2)
+        self.assertEqual(delivery["recovery_requests"], 2)
+        self.assertEqual(delivery.get("full_requests", 0), 0)
+        self.assertEqual(delivery.get("delta_requests", 0), 0)
+        self.assertEqual(delivery["measured_requests"], 2)
+        self.assertEqual(delivery["full_prompt_bytes"], 2000)
+        self.assertEqual(delivery["sent_prompt_bytes"], 200)
+        self.assertEqual(delivery["saved_bytes"], 1800)
+        self.assertNotIn("DO-NOT-LEAK", json.dumps([records, delivery]))
+
+    def test_legacy_delivery_flags_keep_existing_modes(self):
+        flags = [{}, {"incremental": True}, {"incremental": False},
+                 {"recovery_delivery": False, "incremental": True},
+                 {"recovery_delivery": "true"}, {"incremental": "true"}]
+        for value in flags:
+            self.event(value, kind="running")
+        records, _ = self.sampler.poll()
+        delivery = self.sampler.summary()["delivery"]
+        self.assertEqual([row["mode"] for row in records],
+                         ["full", "delta", "full", "delta", "full", "full"])
+        self.assertEqual(delivery["requests"], 6)
+        self.assertEqual(delivery["full_requests"], 4)
+        self.assertEqual(delivery["delta_requests"], 2)
+        self.assertNotIn("recovery_requests", delivery)
+        self.assertTrue(all(not row["complete"] for row in records))
+
     def test_failed_terminal_preserves_zero_and_excludes_positive_usage(self):
         self.event({"type": "result", "subtype": "error_during_execution",
                     "usage": dict.fromkeys(watch.TOKEN_NAMES, 0)})
