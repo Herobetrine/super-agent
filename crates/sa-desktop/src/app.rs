@@ -1021,18 +1021,39 @@ impl App {
                     self.tab = Tab::Approvals;
                 }
                 match (&self.host, &self.host_error) {
-                    (Some(h), _) => match h.fault() {
-                        Some(f) => {
-                            widgets::badge(ui, icon::WARNING_CIRCLE, "调度已停止", pal.fail)
-                                .on_hover_text(format!("调度器遇到无法恢复的错误：{f}"));
+                    (Some(h), _) => {
+                        use sa_engine::engine::SchedulerState;
+                        let health = h.scheduler_health();
+                        match health.state {
+                            SchedulerState::Running => {
+                                let text = match h.try_active_count() {
+                                    Some(n) if n > 0 => format!("调度中 · {n}"),
+                                    _ => "调度中".into(),
+                                };
+                                widgets::badge(ui, icon::PULSE, &text, pal.run)
+                                    .on_hover_text("后台调度检查正常，正在执行任务或等待新的工作。");
+                            }
+                            SchedulerState::DatabaseBusy => {
+                                widgets::badge(ui, icon::HOURGLASS, "等待数据库", pal.warn)
+                                    .on_hover_text("其他操作正在写入工单账本，调度会稍后重试。尚未开始新的派工，不会重复执行已运行的任务。");
+                            }
+                            SchedulerState::Unresponsive => {
+                                widgets::badge(ui, icon::WARNING_CIRCLE, "调度无响应", pal.fail)
+                                    .on_hover_text(format!(
+                                        "后台已 {:.0} 秒未完成调度检查。可能有任务仍在执行；请保留现场并检查故障，勿重复派工。",
+                                        health.last_progress_seconds_ago.unwrap_or_default()
+                                    ));
+                            }
+                            SchedulerState::Failed => {
+                                let reason = h.fault().unwrap_or_else(|| "后台调度异常结束".into());
+                                widgets::badge(ui, icon::WARNING_CIRCLE, "调度已停止", pal.fail)
+                                    .on_hover_text(format!("{reason}\n后续任务不会自动启动。请保留现场并检查故障后恢复工作台。"));
+                            }
+                            SchedulerState::NotStarted | SchedulerState::Stopped => {
+                                widgets::badge(ui, icon::PAUSE, "调度未运行", pal.warn);
+                            }
                         }
-                        None => {
-                            let n = h.active_count();
-                            let text = if n > 0 { format!("调度中 · {n}") } else { "调度中".into() };
-                            widgets::badge(ui, icon::PULSE, &text, pal.run)
-                                .on_hover_text("此窗口持有工单库并负责调度与模型调用。");
-                        }
-                    },
+                    }
                     (None, err) => {
                         let tip = match err {
                             Some(e) => format!("只读观察：{e}"),

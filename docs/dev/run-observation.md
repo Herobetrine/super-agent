@@ -21,6 +21,55 @@ python scripts/agent-control.py --data $data resume --ticket 6
 
 ## 只读采样
 
+### 调度循环健康
+
+本机 `status` 的 `scheduler` 与工单的 `pause`、任务的 `state` 分开报告。
+`scheduler.state` 为 `not_started`、`running`、`database_busy`、`unresponsive`、`failed` 或 `stopped`；
+`last_progress_seconds_ago` 使用单调时钟，表示距最近一次完成调度检查的时间。
+正常配置下超过 30 秒未完成检查会显示“调度无响应”，不把模型长时间工作或工单暂停当成调度故障。
+数据库连接忙时，状态接口仍返回健康快照，`state_available=false`，`pause/jobs=null`；不能把缺失快照读作没有任务。
+`database_busy` 特指派工事务尚未开始便遇到 SQLite 写入竞争，与上述连接快照暂不可读分开。
+这时界面显示“等待数据库”，仅重试尚未执行的准入检查；不更新最近成功检查时间，
+持续受阻仍会变为“调度无响应”。`last_sqlite_code` 和 `last_sqlite_extended_code` 保留数值错误码。
+只有 BEGIN 返回 SQLITE_BUSY 且连接确认不在事务内才可重试；事务体、提交阶段的错误以及
+SQLITE_LOCKED 等其他错误仍按故障处理，避免重放半开路由探针等内存副作用。
+
+后台循环 panic 或意外取消会停止后续准入，记录 `scheduler.failed` 和数据目录中的
+`scheduler-failure.json`（仅固定原因、时间及可用的 SQLite 数值码，不含模型正文）。
+暂时争用另记 `scheduler-busy.json`。这些文件保留最近一次诊断，重启后必须结合时间和当前
+`scheduler.state` 判断，不能因旧故障文件仍存在就认定新进程失败。日志写入失败时不保证两个位置均有记录。
+界面显示“调度已停止”；不会自行重放可能有副作用的工作，也不会绕过暂停或用户停止。
+已准入任务可继续交回结果。数据库事务异常展开时自动回滚，避免留下未关闭事务阻断交付。
+同步准入检查在独立后台线程执行，每个调度循环至多一个检查在途，避免数据库锁占住异步定时器线程。
+普通进度采样也在后台进行；界面设置与协作面板通过独立只读 WAL 连接读取已提交状态，
+连接忙时显示暂不可用，避免绘制等待引擎事务锁。锁等待结束及准入提交前重新核对停止状态。
+
+2026-11-15 的停滞现场中，主控有未读信、员工的子任务已完成，却长期保持 waiting。
+原版本没有观测调度循环退出，界面仍显示调度中；这解释了故障为何没有被正确暴露。
+当晚循环失活的最初触发尚未确定，不能仅凭这次修复归因于缓存保温或锁屏。
+锁屏是客户端录制的独立阻断。
+
+同日 08:15 的再次故障取得了精确触发证据：任务 150 的总线 `roster` 调用耗时 6277 ms，
+期间调度器的 5000 ms 写锁等待超时，现场错误为 `database is locked`。旧 `roster` 为只读查询
+开启 `BEGIN IMMEDIATE`，又按任务逐个扫描约 220 万条事件查询最近进展。修复将它改为
+不占写锁的只读快照，并以工单条件使用既有索引。已运行的任务 148 继续到 09:25 交付，
+不代表其间调度仍正常；主控 27 轮和复核 151 正因这个故障一直留在队列。
+该证据确认此次复发原因，不单独证明凌晨 01:02 的旧现场是同一触发点。
+
+故障回归使用假执行端，覆盖循环 panic、首次轮询前取消、事务内 panic 回滚、
+子任务结束/未读信唤醒、暂停和正常关闭；真实 App 与控制接口另验证数据库忙时仍可响应，
+单工作线程回归验证准入等待数据库锁期间异步定时器继续推进。
+可用冻结 SQLite 备份额外检查现场状态，不会启动 CLI 或模型：
+
+```powershell
+$env:SA_SCHEDULER_SNAPSHOT = '<离线备份的绝对路径，文件名不能为 hub.sqlite3>'
+scripts\cargo.cmd test -p sa-engine --test scheduler_snapshot -- --ignored --nocapture
+Remove-Item Env:SA_SCHEDULER_SNAPSHOT
+```
+
+该测试把备份再复制到临时目录，验证符合条件的 waiting 任务被唤醒、已有 queued 任务仍保留原轮次，
+并至少有一个任务实际准入；不证明业务任务完成。
+
 ```powershell
 python scripts/watch-agent-run.py --database "$data/hub.sqlite3" --ticket 6 `
   --after-seq <开始前事件序号> --output <新的JSONL路径> --duration 900

@@ -88,10 +88,18 @@ impl App {
                 ui.horizontal(|ui| {
                     let (color, text) = match (&self.source.error, &self.source.label) {
                         (Some(_), _) => (pal.fail.fg, "未连接到工单数据库".to_string()),
-                        (None, Some(l)) if self.writable() => (
-                            pal.run.fg,
-                            l.replacen("只读连接", "调度中", 1),
-                        ),
+                        (None, Some(l)) if self.writable() => {
+                            use sa_engine::engine::SchedulerState;
+                            let state = self.host.as_ref().map(|host| host.scheduler_health().state);
+                            let (color, label) = match state {
+                                Some(SchedulerState::Running) => (pal.run.fg, "调度中"),
+                                Some(SchedulerState::DatabaseBusy) => (pal.warn.fg, "等待数据库"),
+                                Some(SchedulerState::Unresponsive) => (pal.fail.fg, "调度无响应"),
+                                Some(SchedulerState::Failed) => (pal.fail.fg, "调度已停止"),
+                                _ => (pal.warn.fg, "调度未运行"),
+                            };
+                            (color, l.replacen("只读连接", label, 1))
+                        }
                         (None, Some(l)) => (pal.run.fg, l.clone()),
                         _ => (pal.faint, "正在连接数据源…".to_string()),
                     };

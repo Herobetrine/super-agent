@@ -62,15 +62,20 @@ impl Server {
                     }
                     _ => {}
                 }
-                let pause = engine.pause_status(ticket)?;
-                let jobs = engine.db().with(|q| {
-                    q.all(
+                let snapshot = engine.db().try_with(|q| {
+                    q.root(ticket)?;
+                    let pause = sa_engine::pause::status(q, ticket)?;
+                    let jobs = q.all(
                         "SELECT id,parent,state,turn FROM jobs WHERE ticket=? ORDER BY id",
                         &[&ticket],
-                    )
+                    )?;
+                    Ok((pause, jobs))
                 })?;
                 wake();
-                Ok(json!({"ticket":ticket,"pause":pause,"jobs":jobs}))
+                Ok(match snapshot {
+                    Some((pause, jobs)) => json!({"ticket":ticket,"pause":pause,"jobs":jobs,"state_available":true,"scheduler":engine.scheduler_health()}),
+                    None => json!({"ticket":ticket,"pause":null,"jobs":null,"state_available":false,"scheduler":engine.scheduler_health()}),
+                })
             });
         }
     }

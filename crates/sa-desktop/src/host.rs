@@ -18,7 +18,8 @@ use sa_store::providers::{self, CustomProvider, Rotation};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock, mpsc};
+use std::sync::{Arc, Mutex, RwLock, mpsc};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 
 /// One operator action. Mirrors the broker's `engineOps` and the studio
@@ -354,6 +355,8 @@ impl Shared {
     }
 }
 
+type TicketActivity = (i64, Vec<sa_engine::JobActivity>);
+
 pub struct Host {
     tx: Option<tokio::sync::mpsc::UnboundedSender<Action>>,
     pub rx: mpsc::Receiver<Outcome>,
@@ -369,6 +372,9 @@ pub struct Host {
     shared: Shared,
     ext: sa_ext::ProjectExtensions,
     notify: Notify,
+    activity_cache: Arc<Mutex<Option<TicketActivity>>>,
+    activity_pending: Arc<AtomicBool>,
+    reader: Mutex<rusqlite::Connection>,
 }
 
 impl Host {
@@ -478,6 +484,11 @@ impl Host {
             Ok(Ok((engine, runtime, adapters, ext))) => {
                 let (catalog_tx, catalogs) = mpsc::channel();
                 let (probe_tx, probes) = mpsc::channel();
+                let reader = rusqlite::Connection::open_with_flags(
+                    engine.data_dir().join(sa_store::DB_FILE),
+                    rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+                )?;
+                reader.busy_timeout(std::time::Duration::ZERO)?;
                 Ok(Self {
                     probe_tx,
                     probes,
@@ -497,6 +508,9 @@ impl Host {
                     catalog_tx,
                     catalogs,
                     notify,
+                    activity_cache: Arc::default(),
+                    activity_pending: Arc::default(),
+                    reader: Mutex::new(reader),
                 })
             }
             Ok(Err(e)) => {
@@ -578,26 +592,63 @@ impl Host {
 
     /// In-memory activity of the ticket's running and retrying jobs.
     pub fn activity(&self, ticket: i64) -> Vec<sa_engine::JobActivity> {
-        self.engine.activity(ticket)
+        // Drawing must not wait for the scheduler, route policy or journal.
+        // One sampler bounds work even if an engine lock never becomes free.
+        let cached = self.activity_cache.try_lock().ok().and_then(|cache| {
+            cache.as_ref().filter(|(id, _)| *id == ticket).map(|(_, list)| list.clone())
+        }).unwrap_or_default();
+        if self.activity_pending.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+            struct Sampling(Arc<AtomicBool>);
+            impl Drop for Sampling {
+                fn drop(&mut self) { self.0.store(false, Ordering::SeqCst); }
+            }
+            let pending = Sampling(self.activity_pending.clone());
+            let engine = self.engine.clone();
+            let cache = self.activity_cache.clone();
+            let wake = self.notify.clone();
+            self.runtime.spawn_blocking(move || {
+                let _pending = pending;
+                let activity = engine.activity(ticket);
+                *cache.lock().unwrap_or_else(|e| e.into_inner()) = Some((ticket, activity));
+                wake();
+            });
+        }
+        cached
     }
 
-    pub fn failover(&self, ticket: i64) -> bool {
-        self.engine.failover(ticket).unwrap_or(false)
+    fn read<T>(&self, f: impl FnOnce(&sa_engine::db::Q) -> Result<T>) -> Result<T> {
+        // WAL readers see the last committed state without waiting for an
+        // in-progress engine transaction or briefly hiding controls each tick.
+        let reader = match self.reader.try_lock() {
+            Ok(reader) => reader,
+            Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => bail!("工单状态正在更新，稍后重试"),
+        };
+        f(&sa_engine::db::Q(&reader))
     }
-    pub fn isolated_writers(&self, ticket: i64) -> bool {
-        self.engine.isolated_writers(ticket).unwrap_or(false)
+    pub fn failover(&self, ticket: i64) -> Result<bool> {
+        self.read(|q| {
+            q.root(ticket)?;
+            q.exists("SELECT 1 FROM ticket_failover WHERE ticket=?", &[&ticket])
+        })
+    }
+    pub fn isolated_writers(&self, ticket: i64) -> Result<bool> {
+        self.read(|q| q.exists("SELECT 1 FROM workspace_policy WHERE ticket=? AND isolated=1", &[&ticket]))
     }
     pub fn workspaces(&self, ticket: i64) -> Result<Vec<sa_engine::workspaces::Workspace>> {
-        self.engine.workspaces(ticket)
+        self.read(|q| {
+            q.all("SELECT job FROM job_workspaces WHERE ticket=? ORDER BY job", &[&ticket])?.iter()
+                .map(|r| sa_engine::workspaces::get(q, sa_engine::db::int_of(r,"job"))?.ok_or_else(|| anyhow!("工作区不存在"))).collect()
+        })
     }
     pub fn checkpoints(&self, ticket: i64) -> Result<Vec<Value>> {
-        self.engine.checkpoints(ticket)
+        self.read(|q| sa_engine::checkpoints::list(q, ticket))
     }
     pub fn scm_bindings(&self, ticket: i64) -> Result<Vec<Value>> {
-        self.engine.scm_bindings(ticket)
+        self.read(|q| sa_engine::scm::bindings(q, ticket))
     }
     pub fn branch_source(&self, ticket: i64) -> Result<Value> {
-        self.engine.db().with(|q| {
+        self.read(|q| {
             q.one(
                 "SELECT lead,permission_profile FROM tickets WHERE id=?",
                 &[&ticket],
@@ -625,9 +676,7 @@ impl Host {
 
     /// Saved routes for new conversations (`route_defaults`).
     pub fn defaults(&self) -> Value {
-        self.engine
-            .db()
-            .with(|q| q.one("SELECT routes FROM route_defaults WHERE singleton=1", &[]))
+        self.read(|q| q.one("SELECT routes FROM route_defaults WHERE singleton=1", &[]))
             .ok()
             .flatten()
             .and_then(|r| {
@@ -640,15 +689,16 @@ impl Host {
 
     /// Stored advisor of a ticket or of the default (`None`): `(agent, route)`.
     pub fn advisor_setting(&self, ticket: Option<i64>) -> Option<(String, Value)> {
-        self.engine
-            .advisor_setting(ticket)
+        self.read(|q| sa_engine::advice::get(q, ticket))
             .ok()
             .flatten()
             .and_then(|(agent, route)| Some((agent, serde_json::to_value(route).ok()?)))
     }
 
     pub fn allow_lead_routing_default(&self) -> bool {
-        routing_default(&self.engine).unwrap_or(true)
+        self.read(|q| Ok(q.one(
+            "SELECT allow_lead_routing FROM studio_model_policy WHERE singleton=1", &[],
+        )?.is_none_or(|row| row["allow_lead_routing"].as_i64() == Some(1)))).unwrap_or(true)
     }
 
     /// Unrecoverable scheduler fault (scheduling stopped).
@@ -661,8 +711,17 @@ impl Host {
         &self.engine
     }
 
+    #[cfg(test)]
     pub fn active_count(&self) -> usize {
         self.engine.active_count()
+    }
+
+    pub fn scheduler_health(&self) -> sa_engine::engine::SchedulerHealth {
+        self.engine.scheduler_health()
+    }
+
+    pub fn try_active_count(&self) -> Option<usize> {
+        self.engine.try_active_count()
     }
 
     /// Stop model scheduling and drain bounded maintenance before releasing the
@@ -2167,7 +2226,27 @@ exit 0
         let status = request("status", "status", &ready["generation"]);
         assert_eq!(status["ok"], true);
         assert_eq!(status["result"]["jobs"][0]["state"], "done");
+        assert_eq!(status["result"]["scheduler"]["state"], "running");
+        assert!(status["result"]["scheduler"]["last_progress_seconds_ago"].is_number());
         assert!(status["result"]["jobs"][0].get("result").is_none());
+        let blocked_engine = host.engine.clone();
+        let (held_tx, held_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let holder = std::thread::spawn(move || blocked_engine.db().with(|_| {
+            held_tx.send(()).unwrap();
+            let _ = release_rx.recv_timeout(std::time::Duration::from_secs(3));
+            Ok(())
+        }).unwrap());
+        held_rx.recv().unwrap();
+        let started = std::time::Instant::now();
+        let busy = request("busy-status", "status", &ready["generation"]);
+        let elapsed = started.elapsed();
+        let _ = release_tx.send(());
+        holder.join().unwrap();
+        assert!(elapsed < std::time::Duration::from_secs(1), "status waited for journal");
+        assert_eq!(busy["result"]["state_available"], false);
+        assert!(busy["result"]["jobs"].is_null());
+        assert!(busy["result"]["scheduler"]["state"].is_string());
         assert_eq!(request("pause", "pause_after_handoff", &ready["generation"])["ok"], true);
         let paused = host.engine().pause_status(ticket).unwrap();
         assert_ne!(paused, sa_engine::PauseStatus::Running);

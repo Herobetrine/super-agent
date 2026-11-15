@@ -38,7 +38,9 @@ pub fn badge(ui: &mut Ui, icon: &str, text: &str, tone: Tone) -> Response {
     } else {
         format!("{icon}  {text}")
     };
-    chip(ui, &label, tone, theme::SMALL)
+    let response = chip(ui, &label, tone, theme::SMALL);
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, text));
+    response
 }
 
 /// Agent avatar circle with monogram.

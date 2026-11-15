@@ -29,6 +29,17 @@ const MAX_BODY: usize = 16_384;
 /// Automated mailbox budget per ticket for bus traffic (`SA_NOTE` keeps 128).
 const BUDGET: i64 = 4_096;
 const ROSTER_LIMIT: i64 = 100;
+const ROSTER_QUERY: &str = "WITH roster AS (
+    SELECT id,parent,agent,coalesce(nullif(assigned_role,''),role,'') AS role,state,depth
+    FROM jobs WHERE ticket=? ORDER BY id DESC LIMIT ?
+), latest AS (
+    SELECT job,max(seq) AS seq FROM events
+    WHERE ticket=? AND kind='job.progress' AND job IN (SELECT id FROM roster)
+    GROUP BY job
+)
+SELECT r.*,e.payload AS progress FROM roster r
+LEFT JOIN latest p ON p.job=r.id LEFT JOIN events e ON e.seq=p.seq
+ORDER BY r.id";
 /// `ask` waits below the 60 s default MCP tool timeout of Codex and DSH.
 const ASK_DEFAULT_SECS: u64 = 45;
 const ASK_MAX_SECS: u64 = 55;
@@ -420,7 +431,16 @@ impl ServerHandler for Handler {
             "tools" | "call" => self.extension(&caller, &request.name, &args, &context.ct).await,
             "ask" => self.ask(&caller, &args, &context.ct).await,
             "advise" => self.advise(&caller, &args, &context.ct).await,
-            "claim" | "release" | "roster" => {
+            "roster" => {
+                let mut claims = self.0.claims.lock().unwrap_or_else(|e| e.into_inner());
+                self.0.db.with(|q| {
+                    let snapshot = q.conn().unchecked_transaction()?;
+                    let roster = claims_call(&Q(&snapshot), &caller, "roster", &args, &mut claims)?;
+                    snapshot.commit()?;
+                    Ok(roster)
+                })
+            }
+            "claim" | "release" => {
                 let mut claims = self.0.claims.lock().unwrap_or_else(|e| e.into_inner());
                 self.0.db.tx(|q| claims_call(q, &caller, &request.name, &args, &mut claims))
             }
@@ -547,19 +567,13 @@ fn unread(q: &Q, caller: &Grantee) -> Result<i64> {
 
 fn roster(q: &Q, caller: &Grantee) -> Result<Value> {
     let rows = q.all(
-        "SELECT id,parent,agent,coalesce(nullif(assigned_role,''),role,'') AS role,state,depth FROM jobs
-         WHERE ticket=? ORDER BY id DESC LIMIT ?",
-        &[&caller.ticket, &ROSTER_LIMIT],
+        ROSTER_QUERY,
+        &[&caller.ticket, &ROSTER_LIMIT, &caller.ticket],
     )?;
     let mut tasks = vec![];
-    for row in rows.iter().rev() {
+    for row in &rows {
         let id = int_of(row, "id");
-        let progress = q
-            .one(
-                "SELECT payload FROM events WHERE job=? AND kind='job.progress' ORDER BY seq DESC LIMIT 1",
-                &[&id],
-            )?
-            .and_then(|r| serde_json::from_str::<Value>(str_of(&r, "payload")).ok());
+        let progress = serde_json::from_str::<Value>(str_of(row, "progress")).ok();
         tasks.push(json!({
             "id": id,
             "parent": row.get("parent").cloned().unwrap_or(Value::Null),

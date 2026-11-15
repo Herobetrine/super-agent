@@ -66,7 +66,7 @@ pub(crate) fn choose(q: &Q, ticket: i64) -> Result<Advisor> {
 }
 
 /// The stored choice for a scope (`None` ticket = global), for settings UIs.
-pub(crate) fn get(q: &Q, ticket: Option<i64>) -> Result<Option<(String, Route)>> {
+pub fn get(q: &Q, ticket: Option<i64>) -> Result<Option<(String, Route)>> {
     stored(q, &scope(ticket))
 }
 

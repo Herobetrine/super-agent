@@ -16,7 +16,7 @@ use crate::activity::{ActivityPhase, JobActivity, RetryInfo, Tracker};
 use crate::adapter::{AGENTS, Adapter, AdapterError, AdapterEvent, ErrorClass, Route, RunRequest, TurnHost};
 use crate::autonomy;
 use crate::context::{self, MAX_PROMPT_BYTES};
-use crate::db::{Db, Q, Who, int_of, now, str_of, who_of};
+use crate::db::{BeginBusy, Db, Q, Who, int_of, now, sqlite_error_codes, str_of, who_of};
 use crate::dispatch::{self, CmdError};
 use crate::guides;
 use crate::job::{JobCtx, envelope};
@@ -31,14 +31,16 @@ use futures::FutureExt;
 use futures::future::{BoxFuture, Shared, join_all};
 use regex::Regex;
 use serde_json::{Map, Value, json};
+use serde::Serialize;
+use std::panic::AssertUnwindSafe;
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
     sync::{
         Arc, LazyLock, Mutex, MutexGuard, Weak,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::{sync::mpsc, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
@@ -61,6 +63,45 @@ static TRANSIENT: LazyLock<Regex> = LazyLock::new(|| {
 });
 static CONTROL_LINE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^SA_(SEND|NOTE|ROLE|TOOL|PROGRESS|MEMO|CANCEL) ").expect("valid regex"));
+
+/// Admission-loop status, independent of ticket pause and model activity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SchedulerState {
+    NotStarted,
+    Running,
+    DatabaseBusy,
+    Unresponsive,
+    Failed,
+    Stopped,
+}
+
+/// A lock-free snapshot that remains available when admission is blocked.
+#[derive(Clone, Debug, Serialize)]
+pub struct SchedulerHealth {
+    pub state: SchedulerState,
+    pub last_progress_seconds_ago: Option<f64>,
+    pub last_sqlite_code: Option<i32>,
+    pub last_sqlite_extended_code: Option<i32>,
+}
+
+const SCHEDULER_NOT_STARTED: u8 = 0;
+const SCHEDULER_RUNNING: u8 = 1;
+const SCHEDULER_FAILED: u8 = 2;
+const SCHEDULER_STOPPED: u8 = 3;
+
+/// Detect a lost timer even when its future is cancelled before its first poll.
+struct TimerExit(Weak<Inner>);
+
+impl Drop for TimerExit {
+    fn drop(&mut self) {
+        if let Some(inner) = self.0.upgrade()
+            && !inner.stopping.load(Ordering::SeqCst)
+        {
+            inner.scheduler_failed("unexpected_exit", "调度循环异常退出，后续准入已停止。".into());
+        }
+    }
+}
 
 /// Pluggable engine services.
 pub struct EngineOptions {
@@ -172,6 +213,11 @@ pub(crate) struct Inner {
     started: AtomicBool,
     stopping: AtomicBool,
     fault: Mutex<Option<String>>,
+    scheduler_state: AtomicU8,
+    scheduler_progress_ms: AtomicU64,
+    scheduler_database_busy: AtomicBool,
+    scheduler_sqlite_code: AtomicU64,
+    scheduler_origin: Instant,
     /// Runner watchdog limits for activity thresholds.
     limits: Option<ResilienceConfig>,
     /// Jobs cancelled inside a journal transaction whose running turns must
@@ -311,6 +357,11 @@ impl Engine {
                 started: AtomicBool::new(false),
                 stopping: AtomicBool::new(false),
                 fault: Mutex::new(None),
+                scheduler_state: AtomicU8::new(SCHEDULER_NOT_STARTED),
+                scheduler_progress_ms: AtomicU64::new(0),
+                scheduler_database_busy: AtomicBool::new(false),
+                scheduler_sqlite_code: AtomicU64::new(0),
+                scheduler_origin: Instant::now(),
             }),
         })
     }
@@ -328,8 +379,43 @@ impl Engine {
         lock(&self.inner.fault).clone()
     }
 
+    /// Reads no engine locks or SQLite state. A stale heartbeat reports the
+    /// admission loop as unresponsive without restarting any admitted work.
+    pub fn scheduler_health(&self) -> SchedulerHealth {
+        let inner = &self.inner;
+        let progress = inner.scheduler_progress_ms.load(Ordering::SeqCst);
+        let age = (progress > 0).then(|| {
+            inner.scheduler_origin.elapsed().as_secs_f64() - (progress - 1) as f64 / 1000.0
+        }).map(|seconds| seconds.max(0.0));
+        let limit = Duration::from_secs(30).max(inner.opts.tick.saturating_mul(4));
+        let state = match inner.scheduler_state.load(Ordering::SeqCst) {
+            SCHEDULER_RUNNING if age.is_some_and(|age| age > limit.as_secs_f64()) => SchedulerState::Unresponsive,
+            SCHEDULER_RUNNING if inner.scheduler_database_busy.load(Ordering::SeqCst) => SchedulerState::DatabaseBusy,
+            SCHEDULER_RUNNING => SchedulerState::Running,
+            SCHEDULER_FAILED => SchedulerState::Failed,
+            SCHEDULER_STOPPED => SchedulerState::Stopped,
+            _ => SchedulerState::NotStarted,
+        };
+        let sqlite_code = inner.scheduler_sqlite_code.load(Ordering::SeqCst);
+        SchedulerHealth {
+            state,
+            last_progress_seconds_ago: age,
+            last_sqlite_code: (sqlite_code > 0).then_some((sqlite_code & 0xff) as i32),
+            last_sqlite_extended_code: (sqlite_code > 0).then_some(sqlite_code as i32),
+        }
+    }
+
     pub fn active_count(&self) -> usize {
         lock(&self.inner.sched).active.len()
+    }
+
+    /// UI callers can skip the count while admission owns the scheduler lock.
+    pub fn try_active_count(&self) -> Option<usize> {
+        match self.inner.sched.try_lock() {
+            Ok(sched) => Some(sched.active.len()),
+            Err(std::sync::TryLockError::Poisoned(error)) => Some(error.into_inner().active.len()),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+        }
     }
 
     /// `start()` (E:32-39): recover interrupted work, then admit every tick.
@@ -339,26 +425,63 @@ impl Engine {
             bail!("引擎正在关闭");
         }
         if inner.started.load(Ordering::SeqCst) {
+            ensure!(inner.scheduler_state.load(Ordering::SeqCst) != SCHEDULER_FAILED, "调度循环已异常退出，请核对现场后重新打开工作台。");
             return Ok(());
         }
+        ensure!(!inner.opts.tick.is_zero(), "调度间隔必须大于零");
         inner.db.tx(|q| q.recover())?;
         inner.started.store(true, Ordering::SeqCst);
         let weak = Arc::downgrade(inner);
         let tick = inner.opts.tick;
+        inner.scheduler_state.store(SCHEDULER_RUNNING, Ordering::SeqCst);
+        inner.mark_scheduler_progress();
+        let exit = TimerExit(weak.clone());
         let timer = tokio::spawn(async move {
-            let mut interval = tokio::time::interval(tick);
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            loop {
-                interval.tick().await;
-                let Some(inner) = weak.upgrade() else { break };
-                if inner.stopping.load(Ordering::SeqCst) || lock(&inner.fault).is_some() {
-                    break;
+            let _exit = exit;
+            let failure_target = weak.clone();
+            let result = AssertUnwindSafe(async move {
+                let mut interval = tokio::time::interval(tick);
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    interval.tick().await;
+                    let Some(inner) = weak.upgrade() else { break };
+                    if inner.stopping.load(Ordering::SeqCst) || lock(&inner.fault).is_some() {
+                        break;
+                    }
+                    // SQLite and scheduler mutexes are synchronous. Keep a
+                    // single pass in flight off the async executor so its timers,
+                    // control service and native streams remain responsive.
+                    loop {
+                        let pass = inner.clone();
+                        let admitted = tokio::task::spawn_blocking(move || {
+                            let admitted = pass.step();
+                            pass.keepalive_pass();
+                            admitted
+                        }).await.unwrap_or_else(|error| {
+                            if error.is_panic() {
+                                std::panic::resume_unwind(error.into_panic());
+                            }
+                            panic!("调度准入任务异常取消");
+                        });
+                        if admitted < READS_PER_SLICE {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                    if inner.scheduler_database_busy.load(Ordering::SeqCst) {
+                        // The ordinary tick can be short. Bound contention retry
+                        // frequency without keeping an async worker blocked.
+                        tokio::time::sleep(Duration::from_millis(250)).await;
+                    }
                 }
-                // A full slice may leave more queued work: yield, then continue.
-                while inner.step() >= READS_PER_SLICE {
-                    tokio::task::yield_now().await;
-                }
-                inner.keepalive_pass();
+            }).catch_unwind().await;
+            if let Err(panic) = result
+                && let Some(inner) = failure_target.upgrade()
+            {
+                let detail = panic.downcast_ref::<&str>().copied()
+                    .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+                    .unwrap_or("未知 panic");
+                inner.scheduler_failed("panic", format!("调度循环异常退出：{detail}"));
             }
         });
         lock(&inner.sched).timer = Some(timer);
@@ -381,6 +504,7 @@ impl Engine {
     pub async fn quiesce(&self) {
         let inner = &self.inner;
         inner.stopping.store(true, Ordering::SeqCst);
+        inner.scheduler_state.store(SCHEDULER_STOPPED, Ordering::SeqCst);
         let tasks: Vec<JoinHandle<()>> = {
             let mut s = lock(&inner.sched);
             if let Some(t) = s.timer.take() {
@@ -1009,15 +1133,101 @@ impl Inner {
         self.abort_jobs(&ids);
     }
 
+    fn scheduler_failed(self: &Arc<Self>, reason: &'static str, message: String) {
+        if self.stopping.load(Ordering::SeqCst) {
+            return;
+        }
+        if self.scheduler_state.compare_exchange(
+            SCHEDULER_RUNNING, SCHEDULER_FAILED, Ordering::SeqCst, Ordering::SeqCst,
+        ).is_err() {
+            return;
+        }
+        lock(&self.fault).get_or_insert(message);
+        // Health changes immediately. Diagnostics must never wait behind a
+        // blocked journal on the scheduler or UI thread, and contain no native
+        // output, prompts, paths or panic payloads.
+        let inner = self.clone();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn_blocking(move || {
+                // Journal I/O faults can prevent the event from being saved,
+                // so retain a small independent diagnostic as well.
+                let mut diagnostic = json!({"reason": reason, "at": now()});
+                let sqlite_code = inner.scheduler_sqlite_code.load(Ordering::SeqCst);
+                if sqlite_code > 0 {
+                    diagnostic["sqlite_code"] = json!(sqlite_code & 0xff);
+                    diagnostic["sqlite_extended_code"] = json!(sqlite_code);
+                }
+                if let Ok(bytes) = serde_json::to_vec(&diagnostic) {
+                    let _ = std::fs::write(inner.data_dir.join("scheduler-failure.json"), bytes);
+                }
+                let _ = inner.db.tx(|q| {
+                    let roots = q.all(
+                        "SELECT id,ticket,turn FROM jobs WHERE parent IS NULL AND state NOT IN ('done','partial','failed','cancelled')",
+                        &[],
+                    )?;
+                    for root in roots {
+                        let mut payload = diagnostic.clone();
+                        payload.as_object_mut().expect("diagnostic object").remove("at");
+                        q.log(who_of(&root), "scheduler.failed", &payload)?;
+                    }
+                    Ok(())
+                });
+            });
+        }
+    }
+
+    fn admission_open(&self) -> bool {
+        self.started.load(Ordering::SeqCst)
+            && !self.stopping.load(Ordering::SeqCst)
+            && self.scheduler_state.load(Ordering::SeqCst) == SCHEDULER_RUNNING
+    }
+
+    fn interrupt_unstarted(&self, turn: &Turn) -> Result<()> {
+        self.db.tx(|q| {
+            if q.live(turn.job.who())? {
+                q.interrupt(turn.job.who(), &turn.job.ticket_profile)?;
+            }
+            Ok(())
+        })
+    }
+
+    fn mark_scheduler_progress(&self) {
+        let elapsed = self.scheduler_origin.elapsed().as_millis().min(u128::from(u64::MAX - 1)) as u64;
+        self.scheduler_progress_ms.store(elapsed + 1, Ordering::SeqCst);
+    }
+
     fn step(self: &Arc<Self>) -> usize {
         if !self.started.load(Ordering::SeqCst) || self.stopping.load(Ordering::SeqCst) || lock(&self.fault).is_some()
         {
             return 0;
         }
         match self.admit() {
-            Ok(n) => n,
+            Ok(n) => {
+                self.scheduler_database_busy.store(false, Ordering::SeqCst);
+                self.mark_scheduler_progress();
+                n
+            }
+            Err(error) if error.downcast_ref::<BeginBusy>().is_some() => {
+                let busy = error.downcast_ref::<BeginBusy>().expect("guard checked BEGIN busy");
+                self.scheduler_sqlite_code.store(busy.extended_code as u64, Ordering::SeqCst);
+                if !self.scheduler_database_busy.swap(true, Ordering::SeqCst) {
+                    let diagnostic = json!({
+                        "reason": "begin_busy", "at": now(),
+                        "sqlite_code": busy.extended_code & 0xff,
+                        "sqlite_extended_code": busy.extended_code,
+                    });
+                    let path = self.data_dir.join("scheduler-busy.json");
+                    if let Ok(bytes) = serde_json::to_vec(&diagnostic) {
+                        let _ = std::fs::write(path, bytes);
+                    }
+                }
+                0
+            }
             Err(e) => {
-                *lock(&self.fault) = Some(e.to_string());
+                if let Some((_, extended)) = sqlite_error_codes(&e) {
+                    self.scheduler_sqlite_code.store(extended as u64, Ordering::SeqCst);
+                }
+                self.scheduler_failed("admission_error", e.to_string());
                 if let Some(t) = lock(&self.sched).timer.take() {
                     t.abort();
                 }
@@ -1057,9 +1267,15 @@ impl Inner {
     /// pass so the writer slot cannot be granted twice.
     fn admit(self: &Arc<Self>) -> Result<usize> {
         let mut sched = lock(&self.sched);
+        if !self.started.load(Ordering::SeqCst) || self.stopping.load(Ordering::SeqCst) || lock(&self.fault).is_some() {
+            return Ok(0);
+        }
         let health = self.health_value();
         let mut aborts = vec![];
-        let admitted = self.db.tx(|q| {
+        let admitted = self.db.admission_tx(|q| {
+            if !self.started.load(Ordering::SeqCst) || self.stopping.load(Ordering::SeqCst) || lock(&self.fault).is_some() {
+                return Ok(vec![]);
+            }
             q.wake()?;
             pause::reconcile(q)?;
             let queued = "SELECT j.*,t.cwd,t.claude_route,t.follow_config,t.agent_routes,t.allow_lead_routing,t.writes,
@@ -1158,6 +1374,7 @@ impl Inner {
                     activity: Mutex::new(Tracker::new(time)),
                 });
             }
+            ensure!(self.admission_open(), "调度准入已停止，本批事务已回滚");
             Ok(slots)
         })?;
         for id in aborts {
@@ -1165,8 +1382,13 @@ impl Inner {
                 slot.cancel.cancel();
             }
         }
-        let n = admitted.len();
+        let mut n = 0;
         for turn in admitted {
+            if !self.admission_open() {
+                self.interrupt_unstarted(&turn)?;
+                continue;
+            }
+            n += 1;
             let turn = Arc::new(turn);
             let id = turn.job.id;
             let inner = self.clone();
@@ -1175,7 +1397,7 @@ impl Inner {
             // the slot is always registered before it can be removed.
             let task = tokio::spawn(async move {
                 if let Err(e) = inner.execute(&t).await {
-                    *lock(&inner.fault) = Some(format!("无法保存任务状态：{e}"));
+                    inner.scheduler_failed("journal_error", format!("无法保存任务状态：{e}"));
                 }
                 let mut s = lock(&inner.sched);
                 s.active.remove(&t.job.id);
@@ -1316,6 +1538,10 @@ impl Inner {
     /// commit. Every error goes to `fail`.
     async fn run(self: &Arc<Self>, turn: &Arc<Turn>) -> Result<(), TurnError> {
         let job = &turn.job;
+        if !self.admission_open() {
+            self.interrupt_unstarted(turn)?;
+            return Ok(());
+        }
         let primary = job.primary();
         turn.ensure_current()?;
         if let Some(w) = self.db.with(|q| crate::workspaces::get(q,job.id))? {
@@ -1494,6 +1720,10 @@ impl Inner {
         let host: Arc<dyn TurnHost> = Arc::new(Host(turn.clone()));
         let (tx, mut rx) = mpsc::unbounded_channel();
         let runner = self.opts.runner.clone();
+        if !self.admission_open() {
+            self.interrupt_unstarted(turn)?;
+            return Ok(());
+        }
         lock(&turn.activity).set_phase(ActivityPhase::Spawning, now());
         let mut native = tokio::spawn(runner.run_turn(adapter, request, host, tx, turn.cancel.clone()));
         let wall = self.opts.runner.wall_clock();
@@ -2554,6 +2784,14 @@ impl Inner {
     /// Start keep-alives for waiting Claude jobs whose cache is about to
     /// expire. Called from the scheduler timer; never blocks it.
     fn keepalive_pass(self: &Arc<Self>) {
+        if self.scheduler_database_busy.load(Ordering::SeqCst) {
+            return;
+        }
+        if self.stopping.load(Ordering::SeqCst)
+            || self.scheduler_state.load(Ordering::SeqCst) != SCHEDULER_RUNNING
+        {
+            return;
+        }
         if !self.opts.efficiency.read().unwrap_or_else(|e| e.into_inner()).claude_keepalive {
             return;
         }
@@ -2585,6 +2823,11 @@ impl Inner {
     }
 
     async fn keepalive(self: Arc<Self>, adapter: Arc<dyn Adapter>, mut request: RunRequest) {
+        if self.stopping.load(Ordering::SeqCst)
+            || self.scheduler_state.load(Ordering::SeqCst) != SCHEDULER_RUNNING
+        {
+            return;
+        }
         let job = request.job;
         let who = Who { ticket: request.ticket, id: job, turn: request.turn };
         // The bus contributes tool definitions; the fork must list the same tools.
@@ -2953,6 +3196,7 @@ mod keepalive_tests {
         let claude = Arc::new(WarmClaude::default());
         let opts = EngineOptions { tick: Duration::from_secs(3600), ..Default::default() };
         let engine = Engine::open(dir, vec![claude.clone() as Arc<dyn Adapter>], opts).unwrap();
+        engine.inner.scheduler_state.store(SCHEDULER_RUNNING, Ordering::SeqCst);
         engine
             .db()
             .with(|q| {
@@ -3026,6 +3270,11 @@ mod keepalive_tests {
             age(engine, 1, 3500.0);
             engine.inner.keepalive_pass();
         };
+        engine.inner.scheduler_state.store(SCHEDULER_FAILED, Ordering::SeqCst);
+        due(&engine);
+        settle(&engine).await;
+        assert!(lock(&claude.seen).is_empty(), "failed scheduler must not keep a cache warm");
+        engine.inner.scheduler_state.store(SCHEDULER_RUNNING, Ordering::SeqCst);
         engine.inner.opts.efficiency.write().unwrap().claude_keepalive = false;
         due(&engine);
         settle(&engine).await;
@@ -3049,3 +3298,7 @@ mod keepalive_tests {
         assert!(lock(&claude.seen).is_empty(), "read-only and running jobs are not refreshed");
     }
 }
+
+#[cfg(test)]
+#[path = "engine/scheduler_tests.rs"]
+mod scheduler_tests;

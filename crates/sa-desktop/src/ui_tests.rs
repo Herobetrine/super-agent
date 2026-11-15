@@ -126,6 +126,93 @@ fn ticket_count(app: &App) -> usize {
 }
 
 #[test]
+fn scheduler_failure_is_not_displayed_as_running() {
+    use sa_engine::engine::SchedulerState;
+    let data = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let mut h = harness(data.path(), "readonly");
+    fork_source(&mut h, project.path());
+    h.run_steps(3);
+    assert!(h.query_by_label("调度中").is_some());
+    // Corrupt only this disposable journal's admission schema. The worker
+    // and UI stay alive, but this must no longer look like a healthy scheduler.
+    h.state().host.as_ref().unwrap().engine().db().with(|q| {
+        q.conn().execute_batch("ALTER TABLE ticket_pause RENAME TO broken_pause")?;
+        Ok(())
+    }).unwrap();
+    until(&mut h, "scheduler fault visible", |app| {
+        app.host.as_ref().unwrap().scheduler_health().state == SchedulerState::Failed
+    });
+    h.run_steps(3);
+    assert!(h.query_by_label("调度已停止").is_some());
+    assert!(h.query_by_label("调度中").is_none());
+    h.state().host.as_ref().unwrap().engine().db().with(|q| {
+        q.conn().execute_batch("ALTER TABLE broken_pause RENAME TO ticket_pause")?;
+        Ok(())
+    }).unwrap();
+}
+
+#[test]
+fn scheduler_database_contention_is_visible_and_clears_after_release() {
+    use sa_engine::engine::SchedulerState;
+    let data = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let mut h = harness(data.path(), "readonly");
+    fork_source(&mut h, project.path());
+    h.state().host.as_ref().unwrap().engine().db().with(|q| {
+        q.conn().busy_timeout(Duration::from_millis(2))?;
+        Ok(())
+    }).unwrap();
+    let writer = rusqlite::Connection::open(data.path().join("hub.sqlite3")).unwrap();
+    writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+    until(&mut h, "database contention visible", |app| {
+        app.host.as_ref().unwrap().scheduler_health().state == SchedulerState::DatabaseBusy
+    });
+    h.run_steps(3);
+    assert!(h.query_by_label("等待数据库").is_some());
+    assert!(h.query_by_label("调度中").is_none());
+    assert!(h.query_by_label("调度已停止").is_none());
+    writer.execute_batch("ROLLBACK").unwrap();
+    until(&mut h, "scheduler resumed after writer release", |app| {
+        app.host.as_ref().unwrap().scheduler_health().state == SchedulerState::Running
+    });
+    h.run_steps(3);
+    assert!(h.query_by_label("调度中").is_some());
+    assert!(h.query_by_label("等待数据库").is_none());
+}
+
+#[test]
+fn conversation_and_collaboration_render_while_journal_is_busy() {
+    let data = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let mut h = harness(data.path(), "readonly");
+    fork_source(&mut h, project.path());
+    h.state_mut().inspector_open = true;
+    h.state_mut().tab = Tab::Collab;
+    h.run_steps(3);
+    // Let the normal activity sampler become due; a held lock must not
+    // prevent the real conversation or collaboration view from repainting.
+    std::thread::sleep(Duration::from_millis(1050));
+    let engine = h.state().host.as_ref().unwrap().engine().clone();
+    let (held_tx, held_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let holder = std::thread::spawn(move || engine.db().with(|_| {
+        held_tx.send(()).unwrap();
+        let _ = release_rx.recv_timeout(Duration::from_secs(3));
+        Ok(())
+    }).unwrap());
+    held_rx.recv().unwrap();
+    let started = Instant::now();
+    h.run_steps(3);
+    h.state_mut().open_models(crate::models::Scope::Defaults);
+    h.run_steps(3);
+    let elapsed = started.elapsed();
+    let _ = release_tx.send(());
+    holder.join().unwrap();
+    assert!(elapsed < Duration::from_secs(1), "UI waited for journal: {elapsed:?}");
+}
+
+#[test]
 fn handoff_pause_clicks_keep_active_work_and_require_explicit_resume() {
     let data = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
@@ -1153,7 +1240,7 @@ fn live_badge_and_failover_toggle() {
     h.run_steps(2);
     h.get_by_label("只读子任务的执行端不可用时自动改派").click();
     until(&mut h, "failover on", |a| {
-        a.host.as_ref().unwrap().failover(ticket)
+        a.host.as_ref().unwrap().failover(ticket).unwrap_or(false)
     });
 }
 

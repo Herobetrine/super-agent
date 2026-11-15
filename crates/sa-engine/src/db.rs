@@ -6,7 +6,7 @@
 
 use crate::protocol::{self as p, END_SQL, digest, stringify};
 use anyhow::{Result, anyhow};
-use rusqlite::{Connection, ToSql, types::ValueRef};
+use rusqlite::{Connection, ToSql, Transaction, TransactionBehavior, types::ValueRef};
 use serde_json::{Map, Value, json};
 use std::{
     path::Path,
@@ -34,6 +34,28 @@ CREATE TABLE IF NOT EXISTS job_failovers(original INTEGER PRIMARY KEY,replacemen
 CREATE INDEX IF NOT EXISTS job_failovers_replacement ON job_failovers(replacement);";
 
 pub const INTERRUPT_REASON: &str = "上次执行中断，可能已经产生副作用，继续前请核对实际状态。";
+
+/// Proof that BEGIN IMMEDIATE failed with BUSY before its closure ran.
+/// Transactions that began successfully never receive this marker.
+#[derive(Debug)]
+pub(crate) struct BeginBusy {
+    pub extended_code: i32,
+}
+
+impl std::fmt::Display for BeginBusy {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "SQLite BEGIN busy (code {})", self.extended_code)
+    }
+}
+
+impl std::error::Error for BeginBusy {}
+
+pub(crate) fn sqlite_error_codes(error: &anyhow::Error) -> Option<(i32, i32)> {
+    match error.downcast_ref::<rusqlite::Error>()? {
+        rusqlite::Error::SqliteFailure(failure, _) => Some((failure.extended_code & 0xff, failure.extended_code)),
+        _ => None,
+    }
+}
 
 pub struct Db {
     conn: Mutex<Option<Connection>>,
@@ -67,24 +89,50 @@ impl Db {
         f(&Q(conn))
     }
 
+    /// Read immediately when the connection is available. UI and observation
+    /// callers can omit their snapshot while an engine transaction owns it.
+    pub fn try_with<T>(&self, f: impl FnOnce(&Q) -> Result<T>) -> Result<Option<T>> {
+        let guard = match self.conn.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+        };
+        let conn = guard.as_ref().ok_or_else(|| anyhow!("调度台已关闭"))?;
+        f(&Q(conn)).map(Some)
+    }
+
     /// `transaction(db, fn)`: BEGIN IMMEDIATE, COMMIT, ROLLBACK on error.
     pub fn tx<T>(&self, f: impl FnOnce(&Q) -> Result<T>) -> Result<T> {
+        self.transaction(f, false)
+    }
+
+    /// Admission alone can retry a BUSY begin: its transaction body has not
+    /// run and therefore cannot have claimed an in-memory breaker probe.
+    pub(crate) fn admission_tx<T>(&self, f: impl FnOnce(&Q) -> Result<T>) -> Result<T> {
+        self.transaction(f, true)
+    }
+
+    fn transaction<T>(&self, f: impl FnOnce(&Q) -> Result<T>, classify_begin_busy: bool) -> Result<T> {
         let guard = self.lock();
         let conn = guard.as_ref().ok_or_else(|| anyhow!("调度台已关闭"))?;
-        conn.execute_batch("BEGIN IMMEDIATE")?;
-        match f(&Q(conn)) {
-            Ok(v) => match conn.execute_batch("COMMIT") {
-                Ok(()) => Ok(v),
-                Err(e) => {
-                    let _ = conn.execute_batch("ROLLBACK");
-                    Err(e.into())
+        // The transaction rolls back on ordinary errors, commit errors and
+        // unwinding. Its lifetime ends before the connection mutex is released.
+        let was_autocommit = conn.is_autocommit();
+        let transaction = match Transaction::new_unchecked(conn, TransactionBehavior::Immediate) {
+            Ok(transaction) => transaction,
+            Err(error) => {
+                let error = anyhow::Error::from(error);
+                if classify_begin_busy && was_autocommit && conn.is_autocommit()
+                    && let Some((rusqlite::ffi::SQLITE_BUSY, extended_code)) = sqlite_error_codes(&error)
+                {
+                    return Err(error.context(BeginBusy { extended_code }));
                 }
-            },
-            Err(e) => {
-                let _ = conn.execute_batch("ROLLBACK");
-                Err(e)
+                return Err(error);
             }
-        }
+        };
+        let value = f(&Q(&transaction))?;
+        transaction.commit()?;
+        Ok(value)
     }
 
     pub fn is_closed(&self) -> bool {

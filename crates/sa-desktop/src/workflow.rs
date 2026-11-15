@@ -36,7 +36,10 @@ impl WorkflowState {
         egui::CollapsingHeader::new("隔离工作区与合入")
             .id_salt(("workspace", ticket))
             .show(ui, |ui| {
-                let mut enabled = host.isolated_writers(ticket);
+                let Ok(mut enabled) = host.isolated_writers(ticket) else {
+                    ui.small("工单状态正在更新，稍后重试。");
+                    return;
+                };
                 if ui
                     .add(widgets::Check::new(&mut enabled, "将后续写入子任务放入独立 Git 工作区"))
                     .changed()

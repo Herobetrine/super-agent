@@ -22,7 +22,8 @@ pub enum PauseStatus {
     Paused,
 }
 
-pub(crate) fn status(q: &Q, ticket: i64) -> Result<PauseStatus> {
+/// Read the pause gate inside an existing journal snapshot.
+pub fn status(q: &Q, ticket: i64) -> Result<PauseStatus> {
     match q.one("SELECT state FROM ticket_pause WHERE ticket=?", &[&ticket])? {
         None => Ok(PauseStatus::Running),
         Some(row) => match str_of(&row, "state") {

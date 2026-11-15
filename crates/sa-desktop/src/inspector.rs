@@ -280,12 +280,15 @@ impl App {
         let badges = self.live_badges();
         if let Some(host) = &self.host {
             let ticket = snap.ticket.id;
-            let mut on = host.failover(ticket);
-            let before = on;
-            widgets::toggle(ui, &mut on, "只读子任务的执行端不可用时自动改派", &pal)
-                .on_hover_text("仅对只读子任务生效；写入任务和主控从不自动改派。");
-            if on != before {
-                self.submit(Action::SetFailover { ticket, enabled: on });
+            if let Ok(mut on) = host.failover(ticket) {
+                let before = on;
+                widgets::toggle(ui, &mut on, "只读子任务的执行端不可用时自动改派", &pal)
+                    .on_hover_text("仅对只读子任务生效；写入任务和主控从不自动改派。");
+                if on != before {
+                    self.submit(Action::SetFailover { ticket, enabled: on });
+                }
+            } else {
+                ui.small("工单状态正在更新，暂无法读取自动改派设置。");
             }
             ui.add_space(6.0);
         }

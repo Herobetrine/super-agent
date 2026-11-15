@@ -100,6 +100,90 @@ fn roster_lists_ticket_tasks_and_published_progress() {
     assert_eq!(tasks[2]["you"], true);
 }
 
+#[test]
+fn roster_progress_is_ticket_scoped_and_uses_the_existing_index() {
+    let fx = fixture();
+    let worker = caller(2, 3, "codex", 1);
+    run(&fx, &worker, "publish", json!({"id":"first","summary":"earlier progress"})).unwrap();
+    run(&fx, &worker, "publish", json!({"id":"latest","summary":"latest progress"})).unwrap();
+    fx.db.with(|q| {
+        // A mismatched historical row must not become another ticket's context.
+        q.log(Who { ticket: 2, id: 2, turn: 3 }, "job.progress", &json!({"summary":"other ticket"}))?;
+        let plan = q.all(
+            &format!("EXPLAIN QUERY PLAN {ROSTER_QUERY}"),
+            &[&1, &ROSTER_LIMIT, &1],
+        )?;
+        assert!(plan.iter().any(|row| str_of(row, "detail").contains("events_ticket_kind")), "{plan:?}");
+        Ok(())
+    }).unwrap();
+    let roster = run(&fx, &worker, "roster", json!({})).unwrap();
+    assert_eq!(roster["tasks"][1]["latest_progress"], "latest progress");
+    assert_eq!(roster["tasks"][2]["latest_progress"], Value::Null);
+    assert_eq!(roster["tasks"].as_array().unwrap().len(), 3);
+}
+
+#[test]
+fn roster_keeps_the_newest_hundred_tasks_in_id_order() {
+    let fx = fixture();
+    fx.db.tx(|q| {
+        for id in 10..115 {
+            q.run(
+                "INSERT INTO jobs(id,ticket,parent,agent,body,writing,depth,turn,state) VALUES(?,1,1,'codex','fixture',0,1,1,'done')",
+                &[&id],
+            )?;
+        }
+        q.log(Who { ticket: 1, id: 114, turn: 1 }, "job.progress", &json!({"summary":"latest task progress"}))?;
+        Ok(())
+    }).unwrap();
+    let roster = run(&fx, &caller(2, 3, "codex", 1), "roster", json!({})).unwrap();
+    let tasks = roster["tasks"].as_array().unwrap();
+    assert_eq!(tasks.len(), 100);
+    assert_eq!(tasks[0]["id"], 15);
+    assert_eq!(tasks[99]["id"], 114);
+    assert_eq!(tasks[99]["latest_progress"], "latest task progress");
+    assert!(tasks.windows(2).all(|pair| pair[0]["id"].as_i64() < pair[1]["id"].as_i64()));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn roster_reads_committed_state_while_another_connection_holds_the_writer() {
+    let Fx { dir, db } = fixture();
+    let bus = CollabBus::start(dir.path(), None).await.unwrap();
+    let grant = bus.grant(1, 2, 3, "codex").unwrap();
+    let worker = client(&bus, &grant.token).await;
+    let wrong_ticket = client(&bus, &bus.grant(2, 2, 3, "codex").unwrap().token).await;
+    let stale = client(&bus, &bus.grant(1, 2, 2, "codex").unwrap().token).await;
+    let (held_tx, held_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let holder = std::thread::spawn(move || {
+        db.tx(|q| {
+            q.run("UPDATE jobs SET role='uncommitted role' WHERE id=2", &[])?;
+            held_tx.send(()).unwrap();
+            release_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+            Ok(())
+        }).unwrap();
+    });
+    held_rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+    let observed = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        let roster = tool(&worker, "roster", json!({})).await;
+        let denied_ticket = tool(&wrong_ticket, "roster", json!({})).await;
+        let denied_turn = tool(&stale, "roster", json!({})).await;
+        (roster, denied_ticket, denied_turn)
+    }).await;
+    // Release the writer even when the read assertion fails.
+    let _ = release_tx.send(());
+    holder.join().unwrap();
+    let (roster, denied_ticket, denied_turn) = observed.expect("roster waited for an unrelated writer");
+    assert_eq!(roster["error"], false);
+    assert_eq!(roster["value"]["tasks"][1]["role"], "writer");
+    assert_eq!(roster["value"]["tasks"].as_array().unwrap().len(), 3);
+    assert_eq!(denied_ticket["error"], true);
+    assert_eq!(denied_turn["error"], true);
+    bus.revoke(&grant.token);
+    let mut request = rmcp::model::CallToolRequestParams::new("roster");
+    request.arguments = Some(Map::new());
+    assert!(worker.call_tool(request).await.is_err());
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn http_round_trip_requires_a_live_grant() {
     use rmcp::ServiceExt;
