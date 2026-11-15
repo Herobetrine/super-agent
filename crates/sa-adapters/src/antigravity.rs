@@ -561,7 +561,13 @@ async fn run(
             overrides.to_string(),
         ]);
     } else {
-        args.push("--disable-slash-commands".into());
+        // agy 1.5.9 strict mode rejects the first read without review. Keep
+        // the private settings deny rules and enable its native review path.
+        args.extend([
+            "--disable-slash-commands".into(),
+            "--settings".into(),
+            json!({"toolPermission":"request-review"}).to_string(),
+        ]);
     }
     emit.journal(
         "adapter.permission",
@@ -637,9 +643,7 @@ async fn run(
     {
         return Err(session_mismatch(FAILED));
     }
-    let ok = last["status"] == json!("SUCCESS")
-        && last["response"].is_string()
-        && conversation.is_some();
+    let ok = last["status"] == json!("SUCCESS") && conversation.is_some();
     if !ok {
         let mut err = if last.is_null() {
             classified(ErrorClass::ProcessCrashed, "agy:no_terminal")
@@ -652,8 +656,32 @@ async fn run(
         err.session_id = conversation.map(str::to_string).or(session);
         return Err(err);
     }
+    let Some(response) = last["response"].as_str() else {
+        let mut err = classified(ErrorClass::Protocol, "agy:invalid_response");
+        err.message = "Antigravity 成功终态缺少有效的正文字符串".into();
+        err.session_id = conversation.map(str::to_string).or(session);
+        return Err(err);
+    };
+    if !sa_engine::protocol::valid_str(response, usize::MAX) {
+        let denied = last["denied_actions"]
+            .as_array()
+            .is_some_and(|actions| !actions.is_empty());
+        let mut err = if denied {
+            classified(ErrorClass::Permission, "agy:empty_response_denied")
+        } else {
+            classified(ErrorClass::Protocol, "agy:empty_response")
+        };
+        err.message = if denied {
+            "Antigravity 操作被权限策略拒绝，未返回有效正文"
+        } else {
+            "Antigravity 成功终态未返回有效正文"
+        }
+        .into();
+        err.session_id = conversation.map(str::to_string).or(session);
+        return Err(err);
+    }
     Ok(RunOutcome {
-        text: last["response"].as_str().unwrap_or_default().to_string(),
+        text: response.to_string(),
         session_id: conversation.map(str::to_string),
     })
 }
@@ -774,13 +802,30 @@ int main(int argc, char **argv) {
     if (!strcmp(kind, "models")) puts(getenv("FAKE_AGY_MODELS"));
     else if (!strcmp(kind, "effort")) puts(getenv("FAKE_AGY_EFFORT"));
     else {
+        const char *expected_settings = getenv("FAKE_AGY_EXPECT_SETTINGS");
+        if (expected_settings) {
+            const char *settings = NULL;
+            int slash_disabled = 0, skip_permissions = 0;
+            for (int i = 1; i < argc; i++) {
+                if (!strcmp(argv[i], "--settings") && i + 1 < argc) settings = argv[++i];
+                if (!strcmp(argv[i], "--disable-slash-commands")) slash_disabled = 1;
+                if (!strcmp(argv[i], "--dangerously-skip-permissions")) skip_permissions = 1;
+            }
+            if (!settings || strcmp(settings, expected_settings)) return 6;
+            int restricted = getenv("FAKE_AGY_EXPECT_RESTRICTED") != NULL;
+            if (slash_disabled != restricted || skip_permissions == restricted) return 7;
+        }
         const char *token = getenv("FAKE_AGY_EXPECT_TOKEN"), *base = getenv("FAKE_AGY_EXPECT_BASE");
         if (token && (!getenv("GEMINI_API_KEY") || strcmp(token, getenv("GEMINI_API_KEY")))) return 3;
         if (base && (!getenv("GOOGLE_GEMINI_BASE_URL") || strcmp(base, getenv("GOOGLE_GEMINI_BASE_URL")))) return 4;
         char input[8192];
         while (fgets(input, sizeof(input), stdin)) {}
         puts("{\"event\":\"init\",\"conversation_id\":\"fixture-session\"}");
-        puts("{\"event\":\"result\",\"result\":{\"conversation_id\":\"fixture-session\",\"status\":\"SUCCESS\",\"response\":\"fixture-ok\"}}");
+        const char *step = getenv("FAKE_AGY_STEP");
+        if (step) puts(step);
+        const char *result = getenv("FAKE_AGY_RESULT");
+        if (result) puts(result);
+        else puts("{\"event\":\"result\",\"result\":{\"conversation_id\":\"fixture-session\",\"status\":\"SUCCESS\",\"response\":\"fixture-ok\"}}");
     }
     return 0;
 }
@@ -838,6 +883,14 @@ int main(int argc, char **argv) {
     }
 
     async fn run_fixture(sys: Sys, route: Route) -> Result<RunOutcome, AdapterError> {
+        run_fixture_profile(sys, route, "full").await
+    }
+
+    async fn run_fixture_profile(
+        sys: Sys,
+        route: Route,
+        profile: &str,
+    ) -> Result<RunOutcome, AdapterError> {
         let req = RunRequest {
             ticket: 1,
             job: 1,
@@ -847,8 +900,8 @@ int main(int argc, char **argv) {
             images: vec![],
             cwd: sys.temp.clone(),
             route,
-            profile: "full".into(),
-            writable: true,
+            profile: profile.into(),
+            writable: profile == "full",
             session_id: None,
             bus: None,
         };
@@ -957,6 +1010,128 @@ int main(int argc, char **argv) {
             expected.push(format!("{source}\trun\t{model}"));
             assert_eq!(calls(root.path()), expected);
         }
+    }
+
+    #[tokio::test]
+    async fn text_permission_override_preserves_restricted_file_denials_and_full_access() {
+        for profile in ["readonly", "ask", "partial", "full"] {
+            let root = tempfile::tempdir().unwrap();
+            let mut sys = fixture_sys(root.path());
+            let restricted = profile != "full";
+            let settings = if restricted {
+                sys.set("FAKE_AGY_EXPECT_RESTRICTED", "1");
+                json!({"toolPermission":"request-review"})
+            } else {
+                json!({"modelProvider":""})
+            };
+            sys.set("FAKE_AGY_EXPECT_SETTINGS", settings.to_string());
+            let settings_path = sys.platform_dir().join("agy-reader").join(SETTINGS_REL);
+            let outcome = run_fixture_profile(sys, route("google", "model-b", None), profile)
+                .await
+                .unwrap();
+            assert_eq!(outcome.text, "fixture-ok");
+            if restricted {
+                assert_eq!(read_json_or(&settings_path), json!({
+                    "modelProvider":"",
+                    "toolPermission":"strict",
+                    "disableSlashCommands":true,
+                    "agentMode":"",
+                    "permissions":{"deny":[
+                        "write_file(*)", "command(*)", "mcp(*)", "execute_url(*)", "read_url(*)"
+                    ]}
+                }));
+            } else {
+                assert!(!settings_path.exists());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn run_rejects_empty_success_with_classification_and_session() {
+        for response in ["", " \t\r\n\u{feff}\u{3000}"] {
+            for denied in [false, true] {
+                let root = tempfile::tempdir().unwrap();
+                let mut sys = fixture_sys(root.path());
+                sys.set("FAKE_AGY_STEP", json!({
+                    "event":"step_update",
+                    "step_update":{"step_type":"agent_response","text_delta":"partial only","state":"DONE"}
+                }).to_string());
+                sys.set("FAKE_AGY_RESULT", json!({"event":"result","result":{
+                    "conversation_id":"fixture-session","status":"SUCCESS","response":response,
+                    "denied_actions":if denied {json!([{"action":"read_file","display_name":"ReadFile"}])} else {json!([])}
+                }}).to_string());
+                let error = run_fixture(sys, route("google", "model-b", None))
+                    .await
+                    .unwrap_err();
+                let expected_class = if denied { ErrorClass::Permission } else { ErrorClass::Protocol };
+                let expected_code = if denied { "agy:empty_response_denied" } else { "agy:empty_response" };
+                assert_eq!(error.class, expected_class);
+                assert_eq!(error.code.as_deref(), Some(expected_code));
+                assert_eq!(error.session_id.as_deref(), Some("fixture-session"));
+                assert!(error.message.contains("未返回有效正文"));
+                assert_eq!(
+                    sa_engine::resilience::RetryLimits::default().for_error(&error),
+                    0
+                );
+                assert!(!sa_engine::resilience::classify::is_retryable(error.class));
+                assert_eq!(
+                    calls(root.path()).iter().filter(|line| line.contains("\trun\t")).count(),
+                    1
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn run_preserves_success_body_despite_denied_actions() {
+        let root = tempfile::tempdir().unwrap();
+        let mut sys = fixture_sys(root.path());
+        let response = "  完整正文\r\n\n";
+        sys.set("FAKE_AGY_RESULT", json!({"event":"result","result":{
+            "conversation_id":"fixture-session","status":"SUCCESS","response":response,
+            "denied_actions":[{"action":"read_file"}]
+        }}).to_string());
+        let outcome = run_fixture(sys, route("google", "model-b", None))
+            .await
+            .unwrap();
+        assert_eq!(outcome.text.as_bytes(), response.as_bytes());
+        assert_eq!(outcome.session_id.as_deref(), Some("fixture-session"));
+    }
+
+    #[tokio::test]
+    async fn run_rejects_malformed_success_body_and_preserves_native_failure() {
+        for response in [None, Some(Value::Null), Some(json!(42))] {
+            let root = tempfile::tempdir().unwrap();
+            let mut sys = fixture_sys(root.path());
+            let mut result = json!({
+                "conversation_id":"fixture-session","status":"SUCCESS",
+                "denied_actions":[{"action":"read_file"}]
+            });
+            if let Some(response) = response {
+                result["response"] = response;
+            }
+            sys.set("FAKE_AGY_RESULT", json!({"event":"result","result":result}).to_string());
+            let error = run_fixture(sys, route("google", "model-b", None))
+                .await
+                .unwrap_err();
+            assert_eq!(error.class, ErrorClass::Protocol);
+            assert_eq!(error.code.as_deref(), Some("agy:invalid_response"));
+            assert_eq!(error.session_id.as_deref(), Some("fixture-session"));
+        }
+        let root = tempfile::tempdir().unwrap();
+        let mut sys = fixture_sys(root.path());
+        sys.set("FAKE_AGY_RESULT", json!({"event":"result","result":{
+            "conversation_id":"fixture-session","status":"ERROR","response":"",
+            "error":"API error (attempt 4): UNAVAILABLE (code 503)",
+            "denied_actions":[{"action":"read_file"}]
+        }}).to_string());
+        let error = run_fixture(sys, route("google", "model-b", None))
+            .await
+            .unwrap_err();
+        assert_eq!(error.class, ErrorClass::Overloaded);
+        assert_eq!(error.http_status, Some(503));
+        assert!(error.native_retry_exhausted());
+        assert_eq!(error.session_id.as_deref(), Some("fixture-session"));
     }
 
     #[tokio::test]
