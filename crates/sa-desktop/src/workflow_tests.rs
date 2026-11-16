@@ -37,6 +37,8 @@ struct State {
     ui: WorkflowState,
     ticket: i64,
     actions: Vec<Action>,
+    /// App fonts are installed on the first frame.
+    fonts: bool,
 }
 
 fn harness(data: &Path) -> Harness<'static, State> {
@@ -45,6 +47,12 @@ fn harness(data: &Path) -> Harness<'static, State> {
         .with_size(egui::vec2(1200.0, 1000.0))
         .build_ui_state(
             |ui, state: &mut State| {
+                // The panel draws with the app's fonts (semibold headings).
+                if !state.fonts {
+                    state.fonts = true;
+                    crate::theme::install_fonts(ui.ctx());
+                    return;
+                }
                 if let Some(action) =
                     state
                         .ui
@@ -58,6 +66,7 @@ fn harness(data: &Path) -> Harness<'static, State> {
                 ui: WorkflowState::default(),
                 ticket: 1,
                 actions: vec![],
+                fonts: false,
             },
         )
 }

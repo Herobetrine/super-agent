@@ -1,12 +1,20 @@
-//! Small painted widgets: chips, avatars, icon buttons, the brand mark.
+//! Painted widgets shared by every screen: buttons, chips, status marks,
+//! avatars, tabs, sheets and dialog chrome.
+//!
+//! Three button weights, in falling order of emphasis: [`primary_button`]
+//! (one per screen or dialog), [`outline_button`] (secondary actions) and
+//! [`quiet_button`] (everything else). States read as a coloured dot plus
+//! text ([`status`]); tinted [`chip`]s are for counts and short tags.
 
 use crate::labels::agent_monogram;
 use crate::theme::{self, Palette, Tone};
 use egui::{
     Align2, Color32, CornerRadius, FontId, Galley, Pos2, Rect, Response, Sense, Shape, Stroke, Ui,
-    Vec2, pos2, text::LayoutJob, vec2,
+    UiBuilder, Vec2, pos2, text::LayoutJob, vec2,
 };
 use std::sync::Arc;
+
+const R: u8 = theme::CONTROL_RADIUS;
 
 /// Single-line galley, elided with "…" when wider than `max_w`.
 pub fn line_galley(ui: &Ui, text: &str, font: FontId, color: Color32, max_w: f32) -> Arc<Galley> {
@@ -18,10 +26,20 @@ pub fn line_galley(ui: &Ui, text: &str, font: FontId, color: Color32, max_w: f32
     ui.painter().layout_job(job)
 }
 
-/// Pill-shaped status chip.
+fn with_icon(icon: &str, text: &str) -> String {
+    if icon.is_empty() {
+        text.to_string()
+    } else if text.is_empty() {
+        icon.to_string()
+    } else {
+        format!("{icon}  {text}")
+    }
+}
+
+/// Tinted tag for counts and short labels.
 pub fn chip(ui: &mut Ui, text: &str, tone: Tone, size: f32) -> Response {
-    let galley = line_galley(ui, text, theme::body(size), tone.fg, 220.0);
-    let pad = vec2(8.0, 3.0);
+    let galley = line_galley(ui, text, theme::body(size), tone.fg, 240.0);
+    let pad = vec2(7.0, 2.5);
     let (rect, resp) = ui.allocate_exact_size(galley.size() + pad * 2.0, Sense::hover());
     if ui.is_rect_visible(rect) {
         ui.painter()
@@ -31,27 +49,55 @@ pub fn chip(ui: &mut Ui, text: &str, tone: Tone, size: f32) -> Response {
     resp
 }
 
-/// Chip with an icon prefix and optional outline.
+/// Chip with an icon prefix, announced to assistive tech by its text.
 pub fn badge(ui: &mut Ui, icon: &str, text: &str, tone: Tone) -> Response {
-    let label = if icon.is_empty() {
-        text.to_string()
-    } else {
-        format!("{icon}  {text}")
-    };
-    let response = chip(ui, &label, tone, theme::SMALL);
+    let response = chip(ui, &with_icon(icon, text), tone, theme::SMALL);
     response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, text));
     response
 }
 
-/// Agent avatar circle with monogram.
+/// State mark: a filled dot, haloed while the work is live.
+pub fn dot(ui: &Ui, center: Pos2, color: Color32, live: bool) {
+    let p = ui.painter();
+    if live {
+        p.circle_filled(center, 6.0, color.gamma_multiply(0.22));
+    }
+    p.circle_filled(center, 3.25, color);
+}
+
+/// A state as a dot plus text, without a background.
+pub fn status(ui: &mut Ui, text: &str, color: Color32, live: bool) -> Response {
+    let galley = line_galley(ui, text, theme::body(theme::SMALL), color, 240.0);
+    let lead = 16.0;
+    let size = vec2(lead + galley.size().x, galley.size().y.max(18.0));
+    let (rect, resp) = ui.allocate_exact_size(size, Sense::hover());
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, text));
+    if ui.is_rect_visible(rect) {
+        dot(ui, pos2(rect.left() + 6.0, rect.center().y + 0.5), color, live);
+        ui.painter().galley(
+            pos2(rect.left() + lead, rect.center().y - galley.size().y / 2.0),
+            galley,
+            color,
+        );
+    }
+    resp
+}
+
+/// Agent avatar: a rounded tile in the agent's colour with its monogram.
+/// Agents are tools, not people, so the tile is square rather than round.
 pub fn avatar_at(ui: &Ui, center: Pos2, radius: f32, agent: &str, pal: &Palette) {
     let p = ui.painter();
-    p.circle_filled(center, radius, pal.agent_color(agent));
+    let rect = Rect::from_center_size(center, Vec2::splat(radius * 2.0));
+    p.rect_filled(
+        rect,
+        CornerRadius::same((radius * 0.62).round() as u8),
+        pal.agent_color(agent),
+    );
     p.text(
         center + vec2(0.0, 0.5),
         Align2::CENTER_CENTER,
         agent_monogram(agent),
-        theme::strong((radius * 0.82).max(7.5)),
+        theme::strong((radius * 0.8).max(7.5)),
         Color32::WHITE,
     );
 }
@@ -75,43 +121,125 @@ pub fn icon_button(
 ) -> Response {
     let (rect, resp) = ui.allocate_exact_size(Vec2::splat(size), Sense::click());
     if ui.is_rect_visible(rect) {
-        let t = ui.ctx().animate_bool_with_time(resp.id.with("hover"), active || resp.hovered(), 0.1);
+        let t = ui
+            .ctx()
+            .animate_bool_with_time(resp.id.with("hover"), active || resp.hovered(), 0.1);
         if t > 0.0 {
-            ui.painter().rect_filled(rect, CornerRadius::same(8), hover_bg.gamma_multiply(t));
+            ui.painter()
+                .rect_filled(rect, CornerRadius::same(R), hover_bg.gamma_multiply(t));
         }
         ui.painter().text(
             rect.center(),
             Align2::CENTER_CENTER,
             icon,
-            theme::body(size * 0.5),
+            theme::body((size * 0.54).clamp(12.0, 18.0)),
             fg,
         );
     }
     resp.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
-/// Text button with icon, quiet by default and outlined on hover.
+/// Toggle for a side panel: a window outline with the panel's side marked,
+/// filled in while the panel is open.
+pub fn panel_button(ui: &mut Ui, right: bool, size: f32, pal: &Palette, open: bool) -> Response {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(size), Sense::click());
+    let label = if right { "项目面板" } else { "会话侧栏" };
+    resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, true, open, label));
+    if ui.is_rect_visible(rect) {
+        let t = ui
+            .ctx()
+            .animate_bool_with_time(resp.id.with("hover"), resp.hovered(), 0.1);
+        let p = ui.painter();
+        if t > 0.0 {
+            p.rect_filled(rect, CornerRadius::same(R), pal.hover.gamma_multiply(t));
+        }
+        let fg = if open { pal.ink } else { pal.mute };
+        let frame = Rect::from_center_size(rect.center(), vec2(16.0, 13.0));
+        let x = if right { frame.right() - 5.5 } else { frame.left() + 5.5 };
+        if open {
+            let pane = if right {
+                Rect::from_min_max(pos2(x, frame.top()), frame.max)
+            } else {
+                Rect::from_min_max(frame.min, pos2(x, frame.bottom()))
+            };
+            p.rect_filled(pane.shrink(1.0), CornerRadius::same(2), fg.gamma_multiply(0.28));
+        }
+        let stroke = Stroke::new(1.3_f32, fg);
+        p.rect_stroke(frame, CornerRadius::same(3), stroke, egui::StrokeKind::Inside);
+        p.line_segment([pos2(x, frame.top() + 1.0), pos2(x, frame.bottom() - 1.0)], stroke);
+    }
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// Borderless text button, optionally with an icon; filled while `active`.
 pub fn quiet_button(ui: &mut Ui, icon: &str, text: &str, pal: &Palette, active: bool) -> Response {
-    let label = if icon.is_empty() {
-        text.to_string()
-    } else {
-        format!("{icon}  {text}")
-    };
-    let galley = line_galley(ui, &label, theme::body(13.0), pal.ink, 400.0);
-    let pad = vec2(10.0, 6.0);
+    let enabled = ui.is_enabled();
+    let color = if enabled { pal.ink } else { pal.faint };
+    let galley = line_galley(ui, &with_icon(icon, text), theme::body(theme::UI), color, 400.0);
+    let pad = vec2(9.0, 5.5);
     let (rect, resp) = ui.allocate_exact_size(galley.size() + pad * 2.0, Sense::click());
-    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), text));
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, text));
     if ui.is_rect_visible(rect) {
         let p = ui.painter();
         if active {
-            p.rect_filled(rect, CornerRadius::same(8), pal.selected);
+            p.rect_filled(rect, CornerRadius::same(R), pal.selected);
         } else {
-            let t = ui.ctx().animate_bool_with_time(resp.id.with("hover"), resp.hovered(), 0.1);
+            let t = ui
+                .ctx()
+                .animate_bool_with_time(resp.id.with("hover"), enabled && resp.hovered(), 0.1);
             if t > 0.0 {
-                p.rect_filled(rect, CornerRadius::same(8), pal.hover.gamma_multiply(t));
+                p.rect_filled(rect, CornerRadius::same(R), pal.hover.gamma_multiply(t));
             }
         }
-        p.galley(rect.min + pad, galley, pal.ink);
+        p.galley(rect.min + pad, galley, color);
+    }
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// Bordered button for secondary actions.
+pub fn outline_button(ui: &mut Ui, icon: &str, text: &str, pal: &Palette) -> Response {
+    let enabled = ui.is_enabled();
+    let color = if enabled { pal.ink } else { pal.faint };
+    let galley = line_galley(ui, &with_icon(icon, text), theme::body(theme::UI), color, 400.0);
+    let pad = vec2(11.0, 5.5);
+    let (rect, resp) = ui.allocate_exact_size(galley.size() + pad * 2.0, Sense::click());
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, text));
+    if ui.is_rect_visible(rect) {
+        let t = ui
+            .ctx()
+            .animate_bool_with_time(resp.id.with("hover"), enabled && resp.hovered(), 0.1);
+        ui.painter().rect(
+            rect,
+            CornerRadius::same(R),
+            pal.surface.lerp_to_gamma(pal.hover, t * 0.7),
+            Stroke::new(1.0_f32, pal.line),
+            egui::StrokeKind::Inside,
+        );
+        ui.painter().galley(rect.min + pad, galley, color);
+    }
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// Bordered button in the failure colour for destructive actions.
+pub fn danger_button(ui: &mut Ui, icon: &str, text: &str, pal: &Palette) -> Response {
+    let enabled = ui.is_enabled();
+    let color = if enabled { pal.fail.fg } else { pal.faint };
+    let galley = line_galley(ui, &with_icon(icon, text), theme::body(theme::UI), color, 400.0);
+    let pad = vec2(11.0, 5.5);
+    let (rect, resp) = ui.allocate_exact_size(galley.size() + pad * 2.0, Sense::click());
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, text));
+    if ui.is_rect_visible(rect) {
+        let t = ui
+            .ctx()
+            .animate_bool_with_time(resp.id.with("hover"), enabled && resp.hovered(), 0.1);
+        ui.painter().rect(
+            rect,
+            CornerRadius::same(R),
+            pal.surface.lerp_to_gamma(pal.fail.bg, t),
+            Stroke::new(1.0_f32, pal.fail.fg.gamma_multiply(0.35)),
+            egui::StrokeKind::Inside,
+        );
+        ui.painter().galley(rect.min + pad, galley, color);
     }
     resp.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
@@ -141,34 +269,42 @@ pub fn brand_mark(ui: &Ui, rect: Rect, pal: &Palette) {
     }
 }
 
+/// Activity spinner sized to sit on a text line.
+pub fn spinner(ui: &mut Ui) -> Response {
+    ui.add(egui::Spinner::new().size(15.0))
+}
+
 /// A one-pixel horizontal rule across the available width.
 pub fn rule(ui: &mut Ui, color: Color32) {
     let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 1.0), Sense::hover());
     ui.painter().rect_filled(r, 0.0, color);
 }
 
-/// Card frame used across panels.
+/// Small muted heading above a group of controls or rows.
+pub fn section(ui: &mut Ui, text: &str, pal: &Palette) -> Response {
+    ui.label(
+        egui::RichText::new(text)
+            .font(theme::strong(theme::SMALL))
+            .color(pal.mute),
+    )
+}
+
+/// Outlined block for an item that stands on its own inside a sheet.
+/// Do not nest cards; separate rows with [`rule`] instead.
 pub fn card(pal: &Palette) -> egui::Frame {
     egui::Frame::new()
         .fill(pal.surface)
-        .stroke(Stroke::new(1.0_f32, pal.line_soft))
+        .stroke(Stroke::new(1.0_f32, pal.line))
         .corner_radius(CornerRadius::same(10))
-        .shadow(soft_shadow(pal))
         .inner_margin(egui::Margin::symmetric(12, 10))
 }
 
-/// Barely-there lift for resting cards (none in dark mode, where edges carry it).
-pub fn soft_shadow(pal: &Palette) -> egui::Shadow {
-    if pal.dark {
-        egui::Shadow::NONE
-    } else {
-        egui::Shadow {
-            offset: [0, 1],
-            blur: 4,
-            spread: 0,
-            color: Color32::from_black_alpha(9),
-        }
-    }
+/// Borderless quiet block (quoted results, summaries, code-like detail).
+pub fn well(pal: &Palette) -> egui::Frame {
+    egui::Frame::new()
+        .fill(pal.surface_alt)
+        .corner_radius(CornerRadius::same(10))
+        .inner_margin(egui::Margin::symmetric(12, 9))
 }
 
 /// Tinted callout frame.
@@ -179,18 +315,35 @@ pub fn callout(tone: Tone) -> egui::Frame {
         .inner_margin(egui::Margin::symmetric(14, 10))
 }
 
-/// Paint a 3px accent bar on the left edge of `rect`.
+/// Paint a 2px lane on the left edge of `rect` (who is speaking).
 pub fn left_bar(ui: &Ui, rect: Rect, color: Color32) {
     ui.painter().rect_filled(
-        Rect::from_min_size(rect.min, vec2(3.0, rect.height())),
-        CornerRadius {
-            nw: 3,
-            sw: 3,
-            ne: 0,
-            se: 0,
-        },
+        Rect::from_min_size(rect.min, vec2(2.0, rect.height())),
+        CornerRadius::same(1),
         color,
     );
+}
+
+/// The window is a grey canvas carrying white sheets. Paints one sheet over
+/// the whole of `ui` and runs `add` inside it, clipped to the sheet.
+pub fn sheet<R>(ui: &mut Ui, pal: &Palette, add: impl FnOnce(&mut Ui) -> R) -> R {
+    let rect = ui.max_rect();
+    ui.painter().rect(
+        rect,
+        CornerRadius::same(theme::RADIUS),
+        pal.surface,
+        Stroke::new(1.0_f32, pal.line),
+        egui::StrokeKind::Inside,
+    );
+    let inner = rect.shrink(1.0);
+    let out = ui
+        .scope_builder(UiBuilder::new().max_rect(inner), |ui| {
+            ui.set_clip_rect(inner.intersect(ui.clip_rect()));
+            add(ui)
+        })
+        .inner;
+    ui.advance_cursor_after_rect(rect);
+    out
 }
 
 /// Soft fades at the clipped edges of a scroll viewport so content dissolves
@@ -201,7 +354,7 @@ pub fn scroll_fades<R>(ui: &Ui, out: &egui::scroll_area::ScrollAreaOutput<R>, bg
     let margin = ui.visuals().clip_rect_margin;
     let rect = out.inner_rect.expand2(vec2(0.0, margin));
     let y = out.state.offset.y;
-    let painter = ui.painter().with_clip_rect(rect);
+    let painter = ui.painter().with_clip_rect(rect.intersect(ui.clip_rect()));
     let band = |top: f32, h: f32, from_bg_at_top: bool| {
         let r = Rect::from_min_max(pos2(rect.left(), top), pos2(rect.right(), top + h));
         let clear = Color32::TRANSPARENT;
@@ -306,22 +459,31 @@ pub fn combo(id: impl std::hash::Hash) -> egui::ComboBox {
             rect.center(),
             Align2::CENTER_CENTER,
             caret,
-            theme::body(12.0),
-            visuals.fg_stroke.color,
+            theme::body(11.0),
+            visuals.fg_stroke.color.gamma_multiply(0.7),
         );
     })
 }
 
+/// Make the combo boxes and buttons added to `ui` borderless until hovered
+/// (toolbars, where a row of outlined controls would read as clutter).
+pub fn quiet_controls(ui: &mut Ui, pal: &Palette) {
+    let w = &mut ui.visuals_mut().widgets;
+    w.inactive.weak_bg_fill = Color32::TRANSPARENT;
+    w.inactive.bg_stroke = Stroke::NONE;
+    w.hovered.weak_bg_fill = pal.hover;
+    w.hovered.bg_stroke = Stroke::NONE;
+    w.active.weak_bg_fill = pal.selected;
+    w.active.bg_stroke = Stroke::NONE;
+    w.open.weak_bg_fill = pal.selected;
+    w.open.bg_stroke = Stroke::NONE;
+}
+
 /// Filled accent button for the primary action of a dialog or screen.
 pub fn primary_button(ui: &mut Ui, icon: &str, text: &str, pal: &Palette, enabled: bool) -> Response {
-    let label = if icon.is_empty() {
-        text.to_string()
-    } else {
-        format!("{icon}  {text}")
-    };
-    let fg = if pal.dark { pal.canvas } else { Color32::WHITE };
-    let galley = line_galley(ui, &label, theme::strong(13.0), fg, 400.0);
-    let pad = vec2(14.0, 7.0);
+    let fg = pal.on_accent;
+    let galley = line_galley(ui, &with_icon(icon, text), theme::strong(theme::UI), fg, 400.0);
+    let pad = vec2(13.0, 6.0);
     let sense = if enabled { Sense::click() } else { Sense::hover() };
     let (rect, resp) = ui.allocate_exact_size(galley.size() + pad * 2.0, sense);
     resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, text));
@@ -329,11 +491,11 @@ pub fn primary_button(ui: &mut Ui, icon: &str, text: &str, pal: &Palette, enable
         let hover = ui.ctx().animate_bool(resp.id.with("hover"), enabled && resp.hovered());
         let mut fill = pal.accent;
         if !enabled {
-            fill = fill.gamma_multiply(0.4);
+            fill = pal.surface.lerp_to_gamma(pal.accent, 0.3);
         } else if hover > 0.0 {
-            fill = fill.lerp_to_gamma(if pal.dark { Color32::WHITE } else { Color32::BLACK }, 0.12 * hover);
+            fill = fill.lerp_to_gamma(pal.surface, 0.18 * hover);
         }
-        ui.painter().rect_filled(rect, CornerRadius::same(9), fill);
+        ui.painter().rect_filled(rect, CornerRadius::same(R), fill);
         ui.painter().galley(rect.min + pad, galley, fg);
     }
     if enabled {
@@ -343,10 +505,10 @@ pub fn primary_button(ui: &mut Ui, icon: &str, text: &str, pal: &Palette, enable
     }
 }
 
-/// iOS-style switch with a label; returns the response of the whole row.
+/// Switch with a label; returns the response of the whole row.
 pub fn toggle(ui: &mut Ui, on: &mut bool, text: &str, pal: &Palette) -> Response {
-    let galley = line_galley(ui, text, theme::body(13.5), pal.ink, ui.available_width() - 48.0);
-    let track = vec2(34.0, 20.0);
+    let galley = line_galley(ui, text, theme::body(theme::UI), pal.ink, ui.available_width() - 44.0);
+    let track = vec2(30.0, 18.0);
     let size = vec2(track.x + 10.0 + galley.size().x, track.y.max(galley.size().y));
     let enabled = ui.is_enabled();
     let (rect, mut resp) = ui.allocate_exact_size(size, Sense::click());
@@ -358,19 +520,16 @@ pub fn toggle(ui: &mut Ui, on: &mut bool, text: &str, pal: &Palette) -> Response
     if ui.is_rect_visible(rect) {
         let t = ui.ctx().animate_bool(resp.id, *on);
         let tr = Rect::from_min_size(pos2(rect.left(), rect.center().y - track.y / 2.0), track);
-        let off = if pal.dark { pal.line } else { hex_line(pal) };
+        let off = pal.line.lerp_to_gamma(pal.faint, 0.45);
         let fill = off.lerp_to_gamma(pal.accent, t);
+        let knob = Color32::WHITE.lerp_to_gamma(pal.on_accent, t);
         let p = ui.painter();
-        p.rect_filled(tr, CornerRadius::same(10), if enabled { fill } else { fill.gamma_multiply(0.5) });
-        let x = egui::lerp(tr.left() + 10.0..=tr.right() - 10.0, t);
-        p.circle_filled(pos2(x, tr.center().y), 7.5, Color32::WHITE);
+        p.rect_filled(tr, CornerRadius::same(9), if enabled { fill } else { fill.gamma_multiply(0.5) });
+        let x = egui::lerp(tr.left() + 9.0..=tr.right() - 9.0, t);
+        p.circle_filled(pos2(x, tr.center().y), 6.5, knob);
         p.galley(pos2(tr.right() + 10.0, rect.center().y - galley.size().y / 2.0), galley, pal.ink);
     }
     resp.on_hover_cursor(egui::CursorIcon::PointingHand)
-}
-
-fn hex_line(pal: &Palette) -> Color32 {
-    pal.line.lerp_to_gamma(pal.faint, 0.4)
 }
 
 /// Frame shared by every modal dialog.
@@ -378,66 +537,69 @@ pub fn modal_frame(pal: &Palette) -> egui::Frame {
     egui::Frame::new()
         .fill(pal.surface)
         .stroke(Stroke::new(1.0_f32, pal.line))
-        .corner_radius(CornerRadius::same(16))
+        .corner_radius(CornerRadius::same(14))
         .shadow(egui::Shadow {
-            offset: [0, 18],
+            offset: [0, 16],
             blur: 48,
             spread: 0,
-            color: Color32::from_black_alpha(if pal.dark { 120 } else { 40 }),
+            color: Color32::from_black_alpha(if pal.dark { 130 } else { 36 }),
         })
-        .inner_margin(egui::Margin::same(22))
+        .inner_margin(egui::Margin::same(20))
 }
 
-/// Dialog header: icon tile, title, optional subtitle and a close button.
+/// Dialog header: title, optional subtitle and a close button.
 /// Returns true when the close button was clicked.
-pub fn modal_header(ui: &mut Ui, icon: &str, title: &str, subtitle: &str, pal: &Palette) -> bool {
+pub fn modal_header(ui: &mut Ui, _icon: &str, title: &str, subtitle: &str, pal: &Palette) -> bool {
     let mut close = false;
-    ui.horizontal(|ui| {
-        let (r, _) = ui.allocate_exact_size(Vec2::splat(36.0), Sense::hover());
-        ui.painter().rect_filled(r, CornerRadius::same(10), pal.pale);
-        ui.painter()
-            .text(r.center(), Align2::CENTER_CENTER, icon, theme::body(18.0), pal.accent);
-        ui.add_space(4.0);
+    ui.horizontal_top(|ui| {
         ui.vertical(|ui| {
-            ui.spacing_mut().item_spacing.y = 1.0;
+            ui.spacing_mut().item_spacing.y = 3.0;
+            ui.set_max_width((ui.available_width() - 36.0).max(80.0));
             ui.label(egui::RichText::new(title).font(theme::strong(16.0)).color(pal.ink));
             if !subtitle.is_empty() {
-                ui.label(egui::RichText::new(subtitle).font(theme::body(theme::SMALL)).color(pal.mute));
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(subtitle).font(theme::body(theme::SMALL)).color(pal.mute),
+                    )
+                    .wrap(),
+                );
             }
         });
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
-            let r = icon_button(ui, egui_phosphor::regular::X, 28.0, pal.mute, pal.hover, false).on_hover_text("关闭");
+            let r = icon_button(ui, egui_phosphor::regular::X, 26.0, pal.mute, pal.hover, false).on_hover_text("关闭");
             r.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "关闭对话框"));
             close = r.clicked();
         });
     });
-    ui.add_space(12.0);
+    ui.add_space(14.0);
     close
 }
 
-/// Segmented control (tabs inside a dialog); returns the newly picked index.
+/// Segmented control (a few exclusive views inside a dialog); returns the newly picked index.
 pub fn segmented(ui: &mut Ui, items: &[&str], current: usize, pal: &Palette) -> Option<usize> {
     let mut picked = None;
     egui::Frame::new()
-        .fill(if pal.dark { pal.canvas } else { pal.hover })
-        .corner_radius(CornerRadius::same(10))
+        .fill(pal.pale)
+        .corner_radius(CornerRadius::same(9))
         .inner_margin(egui::Margin::same(3))
         .show(ui, |ui| {
             ui.spacing_mut().item_spacing.x = 2.0;
             ui.horizontal(|ui| {
                 for (i, name) in items.iter().enumerate() {
                     let selected = i == current;
-                    let font = if selected { theme::strong(13.0) } else { theme::body(13.0) };
+                    let font = if selected { theme::strong(theme::UI) } else { theme::body(theme::UI) };
                     let color = if selected { pal.ink } else { pal.mute };
                     let g = line_galley(ui, name, font, color, 240.0);
-                    let (rect, resp) = ui.allocate_exact_size(g.size() + vec2(24.0, 12.0), Sense::click());
+                    let (rect, resp) = ui.allocate_exact_size(g.size() + vec2(22.0, 10.0), Sense::click());
                     resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, true, selected, *name));
                     if selected {
-                        ui.painter().rect_filled(rect, CornerRadius::same(8), if pal.dark { pal.selected } else { pal.surface });
+                        let fill = if pal.dark { pal.selected } else { pal.surface };
+                        ui.painter().rect_filled(rect.translate(vec2(0.0, 1.0)), CornerRadius::same(7), Color32::from_black_alpha(if pal.dark { 0 } else { 12 }));
+                        ui.painter().rect_filled(rect, CornerRadius::same(7), fill);
                     } else if resp.hovered() {
-                        ui.painter().rect_filled(rect, CornerRadius::same(8), pal.line_soft.gamma_multiply(0.6));
+                        ui.painter().rect_filled(rect, CornerRadius::same(7), pal.hover);
                     }
-                    ui.painter().galley(rect.min + vec2(12.0, 6.0), g, color);
+                    ui.painter().galley(rect.min + vec2(11.0, 5.0), g, color);
                     if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() && !selected {
                         picked = Some(i);
                     }
@@ -447,25 +609,111 @@ pub fn segmented(ui: &mut Ui, items: &[&str], current: usize, pal: &Palette) -> 
     picked
 }
 
-/// Full-width outlined button with an icon and an optional shortcut hint.
+/// One entry of [`tabs`].
+pub struct TabItem<'a> {
+    pub name: &'a str,
+    /// Small count after the name.
+    pub count: Option<String>,
+    /// Draw the count in the warning colour (something needs the operator).
+    pub attention: bool,
+}
+
+/// Underlined tab row across the available width; returns the newly picked index.
+/// Counts are dropped when the row is too narrow for them.
+pub fn tabs(ui: &mut Ui, items: &[TabItem], current: usize, pal: &Palette) -> Option<usize> {
+    let mut picked = None;
+    let gap = 4.0;
+    let pad = 8.0;
+    let avail = ui.available_width();
+    let galleys: Vec<_> = items
+        .iter()
+        .enumerate()
+        .map(|(i, item)| {
+            let selected = i == current;
+            let font = if selected { theme::strong(theme::UI) } else { theme::body(theme::UI) };
+            let color = if selected { pal.ink } else { pal.mute };
+            let name = line_galley(ui, item.name, font, color, avail);
+            let tone = if item.attention { pal.warn.fg } else { pal.faint };
+            let count = item
+                .count
+                .as_ref()
+                .map(|c| line_galley(ui, c, theme::body(theme::TINY), tone, 60.0));
+            (name, count, color, tone)
+        })
+        .collect();
+    let width = |with_counts: bool| -> f32 {
+        galleys
+            .iter()
+            .map(|(n, c, _, _)| {
+                let cw = if with_counts { c.as_ref().map_or(0.0, |g| g.size().x + 5.0) } else { 0.0 };
+                n.size().x + cw + pad * 2.0
+            })
+            .sum::<f32>()
+            + gap * (items.len().saturating_sub(1)) as f32
+    };
+    let counts = width(true) <= avail;
+    let (strip, _) = ui.allocate_exact_size(vec2(avail, 34.0), Sense::hover());
+    let mut x = strip.left();
+    for (i, (item, (name, count, color, tone))) in items.iter().zip(galleys).enumerate() {
+        let selected = i == current;
+        let count = count.filter(|_| counts);
+        let w = name.size().x + count.as_ref().map_or(0.0, |g| g.size().x + 5.0) + pad * 2.0;
+        let rect = Rect::from_min_size(pos2(x, strip.top()), vec2(w, strip.height() - 4.0));
+        x += w + gap;
+        let resp = ui.interact(rect, ui.id().with(("tab", i)), Sense::click());
+        resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, true, selected, item.name));
+        let p = ui.painter();
+        if resp.hovered() && !selected {
+            p.rect_filled(rect, CornerRadius::same(R), pal.hover);
+        }
+        let ny = rect.center().y - name.size().y / 2.0;
+        let nx = rect.left() + pad;
+        let nw = name.size().x;
+        p.galley(pos2(nx, ny), name, color);
+        if let Some(count) = count {
+            p.galley(pos2(nx + nw + 5.0, rect.center().y - count.size().y / 2.0 + 0.5), count, tone);
+        } else if item.attention {
+            // No room for the count: keep a mark that something is waiting.
+            p.circle_filled(pos2(nx + nw + 4.0, ny + 3.0), 2.5, tone);
+        }
+        if selected {
+            p.rect_filled(
+                Rect::from_min_max(pos2(rect.left() + pad, strip.bottom() - 2.0), pos2(rect.right() - pad, strip.bottom())),
+                CornerRadius::same(1),
+                pal.ink,
+            );
+        }
+        if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() && !selected {
+            picked = Some(i);
+        }
+    }
+    picked
+}
+
+/// Full-width row button with an icon and an optional shortcut hint.
 pub fn wide_button(ui: &mut Ui, icon: &str, text: &str, hint: &str, pal: &Palette) -> Response {
     let w = ui.available_width();
-    let (rect, resp) = ui.allocate_exact_size(vec2(w, 38.0), Sense::click());
-    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, text));
+    let (rect, resp) = ui.allocate_exact_size(vec2(w, 34.0), Sense::click());
+    let enabled = ui.is_enabled();
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, text));
     if ui.is_rect_visible(rect) {
-        let t = ui.ctx().animate_bool(resp.id.with("hover"), resp.hovered());
+        let t = ui.ctx().animate_bool(resp.id.with("hover"), enabled && resp.hovered());
         let p = ui.painter();
+        if !pal.dark {
+            p.rect_filled(rect.translate(vec2(0.0, 1.0)), CornerRadius::same(R), Color32::from_black_alpha(8));
+        }
         p.rect(
             rect,
-            CornerRadius::same(10),
-            pal.surface.lerp_to_gamma(pal.hover, t),
-            Stroke::new(1.0_f32, pal.line),
+            CornerRadius::same(R),
+            pal.surface.lerp_to_gamma(pal.surface_alt, t),
+            Stroke::new(1.0_f32, pal.line.lerp_to_gamma(pal.faint, t * 0.5)),
             egui::StrokeKind::Inside,
         );
-        p.text(rect.left_center() + vec2(14.0, 0.0), Align2::LEFT_CENTER, icon, theme::body(16.0), pal.accent);
-        p.text(rect.left_center() + vec2(38.0, 0.0), Align2::LEFT_CENTER, text, theme::strong(13.5), pal.ink);
+        let ink = if enabled { pal.ink } else { pal.faint };
+        p.text(rect.left_center() + vec2(11.0, 0.0), Align2::LEFT_CENTER, icon, theme::body(15.0), ink);
+        p.text(rect.left_center() + vec2(33.0, 0.0), Align2::LEFT_CENTER, text, theme::body(theme::UI), ink);
         if !hint.is_empty() {
-            p.text(rect.right_center() - vec2(12.0, 0.0), Align2::RIGHT_CENTER, hint, theme::body(theme::TINY), pal.faint);
+            p.text(rect.right_center() - vec2(10.0, 0.0), Align2::RIGHT_CENTER, hint, theme::body(theme::TINY), pal.faint);
         }
     }
     resp.on_hover_cursor(egui::CursorIcon::PointingHand)

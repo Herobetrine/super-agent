@@ -8,7 +8,7 @@ use crate::labels;
 use crate::ops::Pending;
 use crate::theme;
 use crate::widgets;
-use egui::{Align, CornerRadius, Frame, Label, Layout, Margin, RichText, Stroke, Ui};
+use egui::{Align, Label, Layout, RichText, Ui};
 use egui_phosphor::regular as icon;
 use serde_json::{Value, json};
 use std::path::PathBuf;
@@ -258,10 +258,9 @@ impl App {
             .frame(widgets::modal_frame(&pal))
             .show(ctx, |ui| {
                 ui.set_width(620.0);
-                if widgets::modal_header(ui, icon::PUZZLE_PIECE, title, subtitle, &pal) {
+                if widgets::modal_header(ui, "", title, subtitle, &pal) {
                     close = true;
                 }
-                ui.add_space(8.0);
                 let max = (ui.ctx().content_rect().height() - 240.0).max(240.0);
                 let kind = Kind::of(&d.view);
                 egui::ScrollArea::vertical()
@@ -273,39 +272,50 @@ impl App {
                         Kind::Probe => probe_view(ui, d, &pal, busy, &mut next),
                         Kind::Preview => {
                             if let View::Preview { name, body } = &d.view {
-                                ui.label(RichText::new(name.as_str()).font(theme::strong(14.0)));
+                                ui.label(RichText::new(name.as_str()).font(theme::strong(theme::BODY)).color(pal.ink));
+                                ui.add_space(8.0);
                                 match body {
                                     None => {
-                                        ui.label(RichText::new("正在读取技能说明…").color(pal.mute));
+                                        ui.label(RichText::new("正在读取技能说明…").font(theme::body(theme::SMALL)).color(pal.mute));
                                     }
                                     Some(Err(e)) => {
-                                        ui.label(RichText::new(e.as_str()).color(pal.fail.fg));
+                                        ui.label(RichText::new(e.as_str()).font(theme::body(theme::SMALL)).color(pal.fail.fg));
                                     }
                                     Some(Ok(text)) => {
-                                        ui.add(Label::new(RichText::new(text.as_str()).monospace().size(12.0)).wrap());
+                                        widgets::well(&pal).show(ui, |ui| {
+                                            ui.set_width(ui.available_width());
+                                            ui.add(
+                                                Label::new(
+                                                    RichText::new(text.as_str())
+                                                        .font(theme::mono(theme::SMALL))
+                                                        .color(pal.ink),
+                                                )
+                                                .wrap(),
+                                            );
+                                        });
                                     }
                                 }
                             }
                         }
                         Kind::Remove(_, name) => {
-                            ui.label(RichText::new(format!("确定从本机配置移除 {name}？")).color(pal.warn.fg));
+                            ui.label(RichText::new(format!("确定从本机配置移除 {name}？")).font(theme::body(theme::UI)).color(pal.warn.fg));
                         }
                         Kind::Forget(_, name) => {
-                            ui.label(RichText::new(format!("取消登记 {name}？原有技能文件会保留。")).color(pal.warn.fg));
+                            ui.label(RichText::new(format!("取消登记 {name}？原有技能文件会保留。")).font(theme::body(theme::UI)).color(pal.warn.fg));
                         }
                     });
                 if let Some((text, error)) = &d.notice {
-                    ui.add_space(6.0);
+                    ui.add_space(8.0);
                     let color = if *error { pal.fail.fg } else { pal.ok.fg };
                     ui.add(Label::new(RichText::new(text).font(theme::body(theme::SMALL)).color(color)).wrap());
                 }
-                ui.add_space(10.0);
+                ui.add_space(16.0);
                 // Footer
                 ui.horizontal(|ui| {
                     match &kind {
                         Kind::List => {
                             if busy {
-                                ui.spinner();
+                                widgets::spinner(ui);
                             }
                             ui.label(
                                 RichText::new(format!("技能 {} · MCP {}", d.skills.len(), d.servers.len()))
@@ -345,7 +355,13 @@ impl App {
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                 let text = if remove { "确认移除" } else { "确认取消登记" };
                                 if ui
-                                    .add_enabled_ui(!busy, |ui| widgets::quiet_button(ui, icon::CHECK, text, &pal, true))
+                                    .add_enabled_ui(!busy, |ui| {
+                                        if remove {
+                                            widgets::danger_button(ui, icon::CHECK, text, &pal)
+                                        } else {
+                                            widgets::primary_button(ui, icon::CHECK, text, &pal, !busy)
+                                        }
+                                    })
                                     .inner
                                     .clicked()
                                 {
@@ -437,12 +453,13 @@ fn list_view(
 ) {
     let data = match &d.data {
         None => {
-            ui.label(RichText::new("正在读取本机配置…").color(pal.mute));
+            ui.label(RichText::new("正在读取本机配置…").font(theme::body(theme::SMALL)).color(pal.mute));
             return;
         }
         Some(Err(e)) => {
-            ui.label(RichText::new(e.as_str()).color(pal.fail.fg));
-            if widgets::quiet_button(ui, icon::ARROWS_CLOCKWISE, "重试", pal, false).clicked() {
+            ui.label(RichText::new(e.as_str()).font(theme::body(theme::SMALL)).color(pal.fail.fg));
+            ui.add_space(8.0);
+            if widgets::outline_button(ui, icon::ARROWS_CLOCKWISE, "重试", pal).clicked() {
                 *reload = true;
             }
             return;
@@ -461,22 +478,29 @@ fn list_view(
             d.query.clear();
         }
     });
+    ui.add_space(12.0);
     if d.scope == ExtScope::Defaults {
         let before = d.defaults_directory;
         ui.add_enabled_ui(!busy, |ui| {
-            ui.horizontal(|ui| {
-                ui.selectable_value(&mut d.defaults_directory, false, "全局默认授权");
-                ui.selectable_value(&mut d.defaults_directory, true, "工作目录默认授权");
-            });
+            let scopes = ["全局默认授权", "工作目录默认授权"];
+            if let Some(i) = widgets::segmented(ui, &scopes, usize::from(d.defaults_directory), pal) {
+                d.defaults_directory = i == 1;
+            }
+            ui.add_space(8.0);
             if d.defaults_directory {
                 let previous_path = d.defaults_path.clone();
-                let r = ui.add(egui::TextEdit::singleline(&mut d.defaults_path).margin(egui::Margin::symmetric(8, 5)).hint_text(widgets::hint(ui, "工作目录绝对路径")).desired_width(440.0));
+                let r = ui.add(egui::TextEdit::singleline(&mut d.defaults_path).margin(egui::Margin::symmetric(8, 5)).hint_text(widgets::hint(ui, "工作目录绝对路径")).desired_width(ui.available_width()));
                 r.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::TextEdit, true, "默认授权工作目录"));
+                ui.add_space(4.0);
                 ui.horizontal(|ui| {
-                    if ui.add_enabled(d.current_project.is_some(), egui::Button::new("使用当前草稿目录")).clicked() {
+                    if ui
+                        .add_enabled_ui(d.current_project.is_some(), |ui| widgets::quiet_button(ui, "", "使用当前草稿目录", pal, false))
+                        .inner
+                        .clicked()
+                    {
                         d.defaults_path = d.current_project.as_ref().unwrap().display().to_string();
                     }
-                    if ui.button("浏览默认授权目录").clicked()
+                    if widgets::quiet_button(ui, "", "浏览默认授权目录", pal, false).clicked()
                         && let Some(path) = rfd::FileDialog::new().set_title("选择默认授权工作目录").pick_folder()
                     {
                         d.defaults_path = path.display().to_string();
@@ -484,7 +508,7 @@ fn list_view(
                     if previous_path != d.defaults_path {
                         d.cwd = None;
                     }
-                    if ui.button("载入目录默认授权").clicked() {
+                    if widgets::outline_button(ui, "", "载入目录默认授权", pal).clicked() {
                         match sa_engine::services::realpath(std::path::Path::new(d.defaults_path.trim())) {
                             Ok(path) if path.is_dir() => {
                                 d.cwd = Some(path);
@@ -497,6 +521,7 @@ fn list_view(
                         }
                     }
                 });
+                ui.add_space(4.0);
                 ui.label(RichText::new("目录默认授权覆盖全局默认，适用于该目录及子目录；最近的祖先目录配置优先。").font(theme::body(theme::SMALL)).color(pal.mute));
             }
         });
@@ -507,10 +532,11 @@ fn list_view(
             *reload = true;
         }
         if let Some(path) = &d.cwd {
-            ui.label(format!("正在编辑目录默认 · {}", path.display()));
+            ui.label(RichText::new(format!("正在编辑目录默认 · {}", path.display())).font(theme::body(theme::SMALL)).color(pal.ink));
         } else if d.defaults_directory {
-            ui.label(RichText::new("先载入目录，再保存该目录默认授权。").color(pal.warn.fg));
+            ui.label(RichText::new("先载入目录，再保存该目录默认授权。").font(theme::body(theme::SMALL)).color(pal.warn.fg));
         }
+        ui.add_space(8.0);
     }
     if d.scope == ExtScope::Draft {
         let before = d.follow;
@@ -536,19 +562,18 @@ fn list_view(
                 .color(pal.mute),
         );
     }
-    ui.add_space(4.0);
+    ui.add_space(12.0);
     ui.horizontal(|ui| {
         let placeholder = if d.tab == ExtTab::Skills { "搜索技能或来源" } else { "搜索 MCP 服务" };
         let r = ui.add(
             egui::TextEdit::singleline(&mut d.query).margin(egui::Margin::symmetric(8, 5))
                 .hint_text(widgets::hint(ui, placeholder))
-                .background_color(pal.canvas)
                 .desired_width(260.0),
         );
         r.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::TextEdit, true, placeholder));
         if d.scope == ExtScope::Defaults {
             if d.tab == ExtTab::Servers {
-                if widgets::quiet_button(ui, icon::PLUS, "添加服务", pal, false).clicked() {
+                if widgets::outline_button(ui, icon::PLUS, "添加服务", pal).clicked() {
                     d.view = View::Edit(ServerForm {
                         args: "[]".into(),
                         ..Default::default()
@@ -556,7 +581,7 @@ fn list_view(
                     d.notice = None;
                 }
             } else if ui
-                .add_enabled_ui(!busy, |ui| widgets::quiet_button(ui, icon::FOLDER_SIMPLE, "导入文件夹", pal, false))
+                .add_enabled_ui(!busy, |ui| widgets::outline_button(ui, icon::FOLDER_SIMPLE, "导入文件夹", pal))
                 .inner
                 .clicked()
             {
@@ -564,7 +589,7 @@ fn list_view(
             }
         }
     });
-    ui.add_space(6.0);
+    ui.add_space(12.0);
     let key = if d.tab == ExtTab::Skills { "skills" } else { "servers" };
     let mut rows: Vec<Value> = data[key].as_array().cloned().unwrap_or_default();
     if d.locked {
@@ -585,9 +610,14 @@ fn list_view(
         } else {
             "尚未配置 MCP 服务。"
         };
-        ui.label(RichText::new(text).color(pal.mute));
+        ui.label(RichText::new(text).font(theme::body(theme::SMALL)).color(pal.mute));
     }
-    for row in rows {
+    for (index, row) in rows.into_iter().enumerate() {
+        if index > 0 {
+            ui.add_space(8.0);
+            widgets::rule(ui, pal.line_soft);
+            ui.add_space(8.0);
+        }
         let id = s(&row, "id").to_string();
         let name = if s(&row, "name").is_empty() { id.clone() } else { s(&row, "name").to_string() };
         let servers = d.tab == ExtTab::Servers;
@@ -596,13 +626,9 @@ fn list_view(
         let unprobed = servers && !row["tools"].is_array();
         let outside = servers && d.scope == ExtScope::Defaults
             && !data["availableServers"].as_array().is_some_and(|ids| ids.iter().any(|v| v.as_str() == Some(&id)));
-        Frame::new()
-            .fill(pal.canvas)
-            .stroke(Stroke::new(1.0_f32, pal.line_soft))
-            .corner_radius(CornerRadius::same(10))
-            .inner_margin(Margin::same(10))
-            .show(ui, |ui| {
+        ui.scope(|ui| {
                 ui.set_width(ui.available_width());
+                ui.spacing_mut().item_spacing.y = 4.0;
                 ui.horizontal(|ui| {
                     let list = if servers { &mut d.servers } else { &mut d.skills };
                     let mut on = list.contains(&id);
@@ -617,18 +643,14 @@ fn list_view(
                             list.retain(|x| *x != id);
                         }
                     }
-                    let tag = if missing {
-                        Some("配置已移除".to_string())
+                    if missing {
+                        widgets::status(ui, "配置已移除", pal.fail.fg, false);
                     } else if inactive {
-                        Some("服务未启用".into())
+                        widgets::status(ui, "服务未启用", pal.neutral.fg, false);
                     } else if unprobed {
-                        Some("待探测工具".into())
+                        widgets::status(ui, "待探测工具", pal.warn.fg, false);
                     } else if servers {
-                        Some(format!("{} 个工具", row["tools"].as_array().map_or(0, Vec::len)))
-                    } else {
-                        None
-                    };
-                    if let Some(t) = tag {
+                        let t = format!("{} 个工具", row["tools"].as_array().map_or(0, Vec::len));
                         widgets::chip(ui, &t, pal.neutral, theme::TINY);
                     }
                 });
@@ -638,7 +660,7 @@ fn list_view(
                     } else {
                         format!("stdio · {}", s(&row, "command"))
                     };
-                    ui.label(RichText::new(line).monospace().size(11.5).color(pal.mute));
+                    ui.label(RichText::new(line).font(theme::mono(theme::TINY)).color(pal.mute));
                     let root = s(&row, "scopeRoot");
                     let scope = if root.is_empty() {
                         "适用目录 · 全局".to_string()
@@ -682,7 +704,7 @@ fn list_view(
                         )
                         .wrap(),
                     );
-                    ui.label(RichText::new(s(&row, "source")).monospace().size(11.0).color(pal.faint));
+                    ui.label(RichText::new(s(&row, "source")).font(theme::mono(theme::TINY)).color(pal.faint));
                     ui.horizontal(|ui| {
                         if widgets::quiet_button(ui, icon::FILE_TEXT, &format!("预览 {name}"), pal, false).clicked() {
                             let (sid, cwd) = (id.clone(), d.cwd.clone());
@@ -698,20 +720,20 @@ fn list_view(
                     });
                 }
             });
-        ui.add_space(6.0);
     }
 }
 
 fn edit_view(ui: &mut Ui, d: &mut ExtDialog, pal: &theme::Palette, busy: bool, next: &mut Option<(Task, Job)>) {
     let View::Edit(f) = &mut d.view else { return };
     ui.label(
-        RichText::new(if f.id.is_some() { "编辑 MCP 服务" } else { "添加 MCP 服务" }).font(theme::strong(14.0)),
+        RichText::new(if f.id.is_some() { "编辑 MCP 服务" } else { "添加 MCP 服务" }).font(theme::strong(theme::BODY)).color(pal.ink),
     );
+    ui.add_space(4.0);
     ui.add(Label::new(RichText::new(TRUST).font(theme::body(theme::SMALL)).color(pal.warn.fg)).wrap());
-    ui.add_space(6.0);
+    ui.add_space(12.0);
     let row = |ui: &mut Ui, label: &str, value: &mut String, hint: &str, multi: bool| {
         ui.horizontal(|ui| {
-            ui.add_sized([120.0, 24.0], Label::new(RichText::new(label).font(theme::body(13.0))));
+            ui.add_sized([120.0, 24.0], Label::new(RichText::new(label).font(theme::body(theme::UI))));
             let edit = if multi {
                 egui::TextEdit::multiline(value).margin(egui::Margin::symmetric(8, 5)).desired_rows(3)
             } else {
@@ -723,14 +745,15 @@ fn edit_view(ui: &mut Ui, d: &mut ExtDialog, pal: &theme::Palette, busy: bool, n
     };
     row(ui, "服务名称", &mut f.name, "", false);
     ui.horizontal(|ui| {
-        ui.label("适用范围");
-        ui.selectable_value(&mut f.directory_only, false, "全局可用");
-        ui.selectable_value(&mut f.directory_only, true, "指定工作目录");
+        ui.add_sized([120.0, 24.0], Label::new(RichText::new("适用范围").font(theme::body(theme::UI))));
+        if let Some(i) = widgets::segmented(ui, &["全局可用", "指定工作目录"], usize::from(f.directory_only), pal) {
+            f.directory_only = i == 1;
+        }
     });
     if f.directory_only {
         row(ui, "服务适用目录", &mut f.scope_root, "工作目录绝对路径", false);
         ui.horizontal(|ui| {
-            if ui.button("浏览服务适用目录").clicked()
+            if widgets::outline_button(ui, "", "浏览服务适用目录", pal).clicked()
                 && let Some(path) = rfd::FileDialog::new().set_title("选择 MCP 服务适用目录").pick_folder()
             {
                 f.scope_root = path.display().to_string();
@@ -739,7 +762,7 @@ fn edit_view(ui: &mut Ui, d: &mut ExtDialog, pal: &theme::Palette, busy: bool, n
         });
     }
     ui.horizontal(|ui| {
-        ui.add_sized([120.0, 24.0], Label::new(RichText::new("传输方式").font(theme::body(13.0))));
+        ui.add_sized([120.0, 24.0], Label::new(RichText::new("传输方式").font(theme::body(theme::UI))));
         let before = f.http;
         widgets::combo("mcp-transport")
             .selected_text(if f.http { "远程服务 · Streamable HTTP" } else { "本机程序 · stdio" })
@@ -763,14 +786,15 @@ fn edit_view(ui: &mut Ui, d: &mut ExtDialog, pal: &theme::Palette, busy: bool, n
         row(ui, "可执行程序", &mut f.command, "单个程序名或路径", false);
         row(ui, "启动参数", &mut f.args, "JSON 字符串数组，例如 [\"--stdio\"]", true);
     }
+    ui.add_space(4.0);
     widgets::toggle(ui, &mut f.enabled, "启用服务，允许将它授予会话", pal);
     widgets::toggle(ui, &mut f.trusted, "我信任上述程序或服务来源", pal);
-    ui.add_space(6.0);
+    ui.add_space(12.0);
     let mut remove = None;
     let mut error = None;
     ui.horizontal(|ui| {
         if let Some(id) = f.id.clone()
-            && widgets::quiet_button(ui, icon::TRASH, "移除服务", pal, false).clicked()
+            && widgets::danger_button(ui, icon::TRASH, "移除服务", pal).clicked()
         {
             remove = Some(json!({"id": id, "name": f.name}));
         }
@@ -855,7 +879,8 @@ fn server_record(f: &ServerForm) -> Result<Value, String> {
 
 fn probe_view(ui: &mut Ui, d: &mut ExtDialog, pal: &theme::Palette, busy: bool, next: &mut Option<(Task, Job)>) {
     let View::Probe { row, result } = &mut d.view else { return };
-    ui.label(RichText::new(format!("探测 {}", s(row, "name"))).font(theme::strong(14.0)));
+    ui.label(RichText::new(format!("探测 {}", s(row, "name"))).font(theme::strong(theme::BODY)).color(pal.ink));
+    ui.add_space(4.0);
     ui.add(Label::new(RichText::new(TRUST).font(theme::body(theme::SMALL)).color(pal.warn.fg)).wrap());
     let http = s(row, "transport") == "http";
     ui.label(
@@ -878,10 +903,14 @@ fn probe_view(ui: &mut Ui, d: &mut ExtDialog, pal: &theme::Palette, busy: bool, 
         v.extend(row["args"].as_array().cloned().unwrap_or_default());
         serde_json::to_string_pretty(&v).unwrap_or_default()
     };
-    ui.label(RichText::new(launch).monospace().size(12.0));
-    ui.add_space(6.0);
+    ui.add_space(8.0);
+    widgets::well(pal).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.add(Label::new(RichText::new(launch).font(theme::mono(theme::SMALL)).color(pal.ink)).wrap());
+    });
+    ui.add_space(12.0);
     if ui
-        .add_enabled_ui(!busy, |ui| widgets::quiet_button(ui, icon::PULSE, "连接并读取工具", pal, true))
+        .add_enabled_ui(!busy, |ui| widgets::outline_button(ui, icon::PULSE, "连接并读取工具", pal))
         .inner
         .clicked()
     {
@@ -891,17 +920,21 @@ fn probe_view(ui: &mut Ui, d: &mut ExtDialog, pal: &theme::Palette, busy: bool, 
     }
     match result {
         None if busy => {
-            ui.label(RichText::new("正在连接服务并读取工具目录…").color(pal.mute));
+            ui.add_space(8.0);
+            ui.label(RichText::new("正在连接服务并读取工具目录…").font(theme::body(theme::SMALL)).color(pal.mute));
         }
         None => {}
         Some(Err(e)) => {
-            ui.label(RichText::new(e.as_str()).color(pal.fail.fg));
+            ui.add_space(8.0);
+            ui.label(RichText::new(e.as_str()).font(theme::body(theme::SMALL)).color(pal.fail.fg));
         }
         Some(Ok(tools)) => {
             let tools = tools.as_array().cloned().unwrap_or_default();
-            ui.label(RichText::new(format!("发现 {} 个工具", tools.len())).strong());
+            ui.add_space(12.0);
+            widgets::section(ui, &format!("发现 {} 个工具", tools.len()), pal);
+            ui.add_space(4.0);
             for t in tools {
-                ui.label(RichText::new(s(&t, "name")).strong());
+                ui.label(RichText::new(s(&t, "name")).font(theme::strong(theme::UI)).color(pal.ink));
                 ui.label(
                     RichText::new(labels::compact(s(&t, "description"), 200))
                         .font(theme::body(theme::SMALL))

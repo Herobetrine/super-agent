@@ -2,7 +2,6 @@
 
 use crate::{app::App, host::Action, ops::Pending, theme, widgets};
 use egui::{RichText, Ui};
-use egui_phosphor::regular as icon;
 use sa_store::efficiency::{self, Settings, Ttl};
 
 pub struct EfficiencyDialog {
@@ -100,7 +99,7 @@ impl App {
                 ui.set_width(540.0);
                 close = widgets::modal_header(
                     ui,
-                    icon::GEAR,
+                    "",
                     "Token 与缓存",
                     "保存后用于所有工单的后续轮次，当前执行继续完成。",
                     &pal,
@@ -114,7 +113,7 @@ impl App {
                 }
                 if dialog.loading.is_some() {
                     ui.horizontal(|ui| {
-                        ui.spinner();
+                        widgets::spinner(ui);
                         ui.label("正在读取已保存设置…");
                     });
                 }
@@ -123,17 +122,17 @@ impl App {
                     ui.add_enabled_ui(editable, |ui| {
                         ui.add(widgets::Check::new(&mut dialog.draft.incremental_context, "增量上下文"));
                         description(ui, "续轮仅补充变化的上下文，完整内容保留为恢复依据。适用于完全访问与自动模式。", &pal);
-                        ui.add_space(14.0);
+                        ui.add_space(16.0);
                         ui.add(widgets::Check::new(&mut dialog.draft.lazy_mcp_schemas, "按需读取 MCP 参数"));
                         description(ui, "大工具目录先发送名称和简述，调用前从完整快照读取该工具的参数。适用于完全访问与自动模式；关闭后恢复完整目录。", &pal);
-                        ui.add_space(14.0);
+                        ui.add_space(16.0);
                         ui.add(widgets::Check::new(&mut dialog.draft.concise_handoffs, "精简协作提示"));
                         description(ui, "要求简短交接、只传相关证据，将长日志留在文件中。", &pal);
-                        ui.add_space(18.0);
-                        ui.separator();
-                        ui.add_space(12.0);
-                        ui.label(RichText::new("Claude 缓存时长").font(theme::strong(14.0)).color(pal.ink));
-                        ui.add_space(6.0);
+                        ui.add_space(16.0);
+                        widgets::rule(ui, pal.line_soft);
+                        ui.add_space(16.0);
+                        widgets::section(ui, "Claude 缓存时长", &pal);
+                        ui.add_space(8.0);
                         ui.horizontal(|ui| {
                             ui.radio_value(&mut dialog.draft.claude_cache_ttl, Ttl::Inherit, "沿用执行端");
                             ui.radio_value(&mut dialog.draft.claude_cache_ttl, Ttl::FiveMinutes, "5 分钟");
@@ -153,23 +152,27 @@ impl App {
                     ui.add_space(12.0);
                     ui.add(egui::Label::new(RichText::new(error).color(pal.fail.fg)).wrap());
                 }
-                ui.add_space(18.0);
+                ui.add_space(16.0);
                 ui.horizontal(|ui| {
-                    if ui.add_enabled(editable, egui::Button::new("恢复默认")).clicked() {
-                        dialog.draft = Settings::default();
-                        dialog.error = None;
-                    }
+                    ui.add_enabled_ui(editable, |ui| {
+                        if widgets::quiet_button(ui, "", "恢复默认", &pal, false).clicked() {
+                            dialog.draft = Settings::default();
+                            dialog.error = None;
+                        }
+                    });
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         save = widgets::primary_button(
                             ui,
-                            icon::CHECK,
+                            "",
                             if dialog.saving { "正在保存…" } else { "保存" },
                             &pal,
                             writable && editable,
                         ).clicked();
-                        if ui.add_enabled(!dialog.saving, egui::Button::new("取消")).clicked() {
-                            close = true;
-                        }
+                        ui.add_enabled_ui(!dialog.saving, |ui| {
+                            if widgets::quiet_button(ui, "", "取消", &pal, false).clicked() {
+                                close = true;
+                            }
+                        });
                     });
                 });
             });

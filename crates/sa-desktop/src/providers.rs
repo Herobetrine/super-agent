@@ -9,7 +9,7 @@ use crate::host::Action;
 use crate::labels::agent_name;
 use crate::theme;
 use crate::widgets;
-use egui::{Align, CornerRadius, Frame, Label, Layout, Margin, RichText, Stroke, Ui};
+use egui::{Align, Label, Layout, RichText, Ui};
 use egui_phosphor::regular as icon;
 use sa_store::providers::{CUSTOM_AGENTS, CustomProvider, ROTATION_AGENTS, Rotation, RouteRef};
 use serde_json::Value;
@@ -112,7 +112,7 @@ impl ProvidersDialog {
 
 fn field(ui: &mut Ui, label: &str, value: &mut String, hint: &str) {
     ui.horizontal(|ui| {
-        ui.add_sized([96.0, 24.0], Label::new(RichText::new(label).font(theme::body(13.0))));
+        ui.add_sized([96.0, 24.0], Label::new(RichText::new(label).font(theme::body(theme::UI))));
         let r = ui.add(
             egui::TextEdit::singleline(value).margin(egui::Margin::symmetric(8, 5))
                 .hint_text(widgets::hint(ui, hint))
@@ -227,7 +227,7 @@ impl App {
                 ui.set_width(620.0);
                 if widgets::modal_header(
                     ui,
-                    icon::PLUGS,
+                    "",
                     "供应商与轮换",
                     "添加兼容端点；某个供应商不可用时按顺序自动改用下一个。",
                     &pal,
@@ -240,6 +240,9 @@ impl App {
                 {
                     close = true;
                 }
+                if return_to_models {
+                    ui.add_space(8.0);
+                }
                 let pages = [Page::Providers, Page::Rotation];
                 let current = pages.iter().position(|p| *p == d.page).unwrap_or(0);
                 if let Some(i) = widgets::segmented(ui, &["自定义供应商", "轮换"], current, &pal)
@@ -247,7 +250,7 @@ impl App {
                     d.page = pages[i];
                     d.message = None;
                 }
-                ui.add_space(10.0);
+                ui.add_space(16.0);
                 let max = (ui.ctx().content_rect().height() - 220.0).max(240.0);
                 egui::ScrollArea::vertical()
                     .max_height(max)
@@ -259,7 +262,7 @@ impl App {
                         Page::Rotation => rotation_page(ui, d, &pal, &mut submit, &mut load, busy),
                     });
                 if let Some((text, error)) = &d.message {
-                    ui.add_space(8.0);
+                    ui.add_space(12.0);
                     let color = if *error { pal.fail.fg } else { pal.ok.fg };
                     ui.add(
                         Label::new(
@@ -326,17 +329,13 @@ fn providers_page(
     let (probing, saving) = (d.probing, d.saving);
     let mut cancel = false;
     if let Some(f) = d.form.as_mut() {
-        Frame::new()
-            .fill(pal.canvas)
-            .stroke(Stroke::new(1.0_f32, pal.line_soft))
-            .corner_radius(CornerRadius::same(10))
-            .inner_margin(Margin::same(12))
+        widgets::well(pal)
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ui.horizontal(|ui| {
                     ui.add_sized(
                         [96.0, 24.0],
-                        Label::new(RichText::new("执行端").font(theme::body(13.0))),
+                        Label::new(RichText::new("执行端").font(theme::body(theme::UI))),
                     );
                     ui.add_enabled_ui(f.id.is_empty(), |ui| {
                         widgets::combo("provider-agent")
@@ -364,7 +363,7 @@ fn providers_page(
                 ui.horizontal(|ui| {
                     ui.add_sized(
                         [96.0, 24.0],
-                        Label::new(RichText::new("模型").font(theme::body(13.0))),
+                        Label::new(RichText::new("模型").font(theme::body(theme::UI))),
                     );
                     egui::ScrollArea::vertical()
                         .id_salt("provider-model-list")
@@ -393,19 +392,14 @@ fn providers_page(
                     .font(theme::body(theme::TINY))
                     .color(pal.mute),
                 );
+                ui.add_space(4.0);
                 widgets::toggle(ui, &mut f.enabled, "启用", pal);
-                ui.add_space(6.0);
+                ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     let can_probe = !probing && !f.base_url.trim().is_empty();
                     if ui
                         .add_enabled_ui(can_probe, |ui| {
-                            widgets::quiet_button(
-                                ui,
-                                icon::ARROWS_CLOCKWISE,
-                                "获取模型",
-                                pal,
-                                false,
-                            )
+                            widgets::outline_button(ui, icon::ARROWS_CLOCKWISE, "获取模型", pal)
                         })
                         .inner
                         .on_hover_text("从接口的 /v1/models 读取模型列表")
@@ -414,7 +408,7 @@ fn providers_page(
                         *probe = Some(f.provider());
                     }
                     if probing {
-                        ui.spinner();
+                        widgets::spinner(ui);
                     }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         let ok = !busy
@@ -438,11 +432,11 @@ fn providers_page(
                     });
                 });
             });
-        ui.add_space(10.0);
+        ui.add_space(16.0);
         if cancel {
             d.form = None;
         }
-    } else if widgets::quiet_button(ui, icon::PLUS, "添加供应商", pal, true).clicked() {
+    } else if widgets::outline_button(ui, icon::PLUS, "添加供应商", pal).clicked() {
         d.form = Some(Form {
             agent: d.preferred_agent.clone(),
             enabled: true,
@@ -450,27 +444,31 @@ fn providers_page(
         });
         d.message = None;
     }
-    ui.add_space(6.0);
+    ui.add_space(8.0);
     if list.is_empty() {
-        ui.label(RichText::new("还没有自定义供应商。").color(pal.mute));
+        ui.label(
+            RichText::new("还没有自定义供应商。")
+                .font(theme::body(theme::SMALL))
+                .color(pal.mute),
+        );
     }
-    for p in list {
-        Frame::new()
-            .fill(pal.surface)
-            .stroke(Stroke::new(1.0_f32, pal.line_soft))
-            .corner_radius(CornerRadius::same(10))
-            .inner_margin(Margin::same(10))
-            .show(ui, |ui| {
+    for (row, p) in list.iter().enumerate() {
+        if row > 0 {
+            ui.add_space(8.0);
+            widgets::rule(ui, pal.line_soft);
+            ui.add_space(8.0);
+        }
+        ui.scope(|ui| {
                 ui.set_width(ui.available_width());
                 ui.horizontal(|ui| {
                     ui.label(
                         RichText::new(&p.name)
-                            .font(theme::strong(13.5))
+                            .font(theme::strong(theme::UI))
                             .color(pal.ink),
                     );
                     widgets::chip(ui, &agent_name(&p.agent), pal.neutral, theme::TINY);
                     if !p.enabled {
-                        widgets::chip(ui, "已停用", pal.warn, theme::TINY);
+                        widgets::status(ui, "已停用", pal.warn.fg, false);
                     }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         let del =
@@ -513,11 +511,10 @@ fn providers_page(
                         p.base_url,
                         p.models.len()
                     ))
-                    .font(theme::body(theme::TINY + 0.5))
+                    .font(theme::body(theme::TINY))
                     .color(pal.mute),
                 );
             });
-        ui.add_space(6.0);
     }
 }
 
@@ -540,7 +537,7 @@ fn rotation_page(
         )
         .wrap(),
     );
-    ui.add_space(8.0);
+    ui.add_space(16.0);
     for agent in ROTATION_AGENTS {
         let catalog = match d.catalogs.get(agent) {
             Some(Some(Ok(c))) => Some(c.clone()),
@@ -549,15 +546,16 @@ fn rotation_page(
         if !d.catalogs.contains_key(agent) {
             load.push(agent.to_string());
         }
-        ui.label(RichText::new(agent_name(agent)).font(theme::strong(13.5)).color(pal.ink));
+        ui.label(RichText::new(agent_name(agent)).font(theme::strong(theme::UI)).color(pal.ink));
+        ui.add_space(4.0);
         let order = d.rotation.order.entry(agent.to_string()).or_default();
         let mut swap: Option<(usize, usize)> = None;
         let mut remove: Option<usize> = None;
         let n = order.len();
         for (i, r) in order.iter().enumerate() {
             ui.horizontal(|ui| {
-                ui.label(RichText::new(format!("{}.", i + 1)).color(pal.faint));
-                ui.label(RichText::new(route_name(catalog.as_ref(), r)).font(theme::body(13.0)));
+                ui.label(RichText::new(format!("{}.", i + 1)).font(theme::body(theme::UI)).color(pal.faint));
+                ui.label(RichText::new(route_name(catalog.as_ref(), r)).font(theme::body(theme::UI)));
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if widgets::icon_button(ui, icon::X, 22.0, pal.mute, pal.hover, false).on_hover_text("移除").clicked() {
                         remove = Some(i);
@@ -587,12 +585,12 @@ fn rotation_page(
         }
         match d.catalogs.get(agent) {
             Some(Some(Err(e))) => {
-                ui.label(RichText::new(e).font(theme::body(theme::TINY + 0.5)).color(pal.fail.fg));
+                ui.label(RichText::new(e).font(theme::body(theme::SMALL)).color(pal.fail.fg));
             }
             None | Some(None) => {
                 ui.horizontal(|ui| {
-                    ui.spinner();
-                    ui.label(RichText::new("正在读取可用路由…").color(pal.mute));
+                    widgets::spinner(ui);
+                    ui.label(RichText::new("正在读取可用路由…").font(theme::body(theme::SMALL)).color(pal.mute));
                 });
             }
             Some(Some(Ok(c))) => {
@@ -642,7 +640,7 @@ fn rotation_page(
                     };
                     let ok = !route.provider.is_empty() && !route.model.is_empty() && !order.contains(&route);
                     if ui
-                        .add_enabled_ui(ok, |ui| widgets::quiet_button(ui, icon::PLUS, "加入", pal, false))
+                        .add_enabled_ui(ok, |ui| widgets::outline_button(ui, icon::PLUS, "加入", pal))
                         .inner
                         .clicked()
                     {
@@ -651,7 +649,7 @@ fn rotation_page(
                 });
             }
         }
-        ui.add_space(10.0);
+        ui.add_space(16.0);
     }
     d.rotation.order.retain(|_, v| !v.is_empty());
     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {

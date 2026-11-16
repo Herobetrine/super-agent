@@ -73,7 +73,7 @@ target\release\super-agent.exe --demo --dark      # 合成数据，不调度
 powershell -File Install-Desktop.ps1              # 桌面快捷方式指向 Rust 版
 ```
 
-`--screenshot <png> [--size 宽x高]` 渲染后保存截图并退出，用于界面回归；截图模式默认不调度，加 `--schedule` 才会取锁；`--dialog models|providers|rotation|extensions` 启动时打开对应对话框。
+`--screenshot <png> [--size 宽x高]` 渲染后保存截图并退出，用于界面回归；截图模式默认不调度，加 `--schedule` 才会取锁；`--dialog models|advisor|providers|rotation|extensions|efficiency|palette` 启动时打开对应对话框，`--project <目录>` 指定新对话草稿的项目目录，`--demo` 使用内置演示数据。
 
 可调度窗口的功能（括号内为对应的 Electron 接口）：
 

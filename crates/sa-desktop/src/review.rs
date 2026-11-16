@@ -879,29 +879,77 @@ impl ReviewState {
         }
     }
 
-    fn restore_dialog(&mut self, ctx: &egui::Context, can_write: bool) {
+    fn restore_dialog(&mut self, ctx: &egui::Context, pal: &Palette, can_write: bool) {
         let Some(plan) = &self.restore_plan else {
             return;
         };
         let mut accept = false;
         let mut cancel = false;
         let modal = egui::Modal::new(egui::Id::new("checkpoint-restore"))
+            .frame(widgets::modal_frame(pal))
             .show(ctx, |ui| {
                 ui.set_width(620.0);
-                ui.heading("确认恢复所选文件");
-                ui.label(format!("{} · {}", display_path(&plan.path), plan.action));
-                ui.label("仅更改此文件；Git 暂存区保持不变。恢复前保存当前内容备份；预览后如有新编辑会取消恢复。");
-                if !plan.complete {
-                    ui.colored_label(egui::Color32::YELLOW, "差异预览已截断，请先核对完整文件。此次仍只恢复所选文件。");
+                if widgets::modal_header(
+                    ui,
+                    "",
+                    "确认恢复所选文件",
+                    &format!("{} · {}", display_path(&plan.path), plan.action),
+                    pal,
+                ) {
+                    cancel = true;
                 }
-                egui::ScrollArea::both().max_height(300.0).show(ui, |ui| {
-                    ui.monospace(&plan.preview);
+                ui.add(
+                    Label::new(
+                        RichText::new("仅更改此文件；Git 暂存区保持不变。恢复前保存当前内容备份；预览后如有新编辑会取消恢复。")
+                            .font(theme::body(theme::SMALL))
+                            .color(pal.mute),
+                    )
+                    .wrap(),
+                );
+                if !plan.complete {
+                    ui.add_space(8.0);
+                    widgets::callout(pal.warn).show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.add(
+                            Label::new(
+                                RichText::new("差异预览已截断，请先核对完整文件。此次仍只恢复所选文件。")
+                                    .font(theme::body(theme::SMALL))
+                                    .color(pal.warn.fg),
+                            )
+                            .wrap(),
+                        );
+                    });
+                }
+                ui.add_space(12.0);
+                widgets::well(pal).show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    egui::ScrollArea::both().max_height(300.0).show(ui, |ui| {
+                        ui.label(
+                            RichText::new(&plan.preview)
+                                .font(theme::mono(12.0))
+                                .color(pal.ink),
+                        );
+                    });
                 });
-                ui.horizontal(|ui| {
-                    cancel = ui.button("取消恢复").clicked();
-                    accept = ui.add_enabled(can_write, egui::Button::new("确认恢复此文件")).clicked();
+                ui.add_space(16.0);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    accept = ui
+                        .add_enabled_ui(can_write, |ui| {
+                            widgets::danger_button(ui, "", "确认恢复此文件", pal)
+                        })
+                        .inner
+                        .clicked();
+                    cancel |= widgets::quiet_button(ui, "", "取消恢复", pal, false).clicked();
                 });
-                if !can_write { ui.label("观察窗口不能恢复文件。"); }
+                if !can_write {
+                    ui.add_space(8.0);
+                    ui.label(
+                        RichText::new("观察窗口不能恢复文件。")
+                            .font(theme::body(theme::SMALL))
+                            .color(pal.mute),
+                    );
+                }
             });
         if accept {
             if let Some(plan) = self.restore_plan.take() {
@@ -928,9 +976,10 @@ impl ReviewState {
         {
             self.refresh(ui.ctx(), cwd.clone(), data.clone());
         }
-        self.restore_dialog(ui.ctx(), can_write);
+        self.restore_dialog(ui.ctx(), pal, can_write);
         ui.ctx().request_repaint_after(Duration::from_secs(1));
         ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 8.0;
             if widgets::quiet_button(ui, icon::ARROWS_CLOCKWISE, "刷新变更", pal, false).clicked()
             {
                 self.refresh(ui.ctx(), cwd.clone(), data.clone());
@@ -942,7 +991,10 @@ impl ReviewState {
                 && self.restore_plan.is_none()
                 && matches!(self.result, Some(Ok(_)));
             if ui
-                .add_enabled(can_write && ready, egui::Button::new("保存检查点"))
+                .add_enabled_ui(can_write && ready, |ui| {
+                    widgets::outline_button(ui, "", "保存检查点", pal)
+                })
+                .inner
                 .clicked()
             {
                 let root = PathBuf::from(&cwd);
@@ -959,27 +1011,55 @@ impl ReviewState {
             }
         });
         if let Some(notice) = &self.notice {
-            ui.add(Label::new(RichText::new(notice).color(pal.mute)).wrap());
+            ui.add_space(8.0);
+            ui.add(
+                Label::new(RichText::new(notice).font(theme::body(theme::SMALL)).color(pal.mute))
+                    .wrap(),
+            );
         }
+        ui.add_space(8.0);
         let view = match &self.result {
             Some(Ok(view)) => view.clone(),
             Some(Err(error)) => {
-                ui.add(Label::new(RichText::new(error).color(pal.fail.fg)).wrap());
+                ui.add(
+                    Label::new(RichText::new(error).font(theme::body(theme::SMALL)).color(pal.fail.fg))
+                        .wrap(),
+                );
                 return;
             }
             None => {
-                ui.label("正在读取文件变更…");
+                ui.label(
+                    RichText::new("正在读取文件变更…")
+                        .font(theme::body(theme::UI))
+                        .color(pal.mute),
+                );
                 return;
             }
         };
         let before_compare = self.compare;
         for path in &view.restore_warnings {
-            ui.add(Label::new(RichText::new(format!("发现未完成或需人工核对的恢复；原内容和操作记录保留于 {}。请先核对再继续恢复。", path.display())).color(pal.warn.fg)).wrap());
+            widgets::callout(pal.warn).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.add(
+                    Label::new(
+                        RichText::new(format!("发现未完成或需人工核对的恢复；原内容和操作记录保留于 {}。请先核对再继续恢复。", path.display()))
+                            .font(theme::body(theme::SMALL))
+                            .color(pal.warn.fg),
+                    )
+                    .wrap(),
+                );
+            });
+            ui.add_space(8.0);
         }
         ui.horizontal(|ui| {
-            ui.selectable_value(&mut self.compare, false, "Git 变更");
+            ui.spacing_mut().item_spacing.x = 4.0;
+            if widgets::quiet_button(ui, "", "Git 变更", pal, !self.compare).clicked() {
+                self.compare = false;
+            }
             ui.add_enabled_ui(view.checkpoint.is_some(), |ui| {
-                ui.selectable_value(&mut self.compare, true, "与检查点比较");
+                if widgets::quiet_button(ui, "", "与检查点比较", pal, self.compare).clicked() {
+                    self.compare = true;
+                }
             });
         });
         if self.compare != before_compare {
@@ -987,7 +1067,14 @@ impl ReviewState {
             self.detail = None;
             self.detail_pending = None;
         }
-        ui.add(Label::new(RichText::new("检查点覆盖已跟踪与未忽略文件（含清洁文件），最多 10000 项、单文件 4 MiB、总计 64 MiB。").font(theme::body(theme::TINY)).color(pal.mute)).wrap());
+        ui.add(
+            Label::new(
+                RichText::new("检查点覆盖已跟踪与未忽略文件（含清洁文件），最多 10000 项、单文件 4 MiB、总计 64 MiB。")
+                    .font(theme::body(theme::TINY))
+                    .color(pal.faint),
+            )
+            .wrap(),
+        );
         if self.compare
             && let Some(point) = &view.checkpoint
         {
@@ -997,14 +1084,19 @@ impl ReviewState {
                     display_time(&point.captured),
                     point.files.len()
                 ))
+                .font(theme::body(theme::SMALL))
                 .color(pal.mute),
             );
         }
+        ui.add_space(4.0);
         let changes = if self.compare {
             match &view.checkpoint_changes {
                 Ok(changes) => changes,
                 Err(e) => {
-                    ui.add(Label::new(RichText::new(e).color(pal.fail.fg)).wrap());
+                    ui.add(
+                        Label::new(RichText::new(e).font(theme::body(theme::SMALL)).color(pal.fail.fg))
+                            .wrap(),
+                    );
                     return;
                 }
             }
@@ -1012,11 +1104,16 @@ impl ReviewState {
             &view.changes
         };
         if changes.is_empty() {
-            ui.label(if self.compare {
-                "当前文件与检查点一致"
-            } else {
-                "工作区干净"
-            });
+            crate::inspector::empty(
+                ui,
+                icon::GIT_DIFF,
+                if self.compare {
+                    "当前文件与检查点一致"
+                } else {
+                    "工作区干净"
+                },
+                pal,
+            );
             return;
         }
         if self
@@ -1032,20 +1129,12 @@ impl ReviewState {
             .id_salt("review-files")
             .max_height(180.0)
             .show(ui, |ui| {
+                ui.spacing_mut().item_spacing.y = 2.0;
                 for change in changes {
                     let key = change.key();
                     let reviewed = self.reviewed.get(&key) == Some(&change.fingerprint);
-                    let label = format!(
-                        "{} {} · {} · {}",
-                        if reviewed { "✓" } else { "○" },
-                        change.area.label(),
-                        change.status_label(),
-                        change.label()
-                    );
-                    if ui
-                        .selectable_label(self.selected.as_ref() == Some(&key), label)
-                        .clicked()
-                    {
+                    let selected = self.selected.as_ref() == Some(&key);
+                    if change_row(ui, pal, change, selected, reviewed).clicked() {
                         self.selected = Some(key);
                         self.detail = None;
                         self.detail_pending = None;
@@ -1056,6 +1145,7 @@ impl ReviewState {
             return;
         };
         if self.compare {
+            ui.add_space(8.0);
             let ready = can_write
                 && cfg!(windows)
                 && self.restore_preview.is_none()
@@ -1063,7 +1153,10 @@ impl ReviewState {
                 && self.restoring.is_none()
                 && self.saving.is_none();
             if ui
-                .add_enabled(ready, egui::Button::new("预览恢复所选文件"))
+                .add_enabled_ui(ready, |ui| {
+                    widgets::outline_button(ui, "", "预览恢复所选文件", pal)
+                })
+                .inner
                 .clicked()
                 && let Some(point) = view.checkpoint.clone()
             {
@@ -1074,7 +1167,12 @@ impl ReviewState {
                 }));
             }
             if !can_write {
-                ui.label("观察窗口不能保存或恢复检查点。");
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new("观察窗口不能保存或恢复检查点。")
+                        .font(theme::body(theme::SMALL))
+                        .color(pal.mute),
+                );
             }
         }
         if self.detail.is_none() && self.detail_pending.is_none() {
@@ -1085,57 +1183,173 @@ impl ReviewState {
                 detail(&root, &selected, point.as_ref())
             }));
         }
+        ui.add_space(8.0);
         widgets::rule(ui, pal.line_soft);
+        ui.add_space(8.0);
         match &self.detail {
             None => {
-                ui.label("正在读取文件差异…");
+                ui.label(
+                    RichText::new("正在读取文件差异…")
+                        .font(theme::body(theme::UI))
+                        .color(pal.mute),
+                );
             }
             Some(Err(e)) => {
-                ui.add(Label::new(RichText::new(e).color(pal.fail.fg)).wrap());
+                ui.add(
+                    Label::new(RichText::new(e).font(theme::body(theme::SMALL)).color(pal.fail.fg))
+                        .wrap(),
+                );
             }
             Some(Ok(detail)) => {
                 let current =
                     detail.key == change.key() && detail.fingerprint == change.fingerprint;
                 let mut reviewed = self.reviewed.get(&detail.key) == Some(&detail.fingerprint);
-                if ui
-                    .add_enabled(
-                        current && detail.complete && self.pending.is_none(),
-                        widgets::Check::new(&mut reviewed, "已审阅此版本"),
-                    )
-                    .changed()
-                {
-                    if reviewed {
-                        self.reviewed
-                            .insert(detail.key.clone(), detail.fingerprint.clone());
-                    } else {
-                        self.reviewed.remove(&detail.key);
-                    }
-                }
-                egui::ScrollArea::horizontal()
-                    .id_salt("review-patch")
-                    .show(ui, |ui| {
-                        for line in detail.text.lines().take(4000) {
-                            let color = if line.starts_with('+') && !line.starts_with("+++") {
-                                pal.ok.fg
-                            } else if line.starts_with('-') && !line.starts_with("---") {
-                                pal.fail.fg
-                            } else if line.starts_with("@@") {
-                                pal.accent
-                            } else {
-                                pal.ink
-                            };
-                            ui.add(
-                                Label::new(RichText::new(line).monospace().size(12.0).color(color))
-                                    .wrap_mode(egui::TextWrapMode::Extend),
-                            );
+                let (added, removed) = line_counts(&detail.text);
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled_ui(current && detail.complete && self.pending.is_none(), |ui| {
+                            ui.add(widgets::Check::new(
+                                &mut reviewed,
+                                RichText::new("已审阅此版本").font(theme::body(theme::UI)),
+                            ))
+                        })
+                        .inner
+                        .changed()
+                    {
+                        if reviewed {
+                            self.reviewed
+                                .insert(detail.key.clone(), detail.fingerprint.clone());
+                        } else {
+                            self.reviewed.remove(&detail.key);
                         }
-                        if detail.text.lines().count() > 4000 {
-                            ui.label("…仅显示前 4000 行");
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.spacing_mut().item_spacing.x = 4.0;
+                        if removed > 0 {
+                            widgets::chip(ui, &format!("−{removed}"), pal.fail, theme::TINY);
+                        }
+                        if added > 0 {
+                            widgets::chip(ui, &format!("+{added}"), pal.run, theme::TINY);
                         }
                     });
+                });
+                ui.add_space(8.0);
+                widgets::well(pal).show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    egui::ScrollArea::horizontal()
+                        .id_salt("review-patch")
+                        .show(ui, |ui| {
+                            ui.spacing_mut().item_spacing.y = 1.0;
+                            for line in detail.text.lines().take(4000) {
+                                let mut text = RichText::new(line).font(theme::mono(12.0));
+                                text = if line.starts_with('+') && !line.starts_with("+++") {
+                                    text.color(pal.run.fg).background_color(pal.run.bg)
+                                } else if line.starts_with('-') && !line.starts_with("---") {
+                                    text.color(pal.fail.fg).background_color(pal.fail.bg)
+                                } else if line.starts_with("@@") {
+                                    text.color(pal.mute)
+                                } else if line.starts_with("diff ")
+                                    || line.starts_with("index ")
+                                    || line.starts_with("+++")
+                                    || line.starts_with("---")
+                                {
+                                    text.color(pal.faint)
+                                } else {
+                                    text.color(pal.ink)
+                                };
+                                ui.add(Label::new(text).wrap_mode(egui::TextWrapMode::Extend));
+                            }
+                            if detail.text.lines().count() > 4000 {
+                                ui.label(
+                                    RichText::new("…仅显示前 4000 行")
+                                        .font(theme::body(theme::SMALL))
+                                        .color(pal.mute),
+                                );
+                            }
+                        });
+                });
             }
         }
     }
+}
+
+/// Added and removed line counts of a patch (file headers excluded).
+fn line_counts(text: &str) -> (usize, usize) {
+    let mut added = 0;
+    let mut removed = 0;
+    for line in text.lines().take(4000) {
+        if line.starts_with('+') && !line.starts_with("+++") {
+            added += 1;
+        } else if line.starts_with('-') && !line.starts_with("---") {
+            removed += 1;
+        }
+    }
+    (added, removed)
+}
+
+/// One file of the change list: review mark, elided path, area and status.
+fn change_row(ui: &mut Ui, pal: &Palette, change: &Change, selected: bool, reviewed: bool) -> egui::Response {
+    let width = ui.available_width();
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, 28.0), egui::Sense::click());
+    let accessible = format!(
+        "{} {} · {} · {}",
+        if reviewed { "✓" } else { "○" },
+        change.area.label(),
+        change.status_label(),
+        change.label()
+    );
+    resp.widget_info(|| {
+        egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, true, selected, &accessible)
+    });
+    if ui.is_rect_visible(rect) {
+        let radius = egui::CornerRadius::same(theme::CONTROL_RADIUS);
+        if selected {
+            ui.painter().rect_filled(rect, radius, pal.selected);
+        } else if resp.hovered() {
+            ui.painter().rect_filled(rect, radius, pal.hover);
+        }
+        let (mark, mark_color) = if reviewed {
+            (icon::CHECK_CIRCLE, pal.ok.fg)
+        } else {
+            (icon::CIRCLE, pal.faint)
+        };
+        ui.painter().text(
+            egui::pos2(rect.left() + 14.0, rect.center().y),
+            egui::Align2::CENTER_CENTER,
+            mark,
+            theme::body(14.0),
+            mark_color,
+        );
+        let status_color = match change.status_label() {
+            "新增" => pal.run.fg,
+            "删除" => pal.fail.fg,
+            "冲突" => pal.warn.fg,
+            _ => pal.mute,
+        };
+        let meta = widgets::line_galley(
+            ui,
+            &format!("{} · {}", change.area.label(), change.status_label()),
+            theme::body(theme::TINY),
+            status_color,
+            (width * 0.4).max(60.0),
+        );
+        let meta_w = meta.size().x;
+        let meta_pos = egui::pos2(rect.right() - 10.0 - meta_w, rect.center().y - meta.size().y / 2.0);
+        ui.painter().galley(meta_pos, meta, status_color);
+        let path = widgets::line_galley(
+            ui,
+            &change.label(),
+            theme::mono(12.0),
+            pal.ink,
+            (width - 28.0 - meta_w - 22.0).max(40.0),
+        );
+        ui.painter().galley(
+            egui::pos2(rect.left() + 28.0, rect.center().y - path.size().y / 2.0),
+            path,
+            pal.ink,
+        );
+    }
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
 #[cfg(test)]

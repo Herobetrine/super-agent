@@ -205,7 +205,7 @@ impl App {
             shot,
             applied_dark: None,
             composer: Composer::new(
-                get("project").map(PathBuf::from).filter(|p| p.is_dir()),
+                opts.project.clone().or_else(|| get("project").map(PathBuf::from)).filter(|p| p.is_dir()),
                 get("lead"),
             ),
             models: None,
@@ -542,61 +542,59 @@ impl eframe::App for App {
         let pal = self.pal.clone();
         let width = ctx.content_rect().width();
 
-        egui::SidePanel::left("rail")
-            .exact_width(56.0)
-            .resizable(false)
-            .show_separator_line(false)
-            .frame(
-                Frame::new()
-                    .fill(pal.rail)
-                    .inner_margin(Margin::symmetric(0, 14)),
-            )
-            .show(ctx, |ui| self.rail(ui));
-
-        if self.sidebar_visible(width) {
+        // A grey canvas carrying the sidebar and one or two white sheets.
+        const GAP: i8 = 8;
+        let sidebar = self.sidebar_visible(width);
+        if sidebar {
             egui::SidePanel::left("sidebar")
-                .default_width(284.0)
+                .default_width(268.0)
                 .width_range(236.0..=400.0)
                 .resizable(true)
-                .frame(
-                    Frame::new()
-                        .fill(pal.sidebar)
-                        .stroke(Stroke::new(1.0_f32, pal.line)),
-                )
+                .show_separator_line(false)
+                .frame(Frame::new().fill(pal.sidebar))
                 .show(ctx, |ui| self.sidebar(ui));
         }
 
-        egui::TopBottomPanel::top("topbar")
-            .exact_height(58.0)
-            .frame(
-                Frame::new()
-                    .fill(pal.surface)
-                    .stroke(Stroke::new(1.0_f32, pal.line_soft))
-                    .inner_margin(Margin {
-                        left: 20,
-                        right: 16,
-                        top: 0,
-                        bottom: 0,
-                    }),
-            )
-            .show(ctx, |ui| self.topbar(ui));
-
         if self.inspector_open {
             egui::SidePanel::right("inspector")
-                .default_width(372.0)
-                .width_range(300.0..=560.0)
+                .default_width(388.0)
+                .width_range(320.0..=600.0)
                 .resizable(true)
-                .frame(
-                    Frame::new()
-                        .fill(pal.canvas)
-                        .stroke(Stroke::new(1.0_f32, pal.line)),
-                )
-                .show(ctx, |ui| self.inspector(ui));
+                .show_separator_line(false)
+                .frame(Frame::new().fill(pal.canvas).inner_margin(Margin {
+                    left: 0,
+                    right: GAP,
+                    top: GAP,
+                    bottom: GAP,
+                }))
+                .show(ctx, |ui| widgets::sheet(ui, &pal, |ui| self.inspector(ui)));
         }
 
         egui::CentralPanel::default()
-            .frame(Frame::new().fill(pal.surface))
-            .show(ctx, |ui| self.conversation(ui));
+            .frame(Frame::new().fill(pal.canvas).inner_margin(Margin {
+                left: if sidebar { 0 } else { GAP },
+                right: GAP,
+                top: GAP,
+                bottom: GAP,
+            }))
+            .show(ctx, |ui| {
+                widgets::sheet(ui, &pal, |ui| {
+                    let bar = egui::TopBottomPanel::top("topbar")
+                        .exact_height(46.0)
+                        .show_separator_line(false)
+                        .frame(Frame::new().inner_margin(Margin {
+                            left: 12,
+                            right: 10,
+                            top: 0,
+                            bottom: 0,
+                        }))
+                        .show_inside(ui, |ui| self.topbar(ui));
+                    let r = bar.response.rect;
+                    ui.painter()
+                        .hline(r.x_range(), r.bottom(), Stroke::new(1.0_f32, pal.line_soft));
+                    self.conversation(ui);
+                });
+            });
         self.confirm_dialog(ctx);
         self.models_dialog(ctx);
         self.providers_dialog(ctx);
@@ -799,143 +797,20 @@ impl App {
         }
     }
 
-    fn rail(&mut self, ui: &mut egui::Ui) {
-        let pal = self.pal.clone();
-        ui.vertical_centered(|ui| {
-            ui.spacing_mut().item_spacing.y = 6.0;
-            let (r, resp) = ui.allocate_exact_size(Vec2::splat(32.0), egui::Sense::hover());
-            widgets::brand_mark(ui, r, &pal);
-            resp.on_hover_text("Super Agent");
-            ui.add_space(14.0);
-            let hover = Color32::from_white_alpha(18);
-            if widgets::icon_button(
-                ui,
-                icon::CHATS_CIRCLE,
-                38.0,
-                pal.rail_ink,
-                hover,
-                self.sidebar_open,
-            )
-            .on_hover_text("会话列表")
-            .clicked()
-            {
-                self.sidebar_open = !self.sidebar_open;
-            }
-            if widgets::icon_button(
-                ui,
-                icon::SQUARES_FOUR,
-                38.0,
-                pal.rail_ink,
-                hover,
-                self.inspector_open,
-            )
-            .on_hover_text("项目面板")
-            .clicked()
-            {
-                self.inspector_open = !self.inspector_open;
-            }
-            let approvals = self
-                .view
-                .as_ref()
-                .and_then(|v| v.snap.as_ref())
-                .map_or(0, |s| s.approvals.len());
-            let r = widgets::icon_button(
-                ui,
-                icon::SHIELD_CHECK,
-                38.0,
-                pal.rail_ink,
-                hover,
-                self.inspector_open && self.tab == Tab::Approvals,
-            )
-            .on_hover_text(if approvals > 0 {
-                format!("待审批 {approvals}")
-            } else {
-                "审批".into()
-            });
-            if approvals > 0 {
-                let c = r.rect.right_top() + egui::vec2(-9.0, 9.0);
-                ui.painter()
-                    .circle_filled(c, 4.5, Color32::from_rgb(0xe0, 0x9a, 0x3c));
-                ui.painter()
-                    .circle_stroke(c, 4.5, Stroke::new(1.5_f32, pal.rail));
-            }
-            if r.clicked() {
-                self.inspector_open = true;
-                self.tab = Tab::Approvals;
-            }
-            if self.writable()
-                && widgets::icon_button(ui, icon::SLIDERS_HORIZONTAL, 38.0, pal.rail_ink, hover, false)
-                    .on_hover_text("模型与执行端 · 新会话默认")
-                    .clicked()
-            {
-                self.open_models(crate::models::Scope::Defaults);
-            }
-            if self.writable() {
-                let r = widgets::icon_button(ui, icon::PUZZLE_PIECE, 38.0, pal.rail_ink, hover, false)
-                    .on_hover_text("MCP 与技能 · 新会话默认");
-                r.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "MCP 与技能"));
-                if r.clicked() {
-                    self.open_extensions(crate::extensions::ExtScope::Defaults);
-                }
-                let r = widgets::icon_button(ui, icon::PLUGS, 38.0, pal.rail_ink, hover, false)
-                    .on_hover_text("供应商与轮换");
-                r.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "供应商与轮换"));
-                if r.clicked() {
-                    self.open_providers();
-                }
-            }
-        });
-        ui.with_layout(egui::Layout::bottom_up(egui::Align::Center), |ui| {
-            ui.spacing_mut().item_spacing.y = 10.0;
-            let settings = widgets::icon_button(ui, icon::GEAR, 38.0, pal.rail_ink, Color32::from_white_alpha(18), self.efficiency.is_some())
-                .on_hover_text("Token 与缓存");
-            settings.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Token 与缓存设置"));
-            if settings.clicked() {
-                self.open_efficiency();
-            }
-            let (color, tip) = match (&self.source.error, &self.source.label) {
-                (Some(e), _) => (Color32::from_rgb(0xe0, 0x7a, 0x52), format!("未连接 · {e}")),
-                (None, Some(l)) => (Color32::from_rgb(0x7c, 0xc4, 0x8f), l.clone()),
-                _ => (pal.rail_mute, "正在连接数据源".to_string()),
-            };
-            let (r, resp) = ui.allocate_exact_size(Vec2::splat(14.0), egui::Sense::hover());
-            ui.painter().circle_filled(r.center(), 4.0, color);
-            resp.on_hover_text(tip);
-            if cfg!(windows) && self.writable() {
-                let tip = if self.notifications_enabled { "系统通知已开启 · 点击关闭" } else { "系统通知已关闭 · 点击开启" };
-                let response = widgets::icon_button(ui, icon::BELL, 34.0, pal.rail_ink, Color32::from_white_alpha(18), self.notifications_enabled)
-                    .on_hover_text(tip);
-                response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "系统通知"));
-                if response.clicked() {
-                    self.notifications_enabled = !self.notifications_enabled;
-                    if !self.notifications_enabled {
-                        self.notifications.stop();
-                    }
-                }
-            }
-            let theme_icon = if self.dark { icon::SUN } else { icon::MOON };
-            if widgets::icon_button(
-                ui,
-                theme_icon,
-                38.0,
-                pal.rail_ink,
-                Color32::from_white_alpha(18),
-                false,
-            )
-            .on_hover_text(if self.dark {
-                "切换到浅色主题"
-            } else {
-                "切换到暗色主题"
-            })
-            .clicked()
-            {
-                self.dark = !self.dark;
-            }
-        });
+    pub(crate) fn notifications_on(&self) -> bool {
+        self.notifications_enabled
+    }
+
+    pub(crate) fn toggle_notifications(&mut self) {
+        self.notifications_enabled = !self.notifications_enabled;
+        if !self.notifications_enabled {
+            self.notifications.stop();
+        }
     }
 
     fn topbar(&mut self, ui: &mut egui::Ui) {
         let pal = self.pal.clone();
+        let sidebar = self.sidebar_visible(ui.ctx().content_rect().width());
         let snap = self.view.as_ref().and_then(|v| v.snap.as_ref());
         let state = snap.map(|s| s.ticket.state.clone());
         let approvals = snap.map_or(0, |s| s.approvals.len());
@@ -955,28 +830,41 @@ impl App {
             });
         let crumb = snap
             .map(|s| labels::basename(&s.ticket.cwd))
-            .filter(|c| !c.is_empty() && !c.contains("super-agent-project-"))
-            .unwrap_or_else(|| "工作台".into());
+            .filter(|c| !c.is_empty() && !c.contains("super-agent-project-"));
         let title_line = labels::compact(&title, 200);
+        // In a narrow column the title needs the room: drop the folder crumb
+        // and the "all is well" scheduler note (the sidebar foot repeats it).
+        let compact = ui.available_width() < 520.0;
         ui.horizontal_centered(|ui| {
-            if widgets::icon_button(ui, icon::SIDEBAR_SIMPLE, 32.0, pal.mute, pal.hover, false)
-                .on_hover_text("展开或收起会话侧栏")
-                .clicked()
-            {
-                self.sidebar_open = !self.sidebar_open;
+            ui.spacing_mut().item_spacing.x = 2.0;
+            if !sidebar {
+                if widgets::panel_button(ui, false, 30.0, &pal, false)
+                    .on_hover_text("展开会话侧栏")
+                    .clicked()
+                {
+                    self.sidebar_open = true;
+                    // Narrow windows show one side at a time.
+                    if !self.sidebar_visible(ui.ctx().content_rect().width()) {
+                        self.inspector_open = false;
+                    }
+                }
+                if self.writable() {
+                    let r = widgets::icon_button(ui, icon::NOTE_PENCIL, 30.0, pal.mute, pal.hover, false)
+                        .on_hover_text("新建对话 · Ctrl N");
+                    r.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "新建对话"));
+                    if r.clicked() {
+                        self.new_conversation();
+                    }
+                }
+                ui.add_space(6.0);
+            } else {
+                ui.add_space(6.0);
             }
-            ui.add_space(4.0);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.spacing_mut().item_spacing.x = 8.0;
-                if widgets::quiet_button(
-                    ui,
-                    icon::SQUARES_FOUR,
-                    "项目面板",
-                    &pal,
-                    self.inspector_open,
-                )
-                .on_hover_text("展开或收起项目面板")
-                .clicked()
+                ui.spacing_mut().item_spacing.x = 4.0;
+                if widgets::panel_button(ui, true, 30.0, &pal, self.inspector_open)
+                    .on_hover_text("展开或收起项目面板 · Ctrl J")
+                    .clicked()
                 {
                     self.inspector_open = !self.inspector_open;
                 }
@@ -984,7 +872,7 @@ impl App {
                     let busy = self.export.is_some();
                     let r = ui
                         .add_enabled_ui(!busy, |ui| {
-                            widgets::icon_button(ui, icon::EXPORT, 32.0, pal.mute, pal.hover, false)
+                            widgets::icon_button(ui, icon::EXPORT, 30.0, pal.mute, pal.hover, false)
                         })
                         .inner
                         .on_hover_text("导出");
@@ -1005,6 +893,7 @@ impl App {
                         None => {}
                     }
                 }
+                ui.add_space(4.0);
                 if approvals > 0
                     && widgets::badge(
                         ui,
@@ -1020,17 +909,23 @@ impl App {
                     self.inspector_open = true;
                     self.tab = Tab::Approvals;
                 }
+                // A healthy scheduler is stated quietly; trouble gets a tinted badge.
+                let quiet = theme::Tone {
+                    bg: Color32::TRANSPARENT,
+                    fg: pal.mute,
+                };
                 match (&self.host, &self.host_error) {
                     (Some(h), _) => {
                         use sa_engine::engine::SchedulerState;
                         let health = h.scheduler_health();
                         match health.state {
+                            SchedulerState::Running if compact => {}
                             SchedulerState::Running => {
                                 let text = match h.try_active_count() {
                                     Some(n) if n > 0 => format!("调度中 · {n}"),
                                     _ => "调度中".into(),
                                 };
-                                widgets::badge(ui, icon::PULSE, &text, pal.run)
+                                widgets::badge(ui, icon::PULSE, &text, quiet)
                                     .on_hover_text("后台调度检查正常，正在执行任务或等待新的工作。");
                             }
                             SchedulerState::DatabaseBusy => {
@@ -1054,32 +949,41 @@ impl App {
                             }
                         }
                     }
+                    (None, _) if compact => {}
                     (None, err) => {
                         let tip = match err {
                             Some(e) => format!("只读观察：{e}"),
                             None => "此窗口只读取工单日志，不调度、不写入，也不调用模型。".into(),
                         };
-                        widgets::badge(ui, icon::EYE, "只读观察", pal.neutral).on_hover_text(tip);
+                        widgets::badge(ui, icon::EYE, "只读观察", quiet).on_hover_text(tip);
                     }
                 }
                 if let Some(st) = &state {
-                    widgets::chip(ui, &labels::job_state(st), pal.state_tone(st), theme::SMALL);
+                    ui.add_space(2.0);
+                    widgets::status(
+                        ui,
+                        &labels::job_state(st),
+                        pal.state_tone(st).fg,
+                        labels::is_active(st),
+                    );
                 }
-                ui.add_space(8.0);
+                ui.add_space(10.0);
                 ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                    ui.spacing_mut().item_spacing.x = 6.0;
-                    ui.label(
-                        egui::RichText::new(&crumb)
-                            .font(theme::body(14.0))
-                            .color(pal.mute),
-                    );
-                    ui.label(
-                        egui::RichText::new("/")
-                            .font(theme::body(14.0))
-                            .color(pal.faint),
-                    );
+                    ui.spacing_mut().item_spacing.x = 7.0;
+                    if let Some(crumb) = crumb.as_ref().filter(|_| !compact) {
+                        ui.label(
+                            egui::RichText::new(crumb)
+                                .font(theme::body(theme::UI))
+                                .color(pal.mute),
+                        );
+                        ui.label(
+                            egui::RichText::new("/")
+                                .font(theme::body(theme::UI))
+                                .color(pal.faint),
+                        );
+                    }
                     let w = ui.available_width();
-                    let g = widgets::line_galley(ui, &title_line, theme::strong(14.5), pal.ink, w);
+                    let g = widgets::line_galley(ui, &title_line, theme::strong(13.5), pal.ink, w);
                     ui.add(egui::Label::new(g).selectable(false))
                         .on_hover_text(title);
                 });

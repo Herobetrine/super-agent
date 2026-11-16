@@ -8,7 +8,7 @@ use crate::labels;
 use crate::models::Scope;
 use crate::theme;
 use crate::widgets;
-use egui::{Align2, CornerRadius, Key, KeyboardShortcut, Modifiers, RichText, Sense, Stroke, vec2};
+use egui::{Align2, CornerRadius, Key, KeyboardShortcut, Modifiers, RichText, Sense, vec2};
 use egui_phosphor::regular as icon;
 
 #[derive(Default)]
@@ -259,14 +259,14 @@ impl App {
                         state.index = 0;
                     }
                 });
-                ui.add_space(6.0);
+                ui.add_space(8.0);
                 widgets::rule(ui, pal.line_soft);
-                ui.add_space(6.0);
+                ui.add_space(4.0);
                 egui::ScrollArea::vertical().max_height(420.0).show(ui, |ui| {
                     if all.is_empty() {
                         ui.add_space(12.0);
                         ui.vertical_centered(|ui| {
-                            ui.label(RichText::new("没有匹配的命令").color(pal.mute));
+                            ui.label(RichText::new("没有匹配的命令").font(theme::body(theme::SMALL)).color(pal.mute));
                         });
                         ui.add_space(12.0);
                     }
@@ -279,11 +279,12 @@ impl App {
                         }
                         let p = ui.painter();
                         if selected || resp.hovered() {
-                            p.rect_filled(rect, CornerRadius::same(8), pal.selected);
+                            p.rect_filled(rect, CornerRadius::same(theme::CONTROL_RADIUS), pal.hover);
                         }
-                        p.text(rect.left_center() + vec2(14.0, 0.0), Align2::LEFT_CENTER, r.icon, theme::body(16.0), pal.accent);
+                        let icon_color = if selected { pal.ink } else { pal.mute };
+                        p.text(rect.left_center() + vec2(14.0, 0.0), Align2::LEFT_CENTER, r.icon, theme::body(16.0), icon_color);
                         let tw = rect.width() - 200.0;
-                        let g = widgets::line_galley(ui, &r.title, theme::body(13.5), pal.ink, tw);
+                        let g = widgets::line_galley(ui, &r.title, theme::body(theme::UI), pal.ink, tw);
                         p.galley(egui::pos2(rect.left() + 40.0, rect.center().y - g.size().y / 2.0), g, pal.ink);
                         if !r.hint.is_empty() {
                             let hg = widgets::line_galley(ui, &r.hint, theme::body(theme::TINY), pal.faint, 150.0);
@@ -302,6 +303,8 @@ impl App {
                     }
                 });
                 ui.add_space(4.0);
+                widgets::rule(ui, pal.line_soft);
+                ui.add_space(6.0);
                 ui.horizontal(|ui| {
                     ui.add_space(8.0);
                     ui.label(
@@ -310,7 +313,6 @@ impl App {
                             .color(pal.faint),
                     );
                 });
-                let _ = Stroke::NONE;
             });
         if modal.should_close() {
             close = true;

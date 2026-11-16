@@ -1,7 +1,8 @@
-//! Brand palette, typography and the custom egui style.
+//! Palette, typography and the custom egui style.
 //!
-//! The light palette follows `desktop/ui/studio.css`; the dark palette keeps the
-//! same green identity with low-glare surfaces.
+//! The interface itself is neutral: greys, an ink accent and hairlines.
+//! Colour is reserved for two things that carry meaning — which agent is
+//! speaking ([`Palette::agent_color`]) and what state work is in ([`Tone`]).
 
 use egui::{
     Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, Margin, Shadow, Stroke,
@@ -9,8 +10,13 @@ use egui::{
 };
 use std::sync::Arc;
 
+/// Corner radius of sheets and dialogs.
 pub const RADIUS: u8 = 12;
+/// Corner radius of buttons, inputs and rows.
+pub const CONTROL_RADIUS: u8 = 8;
 pub const BODY: f32 = 14.5;
+/// Interface text: buttons, rows, form labels.
+pub const UI: f32 = 13.0;
 pub const SMALL: f32 = 12.5;
 pub const TINY: f32 = 11.5;
 pub const MONO: f32 = 13.0;
@@ -41,19 +47,22 @@ pub struct Tone {
 #[derive(Clone, Debug)]
 pub struct Palette {
     pub dark: bool,
+    /// Window background behind the sheets; also the sidebar.
     pub canvas: Color32,
+    /// Sheets, dialogs, inputs.
     pub surface: Color32,
+    /// Quiet blocks inside a sheet.
     pub surface_alt: Color32,
     pub sidebar: Color32,
-    pub rail: Color32,
-    pub rail_ink: Color32,
-    pub rail_mute: Color32,
     pub ink: Color32,
     pub mute: Color32,
     pub faint: Color32,
     pub line: Color32,
     pub line_soft: Color32,
+    /// Primary actions and "on" states.
     pub accent: Color32,
+    /// Text and icons drawn on `accent`.
+    pub on_accent: Color32,
     pub pale: Color32,
     pub hover: Color32,
     pub selected: Color32,
@@ -89,74 +98,70 @@ impl Palette {
     pub fn light() -> Self {
         Self {
             dark: false,
-            canvas: hex(0xf7f8f4),
+            canvas: hex(0xf3f4f6),
             surface: hex(0xffffff),
-            surface_alt: hex(0xfbfcf9),
-            sidebar: hex(0xf3f5ef),
-            rail: hex(0x1e302a),
-            rail_ink: hex(0xe6efe7),
-            rail_mute: hex(0x8fa597),
-            ink: hex(0x263830),
-            mute: hex(0x65746c),
-            faint: hex(0x98a59d),
-            line: hex(0xd9dfd8),
-            line_soft: hex(0xe8ece6),
-            accent: hex(0x355c47),
-            pale: hex(0xe9efdf),
-            hover: hex(0xebefe7),
-            selected: hex(0xe3ebda),
-            user_bubble: hex(0xe9f0df),
-            code_bg: hex(0xf3f5f0),
-            inline_code_bg: hex(0xedf1e8),
-            inline_code_fg: hex(0x2f5340),
-            link: hex(0x2f6a8f),
+            surface_alt: hex(0xf7f8f9),
+            sidebar: hex(0xf3f4f6),
+            ink: hex(0x1a1c20),
+            mute: hex(0x636975),
+            faint: hex(0x9a9fa9),
+            line: hex(0xe1e3e8),
+            line_soft: hex(0xeceef1),
+            accent: hex(0x1a1c20),
+            on_accent: hex(0xffffff),
+            pale: hex(0xeef0f3),
+            hover: hex(0xe9ebee),
+            selected: hex(0xe0e3e8),
+            user_bubble: hex(0xf0f1f4),
+            code_bg: hex(0xf6f7f9),
+            inline_code_bg: hex(0xeef0f3),
+            inline_code_fg: hex(0x2b2f36),
+            link: hex(0x2459c9),
             mark_bg: hex(0xceef9f),
             mark_fg: hex(0x233c32),
-            ok: tone(0xe3ecd9, 0x3b6042),
-            run: tone(0xdceee1, 0x276444),
-            wait: tone(0xe4ebf3, 0x3c5a7d),
-            warn: tone(0xf8eed6, 0x7d5b14),
-            fail: tone(0xf9e5d8, 0x8f481e),
-            stop: tone(0xecebe6, 0x625d55),
-            neutral: tone(0xeef0eb, 0x5b6a62),
-            report: tone(0xf1f5eb, 0x47614b),
+            ok: tone(0xe9f3ec, 0x2f6f47),
+            run: tone(0xe1f4e7, 0x1d7a3e),
+            wait: tone(0xe6eefb, 0x2d5cb0),
+            warn: tone(0xfbf0d9, 0x855800),
+            fail: tone(0xfce9e6, 0xb3261e),
+            stop: tone(0xeeeff2, 0x5d636e),
+            neutral: tone(0xeeeff2, 0x5d636e),
+            report: tone(0xf3f4f6, 0x454a54),
         }
     }
 
     pub fn dark() -> Self {
         Self {
             dark: true,
-            canvas: hex(0x141a17),
-            surface: hex(0x1a221e),
-            surface_alt: hex(0x1f2824),
-            sidebar: hex(0x171e1b),
-            rail: hex(0x0e1412),
-            rail_ink: hex(0xe1ebe3),
-            rail_mute: hex(0x7d9286),
-            ink: hex(0xe2e9e4),
-            mute: hex(0x9aaaa1),
-            faint: hex(0x6d7d74),
-            line: hex(0x2d3934),
-            line_soft: hex(0x25302b),
-            accent: hex(0x8cc4a0),
-            pale: hex(0x223129),
-            hover: hex(0x222c27),
-            selected: hex(0x26372d),
-            user_bubble: hex(0x25382d),
-            code_bg: hex(0x111714),
-            inline_code_bg: hex(0x26322c),
-            inline_code_fg: hex(0xb7dcc3),
-            link: hex(0x8cc0e0),
+            canvas: hex(0x0e0f11),
+            surface: hex(0x17181b),
+            surface_alt: hex(0x1c1e21),
+            sidebar: hex(0x0e0f11),
+            ink: hex(0xe8e9ec),
+            mute: hex(0x9da2ac),
+            faint: hex(0x6b707a),
+            line: hex(0x2b2e33),
+            line_soft: hex(0x222529),
+            accent: hex(0xecedf0),
+            on_accent: hex(0x121316),
+            pale: hex(0x222529),
+            hover: hex(0x23262a),
+            selected: hex(0x2c2f34),
+            user_bubble: hex(0x24272b),
+            code_bg: hex(0x111214),
+            inline_code_bg: hex(0x25282c),
+            inline_code_fg: hex(0xd7dae0),
+            link: hex(0x8ab4f8),
             mark_bg: hex(0xceef9f),
             mark_fg: hex(0x233c32),
-            ok: tone(0x24372a, 0xa9d4b0),
-            run: tone(0x1f3a2b, 0x8fdbaa),
-            wait: tone(0x22303f, 0xa3bfdf),
-            warn: tone(0x3a3120, 0xe7c47e),
-            fail: tone(0x3d2620, 0xf0a888),
-            stop: tone(0x2c2b28, 0xb8b1a6),
-            neutral: tone(0x252d29, 0xa5b2aa),
-            report: tone(0x1f2b23, 0xb5cfb3),
+            ok: tone(0x1b2a20, 0x8fc6a0),
+            run: tone(0x16301f, 0x6fd08c),
+            wait: tone(0x1a2740, 0x8db4f2),
+            warn: tone(0x33290f, 0xe5b95a),
+            fail: tone(0x3a1a18, 0xf08a80),
+            stop: tone(0x25272b, 0xa5aab3),
+            neutral: tone(0x25272b, 0xa5aab3),
+            report: tone(0x1e2023, 0xbfc4cc),
         }
     }
 
@@ -177,19 +182,19 @@ impl Palette {
         }
     }
 
-    /// Avatar color of an agent.
+    /// Identity color of an agent (avatars, reply lanes).
     pub fn agent_color(&self, agent: &str) -> Color32 {
         match (agent, self.dark) {
-            ("codex", false) => hex(0x2f6f5e),
-            ("codex", true) => hex(0x4f9c84),
-            ("claude", false) => hex(0xc06a3e),
-            ("claude", true) => hex(0xd88a5f),
-            ("deepseek", false) => hex(0x3d63b8),
-            ("deepseek", true) => hex(0x6b8fdc),
-            ("antigravity", false) => hex(0x7a58b0),
-            ("antigravity", true) => hex(0x9d80d0),
-            (_, false) => hex(0x6f7d75),
-            (_, true) => hex(0x7f8f86),
+            ("codex", false) => hex(0x1f8a70),
+            ("codex", true) => hex(0x3fa98c),
+            ("claude", false) => hex(0xc8643a),
+            ("claude", true) => hex(0xdb8458),
+            ("deepseek", false) => hex(0x3b63c4),
+            ("deepseek", true) => hex(0x6b8fe0),
+            ("antigravity", false) => hex(0x7b55b8),
+            ("antigravity", true) => hex(0x9f82d6),
+            (_, false) => hex(0x6d7480),
+            (_, true) => hex(0x848b96),
         }
     }
 }
@@ -208,8 +213,8 @@ pub fn apply(ctx: &egui::Context, pal: &Palette) {
     v.weak_text_color = Some(pal.faint);
     v.panel_fill = pal.canvas;
     v.window_fill = pal.surface;
-    // Text fields read as inset wells on both white cards and the canvas.
-    v.extreme_bg_color = if pal.dark { hex(0x111714) } else { hex(0xf4f6f1) };
+    // Text fields: the sheet colour with a hairline, darker than the sheet in dark mode.
+    v.extreme_bg_color = if pal.dark { hex(0x111214) } else { pal.surface };
     v.faint_bg_color = pal.surface_alt;
     v.code_bg_color = pal.inline_code_bg;
     v.hyperlink_color = pal.link;
@@ -217,21 +222,21 @@ pub fn apply(ctx: &egui::Context, pal: &Palette) {
     v.window_corner_radius = CornerRadius::same(RADIUS);
     v.menu_corner_radius = CornerRadius::same(10);
     v.window_shadow = Shadow {
-        offset: [0, 8],
-        blur: 24,
+        offset: [0, 10],
+        blur: 32,
         spread: 0,
-        color: Color32::from_black_alpha(if pal.dark { 90 } else { 28 }),
+        color: Color32::from_black_alpha(if pal.dark { 110 } else { 30 }),
     };
     v.popup_shadow = Shadow {
-        offset: [0, 4],
-        blur: 14,
+        offset: [0, 6],
+        blur: 20,
         spread: 0,
-        color: Color32::from_black_alpha(if pal.dark { 80 } else { 22 }),
+        color: Color32::from_black_alpha(if pal.dark { 100 } else { 24 }),
     };
     v.selection.bg_fill = if pal.dark {
-        Color32::from_rgba_unmultiplied(140, 196, 160, 70)
+        Color32::from_rgba_unmultiplied(138, 180, 248, 60)
     } else {
-        Color32::from_rgba_unmultiplied(53, 92, 71, 52)
+        Color32::from_rgba_unmultiplied(36, 89, 201, 38)
     };
     v.selection.stroke = Stroke::new(1.0_f32, pal.accent);
     v.text_cursor.stroke = Stroke::new(1.5_f32, pal.accent);
@@ -244,7 +249,7 @@ pub fn apply(ctx: &egui::Context, pal: &Palette) {
     v.collapsing_header_frame = false;
     v.indent_has_left_vline = false;
 
-    let r = CornerRadius::same(8);
+    let r = CornerRadius::same(CONTROL_RADIUS);
     let w = &mut v.widgets;
     w.noninteractive.bg_fill = pal.surface;
     w.noninteractive.weak_bg_fill = pal.surface;
@@ -254,28 +259,28 @@ pub fn apply(ctx: &egui::Context, pal: &Palette) {
 
     // Checkboxes, combo boxes and text fields need a visible edge at rest.
     w.inactive.bg_fill = pal.surface;
-    w.inactive.weak_bg_fill = pal.surface_alt;
+    w.inactive.weak_bg_fill = pal.surface;
     w.inactive.bg_stroke = Stroke::new(1.0_f32, pal.line);
     w.inactive.fg_stroke = Stroke::new(1.2_f32, pal.ink);
     w.inactive.corner_radius = r;
     w.inactive.expansion = 0.0;
 
     w.hovered.bg_fill = pal.hover;
-    w.hovered.weak_bg_fill = pal.hover;
+    w.hovered.weak_bg_fill = pal.surface_alt;
     w.hovered.bg_stroke = Stroke::new(1.0_f32, pal.faint);
     w.hovered.fg_stroke = Stroke::new(1.4_f32, pal.ink);
     w.hovered.corner_radius = r;
     w.hovered.expansion = 0.0;
 
     w.active.bg_fill = pal.selected;
-    w.active.weak_bg_fill = pal.selected;
-    w.active.bg_stroke = Stroke::new(1.0_f32, pal.accent);
+    w.active.weak_bg_fill = pal.hover;
+    w.active.bg_stroke = Stroke::new(1.0_f32, pal.mute);
     w.active.fg_stroke = Stroke::new(1.5_f32, pal.ink);
     w.active.corner_radius = r;
     w.active.expansion = 0.0;
 
     w.open.bg_fill = pal.selected;
-    w.open.weak_bg_fill = pal.selected;
+    w.open.weak_bg_fill = pal.hover;
     w.open.bg_stroke = Stroke::new(1.0_f32, pal.line);
     w.open.fg_stroke = Stroke::new(1.2_f32, pal.ink);
     w.open.corner_radius = r;
@@ -284,17 +289,17 @@ pub fn apply(ctx: &egui::Context, pal: &Palette) {
     style.text_styles = [
         (TextStyle::Small, body(SMALL)),
         (TextStyle::Body, body(BODY)),
-        (TextStyle::Button, body(13.5)),
-        (TextStyle::Heading, strong(19.0)),
+        (TextStyle::Button, body(UI)),
+        (TextStyle::Heading, strong(18.0)),
         (TextStyle::Monospace, mono(MONO)),
     ]
     .into();
     let s = &mut style.spacing;
     s.item_spacing = Vec2::new(8.0, 6.0);
-    s.button_padding = Vec2::new(12.0, 6.0);
-    s.interact_size = Vec2::new(28.0, 26.0);
+    s.button_padding = Vec2::new(11.0, 5.5);
+    s.interact_size = Vec2::new(28.0, 28.0);
     s.window_margin = Margin::same(14);
-    s.menu_margin = Margin::same(8);
+    s.menu_margin = Margin::same(6);
     s.indent = 18.0;
     s.icon_width = 15.0;
     s.icon_spacing = 6.0;

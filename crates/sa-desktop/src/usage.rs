@@ -3,6 +3,7 @@
 use crate::{
     labels,
     theme::{self, Palette},
+    widgets,
 };
 use egui::{RichText, Ui};
 use sa_store::{TicketUsage, TokenCounts};
@@ -23,7 +24,7 @@ fn number(value: Option<u64>) -> String {
         .unwrap_or_else(|| "未报告".into())
 }
 
-fn counts(ui: &mut Ui, tokens: &TokenCounts) {
+fn counts(ui: &mut Ui, tokens: &TokenCounts, pal: &Palette) {
     egui::Grid::new(ui.id().with("counts"))
         .num_columns(2)
         .spacing([20.0, 5.0])
@@ -36,11 +37,27 @@ fn counts(ui: &mut Ui, tokens: &TokenCounts) {
                 ("缓存写入", tokens.cache_creation_input_tokens),
                 ("推理输出", tokens.reasoning_output_tokens),
             ] {
-                ui.label(name);
-                ui.monospace(number(value));
+                ui.label(dim(name));
+                ui.label(mono_value(number(value), pal));
                 ui.end_row();
             }
         });
+}
+
+fn dim(text: impl Into<String>) -> RichText {
+    RichText::new(text.into()).font(theme::body(theme::SMALL))
+}
+
+fn help(ui: &mut Ui, text: impl Into<String>, pal: &Palette) {
+    ui.add(egui::Label::new(dim(text).color(pal.mute)).wrap());
+}
+
+fn mono_value(text: String, pal: &Palette) -> RichText {
+    RichText::new(text).font(theme::mono(12.0)).color(pal.ink)
+}
+
+fn heading(ui: &mut Ui, text: &str, pal: &Palette) {
+    ui.label(RichText::new(text).font(theme::strong(theme::UI)).color(pal.ink));
 }
 
 fn hover_item(ui: &mut Ui, text: &str, label: &str, pal: &Palette, details: impl FnOnce(&mut Ui)) {
@@ -59,19 +76,20 @@ fn hover_item(ui: &mut Ui, text: &str, label: &str, pal: &Palette, details: impl
 
 fn coverage(ui: &mut Ui, usage: &TicketUsage, pal: &Palette) {
     if usage.pending {
-        ui.label("正在汇总较早的记录…");
+        help(ui, "正在汇总较早的记录…", pal);
         ui.ctx()
             .request_repaint_after(std::time::Duration::from_millis(250));
     }
     if usage.partial || usage.unreported_jobs > 0 {
-        ui.label(
-            RichText::new("当前显示已报告的用量，部分调用或历史记录缺少计数。")
-                .small()
-                .color(pal.warn.fg),
+        ui.add(
+            egui::Label::new(
+                dim("当前显示已报告的用量，部分调用或历史记录缺少计数。").color(pal.warn.fg),
+            )
+            .wrap(),
         );
     }
     if usage.jobs.iter().any(|job| job.agent == "claude") {
-        ui.label("Claude 仅统计主循环，内部子任务未计入。");
+        help(ui, "Claude 仅统计主循环，内部子任务未计入。", pal);
     }
 }
 
@@ -94,13 +112,13 @@ pub fn footer(ui: &mut Ui, usage: &TicketUsage, pal: &Palette) {
         ui.spacing_mut().item_spacing.x = 12.0;
         hover_item(ui, &format!("{} 用量", egui_phosphor::regular::GAUGE), "令牌用量", pal, |ui| {
         ui.set_width(330.0);
-        ui.label(RichText::new("执行端已报告用量").strong());
+        heading(ui, "执行端已报告用量", pal);
         coverage(ui, usage, pal);
-        counts(ui, &usage.totals);
+        counts(ui, &usage.totals, pal);
         if usage.unreported_jobs > 0 {
-            ui.label(format!("{} 个任务尚未报告用量", usage.unreported_jobs));
+            help(ui, format!("{} 个任务尚未报告用量", usage.unreported_jobs), pal);
         }
-        ui.separator();
+        widgets::rule(ui, pal.line_soft);
         egui::ScrollArea::vertical()
             .max_height(310.0)
             .show(ui, |ui| {
@@ -112,21 +130,21 @@ pub fn footer(ui: &mut Ui, usage: &TicketUsage, pal: &Palette) {
                         number(job.tokens.total_tokens)
                     );
                     ui.push_id(job.job, |ui| {
-                        ui.collapsing(title, |ui| {
-                            counts(ui, &job.tokens);
+                        ui.collapsing(RichText::new(title).font(theme::body(theme::UI)), |ui| {
+                            counts(ui, &job.tokens, pal);
                             if job.agent == "claude" {
-                                ui.label("主循环用量，内部子任务未计入。");
+                                help(ui, "主循环用量，内部子任务未计入。", pal);
                             }
-                            ui.label(format!(
-                                "已报告 {} 次执行 · 未报告 {} 次",
-                                job.reported_attempts, job.unreported_attempts
-                            ));
+                            help(
+                                ui,
+                                format!(
+                                    "已报告 {} 次执行 · 未报告 {} 次",
+                                    job.reported_attempts, job.unreported_attempts
+                                ),
+                                pal,
+                            );
                             if job.partial {
-                                ui.label(
-                                    RichText::new("此任务的计数存在缺口")
-                                        .small()
-                                        .color(pal.warn.fg),
-                                );
+                                ui.label(dim("此任务的计数存在缺口").color(pal.warn.fg));
                             }
                         });
                     });
@@ -135,36 +153,36 @@ pub fn footer(ui: &mut Ui, usage: &TicketUsage, pal: &Palette) {
         });
         hover_item(ui, "Token 速率", "Token 速率", pal, |ui| {
             ui.set_max_width(350.0);
-            ui.label(RichText::new("平均输出速率").strong());
-            ui.monospace(rate(usage.performance.output_tokens_per_second()));
-            ui.label("可计时执行的输出 Token ÷ 执行耗时，包含工具调用和等待；排除轮次间空闲。并行任务按各自耗时加权，非模型纯生成速度。");
-            ui.label("执行中统计截至最近一次用量报告，未上报的生成进度不估算。");
+            heading(ui, "平均输出速率", pal);
+            ui.label(mono_value(rate(usage.performance.output_tokens_per_second()), pal));
+            help(ui, "可计时执行的输出 Token ÷ 执行耗时，包含工具调用和等待；排除轮次间空闲。并行任务按各自耗时加权，非模型纯生成速度。", pal);
+            help(ui, "执行中统计截至最近一次用量报告，未上报的生成进度不估算。", pal);
             if usage.performance.samples > 0 {
-                ui.label(format!("计入输出 {} Token · 耗时 {:.3} 秒 · {} 个样本",
+                help(ui, format!("计入输出 {} Token · 耗时 {:.3} 秒 · {} 个样本",
                     number(Some(usage.performance.output_tokens)), usage.performance.elapsed_ms as f64 / 1000.0,
-                    usage.performance.samples));
+                    usage.performance.samples), pal);
             }
             if usage.performance.partial {
-                ui.label("部分执行缺少完整计时或输出，仅展示可用样本。");
+                help(ui, "部分执行缺少完整计时或输出，仅展示可用样本。", pal);
             }
             coverage(ui, usage, pal);
             egui::ScrollArea::vertical().id_salt("rate-jobs").max_height(240.0).show(ui, |ui| {
                 for job in &usage.jobs {
-                    ui.label(format!("{} #{} · {}", labels::agent_name(&job.agent), job.job,
-                        rate(job.performance.output_tokens_per_second())));
+                    ui.label(dim(format!("{} #{} · {}", labels::agent_name(&job.agent), job.job,
+                        rate(job.performance.output_tokens_per_second()))));
                 }
             });
         });
         hover_item(ui, "缓存命中率", "缓存命中率", pal, |ui| {
             ui.set_max_width(350.0);
-            ui.label(RichText::new("输入缓存命中率").strong());
-            ui.monospace(hit_rate(&usage.totals));
-            ui.label("缓存读取 Token ÷ 全部输入 Token（含缓存读取与写入）。缓存写入不算命中；缺失字段或零输入不估算。");
-            ui.label(format!("缓存读取 {} · 输入 {}", number(usage.totals.cache_read_input_tokens), number(usage.totals.input_tokens)));
+            heading(ui, "输入缓存命中率", pal);
+            ui.label(mono_value(hit_rate(&usage.totals), pal));
+            help(ui, "缓存读取 Token ÷ 全部输入 Token（含缓存读取与写入）。缓存写入不算命中；缺失字段或零输入不估算。", pal);
+            help(ui, format!("缓存读取 {} · 输入 {}", number(usage.totals.cache_read_input_tokens), number(usage.totals.input_tokens)), pal);
             coverage(ui, usage, pal);
             egui::ScrollArea::vertical().id_salt("cache-jobs").max_height(240.0).show(ui, |ui| {
                 for job in &usage.jobs {
-                    ui.label(format!("{} #{} · {}", labels::agent_name(&job.agent), job.job, hit_rate(&job.tokens)));
+                    ui.label(dim(format!("{} #{} · {}", labels::agent_name(&job.agent), job.job, hit_rate(&job.tokens))));
                 }
             });
         });

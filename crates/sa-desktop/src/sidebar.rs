@@ -1,9 +1,10 @@
-//! Left sidebar: brand, search and tickets grouped by project folder.
+//! Left sidebar: brand, new conversation, search, tickets grouped by project
+//! folder, and the settings row at the foot.
 
 use crate::app::App;
 use crate::host::Action;
 use crate::labels;
-use crate::theme;
+use crate::theme::{self, Palette};
 use crate::widgets;
 use egui::{Align2, CornerRadius, Frame, Margin, RichText, Sense, Stroke, Ui, pos2, vec2};
 use egui_phosphor::regular as icon;
@@ -70,118 +71,99 @@ fn display_name(g: &Group, all: &[Group]) -> String {
     }
 }
 
+/// Row height of a ticket; one line, so a screen holds many.
+const ROW: f32 = 32.0;
+/// Horizontal centre of the state mark and of the group caret.
+const MARK_X: f32 = 15.0;
+/// Where titles and group names start.
+const TEXT_X: f32 = 28.0;
+
+/// The state mark in front of a ticket title.
+fn state_mark(ui: &Ui, c: egui::Pos2, state: &str, pal: &Palette) {
+    let p = ui.painter();
+    match state {
+        "running" | "started" => widgets::dot(ui, c, pal.run.fg, true),
+        "queued" | "waiting" | "draining" => {
+            p.circle_stroke(c, 3.25, Stroke::new(1.5_f32, pal.wait.fg));
+        }
+        "partial" => widgets::dot(ui, c, pal.warn.fg, false),
+        "failed" | "error" => widgets::dot(ui, c, pal.fail.fg, false),
+        "cancelled" | "interrupted" | "stopped" => {
+            p.circle_stroke(c, 3.25, Stroke::new(1.5_f32, pal.faint));
+        }
+        "done" | "completed" | "success" | "reported" => {
+            p.text(c, Align2::CENTER_CENTER, icon::CHECK, theme::body(12.0), pal.faint);
+        }
+        _ => widgets::dot(ui, c, pal.faint, false),
+    }
+}
+
 impl App {
     pub fn sidebar(&mut self, ui: &mut Ui) {
         let pal = self.pal.clone();
         egui::TopBottomPanel::bottom("sidebar-foot")
-            .frame(
-                Frame::new()
-                    .inner_margin(Margin::symmetric(18, 12))
-                    .stroke(Stroke::new(1.0_f32, pal.line_soft)),
-            )
+            .frame(Frame::new().inner_margin(Margin {
+                left: 10,
+                right: 8,
+                top: 6,
+                bottom: 10,
+            }))
             .show_separator_line(false)
-            .show_inside(ui, |ui| {
-                if widgets::wide_button(ui, icon::GEAR, "Token 与缓存", "", &pal).clicked() {
-                    self.open_efficiency();
-                }
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    let (color, text) = match (&self.source.error, &self.source.label) {
-                        (Some(_), _) => (pal.fail.fg, "未连接到工单数据库".to_string()),
-                        (None, Some(l)) if self.writable() => {
-                            use sa_engine::engine::SchedulerState;
-                            let state = self.host.as_ref().map(|host| host.scheduler_health().state);
-                            let (color, label) = match state {
-                                Some(SchedulerState::Running) => (pal.run.fg, "调度中"),
-                                Some(SchedulerState::DatabaseBusy) => (pal.warn.fg, "等待数据库"),
-                                Some(SchedulerState::Unresponsive) => (pal.fail.fg, "调度无响应"),
-                                Some(SchedulerState::Failed) => (pal.fail.fg, "调度已停止"),
-                                _ => (pal.warn.fg, "调度未运行"),
-                            };
-                            (color, l.replacen("只读连接", label, 1))
-                        }
-                        (None, Some(l)) => (pal.run.fg, l.clone()),
-                        _ => (pal.faint, "正在连接数据源…".to_string()),
-                    };
-                    let (r, _) = ui.allocate_exact_size(vec2(8.0, 16.0), Sense::hover());
-                    ui.painter().circle_filled(r.center(), 3.5, color);
-                    let g = widgets::line_galley(
-                        ui,
-                        &text,
-                        theme::body(theme::TINY),
-                        pal.mute,
-                        ui.available_width(),
-                    );
-                    ui.add(egui::Label::new(g).selectable(false))
-                        .on_hover_text(&text);
-                });
-            });
+            .show_inside(ui, |ui| self.sidebar_foot(ui));
 
         Frame::new()
             .inner_margin(Margin {
-                left: 14,
-                right: 14,
-                top: 18,
+                left: 12,
+                right: 8,
+                top: 16,
                 bottom: 0,
             })
             .show(ui, |ui| {
                 ui.spacing_mut().item_spacing.y = 0.0;
                 ui.horizontal(|ui| {
-                    ui.add_space(4.0);
-                    ui.vertical(|ui| {
-                        ui.spacing_mut().item_spacing.y = 1.0;
-                        ui.label(
-                            RichText::new("Super Agent")
-                                .font(theme::strong(16.5))
-                                .color(pal.ink),
-                        );
-                        ui.label(
-                            RichText::new("项目工作台")
-                                .font(theme::body(theme::SMALL))
-                                .color(pal.mute),
-                        );
-                    });
-                });
-                ui.add_space(16.0);
-                if self.writable() {
-                    if widgets::wide_button(ui, icon::NOTE_PENCIL, "新建对话", "Ctrl N", &pal)
-                        .on_hover_text("开始一个新会话")
-                        .clicked()
-                    {
-                        self.new_conversation();
-                    }
-                    ui.add_space(10.0);
-                }
-                let writable = self.writable();
-                let providers = ui.add_enabled_ui(writable, |ui| {
-                    widgets::wide_button(ui, icon::PLUGS, "管理自定义供应商", "", &pal)
-                }).inner.on_hover_text("添加兼容接口并获取在线模型")
-                    .on_disabled_hover_text("此窗口为只读观察模式，请在正在运行的主窗口管理供应商");
-                if providers.clicked() {
-                    self.open_providers();
-                }
-                ui.add_space(10.0);
-                self.search_box(ui);
-                ui.add_space(16.0);
-                ui.horizontal(|ui| {
-                    ui.add_space(4.0);
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    ui.add_space(2.0);
+                    let (r, _) = ui.allocate_exact_size(vec2(22.0, 30.0), Sense::hover());
+                    widgets::brand_mark(
+                        ui,
+                        egui::Rect::from_center_size(r.center(), vec2(22.0, 22.0)),
+                        &pal,
+                    );
                     ui.label(
-                        RichText::new("最近对话")
-                            .font(theme::body(theme::TINY + 0.5))
-                            .color(pal.mute),
+                        RichText::new("Super Agent")
+                            .font(theme::strong(14.0))
+                            .color(pal.ink),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.add_space(4.0);
-                        if !self.history.is_empty() {
-                            ui.label(
-                                RichText::new(self.history.len().to_string())
-                                    .font(theme::body(theme::TINY))
-                                    .color(pal.faint),
-                            );
+                        if widgets::panel_button(ui, false, 30.0, &pal, true)
+                            .on_hover_text("收起会话侧栏")
+                            .clicked()
+                        {
+                            self.sidebar_open = false;
                         }
                     });
                 });
-                ui.add_space(6.0);
+                ui.add_space(12.0);
+                Frame::new()
+                    .inner_margin(Margin {
+                        left: 0,
+                        right: 4,
+                        top: 0,
+                        bottom: 0,
+                    })
+                    .show(ui, |ui| {
+                        if self.writable() {
+                            if widgets::wide_button(ui, icon::NOTE_PENCIL, "新建对话", "Ctrl N", &pal)
+                                .on_hover_text("开始一个新会话")
+                                .clicked()
+                            {
+                                self.new_conversation();
+                            }
+                            ui.add_space(8.0);
+                        }
+                        self.search_box(ui);
+                    });
+                ui.add_space(10.0);
             });
 
         let out = egui::ScrollArea::vertical()
@@ -190,24 +172,24 @@ impl App {
             .show(ui, |ui| {
                 Frame::new()
                     .inner_margin(Margin {
-                        left: 10,
-                        right: 10,
+                        left: 8,
+                        right: 8,
                         top: 0,
                         bottom: 12,
                     })
                     .show(ui, |ui| {
-                        ui.spacing_mut().item_spacing.y = 2.0;
+                        ui.spacing_mut().item_spacing.y = 1.0;
                         if !self.history_loaded {
                             ui.add_space(20.0);
                             ui.horizontal(|ui| {
                                 ui.add_space(8.0);
-                                ui.spinner();
-                                ui.label(RichText::new("正在读取会话…").color(pal.mute));
+                                widgets::spinner(ui);
+                                ui.label(RichText::new("正在读取会话…").font(theme::body(theme::UI)).color(pal.mute));
                             });
                             return;
                         }
                         if self.history.is_empty() {
-                            ui.add_space(24.0);
+                            ui.add_space(28.0);
                             ui.vertical_centered(|ui| {
                                 let text = if self.source.error.is_some() {
                                     "暂时无法读取会话"
@@ -216,7 +198,7 @@ impl App {
                                 } else {
                                     "没找到匹配的会话。"
                                 };
-                                ui.label(RichText::new(text).color(pal.mute));
+                                ui.label(RichText::new(text).font(theme::body(theme::UI)).color(pal.mute));
                             });
                             return;
                         }
@@ -234,15 +216,22 @@ impl App {
                         let mut clicked = None;
                         let mut action = None;
                         if !pinned.is_empty() {
-                            ui.horizontal(|ui| {
-                                ui.add_space(8.0);
-                                ui.label(
-                                    RichText::new(format!("{}  置顶", icon::PUSH_PIN))
-                                        .font(theme::strong(13.0))
-                                        .color(pal.mute),
-                                );
-                            });
-                            ui.add_space(2.0);
+                            let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 28.0), Sense::hover());
+                            let p = ui.painter();
+                            p.text(
+                                pos2(rect.left() + MARK_X, rect.center().y),
+                                Align2::CENTER_CENTER,
+                                icon::PUSH_PIN,
+                                theme::body(12.0),
+                                pal.faint,
+                            );
+                            p.text(
+                                pos2(rect.left() + TEXT_X, rect.center().y),
+                                Align2::LEFT_CENTER,
+                                "置顶",
+                                theme::strong(theme::SMALL),
+                                pal.mute,
+                            );
                             for r in &pinned {
                                 let (c, a) = self.ticket_row(ui, r);
                                 if c {
@@ -250,7 +239,7 @@ impl App {
                                 }
                                 action = action.or(a);
                             }
-                            ui.add_space(8.0);
+                            ui.add_space(10.0);
                         }
                         for g in &all {
                             let open = searching || !self.collapsed_projects.contains(&g.key);
@@ -267,11 +256,10 @@ impl App {
                                     }
                                     action = action.or(a);
                                 }
-                                ui.add_space(6.0);
                             }
+                            ui.add_space(10.0);
                         }
                         if archived > 0 {
-                            ui.add_space(4.0);
                             let text = if self.show_archived {
                                 format!("隐藏已归档（{archived}）")
                             } else {
@@ -294,32 +282,113 @@ impl App {
         widgets::scroll_fades(ui, &out, pal.sidebar);
     }
 
+    /// Data source state and the settings that apply to every conversation.
+    fn sidebar_foot(&mut self, ui: &mut Ui) {
+        let pal = self.pal.clone();
+        ui.spacing_mut().item_spacing.y = 4.0;
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            let (color, text) = match (&self.source.error, &self.source.label) {
+                (Some(_), _) => (pal.fail.fg, "未连接到工单数据库".to_string()),
+                (None, Some(l)) if self.writable() => {
+                    use sa_engine::engine::SchedulerState;
+                    let state = self.host.as_ref().map(|host| host.scheduler_health().state);
+                    let (color, label) = match state {
+                        Some(SchedulerState::Running) => (pal.run.fg, "调度中"),
+                        Some(SchedulerState::DatabaseBusy) => (pal.warn.fg, "等待数据库"),
+                        Some(SchedulerState::Unresponsive) => (pal.fail.fg, "调度无响应"),
+                        Some(SchedulerState::Failed) => (pal.fail.fg, "调度已停止"),
+                        _ => (pal.warn.fg, "调度未运行"),
+                    };
+                    (color, l.replacen("只读连接", label, 1))
+                }
+                (None, Some(l)) => (pal.run.fg, l.clone()),
+                _ => (pal.faint, "正在连接数据源…".to_string()),
+            };
+            let (r, _) = ui.allocate_exact_size(vec2(18.0, 18.0), Sense::hover());
+            ui.painter()
+                .circle_filled(pos2(r.left() + 5.0 + 3.0, r.center().y), 3.0, color);
+            let g = widgets::line_galley(
+                ui,
+                &text,
+                theme::body(theme::TINY),
+                pal.faint,
+                ui.available_width() - 4.0,
+            );
+            ui.add(egui::Label::new(g).selectable(false))
+                .on_hover_text(&text);
+        });
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 2.0;
+            let size = 30.0;
+            let button = |ui: &mut Ui, ic: &str, label: &'static str, tip: &str| {
+                let r = widgets::icon_button(ui, ic, size, pal.mute, pal.hover, false).on_hover_text(tip);
+                r.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, label));
+                r.clicked()
+            };
+            if self.writable() {
+                if button(ui, icon::SLIDERS_HORIZONTAL, "模型与执行端", "模型与执行端 · 新会话默认") {
+                    self.open_models(crate::models::Scope::Defaults);
+                }
+                if button(ui, icon::PUZZLE_PIECE, "MCP 与技能", "MCP 与技能 · 新会话默认") {
+                    self.open_extensions(crate::extensions::ExtScope::Defaults);
+                }
+                if button(ui, icon::PLUGS, "供应商与轮换", "自定义供应商与轮换") {
+                    self.open_providers();
+                }
+            }
+            if button(ui, icon::GAUGE, "Token 与缓存", "Token 与缓存") {
+                self.open_efficiency();
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.spacing_mut().item_spacing.x = 2.0;
+                let (ic, tip) = if self.dark {
+                    (icon::SUN, "切换到浅色主题 · Ctrl Shift L")
+                } else {
+                    (icon::MOON, "切换到暗色主题 · Ctrl Shift L")
+                };
+                if button(ui, ic, "切换主题", tip) {
+                    self.dark = !self.dark;
+                }
+                if cfg!(windows) && self.writable() {
+                    let (ic, tip) = if self.notifications_on() {
+                        (icon::BELL, "系统通知已开启 · 点击关闭")
+                    } else {
+                        (icon::BELL_SLASH, "系统通知已关闭 · 点击开启")
+                    };
+                    if button(ui, ic, "系统通知", tip) {
+                        self.toggle_notifications();
+                    }
+                }
+            });
+        });
+    }
+
     fn search_box(&mut self, ui: &mut Ui) {
         let pal = self.pal.clone();
         let mut q = self.search.clone();
         Frame::new()
-            .fill(pal.surface)
-            .stroke(Stroke::new(1.0_f32, pal.line))
-            .corner_radius(CornerRadius::same(10))
+            .fill(pal.hover)
+            .corner_radius(CornerRadius::same(theme::CONTROL_RADIUS))
             .inner_margin(Margin {
                 left: 10,
-                right: 6,
-                top: 5,
-                bottom: 5,
+                right: 4,
+                top: 4,
+                bottom: 4,
             })
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 6.0;
+                    ui.spacing_mut().item_spacing.x = 7.0;
                     ui.label(
                         RichText::new(icon::MAGNIFYING_GLASS)
-                            .font(theme::body(15.0))
+                            .font(theme::body(14.0))
                             .color(pal.mute),
                     );
-                    let clear_w = if q.is_empty() { 0.0 } else { 24.0 };
+                    let clear_w = if q.is_empty() { 0.0 } else { 26.0 };
                     let edit = egui::TextEdit::singleline(&mut q)
                         .hint_text(RichText::new("搜索对话或项目").color(pal.faint))
                         .frame(false)
-                        .font(theme::body(13.5))
+                        .font(theme::body(theme::UI))
                         .desired_width(ui.available_width() - clear_w)
                         .margin(Margin::symmetric(0, 3))
                         .id_salt("sidebar-search");
@@ -329,7 +398,7 @@ impl App {
                         r.request_focus();
                     }
                     if !q.is_empty()
-                        && widgets::icon_button(ui, icon::X, 22.0, pal.mute, pal.hover, false)
+                        && widgets::icon_button(ui, icon::X, 22.0, pal.mute, pal.selected, false)
                             .on_hover_text("清除搜索")
                             .clicked()
                     {
@@ -346,46 +415,42 @@ impl App {
     fn group_header(&self, ui: &mut Ui, g: &Group, name: &str, open: bool) -> bool {
         let pal = &self.pal;
         let w = ui.available_width();
-        let (rect, resp) = ui.allocate_exact_size(vec2(w, 30.0), Sense::click());
+        let (rect, resp) = ui.allocate_exact_size(vec2(w, 28.0), Sense::click());
         if ui.is_rect_visible(rect) {
             let p = ui.painter();
-            if resp.hovered() {
-                p.rect_filled(rect, CornerRadius::same(8), pal.hover);
-            }
             let caret = if open {
                 icon::CARET_DOWN
             } else {
                 icon::CARET_RIGHT
             };
+            let hovered = resp.hovered();
             p.text(
-                pos2(rect.left() + 12.0, rect.center().y),
+                pos2(rect.left() + MARK_X, rect.center().y),
                 Align2::CENTER_CENTER,
                 caret,
-                theme::body(11.0),
-                pal.faint,
+                theme::body(10.0),
+                if hovered { pal.mute } else { pal.faint },
             );
-            p.text(
-                pos2(rect.left() + 30.0, rect.center().y),
-                Align2::CENTER_CENTER,
-                icon::FOLDER_SIMPLE,
-                theme::body(15.0),
-                pal.mute,
-            );
-            let count = g.rows.len().to_string();
-            let cg = widgets::line_galley(ui, &count, theme::body(theme::TINY), pal.faint, 60.0);
-            let cx = rect.right() - 10.0 - cg.size().x;
-            p.galley(pos2(cx, rect.center().y - cg.size().y / 2.0), cg, pal.faint);
+            let mut right = rect.right() - 8.0;
+            if hovered || !open {
+                let count = g.rows.len().to_string();
+                let cg = widgets::line_galley(ui, &count, theme::body(theme::TINY), pal.faint, 60.0);
+                right -= cg.size().x;
+                p.galley(pos2(right, rect.center().y - cg.size().y / 2.0), cg, pal.faint);
+                right -= 8.0;
+            }
+            let color = if hovered { pal.ink } else { pal.mute };
             let ng = widgets::line_galley(
                 ui,
                 name,
-                theme::strong(13.5),
-                pal.ink,
-                cx - rect.left() - 52.0,
+                theme::strong(theme::SMALL),
+                color,
+                right - rect.left() - TEXT_X,
             );
             p.galley(
-                pos2(rect.left() + 42.0, rect.center().y - ng.size().y / 2.0),
+                pos2(rect.left() + TEXT_X, rect.center().y - ng.size().y / 2.0),
                 ng,
-                pal.ink,
+                color,
             );
         }
         let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
@@ -401,70 +466,61 @@ impl App {
         let pal = &self.pal;
         let selected = self.view.as_ref().is_some_and(|v| v.id == r.id);
         let w = ui.available_width();
-        let (rect, resp) = ui.allocate_exact_size(vec2(w, 54.0), Sense::click());
+        let (rect, resp) = ui.allocate_exact_size(vec2(w, ROW), Sense::click());
         if ui.is_rect_visible(rect) {
             let p = ui.painter();
+            let radius = CornerRadius::same(theme::CONTROL_RADIUS);
             if selected {
-                p.rect_filled(rect, CornerRadius::same(9), pal.selected);
-                p.rect_filled(
-                    egui::Rect::from_min_size(
-                        pos2(rect.left() + 3.0, rect.top() + 14.0),
-                        vec2(3.0, rect.height() - 28.0),
-                    ),
-                    CornerRadius::same(2),
-                    pal.accent,
-                );
+                p.rect_filled(rect, radius, pal.selected);
             } else if resp.hovered() {
-                p.rect_filled(rect, CornerRadius::same(9), pal.hover);
+                p.rect_filled(rect, radius, pal.hover);
             }
-            let left = rect.left() + 18.0;
-            let inner_w = rect.right() - 10.0 - left;
-            let name = r.title.as_deref().filter(|t| !t.is_empty()).unwrap_or(&r.goal);
-            let mut title = labels::compact(if name.is_empty() { "会话" } else { name }, 120);
+            let y = rect.center().y;
+            let mark = pos2(rect.left() + MARK_X, y + 0.5);
             if r.archived {
-                title = format!("{} {title}", icon::ARCHIVE);
-            }
-            let font = if selected {
-                theme::strong(13.5)
+                p.text(mark, Align2::CENTER_CENTER, icon::ARCHIVE, theme::body(12.0), pal.faint);
             } else {
-                theme::body(13.5)
-            };
-            let tg = widgets::line_galley(ui, &title, font, pal.ink, inner_w);
-            p.galley(pos2(left, rect.top() + 8.0), tg, pal.ink);
-
-            let tone = pal.state_tone(&r.state);
-            let st = labels::job_state(&r.state);
-            let sg = widgets::line_galley(ui, &st, theme::body(theme::TINY), tone.fg, 120.0);
-            let chip = egui::Rect::from_min_size(
-                pos2(left, rect.top() + 30.0),
-                sg.size() + vec2(12.0, 3.0),
-            );
-            p.rect_filled(chip, CornerRadius::same(5), tone.bg);
-            p.galley(chip.min + vec2(6.0, 1.5), sg, tone.fg);
-            let lead = labels::agent_name(&r.lead);
-            let mg = widgets::line_galley(ui, &lead, theme::body(theme::TINY), pal.faint, 120.0);
+                state_mark(ui, mark, &r.state, pal);
+            }
             let time = labels::relative(r.created);
             let rg = widgets::line_galley(ui, &time, theme::body(theme::TINY), pal.faint, 100.0);
-            let rx = rect.right() - 10.0 - rg.size().x;
-            let y = chip.center().y;
-            if chip.right() + 8.0 + mg.size().x < rx - 8.0 {
-                p.galley(
-                    pos2(chip.right() + 8.0, y - mg.size().y / 2.0),
-                    mg,
-                    pal.faint,
-                );
-            }
+            let rx = rect.right() - 8.0 - rg.size().x;
             p.galley(pos2(rx, y - rg.size().y / 2.0), rg, pal.faint);
+
+            let name = r.title.as_deref().filter(|t| !t.is_empty()).unwrap_or(&r.goal);
+            let title = labels::compact(if name.is_empty() { "会话" } else { name }, 120);
+            let color = if selected || labels::is_active(&r.state) {
+                pal.ink
+            } else if r.archived {
+                pal.mute
+            } else {
+                pal.ink.gamma_multiply(0.86)
+            };
+            let left = rect.left() + TEXT_X;
+            let tg = widgets::line_galley(ui, &title, theme::body(theme::UI), color, rx - 10.0 - left);
+            p.galley(pos2(left, y - tg.size().y / 2.0), tg, color);
         }
         let resp = resp
             .on_hover_cursor(egui::CursorIcon::PointingHand)
             .on_hover_ui(|ui| {
-                ui.label(RichText::new(labels::compact(&r.goal, 400)));
+                ui.label(RichText::new(labels::compact(&r.goal, 400)).font(theme::body(theme::UI)));
                 ui.label(
-                    RichText::new(format!("#{} · {}", r.id, r.cwd))
-                        .font(theme::body(theme::TINY))
-                        .color(self.pal.mute),
+                    RichText::new(format!(
+                        "{} · 主控 {} · #{}",
+                        labels::job_state(&r.state),
+                        labels::agent_name(&r.lead),
+                        r.id
+                    ))
+                    .font(theme::body(theme::TINY))
+                    .color(self.pal.mute),
                 );
+                if !r.cwd.is_empty() {
+                    ui.label(
+                        RichText::new(&r.cwd)
+                            .font(theme::body(theme::TINY))
+                            .color(self.pal.faint),
+                    );
+                }
             });
         let mut action = None;
         if self.writable() {
@@ -523,9 +579,9 @@ impl App {
                 if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                     save = true;
                 }
-                ui.add_space(14.0);
+                ui.add_space(16.0);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if widgets::primary_button(ui, icon::CHECK, "保存", &pal, true).clicked() {
+                    if widgets::primary_button(ui, "", "保存", &pal, true).clicked() {
                         save = true;
                     }
                     if widgets::quiet_button(ui, "", "取消", &pal, false).clicked() {

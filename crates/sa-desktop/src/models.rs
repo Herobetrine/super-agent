@@ -181,7 +181,7 @@ fn combo(ui: &mut Ui, label: &str, id: &str, options: &[&Value], current: &str, 
     ui.horizontal(|ui| {
         ui.add_sized(
             [64.0, 24.0],
-            Label::new(RichText::new(label).font(theme::body(13.0))),
+            Label::new(RichText::new(label).font(theme::body(theme::UI))),
         );
         let text = options
             .iter()
@@ -231,7 +231,7 @@ fn model_combo(
     ui.horizontal(|ui| {
         ui.add_sized(
             [64.0, 24.0],
-            Label::new(RichText::new("模型").font(theme::body(13.0))),
+            Label::new(RichText::new("模型").font(theme::body(theme::UI))),
         );
         let text = options
             .iter()
@@ -267,11 +267,15 @@ fn model_combo(
                                 || label_of(model).to_lowercase().contains(&needle)
                         })
                         .collect();
-                    ui.label(format!(
-                        "匹配 {} / 共 {} 个模型",
-                        matches.len(),
-                        options.len()
-                    ));
+                    ui.label(
+                        RichText::new(format!(
+                            "匹配 {} / 共 {} 个模型",
+                            matches.len(),
+                            options.len()
+                        ))
+                        .font(theme::body(theme::SMALL))
+                        .color(ui.visuals().weak_text_color()),
+                    );
                     let row_height = ui.spacing().interact_size.y;
                     egui::ScrollArea::vertical()
                         .id_salt("model-results")
@@ -301,7 +305,8 @@ fn model_combo(
     });
     ui.label(
         RichText::new(format!("共 {} 个模型，可在列表中搜索", options.len()))
-            .font(theme::body(theme::TINY)),
+            .font(theme::body(theme::TINY))
+            .color(ui.visuals().weak_text_color()),
     );
     picked
 }
@@ -329,7 +334,7 @@ fn effort_combo(ui: &mut Ui, model: Option<&Value>, pick: &Value, locked: bool) 
     ui.horizontal(|ui| {
         ui.add_sized(
             [64.0, 24.0],
-            Label::new(RichText::new("思考强度").font(theme::body(13.0))),
+            Label::new(RichText::new("思考强度").font(theme::body(theme::UI))),
         );
         let enabled = !locked && (!declared.is_empty() || current.is_some());
         ui.add_enabled_ui(enabled, |ui| {
@@ -360,7 +365,8 @@ fn effort_combo(ui: &mut Ui, model: Option<&Value>, pick: &Value, locked: bool) 
     if declared.is_empty() {
         ui.label(
             RichText::new("目录未提供思考强度选项，使用执行端默认设置。")
-                .font(theme::body(theme::TINY)),
+                .font(theme::body(theme::TINY))
+                .color(ui.visuals().weak_text_color()),
         );
     }
     chosen.map(|effort| {
@@ -577,7 +583,7 @@ impl App {
                 ui.set_width(540.0);
                 if widgets::modal_header(
                     ui,
-                    icon::SLIDERS_HORIZONTAL,
+                    "",
                     title,
                     "为每个执行端选择执行方式、供应商与模型；带 · 的已明确指定。",
                     &pal,
@@ -604,9 +610,10 @@ impl App {
                 if let Some(i) = widgets::segmented(ui, &refs, current, &pal) {
                     switch_to = Some(AGENTS.get(i).copied().unwrap_or(ADVISOR).to_string());
                 }
+                ui.add_space(12.0);
                 if d.agent != ADVISOR {
                     ui.horizontal(|ui| {
-                        if widgets::quiet_button(ui, icon::PLUGS, "自定义供应商", &pal, false).clicked()
+                        if widgets::outline_button(ui, icon::PLUGS, "自定义供应商", &pal).clicked()
                         {
                             manage_providers = Some(d.agent.clone());
                         }
@@ -616,6 +623,7 @@ impl App {
                                 .color(pal.mute),
                         );
                     });
+                    ui.add_space(8.0);
                     ui.add_enabled_ui(!d.saving, |ui| {
                         widgets::toggle(
                             ui,
@@ -638,7 +646,7 @@ impl App {
                         .wrap(),
                     );
                 }
-                ui.add_space(12.0);
+                ui.add_space(16.0);
                 let agent = d.agent.clone();
                 if agent == ADVISOR {
                     if let Some(load) = advisor_panel(ui, d, &pal) {
@@ -648,12 +656,12 @@ impl App {
                 match d.catalogs.get(&agent) {
                     None | Some(Probe::Loading) => {
                         ui.horizontal(|ui| {
-                            ui.spinner();
-                            ui.label(RichText::new("正在获取模型目录…").color(pal.mute));
+                            widgets::spinner(ui);
+                            ui.label(RichText::new("正在获取模型目录…").font(theme::body(theme::SMALL)).color(pal.mute));
                         });
                     }
                     Some(Probe::Failed(e)) => {
-                        ui.add(Label::new(RichText::new(e).color(pal.fail.fg)).wrap());
+                        ui.add(Label::new(RichText::new(e).font(theme::body(theme::SMALL)).color(pal.fail.fg)).wrap());
                         if widgets::quiet_button(
                             ui,
                             icon::ARROWS_CLOCKWISE,
@@ -693,7 +701,7 @@ impl App {
                                 .wrap(),
                             );
                         }
-                        ui.add_space(6.0);
+                        ui.add_space(12.0);
                         let mode = pick_str(&pick, "mode").to_string();
                         let provider = pick_str(&pick, "provider").to_string();
                         let modes = rows(&c, "modes");
@@ -815,7 +823,7 @@ impl App {
                     }
                 }
                 }
-                ui.add_space(12.0);
+                ui.add_space(16.0);
                 let status = if d.locked {
                     "活动任务的模型保持原配置；交给主控的开关在后续派工生效。".to_string()
                 } else if let Some(w) = &d.warning {
@@ -836,7 +844,7 @@ impl App {
                     )
                     .wrap(),
                 );
-                ui.add_space(10.0);
+                ui.add_space(12.0);
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     ui.spacing_mut().item_spacing.x = 8.0;
                     {
@@ -851,7 +859,7 @@ impl App {
                             save = true;
                         }
                         if d.saving {
-                            ui.spinner();
+                            widgets::spinner(ui);
                         }
                     }
                     if widgets::quiet_button(
@@ -1004,7 +1012,7 @@ fn advisor_panel(ui: &mut Ui, d: &mut ModelDialog, pal: &theme::Palette) -> Opti
         )
         .wrap(),
     );
-    ui.add_space(6.0);
+    ui.add_space(12.0);
     let mut follow = d.advisor_follow;
     widgets::toggle(ui, &mut follow, "跟随主控（沿用主控当前的执行端与模型）", pal);
     if follow != d.advisor_follow {
@@ -1019,7 +1027,7 @@ fn advisor_panel(ui: &mut Ui, d: &mut ModelDialog, pal: &theme::Palette) -> Opti
         ui.add(Label::new(RichText::new(scope).font(theme::body(theme::SMALL)).color(pal.mute)).wrap());
         return None;
     }
-    ui.add_space(6.0);
+    ui.add_space(12.0);
     let names: Vec<String> = AGENTS.iter().map(|a| agent_name(a)).collect();
     let refs: Vec<&str> = names.iter().map(String::as_str).collect();
     let current = AGENTS.iter().position(|a| *a == d.advisor_agent).unwrap_or(0);
@@ -1028,6 +1036,7 @@ fn advisor_panel(ui: &mut Ui, d: &mut ModelDialog, pal: &theme::Palette) -> Opti
         d.advisor_pick = json!({});
         d.advisor_dirty = true;
     }
+    ui.add_space(12.0);
     let agent = d.advisor_agent.clone();
     match d.catalogs.get(&agent) {
         None => {
@@ -1035,12 +1044,12 @@ fn advisor_panel(ui: &mut Ui, d: &mut ModelDialog, pal: &theme::Palette) -> Opti
         }
         Some(Probe::Loading) => {
             ui.horizontal(|ui| {
-                ui.spinner();
-                ui.label(RichText::new("正在获取模型目录…").color(pal.mute));
+                widgets::spinner(ui);
+                ui.label(RichText::new("正在获取模型目录…").font(theme::body(theme::SMALL)).color(pal.mute));
             });
         }
         Some(Probe::Failed(e)) => {
-            ui.add(Label::new(RichText::new(e).color(pal.fail.fg)).wrap());
+            ui.add(Label::new(RichText::new(e).font(theme::body(theme::SMALL)).color(pal.fail.fg)).wrap());
         }
         Some(Probe::Ready(c)) => {
             let c = c.clone();

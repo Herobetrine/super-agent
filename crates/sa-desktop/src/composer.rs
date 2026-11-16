@@ -173,6 +173,17 @@ impl Current {
     }
 }
 
+/// Label and explanation of a ticket's pause state (`None`: not pausing).
+pub(crate) fn pause_text(pause: Option<&str>) -> (&'static str, &'static str) {
+    match pause {
+        Some("paused") => ("已暂停后续调度", "可补充指令；点击恢复调度后才会继续执行。"),
+        Some("draining") => ("等待当前工作完成交接", "正在执行的操作会继续，已有协作者完成后由主控收拢交接。"),
+        Some("handoff") => ("等待主控完成本轮交接", "保留当前操作；收齐已有回报后的最终交接轮禁止新派工。"),
+        _ => ("", "保留当前操作，等待协作者完成并由主控交接后暂停后续调度。"),
+    }
+}
+
+/// Round send / stop button of the composer.
 fn round_button(
     ui: &mut Ui,
     ic: &str,
@@ -186,23 +197,23 @@ fn round_button(
     } else {
         Sense::hover()
     };
-    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(34.0), sense);
+    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(30.0), sense);
     resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, label));
     if ui.is_rect_visible(rect) {
         let fill = if !enabled {
-            fill.gamma_multiply(0.35)
+            fill.gamma_multiply(0.22)
         } else if resp.hovered() {
-            fill.gamma_multiply(0.85)
+            fill.gamma_multiply(0.82)
         } else {
             fill
         };
         let p = ui.painter();
-        p.circle_filled(rect.center(), 17.0, fill);
+        p.circle_filled(rect.center(), 15.0, fill);
         p.text(
             rect.center(),
             Align2::CENTER_CENTER,
             ic,
-            theme::body(17.0),
+            theme::body(15.0),
             fg,
         );
     }
@@ -631,6 +642,38 @@ impl App {
         }
     }
 
+    /// Pause-after-handoff control of the status strip above the input.
+    /// Returns the action the operator chose.
+    pub(crate) fn pause_control(&self, ui: &mut Ui, ticket: i64, pause: Option<&str>) -> Option<Action> {
+        let pal = &self.pal;
+        let enabled = self.writable() && self.composer.pending == 0;
+        let mut action = None;
+        ui.add_enabled_ui(enabled, |ui| match pause {
+            Some("paused") => {
+                if widgets::outline_button(ui, icon::PLAY, "恢复调度", pal).clicked() {
+                    action = Some(Action::ResumePaused { ticket });
+                }
+            }
+            Some("draining" | "handoff") => {
+                if widgets::quiet_button(ui, "", "取消暂停请求", pal, false)
+                    .on_hover_text("恢复正常调度；正在进行的交接轮仍会完成。")
+                    .clicked()
+                {
+                    action = Some(Action::ResumePaused { ticket });
+                }
+            }
+            _ => {
+                if widgets::quiet_button(ui, icon::PAUSE, "交接后暂停", pal, false)
+                    .on_hover_text(pause_text(None).1)
+                    .clicked()
+                {
+                    action = Some(Action::PauseAfterHandoff { ticket });
+                }
+            }
+        });
+        action
+    }
+
     /// The input area at the bottom of the conversation column.
     pub fn composer(&mut self, ui: &mut Ui) {
         let pal = self.pal.clone();
@@ -687,67 +730,26 @@ impl App {
             ui.add_space(6.0);
         }
 
-        let pause_status = self.view.as_ref().and_then(|v| v.snap.as_ref())
-            .and_then(|s| s.ticket.pause_status.clone());
-        if let Some(ticket) = cur.ticket
-            && (in_flight || pause_status.is_some())
-        {
-            let mut action = None;
-            ui.horizontal_wrapped(|ui| {
-                let (label, hint) = match pause_status.as_deref() {
-                    Some("paused") => ("已暂停后续调度", "可补充指令；点击恢复调度后才会继续执行。"),
-                    Some("draining") => ("等待当前工作完成交接", "正在执行的操作会继续，已有协作者完成后由主控收拢交接。"),
-                    Some("handoff") => ("等待主控完成本轮交接", "保留当前操作；收齐已有回报后的最终交接轮禁止新派工。"),
-                    _ => ("", "保留当前操作，等待协作者完成并由主控交接后暂停后续调度。"),
-                };
-                if !label.is_empty() {
-                    ui.label(RichText::new(label).color(pal.mute)).on_hover_text(hint);
-                }
-                let enabled = self.writable() && !busy;
-                match pause_status.as_deref() {
-                    Some("paused") => {
-                        if ui.add_enabled(enabled, egui::Button::new("恢复调度")).clicked() {
-                            action = Some(Action::ResumePaused { ticket });
-                        }
-                    }
-                    Some("draining" | "handoff") => {
-                        if ui.add_enabled(enabled, egui::Button::new("取消暂停请求"))
-                            .on_hover_text("恢复正常调度；正在进行的交接轮仍会完成。")
-                            .clicked()
-                        {
-                            action = Some(Action::ResumePaused { ticket });
-                        }
-                    }
-                    _ => {
-                        if ui.add_enabled(enabled, egui::Button::new("交接后暂停"))
-                            .on_hover_text(hint).clicked()
-                        {
-                            action = Some(Action::PauseAfterHandoff { ticket });
-                        }
-                    }
-                }
-            });
-            if let Some(action) = action { self.submit(action); }
-            ui.add_space(6.0);
-        }
-
         let mut send = false;
         let mut stop = false;
         let mut pick_project = false;
         let mut pick_files = false;
         let mut models = None;
         let mut exts = None;
+        let editor_id = egui::Id::new("sa-composer-editor");
+        // The edge darkens while the editor has the keyboard.
+        let focused = ui.memory(|m| m.has_focus(editor_id));
         Frame::new()
             .fill(pal.surface)
-            .stroke(Stroke::new(1.0_f32, pal.line))
-            .corner_radius(CornerRadius::same(18))
+            .stroke(Stroke::new(1.0_f32, if focused { pal.faint } else { pal.line }))
+            .corner_radius(CornerRadius::same(14))
             .shadow(egui::Shadow {
-                offset: [0, 6],
-                blur: 24,
+                offset: [0, 3],
+                blur: 14,
                 spread: 0,
-                color: Color32::from_black_alpha(if pal.dark { 70 } else { 18 }),
+                color: Color32::from_black_alpha(if pal.dark { 70 } else { 12 }),
             })
-            .inner_margin(Margin { left: 16, right: 12, top: 12, bottom: 10 })
+            .inner_margin(Margin { left: 14, right: 10, top: 11, bottom: 8 })
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ui.spacing_mut().item_spacing.y = 6.0;
@@ -779,7 +781,6 @@ impl App {
 
                 // `@` mentions: pick project files (attached to a new
                 // conversation, or inserted as a path in a follow-up).
-                let editor_id = ui.make_persistent_id("composer");
                 let keyboard_ready = self.composer.keyboard_ready(ui, editor_id);
                 let root = if fixed {
                     (!cur.cwd.is_empty()).then(|| PathBuf::from(&cur.cwd))
@@ -812,19 +813,17 @@ impl App {
                             })
                             .then(|| hits[*row].clone());
                         }
-                        Frame::new()
-                            .fill(pal.surface_alt)
-                            .stroke(Stroke::new(1.0_f32, pal.line_soft))
-                            .corner_radius(CornerRadius::same(10))
+                        widgets::well(&pal)
                             .inner_margin(Margin::same(4))
                             .show(ui, |ui| {
                                 ui.set_width(ui.available_width());
+                                ui.spacing_mut().item_spacing.y = 1.0;
                                 for (i, f) in hits.iter().enumerate() {
                                     let (rect, r) =
                                         ui.allocate_exact_size(Vec2::new(ui.available_width(), 26.0), Sense::click());
                                     r.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, f));
                                     if i == self.composer.mention_row || r.hovered() {
-                                        ui.painter().rect_filled(rect, CornerRadius::same(7), pal.selected);
+                                        ui.painter().rect_filled(rect, CornerRadius::same(6), pal.selected);
                                     }
                                     ui.painter().text(
                                         rect.left_center() + Vec2::new(10.0, 0.0),
@@ -833,7 +832,7 @@ impl App {
                                         theme::body(13.0),
                                         pal.mute,
                                     );
-                                    let g = widgets::line_galley(ui, f, theme::body(12.5), pal.ink, rect.width() - 40.0);
+                                    let g = widgets::line_galley(ui, f, theme::body(theme::SMALL), pal.ink, rect.width() - 40.0);
                                     ui.painter().galley(
                                         rect.left_center() + Vec2::new(30.0, -g.size().y / 2.0),
                                         g,
@@ -843,11 +842,14 @@ impl App {
                                         pick = Some(f.clone());
                                     }
                                 }
-                                ui.label(
-                                    RichText::new("↑↓ 选择 · Enter 附加到消息")
-                                    .font(theme::body(theme::TINY))
-                                    .color(pal.faint),
-                                );
+                                ui.horizontal(|ui| {
+                                    ui.add_space(8.0);
+                                    ui.label(
+                                        RichText::new("↑↓ 选择 · Enter 附加到消息")
+                                            .font(theme::body(theme::TINY))
+                                            .color(pal.faint),
+                                    );
+                                });
                             });
                         if let Some(f) = pick {
                             self.composer.draft.truncate(*at);
@@ -914,38 +916,41 @@ impl App {
 
                 let has_draft = !self.composer.draft.trim().is_empty();
                 ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 6.0;
+                    ui.spacing_mut().item_spacing.x = 2.0;
+                    // Toolbar controls stay borderless until hovered.
+                    widgets::quiet_controls(ui, &pal);
+                    let tool = 28.0;
                     if fixed {
                         if cur.loaded {
-                            if widgets::icon_button(ui, icon::PAPERCLIP, 26.0, pal.mute, pal.hover, false)
+                            if widgets::icon_button(ui, icon::PAPERCLIP, tool, pal.mute, pal.hover, false)
                                 .on_hover_text("附加项目文件到本条消息").clicked()
                             {
                                 pick_files = true;
                             }
-                            widgets::chip(ui, &labels::profile(&cur.profile), pal.neutral, theme::TINY)
-                                .on_hover_text("权限已锁定 · 新建对话可更改");
-                            ui.label(
-                                RichText::new(format!("主控 · {}", agent_name(&cur.lead)))
-                                    .font(theme::body(theme::TINY + 0.5))
-                                    .color(pal.mute),
-                            );
-                            let folder = format!("{} {}", icon::FOLDER_SIMPLE, labels::basename(&cur.cwd));
-                            ui.label(RichText::new(folder).font(theme::body(theme::TINY + 0.5)).color(pal.mute))
-                                .on_hover_text(&cur.cwd);
                             if let Some(t) = cur.ticket
-                                && widgets::icon_button(ui, icon::SLIDERS_HORIZONTAL, 26.0, pal.mute, pal.hover, false)
+                                && widgets::icon_button(ui, icon::SLIDERS_HORIZONTAL, tool, pal.mute, pal.hover, false)
                                     .on_hover_text("本次会话的模型与执行端")
                                     .clicked()
                             {
                                 models = Some(crate::models::Scope::Ticket(t));
                             }
                             if let Some(t) = cur.ticket
-                                && widgets::icon_button(ui, icon::PUZZLE_PIECE, 26.0, pal.mute, pal.hover, false)
+                                && widgets::icon_button(ui, icon::PUZZLE_PIECE, tool, pal.mute, pal.hover, false)
                                     .on_hover_text("本次会话的 MCP 与技能")
                                     .clicked()
                             {
                                 exts = Some(crate::extensions::ExtScope::Ticket(t));
                             }
+                            ui.add_space(8.0);
+                            let meta = format!(
+                                "{} {}　主控 · {}　{}",
+                                icon::FOLDER_SIMPLE,
+                                labels::basename(&cur.cwd),
+                                agent_name(&cur.lead),
+                                labels::profile(&cur.profile)
+                            );
+                            ui.label(RichText::new(meta).font(theme::body(theme::TINY)).color(pal.faint))
+                                .on_hover_text(format!("{}\n权限已锁定 · 新建对话可更改", cur.cwd));
                         }
                     } else {
                         let folder = self
@@ -966,20 +971,8 @@ impl App {
                         {
                             pick_project = true;
                         }
-                        let can_attach = self.composer.project.is_some() && !busy;
-                        if ui
-                            .add_enabled_ui(can_attach, |ui| {
-                                widgets::icon_button(ui, icon::PAPERCLIP, 30.0, pal.mute, pal.hover, false)
-                            })
-                            .inner
-                            .on_hover_text("附加项目文件")
-                            .on_disabled_hover_text("先选择项目目录")
-                            .clicked()
-                        {
-                            pick_files = true;
-                        }
                         widgets::combo("lead")
-                            .width(150.0)
+                            .width(1.0)
                             .selected_text(format!("主控 · {}", agent_name(&self.composer.lead)))
                             .show_ui(ui, |ui| {
                                 for a in LEADS {
@@ -988,22 +981,35 @@ impl App {
                             });
                         let mut next = self.composer.profile.clone();
                         widgets::combo("profile")
-                            .width(118.0)
+                            .width(1.0)
                             .selected_text(labels::profile(&self.composer.profile))
                             .show_ui(ui, |ui| {
                                 for p in PROFILES {
                                     ui.selectable_value(&mut next, p.to_string(), labels::profile(p));
                                 }
                             });
+                        ui.add_space(4.0);
+                        let can_attach = self.composer.project.is_some() && !busy;
+                        if ui
+                            .add_enabled_ui(can_attach, |ui| {
+                                widgets::icon_button(ui, icon::PAPERCLIP, tool, pal.mute, pal.hover, false)
+                            })
+                            .inner
+                            .on_hover_text("附加项目文件")
+                            .on_disabled_hover_text("先选择项目目录")
+                            .clicked()
+                        {
+                            pick_files = true;
+                        }
                         let tip = App::routes_summary(self.composer.routes.as_ref());
-                        if widgets::icon_button(ui, icon::SLIDERS_HORIZONTAL, 30.0, pal.mute, pal.hover, self.composer.routes.is_some())
+                        if widgets::icon_button(ui, icon::SLIDERS_HORIZONTAL, tool, pal.mute, pal.hover, self.composer.routes.is_some())
                             .on_hover_text(format!("模型与执行端
 {tip}"))
                             .clicked()
                         {
                             models = Some(crate::models::Scope::Draft);
                         }
-                        if widgets::icon_button(ui, icon::PUZZLE_PIECE, 30.0, pal.mute, pal.hover, self.composer.extensions.is_some())
+                        if widgets::icon_button(ui, icon::PUZZLE_PIECE, tool, pal.mute, pal.hover, self.composer.extensions.is_some())
                             .on_hover_text("本次新会话的 MCP 与技能")
                             .clicked()
                         {
@@ -1030,7 +1036,7 @@ impl App {
                                 let text = if target.is_some() { "定向留言" } else { "追加" };
                                 if ui
                                     .add_enabled_ui(!busy && !note_only, |ui| {
-                                        widgets::quiet_button(ui, icon::CHAT_CIRCLE_DOTS, text, &pal, false)
+                                        widgets::outline_button(ui, icon::ARROW_UP, text, &pal)
                                     })
                                     .inner
                                     .clicked()
@@ -1041,7 +1047,7 @@ impl App {
                         } else {
                             let enabled = has_draft && !busy && !note_only && cur.loaded;
                             let tip = if cur.stopped() { "恢复并发送" } else { "发送" };
-                            if round_button(ui, icon::ARROW_UP, tip, pal.accent, pal.surface, enabled)
+                            if round_button(ui, icon::ARROW_UP, tip, pal.accent, pal.on_accent, enabled)
                                 .on_hover_text(tip)
                                 .clicked()
                             {
@@ -1049,14 +1055,16 @@ impl App {
                             }
                         }
                         if busy {
-                            ui.spinner();
+                            widgets::spinner(ui);
                         } else if ui.available_width() > 150.0 {
                             let text = if note_only {
                                 "任务已停止 · 留言草稿已保留"
                             } else if in_flight {
                                 "Enter 追加指令 · Shift+Enter 换行"
-                            } else {
+                            } else if has_draft {
                                 "Enter 发送 · Shift+Enter 换行"
+                            } else {
+                                ""
                             };
                             let g = widgets::line_galley(ui, text, theme::body(theme::TINY), pal.faint, ui.available_width());
                             ui.add(Label::new(g).selectable(false));
@@ -1106,13 +1114,7 @@ impl App {
         };
         let mut decision = None;
         let modal = egui::Modal::new(egui::Id::new("sa-confirm"))
-            .frame(
-                Frame::new()
-                    .fill(pal.surface)
-                    .stroke(Stroke::new(1.0_f32, pal.line))
-                    .corner_radius(CornerRadius::same(14))
-                    .inner_margin(Margin::same(20)),
-            )
+            .frame(widgets::modal_frame(&pal))
             .show(ctx, |ui| {
                 ui.set_max_width(440.0);
                 ui.label(
@@ -1122,12 +1124,12 @@ impl App {
                 );
                 ui.add_space(10.0);
                 ui.add(
-                    Label::new(RichText::new(text).font(theme::body(13.5)).color(pal.ink)).wrap(),
+                    Label::new(RichText::new(text).font(theme::body(theme::UI)).color(pal.ink)).wrap(),
                 );
-                ui.add_space(16.0);
+                ui.add_space(18.0);
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     ui.spacing_mut().item_spacing.x = 8.0;
-                    if widgets::quiet_button(ui, icon::SHIELD_WARNING, ok, &pal, true).clicked() {
+                    if widgets::danger_button(ui, icon::SHIELD_WARNING, ok, &pal).clicked() {
                         decision = Some(true);
                     }
                     if widgets::quiet_button(ui, "", "取消", &pal, false).clicked() {

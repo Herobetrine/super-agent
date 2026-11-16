@@ -1,10 +1,10 @@
-//! Command line: `super-agent [--data <dir>] [--ticket <id>] [--demo] [--observe] [--schedule] [--dark]
+//! Command line: `super-agent [--data <dir>] [--project <dir>] [--ticket <id>] [--demo] [--observe] [--schedule] [--dark]
 //! [--inspector [tab]] [--dialog models|advisor|providers|rotation|extensions|palette|efficiency] [--screenshot <out.png> [--size WxH]]`.
 
 use anyhow::{Context, Result, bail};
 use std::path::PathBuf;
 
-pub const USAGE: &str = "用法: super-agent [--data <目录>] [--ticket <编号>] [--demo] [--observe] [--schedule] [--dark] \
+pub const USAGE: &str = "用法: super-agent [--data <目录>] [--project <目录>] [--ticket <编号>] [--demo] [--observe] [--schedule] [--dark] \
 [--inspector [collab|native|plan|approvals|diff]] [--dialog models|advisor|providers|rotation|extensions|palette|efficiency] [--at-top] [--expand-all] [--screenshot <输出.png> [--size 宽x高]]";
 
 #[derive(Clone, Debug, Default)]
@@ -27,6 +27,8 @@ pub struct Options {
     pub expand_all: bool,
     /// Open a dialog at start (`models`; screenshot review aid).
     pub dialog: Option<String>,
+    /// Project folder of the new-conversation draft (screenshot review aid).
+    pub project: Option<PathBuf>,
 }
 
 fn parse_size(s: &str) -> Result<(f32, f32)> {
@@ -66,6 +68,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Options> {
                 d @ ("models" | "advisor" | "providers" | "rotation" | "extensions" | "palette" | "efficiency") => o.dialog = Some(d.into()),
                 other => bail!("未知对话框：{other}"),
             },
+            "--project" => o.project = Some(PathBuf::from(value("--project")?)),
             "--screenshot" => o.screenshot = Some(PathBuf::from(value("--screenshot")?)),
             "--size" => o.size = Some(parse_size(&value("--size")?)?),
             "--inspector" => {
