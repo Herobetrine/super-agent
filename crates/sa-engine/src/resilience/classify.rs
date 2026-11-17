@@ -18,6 +18,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Upper bound for any provider-announced Retry-After we accept.
 pub const MAX_RETRY_AFTER: Duration = Duration::from_secs(6 * 3600);
+/// Subscription windows can span a week, independently of transient retries.
+pub const MAX_QUOTA_RESET: Duration = Duration::from_secs(8 * 86_400);
 
 /// Fixed operator-facing message for a class.
 pub fn message_for(class: ErrorClass) -> &'static str {
@@ -88,6 +90,56 @@ pub fn classified(class: ErrorClass, code: &str) -> AdapterError {
         e.code = Some(code);
     }
     e
+}
+
+/// Subscription exhaustion is a billing class with a distinct scheduler marker.
+pub fn quota(kind: &str, reset: Option<Duration>) -> AdapterError {
+    let mut e = classified(ErrorClass::Billing, &format!("quota:{}", sanitize_code(kind)));
+    e.message = "订阅额度窗口已用尽，等待额度重置后继续".into();
+    e.retry_after = reset.map(|d| d.min(MAX_QUOTA_RESET));
+    e
+}
+
+/// Format unix seconds without depending on the operator's local timezone.
+pub fn utc_minute(secs: i64) -> String {
+    let days = secs.div_euclid(86_400);
+    let minute = secs.rem_euclid(86_400) / 60;
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = mp + if mp < 10 { 3 } else { -9 };
+    let year = y + i64::from(month <= 2);
+    format!("{year:04}-{month:02}-{day:02} {:02}:{:02} UTC", minute / 60, minute % 60)
+}
+
+fn quota_reset(text: &str, now: SystemTime) -> Option<Duration> {
+    use std::sync::LazyLock;
+    static DURATION: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(r"(?i)\bin\s*(\d+)\s*(days?|hours?|minutes?)(?:\s+(\d+)\s*(days?|hours?|minutes?))?\b")
+            .expect("valid quota duration")
+    });
+    if let Some(c) = DURATION.captures(text) {
+        let unit = |n: &str, u: &str| {
+            let scale = match u.as_bytes()[0].to_ascii_lowercase() {
+                b'd' => 86_400,
+                b'h' => 3600,
+                _ => 60,
+            };
+            n.parse::<u64>().unwrap_or(u64::MAX).saturating_mul(scale)
+        };
+        let first = unit(&c[1], &c[2]);
+        let second = c.get(3).zip(c.get(4)).map_or(0, |(n, u)| unit(n.as_str(), u.as_str()));
+        return Some(Duration::from_secs(first.saturating_add(second)).min(MAX_QUOTA_RESET));
+    }
+    // Older Claude CLI messages append an absolute reset after a pipe.
+    let at = text.rsplit_once('|')?.1.trim().parse::<u64>().ok()?;
+    let now = now.duration_since(UNIX_EPOCH).ok()?.as_secs();
+    Some(Duration::from_secs(at.saturating_sub(now)).min(MAX_QUOTA_RESET))
 }
 
 /// Class for an upstream HTTP status.
@@ -290,9 +342,13 @@ pub fn codex_error(error: &Value) -> AdapterError {
         .and_then(Value::as_u64)
         .and_then(|s| u16::try_from(s).ok());
     let code = format!("codex:{}", norm(name));
+    if norm(name) == "usagelimitexceeded" {
+        let mut e = quota("codex", None);
+        e.http_status = status;
+        return e;
+    }
     let by_name = match norm(name).as_str() {
         "contextwindowexceeded" => Some(ErrorClass::InputTooLarge),
-        "usagelimitexceeded" => Some(ErrorClass::Billing),
         "unauthorized" => Some(ErrorClass::Auth),
         "badrequest" => Some(ErrorClass::Protocol),
         "sandboxerror" => Some(ErrorClass::Permission),
@@ -355,6 +411,15 @@ pub fn match_text(text: &str) -> Option<(ErrorClass, String)> {
         ),
         (
             &[
+                "usage limit reached", "hit your usage limit", "hit your limit",
+                "hit your session limit", "5-hour limit", "five-hour limit",
+                "weekly limit", "usage_limit_reached",
+            ],
+            ErrorClass::Billing,
+            "quota",
+        ),
+        (
+            &[
                 "insufficient_quota",
                 "billing",
                 "credit balance",
@@ -403,7 +468,8 @@ pub fn match_text(text: &str) -> Option<(ErrorClass, String)> {
     ];
     for (needles, class, code) in words {
         if needles.iter().any(|n| t.contains(n)) {
-            return Some((*class, format!("text:{code}")));
+            let code = if *code == "quota" { "quota:text".into() } else { format!("text:{code}") };
+            return Some((*class, code));
         }
     }
     if let Some(status) = status_token(&t) {
@@ -454,6 +520,9 @@ fn status_token(t: &str) -> Option<u16> {
 /// never copied into the result.
 pub fn classify_text(text: &str) -> AdapterError {
     match match_text(text) {
+        Some((_, code)) if code.starts_with("quota:") => {
+            quota("text", quota_reset(text, SystemTime::now()))
+        }
         Some((class, code)) => {
             let mut e = classified(class, &code);
             if let Some(s) = code.strip_prefix("http:").and_then(|s| s.parse().ok()) {
@@ -510,6 +579,10 @@ impl StderrTail {
     pub fn exit_error(&self, code: Option<i32>) -> AdapterError {
         let mut e = from_exit(code);
         if let Some((class, tail_code)) = self.classify() {
+            if tail_code.starts_with("quota:") {
+                let text: Vec<_> = self.buf.iter().copied().collect();
+                return classify_text(&String::from_utf8_lossy(&text));
+            }
             let exit = e.code.take().unwrap_or_default();
             e = classified(class, &format!("{exit}/{tail_code}"));
         }
@@ -533,6 +606,84 @@ impl std::fmt::Debug for StderrTail {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn quota_errors_keep_distinct_marker_and_bounded_reset() {
+        let error = quota("Five_Hour ?<>\n", Some(Duration::from_secs(20 * 86_400)));
+        assert_eq!(error.class, ErrorClass::Billing);
+        assert_eq!(error.code.as_deref(), Some("quota:five_hour"));
+        assert!(error.quota_exhausted());
+        assert_eq!(error.retry_after, Some(MAX_QUOTA_RESET));
+        assert_eq!(error.message, "订阅额度窗口已用尽，等待额度重置后继续");
+        assert_eq!(quota("window", None).retry_after, None);
+        assert_eq!(quota("window", Some(Duration::ZERO)).retry_after, Some(Duration::ZERO));
+        assert!(!classified(ErrorClass::Billing, "text:billing").quota_exhausted());
+        assert!(quota(&"A".repeat(100), None).code.unwrap().len() <= 48);
+        for native in [
+            json!("usageLimitExceeded"),
+            json!({"codexErrorInfo":"usageLimitExceeded"}),
+            json!({"data":{"codexErrorInfo":{"usageLimitExceeded":{}}}}),
+        ] {
+            assert!(codex_error(&native).quota_exhausted());
+        }
+    }
+
+    #[test]
+    fn quota_text_distinguishes_windows_from_api_billing_and_rate_limits() {
+        for text in [
+            "usage limit reached", "You have hit your usage limit", "hit your limit",
+            "hit your session limit", "5-hour limit", "five-hour limit",
+            "weekly limit", "usage_limit_reached",
+        ] {
+            let error = classify_text(&format!("{text}; HTTP 429 key=fixture-private"));
+            assert!(error.quota_exhausted(), "{text}");
+            assert_eq!(error.class, ErrorClass::Billing);
+            assert!(!error.message.contains("fixture-private"));
+        }
+        for text in ["usage limit", "insufficient_quota", "credit balance", "payment required", "quota exceeded"] {
+            let error = classify_text(text);
+            assert_eq!(error.class, ErrorClass::Billing);
+            assert!(!error.quota_exhausted(), "{text}");
+        }
+        assert_eq!(classify_text("HTTP 429 too many requests").class, ErrorClass::RateLimited);
+        assert_eq!(classify_text("invalid api key; usage limit reached").class, ErrorClass::Auth);
+        let mut tail = StderrTail::default();
+        tail.push(b"usage limit reached; try again in 2 days");
+        let error = tail.exit_error(Some(1));
+        assert!(error.quota_exhausted());
+        assert_eq!(error.retry_after, Some(Duration::from_secs(2 * 86_400)));
+    }
+
+    #[test]
+    fn quota_reset_parses_relative_and_legacy_absolute_forms() {
+        let now = UNIX_EPOCH + Duration::from_secs(1_731_234_000);
+        for (text, secs) in [
+            ("try again in 3 hours 12 minutes", 3 * 3600 + 12 * 60),
+            ("in 2 days", 2 * 86_400), ("in45minutes", 45 * 60),
+            ("in 1 day 1 hour", 86_400 + 3600), ("in 1 minute", 60),
+            ("in 0 minutes", 0), ("in 999999999999999999999999 days", 8 * 86_400),
+            ("usage limit reached|1731234567", 567),
+            ("usage limit reached|123", 0),
+            ("usage limit reached|9999999999", 8 * 86_400),
+        ] {
+            assert_eq!(quota_reset(text, now), Some(Duration::from_secs(secs)), "{text}");
+        }
+        for text in ["resets 5pm (Asia/Taipei)", "in -2 hours", "in 5 seconds", "in soon", "limit|bad"] {
+            assert_eq!(quota_reset(text, now), None, "{text}");
+        }
+        assert_eq!(classify_text("usage limit reached, try again in45minutes").retry_after,
+            Some(Duration::from_secs(45 * 60)));
+        assert_eq!(classify_text("usage limit reached|1").retry_after, Some(Duration::ZERO));
+        assert_eq!(classify_text("payment required, in 2 days").retry_after, None);
+    }
+
+    #[test]
+    fn utc_minutes_cover_epoch_leap_day_and_year_boundary() {
+        assert_eq!(utc_minute(0), "1970-01-01 00:00 UTC");
+        assert_eq!(utc_minute(-1), "1969-12-31 23:59 UTC");
+        assert_eq!(utc_minute(days_from_civil(2024, 2, 29) * 86_400 + 86_399), "2024-02-29 23:59 UTC");
+        assert_eq!(utc_minute(days_from_civil(2025, 1, 1) * 86_400), "2025-01-01 00:00 UTC");
+    }
 
     #[test]
     fn http_mapping() {

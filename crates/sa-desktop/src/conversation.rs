@@ -36,6 +36,9 @@ fn centered<R>(ui: &mut Ui, max: f32, side: f32, add: impl FnOnce(&mut Ui) -> R)
 
 fn control_icon(kind: ControlKind) -> &'static str {
     match kind {
+        ControlKind::ReportDone | ControlKind::CheckPass => icon::CHECK,
+        ControlKind::ReportPartial | ControlKind::ReportBlocked | ControlKind::CheckFail => icon::WARNING,
+        ControlKind::Ask => icon::CHAT_TEXT,
         ControlKind::Progress => icon::FLAG,
         ControlKind::Send => icon::PAPER_PLANE_TILT,
         ControlKind::Note => icon::CHAT_TEXT,
@@ -48,6 +51,24 @@ fn control_icon(kind: ControlKind) -> &'static str {
         ControlKind::Learn => icon::LIGHTBULB,
         ControlKind::Exhausted => icon::LIST_CHECKS,
     }
+}
+
+#[derive(Clone, Default)]
+struct QuestionDraft {
+    body: String,
+    pending: bool,
+    answered: bool,
+    ime_active: bool,
+}
+
+pub fn answer_finished(ctx: &egui::Context, question: i64, ok: bool) {
+    let id = egui::Id::new(("question-answer", question));
+    ctx.data_mut(|data| {
+        let mut draft = data.get_temp::<QuestionDraft>(id).unwrap_or_default();
+        draft.pending = false;
+        draft.answered = ok;
+        data.insert_temp(id, draft);
+    });
 }
 
 /// Stage text of the autonomy strip (studio.js `renderHeader`).
@@ -90,6 +111,9 @@ impl App {
                         self.status_strip(ui, s);
                         ui.add_space(6.0);
                     }
+                    if let Some(s) = &snap {
+                        self.question_cards(ui, s);
+                    }
                     if self.writable() {
                         self.composer(ui);
                     } else {
@@ -97,7 +121,7 @@ impl App {
                     }
                     if let Some(s) = &snap {
                         ui.add_space(6.0);
-                        crate::usage::footer(ui, &s.usage, &pal);
+                        crate::usage::footer(ui, &s.usage, &s.quota, &pal);
                     }
                 });
             });
@@ -151,6 +175,88 @@ impl App {
             ui.add_space(4.0);
         }
         self.feed_area(ui, &snap);
+    }
+
+    fn question_cards(&mut self, ui: &mut Ui, snap: &Snapshot) {
+        if snap.questions.is_empty() {
+            return;
+        }
+        let pal = self.pal.clone();
+        let writable = self.writable() && !self.opts.demo;
+        let mut questions: Vec<_> = snap.questions.iter().collect();
+        questions.sort_by(|a, b| a.asked.total_cmp(&b.asked).then(a.id.cmp(&b.id)));
+        let mut action = None;
+        egui::ScrollArea::vertical()
+            .id_salt(("questions", snap.ticket.id))
+            .max_height((ui.available_height() * 0.45).clamp(140.0, 260.0))
+            .show(ui, |ui| {
+                for q in questions {
+                    let id = egui::Id::new(("question-answer", q.id));
+                    let mut draft = ui.ctx().data_mut(|data| data.get_temp::<QuestionDraft>(id).unwrap_or_default());
+                    let who = if q.origin == "platform" {
+                        "平台已暂停这项工作".to_owned()
+                    } else if let Some(job) = snap.jobs.iter().find(|job| job.id == q.job) {
+                        if job.parent.is_none() {
+                            format!("主控 {} 想请你决定", agent_name(&job.agent))
+                        } else {
+                            format!("协作者 {} #{} 想请你决定", agent_name(&job.agent), job.id)
+                        }
+                    } else {
+                        format!("协作者 #{} 想请你决定", q.job)
+                    };
+                    widgets::callout(pal.warn).show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.label(RichText::new(who).font(theme::strong(theme::UI)).color(pal.ink));
+                        ui.add(Label::new(RichText::new(&q.question).font(theme::body(theme::UI)).color(pal.ink)).wrap().selectable(true));
+                        if writable {
+                            ui.add_enabled_ui(!draft.pending && !draft.answered, |ui| {
+                                ui.horizontal_wrapped(|ui| {
+                                    for option in &q.options {
+                                        if widgets::outline_button(ui, "", option, &pal).clicked() {
+                                            action = Some(crate::host::Action::Answer { question: q.id, body: option.clone() });
+                                        }
+                                    }
+                                });
+                                ui.horizontal(|ui| {
+                                    let editor = egui::Id::new(("answer-input", q.id));
+                                    let keyboard_ready = crate::composer::keyboard_ready(ui, editor, &mut draft.ime_active);
+                                    let response = ui.add(
+                                        egui::TextEdit::singleline(&mut draft.body)
+                                            .id(editor)
+                                            .font(theme::body(theme::UI))
+                                            .margin(Margin::symmetric(8, 5))
+                                            .desired_width((ui.available_width() - 70.0).max(70.0)),
+                                    );
+                                    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::TextEdit, ui.is_enabled(), format!("回答问题 #{}", q.id)));
+                                    let enter = keyboard_ready && (response.has_focus() || response.lost_focus())
+                                        && ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
+                                    let can_answer = ui.is_enabled() && !draft.body.trim().is_empty();
+                                    let clicked = widgets::primary_button(ui, "", "回答", &pal, can_answer).clicked();
+                                    if (enter || clicked) && !draft.body.trim().is_empty() {
+                                        action = Some(crate::host::Action::Answer { question: q.id, body: draft.body.trim().to_owned() });
+                                    }
+                                });
+                            });
+                        }
+                        if let Some(fallback) = &q.fallback {
+                            ui.add(Label::new(RichText::new(format!("无人回答时：{fallback}")).font(theme::body(theme::SMALL)).color(pal.mute)).wrap());
+                        }
+                    });
+                    if action.as_ref().is_some_and(|a| matches!(a, crate::host::Action::Answer { question, .. } if *question == q.id)) {
+                        draft.pending = true;
+                    }
+                    ui.ctx().data_mut(|data| data.insert_temp(id, draft));
+                    ui.add_space(6.0);
+                }
+            });
+        if let Some(action) = action {
+            let question = match &action { crate::host::Action::Answer { question, .. } => *question, _ => return };
+            let before = self.composer.pending;
+            self.submit(action);
+            if self.composer.pending == before {
+                answer_finished(ui.ctx(), question, false);
+            }
+        }
     }
 
     fn error_banner(&self, ui: &mut Ui, err: &str) {
@@ -389,10 +495,18 @@ impl App {
         let active = labels::is_active(status);
         let pause = snap.ticket.pause_status.clone();
         let root = snap.jobs.iter().find(|j| j.parent.is_none());
-        let badge = match (active, root) {
+        let mut badge = match (active, root) {
             (true, Some(r)) => self.live_badges().remove(&r.id),
             _ => None,
         };
+        if let Some(root) = root.filter(|root| root.state == "running") {
+            let latest = snap.events.iter()
+                .filter(|event| event.job == Some(root.id) && matches!(event.kind.as_str(), "check.started" | "check.result" | "reply" | "turn.failed" | "cancelled"))
+                .max_by_key(|event| event.seq);
+            if let Some(event) = latest.filter(|event| event.kind == "check.started") {
+                badge = Some((labels::collaboration_event("check.started", &event.payload).unwrap_or_default(), pal.run));
+            }
+        }
         // Running collaborators by agent, the lead excluded.
         let mut running: Vec<(String, usize)> = Vec::new();
         for j in &snap.jobs {
@@ -551,7 +665,7 @@ impl App {
         let ticket = view.id;
         let at_top = self.opts.at_top;
         let jump = std::mem::take(&mut self.scroll_to_bottom) && !at_top;
-        let items = view.feed.items.clone();
+        let feed = view.feed.clone();
         let partial = view.partial_history;
         let mut open_groups = std::mem::take(&mut view.open_groups);
         let pending: Vec<i64> = snap.approvals.iter().map(|a| a.id).collect();
@@ -576,7 +690,7 @@ impl App {
                         ui.add_space(14.0);
                     }
                     let mut prev: Option<&Item> = None;
-                    for item in &items {
+                    for item in &feed.items {
                         ui.add_space(gap(prev, item));
                         show_item(ui, item, snap, &pal, &mut open_groups, &pending, writable);
                         prev = Some(item);
@@ -1041,6 +1155,21 @@ fn controls_box(ui: &mut Ui, controls: &[Control], pal: &Palette) {
             ui.set_width(ui.available_width());
             ui.spacing_mut().item_spacing.y = 0.0;
             for c in controls {
+                if matches!(c.kind, ControlKind::ReportDone | ControlKind::ReportPartial | ControlKind::ReportBlocked | ControlKind::Ask | ControlKind::CheckPass | ControlKind::CheckFail) {
+                    let tone = match c.kind {
+                        ControlKind::ReportDone | ControlKind::CheckPass => pal.ok,
+                        _ => pal.warn,
+                    };
+                    ui.add_space(5.0);
+                    if !c.title.is_empty() {
+                        ui.label(RichText::new(&c.title).font(theme::strong(theme::SMALL)).color(tone.fg));
+                    }
+                    if !c.text.is_empty() {
+                        ui.add(Label::new(RichText::new(&c.text).font(theme::body(theme::SMALL)).color(if matches!(c.kind, ControlKind::CheckPass | ControlKind::CheckFail) { tone.fg } else { pal.ink })).wrap().selectable(true));
+                    }
+                    ui.add_space(5.0);
+                    continue;
+                }
                 let (rect, resp) =
                     ui.allocate_exact_size(vec2(ui.available_width(), 26.0), Sense::hover());
                 let p = ui.painter();

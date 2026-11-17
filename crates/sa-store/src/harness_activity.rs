@@ -394,6 +394,17 @@ mod tests {
     }
 
     #[test]
+    fn quota_observations_do_not_become_harness_activities() {
+        for raw in [
+            json!({"method":"account/rateLimits/read","result":{"rateLimits":{"usedPercent":92}}}),
+            json!({"method":"account/rateLimits/updated","params":{"rateLimits":{"usedPercent":92}}}),
+            json!({"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","rateLimitType":"five_hour","resetsAt":1_800_000_000}}),
+        ] {
+            assert_eq!(harness_activity(&raw), None, "{raw}");
+        }
+    }
+
+    #[test]
     fn malformed_frames_never_become_activities() {
         for raw in [
             json!(null),

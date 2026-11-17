@@ -12,6 +12,7 @@
 pub mod activity;
 pub mod advice;
 pub mod checkpoints;
+mod checks;
 pub mod adapter;
 pub mod autonomy;
 pub mod context;

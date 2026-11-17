@@ -50,6 +50,15 @@ pub enum Action {
         job: i64,
         body: String,
     },
+    Answer {
+        question: i64,
+        body: String,
+    },
+    SaveProjectChecks {
+        cwd: String,
+        checks: Vec<Vec<String>>,
+        request: u64,
+    },
     Cancel {
         ticket: i64,
     },
@@ -164,6 +173,8 @@ impl Action {
             Action::ForkCheckpoint { .. } => ActionKind::Fork,
             Action::Follow { .. } => ActionKind::Follow,
             Action::Note { .. } => ActionKind::Note,
+            Action::Answer { question, .. } => ActionKind::Answer { question: *question },
+            Action::SaveProjectChecks { request, .. } => ActionKind::ProjectChecks { request: *request },
             Action::Cancel { .. } => ActionKind::Cancel,
             Action::Retry { .. } => ActionKind::Retry,
             Action::Decide { allow, .. } => ActionKind::Decide { allow: *allow },
@@ -205,6 +216,8 @@ pub enum ActionKind {
     Fork,
     Follow,
     Note,
+    Answer { question: i64 },
+    ProjectChecks { request: u64 },
     Cancel,
     Retry,
     Decide { allow: bool },
@@ -259,7 +272,7 @@ fn maintenance_finished(
 
 /// Routine mutations remain ordered. Potentially long Git/SCM operations use
 /// engine-owned workspace leases and send their own completion when ready, so
-/// Cancel/Decide/Note never wait behind a test process or remote status fetch.
+/// Cancel/Decide/Answer/Note never wait behind a test process or remote status fetch.
 /// Track tasks to completion rather than detaching spawn_blocking work from its
 /// journal and lock owner during shutdown.
 async fn action_loop(
@@ -632,6 +645,11 @@ impl Host {
             q.exists("SELECT 1 FROM ticket_failover WHERE ticket=?", &[&ticket])
         })
     }
+    pub fn project_checks(&self, ctx: &egui::Context, cwd: &str) -> crate::ops::Pending<Vec<Vec<String>>> {
+        let engine = self.engine.clone();
+        let cwd = cwd.to_owned();
+        crate::ops::Pending::spawn(ctx, move || engine.project_checks(&cwd))
+    }
     pub fn isolated_writers(&self, ticket: i64) -> Result<bool> {
         self.read(|q| q.exists("SELECT 1 FROM workspace_policy WHERE ticket=? AND isolated=1", &[&ticket]))
     }
@@ -838,6 +856,14 @@ async fn execute(engine: &Engine, shared: &Shared, action: Action) -> Result<Opt
         }
         Action::Note { ticket, job, body } => {
             engine.note(ticket, job, &body)?;
+            Ok(None)
+        }
+        Action::Answer { question, body } => {
+            engine.answer(question, &body)?;
+            Ok(None)
+        }
+        Action::SaveProjectChecks { cwd, checks, .. } => {
+            engine.set_project_checks(&cwd, checks)?;
             Ok(None)
         }
         Action::Cancel { ticket } => {
@@ -2102,7 +2128,9 @@ exit 0
             lazy_mcp_schemas: false,
             concise_handoffs: false,
             claude_cache_ttl: Ttl::OneHour,
-        claude_keepalive: true,
+            claude_keepalive: true,
+            max_collaborators: 2,
+            quota_guard: false,
         };
         assert!(host.submit(Action::SaveEfficiency { settings: changed.clone() }));
         let saved = outcome(&host);

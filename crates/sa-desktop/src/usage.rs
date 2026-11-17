@@ -6,7 +6,7 @@ use crate::{
     widgets,
 };
 use egui::{RichText, Ui};
-use sa_store::{TicketUsage, TokenCounts};
+use sa_store::{TicketUsage, TokenCounts, quota::Observed};
 
 fn number(value: Option<u64>) -> String {
     value
@@ -57,7 +57,11 @@ fn mono_value(text: String, pal: &Palette) -> RichText {
 }
 
 fn heading(ui: &mut Ui, text: &str, pal: &Palette) {
-    ui.label(RichText::new(text).font(theme::strong(theme::UI)).color(pal.ink));
+    ui.label(
+        RichText::new(text)
+            .font(theme::strong(theme::UI))
+            .color(pal.ink),
+    );
 }
 
 fn hover_item(ui: &mut Ui, text: &str, label: &str, pal: &Palette, details: impl FnOnce(&mut Ui)) {
@@ -106,8 +110,89 @@ fn hit_rate(tokens: &TokenCounts) -> String {
         .unwrap_or_else(|| "未报告或输入为零".into())
 }
 
-/// Quiet composer footer: exact values only exist inside hover details.
-pub fn footer(ui: &mut Ui, usage: &TicketUsage, pal: &Palette) {
+fn quota_has_data(observed: &Observed) -> bool {
+    let window = &observed.window;
+    window.exhausted
+        || window.used.is_some_and(f64::is_finite)
+        || window
+            .resets_at
+            .is_some_and(|reset| !labels::stamp(reset).is_empty())
+}
+
+fn quota_summary(quota: &[Observed]) -> Option<String> {
+    let window = quota
+        .iter()
+        .map(|observed| &observed.window)
+        .filter(|window| {
+            window.exhausted
+                || window
+                    .used
+                    .is_some_and(|used| used.is_finite() && used >= 0.5)
+        })
+        .max_by(|a, b| {
+            a.exhausted.cmp(&b.exhausted).then_with(|| {
+                a.used
+                    .filter(|used| used.is_finite())
+                    .unwrap_or(-1.0)
+                    .total_cmp(&b.used.filter(|used| used.is_finite()).unwrap_or(-1.0))
+            })
+        })?;
+    Some(if window.exhausted {
+        "额度已用尽".into()
+    } else {
+        format!("额度 {:.0}%", window.used.unwrap_or(0.0) * 100.0)
+    })
+}
+
+fn quota_line(observed: &Observed, now: f64) -> String {
+    let window = &observed.window;
+    let length = match window.minutes {
+        Some(300) => "5 小时".into(),
+        Some(10080) => "每周".into(),
+        Some(minutes) => format!("{minutes} 分钟"),
+        // Kinds named after an error code say nothing to the operator.
+        None if matches!(window.kind.as_str(), "unknown" | "text" | "window" | "codex") => "额度窗口".into(),
+        None => window.kind.clone(),
+    };
+    let used = if window.exhausted {
+        "已用尽".into()
+    } else {
+        window
+            .used
+            .filter(|used| used.is_finite())
+            .map(|used| format!("{:.0}%", used * 100.0))
+            .unwrap_or_else(|| "未报告".into())
+    };
+    let reset = window
+        .resets_at
+        .map(|reset| {
+            let time = labels::stamp(reset);
+            if time.is_empty() {
+                String::new()
+            } else {
+                format!(" · {time} 重置（{}后）", labels::duration(reset - now))
+            }
+        })
+        .unwrap_or_default();
+    format!(
+        "{} · {length} · {used}{reset}",
+        labels::agent_name(&observed.agent)
+    )
+}
+
+fn quota_details(ui: &mut Ui, quota: &[Observed], pal: &Palette) {
+    if !quota.iter().any(quota_has_data) {
+        return;
+    }
+    heading(ui, "订阅额度窗口", pal);
+    let now = labels::now_secs();
+    for observed in quota.iter().filter(|observed| quota_has_data(observed)) {
+        help(ui, quota_line(observed, now), pal);
+    }
+}
+
+/// Quiet composer footer: exact token values only exist inside hover details.
+pub fn footer(ui: &mut Ui, usage: &TicketUsage, quota: &[Observed], pal: &Palette) {
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing.x = 12.0;
         hover_item(ui, &format!("{} 用量", egui_phosphor::regular::GAUGE), "令牌用量", pal, |ui| {
@@ -117,6 +202,10 @@ pub fn footer(ui: &mut Ui, usage: &TicketUsage, pal: &Palette) {
         counts(ui, &usage.totals, pal);
         if usage.unreported_jobs > 0 {
             help(ui, format!("{} 个任务尚未报告用量", usage.unreported_jobs), pal);
+        }
+        if quota.iter().any(quota_has_data) {
+            widgets::rule(ui, pal.line_soft);
+            quota_details(ui, quota, pal);
         }
         widgets::rule(ui, pal.line_soft);
         egui::ScrollArea::vertical()
@@ -186,6 +275,12 @@ pub fn footer(ui: &mut Ui, usage: &TicketUsage, pal: &Palette) {
                 }
             });
         });
+        if let Some(summary) = quota_summary(quota) {
+            hover_item(ui, &summary, &summary, pal, |ui| {
+                ui.set_max_width(350.0);
+                quota_details(ui, quota, pal);
+            });
+        }
         let state = if usage.pending { "汇总中" }
             else if usage.totals.total_tokens.is_none() { "尚未完整报告" }
             else if usage.partial { "部分统计" } else { "已更新" };
@@ -204,6 +299,147 @@ mod tests {
         assert_eq!(number(None), "未报告");
         assert_eq!(number(Some(0)), "0");
         assert_eq!(number(Some(1234567)), "1,234,567");
+    }
+
+    fn quota_window(agent: &str, used: Option<f64>, minutes: Option<i64>) -> Observed {
+        Observed {
+            agent: agent.into(),
+            provider: "subscription".into(),
+            window: sa_store::quota::Window {
+                kind: "primary".into(),
+                used,
+                resets_at: None,
+                exhausted: false,
+                minutes,
+            },
+            observed_at: labels::now_secs(),
+        }
+    }
+
+    #[test]
+    fn low_quota_and_old_snapshot_add_no_footer_segment() {
+        for quota in [
+            vec![],
+            vec![quota_window("codex", None, None)],
+            vec![quota_window("codex", Some(0.49), Some(300))],
+        ] {
+            let has_window = quota.iter().any(quota_has_data);
+            assert_eq!(quota_summary(&quota), None);
+            let mut h = Harness::builder()
+                .with_size(egui::vec2(500.0, 560.0))
+                .build_ui(move |ui| {
+                    crate::theme::install_fonts(ui.ctx());
+                    ui.style_mut().interaction.tooltip_delay = 0.0;
+                    footer(ui, &TicketUsage::default(), &quota, &Palette::light());
+                });
+            h.run_steps(3);
+            assert!(h.query_by_label("额度 49%").is_none());
+            assert!(h.query_by_label("额度已用尽").is_none());
+            assert!(h.query_by_label("订阅额度窗口").is_none());
+            h.get_by_label("令牌用量").hover();
+            h.run_steps(40);
+            assert_eq!(h.query_by_label("订阅额度窗口").is_some(), has_window);
+            if has_window {
+                assert!(h.query_by_label("Codex · 5 小时 · 49%").is_some());
+            }
+        }
+        assert_eq!(
+            quota_summary(&[quota_window("codex", Some(0.5), Some(300))]),
+            Some("额度 50%".into())
+        );
+    }
+
+    #[test]
+    fn quota_segment_shows_windows_only_on_hover() {
+        let quota = vec![quota_window("codex", Some(0.85), Some(300))];
+        let mut h = Harness::builder()
+            .with_size(egui::vec2(500.0, 560.0))
+            .build_ui(move |ui| {
+                crate::theme::install_fonts(ui.ctx());
+                ui.style_mut().interaction.tooltip_delay = 0.0;
+                ui.label("输入框上方");
+                footer(ui, &TicketUsage::default(), &quota, &Palette::light());
+            });
+        h.run_steps(3);
+        assert!(h.query_by_label("额度 85%").is_some());
+        assert!(h.query_by_label("Codex · 5 小时 · 85%").is_none());
+        for label in ["令牌用量", "额度 85%"] {
+            h.get_by_label(label).hover();
+            h.run_steps(40);
+            assert!(h.query_by_label("订阅额度窗口").is_some());
+            assert!(h.query_by_label("Codex · 5 小时 · 85%").is_some());
+            h.get_by_label(label).click();
+            h.run_steps(3);
+            h.get_by_label("输入框上方").hover();
+            h.run_steps(40);
+            assert!(h.query_by_label("订阅额度窗口").is_none());
+        }
+    }
+
+    #[test]
+    fn exhausted_quota_takes_priority_over_used_percent() {
+        let mut exhausted = quota_window("claude", None, Some(10080));
+        exhausted.window.exhausted = true;
+        let quota = vec![quota_window("codex", Some(0.99), Some(300)), exhausted];
+        assert_eq!(quota_summary(&quota), Some("额度已用尽".into()));
+        let mut h = Harness::builder()
+            .with_size(egui::vec2(500.0, 560.0))
+            .build_ui(move |ui| {
+                crate::theme::install_fonts(ui.ctx());
+                ui.style_mut().interaction.tooltip_delay = 0.0;
+                footer(ui, &TicketUsage::default(), &quota, &Palette::light());
+            });
+        h.run_steps(3);
+        h.get_by_label("额度已用尽").hover();
+        h.run_steps(40);
+        assert!(h.query_by_label("Claude Code · 每周 · 已用尽").is_some());
+        assert!(h.query_by_label("Codex · 5 小时 · 99%").is_some());
+    }
+
+    #[test]
+    fn most_constrained_segment_keeps_all_current_windows_in_hover() {
+        let quota = vec![
+            quota_window("codex", Some(0.65), Some(300)),
+            quota_window("claude", Some(0.85), Some(10080)),
+            quota_window("codex", Some(0.2), Some(60)),
+        ];
+        assert_eq!(quota_summary(&quota), Some("额度 85%".into()));
+        let mut h = Harness::builder()
+            .with_size(egui::vec2(500.0, 560.0))
+            .build_ui(move |ui| {
+                crate::theme::install_fonts(ui.ctx());
+                ui.style_mut().interaction.tooltip_delay = 0.0;
+                footer(ui, &TicketUsage::default(), &quota, &Palette::light());
+            });
+        h.run_steps(3);
+        h.get_by_label("额度 85%").hover();
+        h.run_steps(40);
+        for line in [
+            "Codex · 5 小时 · 65%",
+            "Claude Code · 每周 · 85%",
+            "Codex · 60 分钟 · 20%",
+        ] {
+            assert!(
+                h.query_by_label(line).is_some(),
+                "missing quota window: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn quota_reset_reuses_local_clock_and_duration_and_ignores_empty_windows() {
+        let mut observed = quota_window("claude", None, None);
+        assert!(!quota_has_data(&observed));
+        assert_eq!(quota_summary(&[observed.clone()]), None);
+        observed.window.kind = "seven_day_opus".into();
+        observed.window.resets_at = Some(2_000_000_000.0);
+        assert_eq!(
+            quota_line(&observed, 2_000_000_000.0 - 5700.0),
+            format!(
+                "Claude Code · seven_day_opus · 未报告 · {} 重置（1 小时 35 分后）",
+                labels::stamp(2_000_000_000.0)
+            )
+        );
     }
 
     #[test]
@@ -230,7 +466,7 @@ mod tests {
                 crate::theme::install_fonts(ui.ctx());
                 ui.style_mut().interaction.tooltip_delay = 0.0;
                 ui.label("输入框上方");
-                footer(ui, &usage, &Palette::light());
+                footer(ui, &usage, &[], &Palette::light());
             });
         h.run_steps(3);
         assert!(h.query_by_label("1,250").is_none());

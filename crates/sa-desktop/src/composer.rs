@@ -124,25 +124,30 @@ impl Composer {
     /// TextEdit's IME state is private in egui 0.33. Keep the shortcut gate
     /// across frames too, and leave the commit/cancel frame to the editor.
     fn keyboard_ready(&mut self, ui: &Ui, editor: egui::Id) -> bool {
+        keyboard_ready(ui, editor, &mut self.ime_active)
+    }
+}
+
+pub(crate) fn keyboard_ready(ui: &Ui, editor: egui::Id, ime_active: &mut bool) -> bool {
         let focused = ui.is_enabled()
             && ui.input(|i| i.focused)
             && ui.memory(|m| m.has_focus(editor) && m.allows_interaction(ui.layer_id()));
         if !focused {
-            self.ime_active = false;
+            *ime_active = false;
             return false;
         }
-        let mut composing = self.ime_active;
+        let mut composing = *ime_active;
         ui.input(|i| {
             for event in &i.events {
                 if let Event::Ime(ime) = event {
                     composing = true;
                     match ime {
                         egui::ImeEvent::Enabled | egui::ImeEvent::Preedit(_) => {
-                            self.ime_active = true
+                            *ime_active = true
                         }
                         egui::ImeEvent::Commit(text) if text == "\n" || text == "\r" => {}
                         egui::ImeEvent::Commit(_) | egui::ImeEvent::Disabled => {
-                            self.ime_active = false
+                            *ime_active = false
                         }
                     }
                 }
@@ -150,7 +155,6 @@ impl Composer {
         });
         !composing
     }
-}
 
 /// What the selected ticket allows right now.
 struct Current {
@@ -290,6 +294,7 @@ impl App {
         if let Action::Create { cwd, .. } = &action {
             self.composer.last_create_context = Some((self.epoch, cwd.clone()));
         }
+        let kind = action.kind();
         if host.submit(action) {
             if fork_context.is_some() {
                 self.composer.pending_fork = fork_context;
@@ -297,6 +302,9 @@ impl App {
             self.composer.pending += 1;
             self.composer.message = None;
         } else {
+            if let ActionKind::ProjectChecks { request } = kind {
+                self.workflow.checks_result(request, Err("调度线程已退出，请重新打开窗口".into()));
+            }
             self.composer.message = Some(("调度线程已退出，请重新打开窗口".into(), true));
         }
     }
@@ -396,6 +404,15 @@ impl App {
                 (ActionKind::Fork, Ok(None)) => {
                     self.composer.message =
                         Some(("分支创建未返回工单编号，请刷新会话列表核对。".into(), true));
+                }
+                (ActionKind::Answer { question }, result) => {
+                    crate::conversation::answer_finished(&self.ctx, question, result.is_ok());
+                    if let Err(error) = result {
+                        self.composer.message = Some((error, true));
+                    }
+                }
+                (ActionKind::ProjectChecks { request }, result) => {
+                    self.workflow.checks_result(request, result.map(|_| ()));
                 }
                 (ActionKind::Note, Ok(_)) => {
                     self.composer.target = None;

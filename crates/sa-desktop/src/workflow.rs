@@ -8,6 +8,13 @@ use egui::{Label, RichText, Ui};
 
 #[derive(Default)]
 pub struct WorkflowState {
+    checks_project: Option<String>,
+    checks_rows: Vec<Vec<String>>,
+    checks_input: String,
+    checks_loading: Option<crate::ops::Pending<Vec<Vec<String>>>>,
+    checks_error: Option<String>,
+    checks_saving: Option<u64>,
+    checks_loaded: bool,
     command: String,
     confirm: Option<i64>,
     error: Option<String>,
@@ -57,6 +64,112 @@ fn workspace_tone(state: &str, pal: &Palette) -> Tone {
 }
 
 impl WorkflowState {
+    pub fn checks_result(&mut self, request: u64, result: Result<(), String>) {
+        if self.checks_saving != Some(request) {
+            return;
+        }
+        self.checks_saving = None;
+        self.checks_error = result.err();
+    }
+
+    /// Project checks are available in observer windows through a read-only connection.
+    #[allow(clippy::too_many_arguments)]
+    pub fn checks(
+        &mut self,
+        ui: &mut Ui,
+        pal: &Palette,
+        host: Option<&Host>,
+        cwd: &str,
+        data: Option<&std::path::Path>,
+        demo: bool,
+    ) -> Option<Action> {
+        if self.checks_project.as_deref() != Some(cwd) {
+            self.checks_project = Some(cwd.to_owned());
+            self.checks_rows.clear();
+            self.checks_input.clear();
+            self.checks_error = None;
+            self.checks_saving = None;
+            self.checks_loaded = demo;
+            self.checks_loading = if demo {
+                self.checks_rows = vec![vec!["cargo".into(), "test".into(), "--workspace".into()]];
+                None
+            } else if let Some(host) = host {
+                Some(host.project_checks(ui.ctx(), cwd))
+            } else {
+                let data = data.map(std::path::Path::to_path_buf).unwrap_or_else(sa_store::default_data_dir);
+                let project = sa_engine::services::realpath(std::path::Path::new(cwd))
+                    .map(|path| path.to_string_lossy().into_owned()).unwrap_or_else(|_| cwd.to_owned());
+                Some(crate::ops::Pending::spawn(ui.ctx(), move || {
+                    use rusqlite::OptionalExtension;
+                    let connection = rusqlite::Connection::open_with_flags(data.join(sa_store::DB_FILE), rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+                    connection.busy_timeout(std::time::Duration::from_secs(1))?;
+                    let exists: bool = connection.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='project_checks')", [], |row| row.get(0))?;
+                    if !exists { return Ok(vec![]); }
+                    let text: Option<String> = connection.query_row("SELECT checks FROM project_checks WHERE project=?", [&project], |row| row.get(0)).optional()?;
+                    Ok(text.map(|text| serde_json::from_str(&text)).transpose()?.unwrap_or_default())
+                }))
+            };
+        }
+        if let Some(result) = self.checks_loading.as_ref().and_then(crate::ops::Pending::poll) {
+            self.checks_loading = None;
+            match result {
+                Ok(rows) => { self.checks_rows = rows; self.checks_loaded = true; }
+                Err(error) => self.checks_error = Some(error),
+            }
+        }
+        let writable = host.is_some() && !demo;
+        let mut action = None;
+        egui::CollapsingHeader::new(heading("完成检查", pal))
+            .id_salt(("completion-checks", cwd))
+            .show(ui, |ui| {
+                help(ui, "写入任务或主控报告完成时由平台运行；未通过会退回原任务修复，最多两次。命令由你指定，agent 不能修改。", pal);
+                let mut remove = None;
+                for (index, argv) in self.checks_rows.iter().enumerate() {
+                    ui.horizontal_top(|ui| {
+                        if writable && self.checks_saving.is_none() && widgets::quiet_button(ui, "", &format!("移除检查 {}", index + 1), pal, false).clicked() {
+                            remove = Some(index);
+                        }
+                        ui.add(Label::new(RichText::new(serde_json::to_string(argv).unwrap_or_default()).font(theme::mono(12.0)).color(pal.ink)).wrap().selectable(true));
+                    });
+                }
+                if let Some(index) = remove { self.checks_rows.remove(index); }
+                if writable {
+                    ui.add_enabled_ui(self.checks_loaded && self.checks_saving.is_none(), |ui| {
+                        let response = ui.add(
+                            egui::TextEdit::singleline(&mut self.checks_input)
+                                .font(theme::mono(12.0))
+                                .margin(egui::Margin::symmetric(8, 5))
+                                .desired_width(f32::INFINITY)
+                                .hint_text(widgets::hint(ui, r#"["git","diff","--check"]"#)),
+                        );
+                        response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::TextEdit, ui.is_enabled(), "完成检查命令"));
+                        ui.horizontal_wrapped(|ui| {
+                            if ui.add_enabled_ui(self.checks_rows.len() < 4, |ui| widgets::outline_button(ui, "", "添加检查", pal)).inner.clicked() {
+                                match serde_json::from_str::<Vec<String>>(&self.checks_input) {
+                                    Ok(argv) if !argv.is_empty() => {
+                                        self.checks_rows.push(argv);
+                                        self.checks_input.clear();
+                                        self.checks_error = None;
+                                    }
+                                    _ => self.checks_error = Some("请输入命令参数数组，例如 [\"git\",\"diff\",\"--check\"]".into()),
+                                }
+                            }
+                            let can_save = ui.is_enabled();
+                            if widgets::primary_button(ui, "", "保存完成检查", pal, can_save).clicked() {
+                                static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+                                let request = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                self.checks_saving = Some(request);
+                                self.checks_error = None;
+                                action = Some(Action::SaveProjectChecks { cwd: cwd.to_owned(), checks: self.checks_rows.clone(), request });
+                            }
+                        });
+                    });
+                }
+                if let Some(error) = &self.checks_error { problem(ui, error, pal); }
+            });
+        ui.add_space(8.0);
+        action
+    }
     pub fn show(
         &mut self,
         ui: &mut egui::Ui,

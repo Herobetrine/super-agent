@@ -25,6 +25,10 @@ pub struct Settings {
     /// Refresh the Claude lead's prompt cache with forked one-line turns while
     /// it waits longer than the cache lifetime (bounded, see the engine).
     pub claude_keepalive: bool,
+    /// Running non-root jobs per ticket; zero leaves concurrency unlimited.
+    pub max_collaborators: u32,
+    /// Hold work until subscription windows reset and reserve usage for the lead.
+    pub quota_guard: bool,
 }
 
 impl Default for Settings {
@@ -35,6 +39,8 @@ impl Default for Settings {
             concise_handoffs: true,
             claude_cache_ttl: Ttl::Inherit,
             claude_keepalive: true,
+            max_collaborators: 4,
+            quota_guard: true,
         }
     }
 }

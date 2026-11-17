@@ -198,6 +198,7 @@ struct Child {
     write: bool,
     role: String,
     files: Vec<String>,
+    needs: Vec<i64>,
 }
 
 /// `check(store, ctx, cmd)` (D:5-68). `None` means an exact replay of an
@@ -272,6 +273,8 @@ fn check(q: &Q, turn: &Turn, cmd: &Value) -> Result<Option<Child>> {
         "SELECT * FROM jobs WHERE parent=? AND source_turn=? AND msgkey=?",
         &[&job.id, &logical, &id],
     )?;
+    let replay = old.as_ref().and_then(|row| row["id"].as_i64()).unwrap_or(0);
+    let needs = dependencies(q, job, cmd.get("after"), replay)?;
     if let Some(old) = old {
         let manifest = q.one("SELECT manifest FROM job_files WHERE job=?", &[&old["id"].as_i64()])?;
         let names: Vec<Value> = match manifest {
@@ -290,6 +293,8 @@ fn check(q: &Q, turn: &Turn, cmd: &Value) -> Result<Option<Child>> {
         let old_model = old_route.as_ref().and_then(|route| route["model"].as_str());
         let old_effort = old_route.as_ref().and_then(|route| route["reasoning_effort"].as_str());
         let old_override = old.get("permission_override").and_then(Value::as_str);
+        let old_needs: Vec<i64> = q.all("SELECT needs FROM job_deps WHERE job=? ORDER BY needs", &[&old["id"].as_i64()])?
+            .iter().filter_map(|row| row["needs"].as_i64()).collect();
         if str_of(&old, "agent") != to
             || str_of(&old, "body") != body
             || (old["writing"].as_i64().unwrap_or(0) != 0) != write
@@ -297,6 +302,7 @@ fn check(q: &Q, turn: &Turn, cmd: &Value) -> Result<Option<Child>> {
             || old_model != model
             || old_effort != effort
             || old_override != override_.as_deref()
+            || old_needs != needs
             || stringify(&files_value) != stringify(&Value::Array(names))
         {
             return Err(rejected("同一消息 ID 携带不同的任务、模型、附件或权限"));
@@ -356,7 +362,109 @@ fn check(q: &Q, turn: &Turn, cmd: &Value) -> Result<Option<Child>> {
         write,
         role,
         files,
+        needs,
     }))
+}
+
+/// Resolve only existing direct children, so a new dispatch cannot form a cycle.
+fn dependencies(q: &Q, job: &crate::job::JobCtx, after: Option<&Value>, replay: i64) -> Result<Vec<i64>> {
+    let Some(after) = after else { return Ok(vec![]) };
+    let Some(entries) = after.as_array().filter(|entries| (1..=8).contains(&entries.len())) else {
+        return Err(rejected("after 需要 1 到 8 个任务 ID 或消息 ID"));
+    };
+    let mut needs = Vec::new();
+    for entry in entries {
+        let child = if let Some(key) = entry.as_str() {
+            q.one(
+                "SELECT id FROM jobs WHERE parent=? AND ticket=? AND id>? AND msgkey=? AND id!=?
+      ORDER BY CASE WHEN source_turn=? THEN 0 ELSE 1 END,id DESC LIMIT 1",
+                &[&job.id, &job.ticket, &job.floor, &key, &replay, &job.logical()],
+            )?
+        } else if let Some(id) = p::safe_int(Some(entry)) {
+            q.one("SELECT id FROM jobs WHERE id=? AND parent=? AND ticket=? AND id>?", &[&id, &job.id, &job.ticket, &job.floor])?
+        } else {
+            None
+        };
+        let Some(id) = child.and_then(|row| row["id"].as_i64()) else {
+            return Err(rejected("after 引用了不存在的任务"));
+        };
+        needs.push(id);
+    }
+    needs.sort_unstable();
+    needs.dedup();
+    Ok(needs)
+}
+
+/// Continuing uses the mailbox receipt as its logical-turn idempotency key.
+fn continue_child(q: &Q, turn: &Turn, cmd: &Value) -> Result<()> {
+    let job = &turn.job;
+    let Some(fields) = cmd.as_object() else { return Err(rejected("SA_SEND 需要 JSON 对象")) };
+    if ["to", "role", "write", "files", "model", "reasoning_effort", "permission_profile", "after",
+        "provider", "mode", "selection", "route", "route_override", "permission_override"]
+        .iter().any(|key| fields.contains_key(*key))
+    {
+        return Err(rejected("continue 不可与派工目标、职能、写入、附件、路由、权限或 after 同时使用"));
+    }
+    let Some(target) = p::safe_int(cmd.get("continue")).filter(|id| *id > 0) else {
+        return Err(rejected("continue 需要有效的子任务编号"));
+    };
+    if !p::valid_text(cmd.get("id"), 96) || !p::valid_text(cmd.get("body"), usize::MAX) {
+        return Err(rejected("续派需要有效的消息 ID 和非空正文"));
+    }
+    let key = cmd["id"].as_str().unwrap_or_default();
+    let logical = job.logical();
+    if let Some(old) = q.one(
+        "SELECT m.target,e.payload,e.turn AS note_turn,e.seq AS note_seq FROM mailbox m JOIN events e ON e.seq=m.seq WHERE m.source=? AND m.source_turn=? AND m.msgkey=?",
+        &[&job.id, &logical, &key],
+    )? {
+        let payload: Value = serde_json::from_str(str_of(&old, "payload"))?;
+        if old["target"].as_i64() != Some(target) || payload.get("body") != cmd.get("body") {
+            return Err(rejected("同一续派消息 ID 携带不同的任务或正文"));
+        }
+        // A matching SA_NOTE uses the same mailbox key but never requeued
+        // the child. Only the paired continuation event proves this replay.
+        if !q.exists(
+            "SELECT 1 FROM events WHERE job=? AND turn=? AND seq>? AND kind='continued'
+      AND json_extract(payload,'$.job')=? AND json_extract(payload,'$.key')=?",
+            &[&job.id, &old["note_turn"].as_i64(), &old["note_seq"].as_i64(), &target, &key],
+        )? {
+            return Err(rejected("该消息 ID 已用于信件，请为续派使用新的 ID"));
+        }
+        return Ok(());
+    }
+    let Some(child) = q.one("SELECT * FROM jobs WHERE id=?", &[&target])? else {
+        return Err(rejected("续派目标任务不存在"));
+    };
+    if child["ticket"].as_i64() != Some(job.ticket) {
+        return Err(rejected("只能续派同一工单的任务"));
+    }
+    if child["parent"].as_i64() != Some(job.id) {
+        return Err(rejected("只能续派自己的直接子任务"));
+    }
+    if target <= job.floor {
+        return Err(rejected("不能续派当前阶段之前的子任务"));
+    }
+    if !matches!(str_of(&child, "state"), "done" | "partial") {
+        return Err(rejected(format!("子任务状态为「{}」，只能续派已完成或部分完成的子任务", str_of(&child, "state"))));
+    }
+    if q.exists("SELECT 1 FROM job_failovers WHERE original=?", &[&target])? {
+        return Err(rejected("该子任务已被自动改派替代，不能续派"));
+    }
+    if q.exists("SELECT 1 FROM job_workspaces WHERE job=? AND state='merged'", &[&target])? {
+        return Err(rejected("该工作区已合入，请创建新任务继续修改"));
+    }
+    if job.is_root() && crate::pause::consolidating(q, job.ticket)? {
+        return Err(rejected("工单正在最后一次暂停交接，请汇总已有结果并结束本轮"));
+    }
+    q.run("UPDATE jobs SET state='queued',turn=turn+1,ready_after=0,dispatch_turn=NULL WHERE id=?", &[&target])?;
+    let source = NoteSource { who: job.who(), agent: job.agent.clone(), logical };
+    let seq = q.record_note(job.ticket, Some(&json!(target)), cmd.get("body"), Some(&source), Some(key))?;
+    // A mailbox-budget refusal must roll back the requeue as well.
+    if !q.exists("SELECT 1 FROM mailbox WHERE seq=? AND target=?", &[&seq, &target])? {
+        return Err(rejected("自动信箱达到预算，无法续派子任务"));
+    }
+    q.log(job.who(), "continued", &json!({"job": target, "key": key}))?;
+    Ok(())
 }
 
 /// `dispatch(store, ctx, cmd)` (D:70-124).
@@ -368,6 +476,12 @@ async fn dispatch(turn: &Arc<Turn>, cmd: &Value) -> Result<()> {
     };
     if turn.aborted() || !inner.db.with(|q| q.live(job.who()))? || inner.db.with(|q| superseded(q))? {
         return Ok(());
+    }
+    if cmd.as_object().is_some_and(|fields| fields.contains_key("continue")) {
+        return inner.db.tx(|q| {
+            if !q.live(job.who())? || superseded(q)? { return Ok(()); }
+            continue_child(q, turn, cmd)
+        });
     }
     let Some(first) = inner.db.with(|q| check(q, turn, cmd))? else {
         return Ok(());
@@ -405,6 +519,9 @@ async fn dispatch(turn: &Arc<Turn>, cmd: &Value) -> Result<()> {
                 &c.override_,
             ],
         )?;
+        for needs in &c.needs {
+            q.run("INSERT INTO job_deps(job,needs) VALUES(?,?)", &[&child, needs])?;
+        }
         if c.write && q.exists("SELECT 1 FROM workspace_policy WHERE ticket=? AND isolated=1", &[&job.ticket])? {
             // Nested children branch from their parent's committed workspace.
             crate::workspaces::plan(q,&inner.data_dir,child,job.ticket,&job.cwd)?;
@@ -588,4 +705,23 @@ fn cancel(turn: &Turn, text: &str, streaming: bool) -> Result<Vec<i64>> {
         )?;
         Ok(cancelled)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dependencies_prefer_logical_turn_and_compare_normalized_sets() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE jobs(id INTEGER PRIMARY KEY,parent INTEGER,ticket INTEGER,msgkey TEXT,source_turn INTEGER);
+          INSERT INTO jobs VALUES(11,1,2,'impl',3),(12,1,2,'impl',4),(13,1,2,'review',4),(14,9,2,'foreign',4);").unwrap();
+        let q = Q(&conn);
+        let job = crate::job::JobCtx::from_row(json!({"id":1,"ticket":2,"floor":10,"turn":3}).as_object().unwrap());
+        assert_eq!(dependencies(&q, &job, Some(&json!(["impl",12,11])), 0).unwrap(), vec![11,12]);
+        assert_eq!(dependencies(&q, &job, Some(&json!(["impl"])), 11).unwrap(), vec![12]);
+        assert!(dependencies(&q, &job, Some(&json!(["missing"])), 0).is_err());
+        assert!(dependencies(&q, &job, Some(&json!([14])), 0).is_err());
+        assert!(dependencies(&q, &job, Some(&json!([])), 0).is_err());
+    }
 }

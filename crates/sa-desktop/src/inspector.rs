@@ -15,6 +15,17 @@ use sa_store::{JobView, Snapshot};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 
+fn collaborator_slots(running: i64, queued: i64, cap: u32, has_collaborators: bool) -> Option<String> {
+    if cap == 0 || !has_collaborators {
+        return None;
+    }
+    let mut text = format!("协作者 运行 {running} / 上限 {cap}");
+    if queued > 0 {
+        text.push_str(&format!(" · 排队 {queued}"));
+    }
+    Some(text)
+}
+
 fn route_text(route: &Option<Value>) -> Option<String> {
     let r = route.as_ref()?;
     let r = match r {
@@ -65,7 +76,7 @@ impl App {
                 top: 11,
                 bottom: 0,
             })
-            .show(ui, |ui| self.tabs(ui, snap.as_ref()));
+            .show(ui, |ui| self.tabs(ui, snap.as_deref()));
         let r = head.response.rect;
         ui.painter().hline(
             ui.max_rect().x_range(),
@@ -208,9 +219,21 @@ impl App {
     }
     fn collab_tab(&mut self, ui: &mut Ui, snap: &Snapshot) {
         let pal = self.pal.clone();
+        if let Some(settings) = self.saved_efficiency()
+            && let Some(text) = collaborator_slots(
+                snap.running_peers, snap.queued_peers, settings.max_collaborators,
+                snap.total_jobs > 1 || snap.jobs.iter().any(|job| job.parent.is_some()),
+            )
+        {
+            note(ui, &text, &pal);
+            ui.add_space(6.0);
+        }
         if let Some(host)=&self.host {
             let action=self.workflow.show(ui,&pal,host,snap.ticket.id);
             if let Some(action)=action {self.submit(action);}
+        }
+        if let Some(action) = self.workflow.checks(ui, &pal, self.host.as_ref(), &snap.ticket.cwd, self.opts.data.as_deref(), self.opts.demo) {
+            self.submit(action);
         }
         let badges = self.live_badges();
         if let Some(host) = &self.host {
@@ -373,7 +396,8 @@ impl App {
                 ui.spacing_mut().item_spacing.x = 0.0;
                 ui.add_space(depth as f32 * STEP);
                 ui.vertical(|ui| {
-                    let card = CardCtx { permission: &permission, writable, stopped, badge: badges.get(&job.id) };
+                    let status = collaboration_status(job, snap);
+                    let card = CardCtx { permission: &permission, writable, stopped, badge: badges.get(&job.id), status: status.as_deref() };
                     match job_card(ui, job, open, &card, &pal) {
                         Some(CardAction::Toggle) => toggle = Some(job.id),
                         Some(a) => act = Some((a, job.id, job.agent.clone())),
@@ -428,6 +452,7 @@ enum CardAction {
 /// Ticket-wide inputs of a job row.
 struct CardCtx<'a> {
     permission: &'a str,
+    status: Option<&'a str>,
     /// This window schedules the journal.
     writable: bool,
     /// The ticket is cancelled.
@@ -439,6 +464,26 @@ struct CardCtx<'a> {
 /// Where the lines under a job's name start (avatar + gap).
 const JOB_TEXT: f32 = 27.0;
 
+/// Attention and prerequisites take precedence over a generic engine state.
+pub(crate) fn collaboration_status(job: &JobView, snap: &Snapshot) -> Option<String> {
+    if snap.questions.iter().any(|q| q.job == job.id) {
+        return Some("等你回答".into());
+    }
+    if job.state == "running"
+        && let Some(event) = snap.events.iter().rev().find(|event| event.job == Some(job.id) && matches!(event.kind.as_str(), "check.started" | "check.result"))
+        && event.kind == "check.started"
+    {
+        return labels::collaboration_event(&event.kind, &event.payload);
+    }
+    if job.state == "queued" {
+        let unmet: Vec<_> = job.needs.iter().filter(|id| !snap.jobs.iter().any(|j| j.id == **id && j.state == "done")).map(|id| format!("#{id}")).collect();
+        if !unmet.is_empty() {
+            return Some(format!("等待 {} 完成", unmet.join("、")));
+        }
+    }
+    None
+}
+
 /// One job of the collaboration tree: who, state, role and route; click to
 /// read its brief and result.
 fn job_card(
@@ -448,7 +493,7 @@ fn job_card(
     card: &CardCtx,
     pal: &Palette,
 ) -> Option<CardAction> {
-    let CardCtx { permission: ticket_permission, writable, stopped, badge } = *card;
+    let CardCtx { permission: ticket_permission, writable, stopped, badge, status } = *card;
     let mut clicked = None;
     let mut hovered = false;
     let bg = ui.painter().add(egui::Shape::Noop);
@@ -493,11 +538,14 @@ fn job_card(
                             .font(theme::body(11.0))
                             .color(pal.faint),
                         );
-                        match badge {
-                            Some((text, tone)) => {
+                        match (status, badge) {
+                            (Some(text), _) => {
+                                widgets::status(ui, text, pal.wait.fg, false);
+                            }
+                            (None, Some((text, tone))) => {
                                 widgets::status(ui, text, tone.fg, true);
                             }
-                            None => {
+                            (None, None) => {
                                 widgets::status(
                                     ui,
                                     &job_state(&job.state),
@@ -528,6 +576,17 @@ fn job_card(
             sub(ui, &line, theme::body(theme::SMALL), pal.mute);
             if let Some(r) = route_text(&job.route) {
                 sub(ui, &r, theme::mono(11.0), pal.faint).on_hover_text("模型路由");
+            }
+            if let Some(outcome) = &job.outcome {
+                let status = outcome.get("status").and_then(Value::as_str).unwrap_or_default();
+                let summary = outcome.get("summary").and_then(Value::as_str).unwrap_or_default().lines().next().unwrap_or_default();
+                let color = if status == "done" { pal.ok.fg } else { pal.warn.fg };
+                ui.add(Label::new(RichText::new(format!("{} · {summary}", labels::outcome_status(status))).font(theme::body(theme::SMALL)).color(color)).wrap());
+            }
+            if let Some(checks) = &job.checks {
+                for (text, ok) in labels::check_lines(checks) {
+                    ui.add(Label::new(RichText::new(text).font(theme::body(theme::SMALL)).color(if ok { pal.ok.fg } else { pal.warn.fg })).wrap());
+                }
             }
             let area = head.rect.union(ui.min_rect());
             let resp = ui.interact(area, ui.id().with(("job", job.id)), Sense::click());
@@ -922,4 +981,18 @@ fn approvals_tab(ui: &mut Ui, snap: &Snapshot, pal: &Palette, writable: bool) ->
         });
     }
     action
+}
+
+#[cfg(test)]
+mod usage_tests {
+    use super::collaborator_slots;
+
+    #[test]
+    fn slots_hide_unlimited_or_empty_tickets_and_show_full_counts() {
+        assert_eq!(collaborator_slots(2, 100, 4, true).as_deref(), Some("协作者 运行 2 / 上限 4 · 排队 100"));
+        assert_eq!(collaborator_slots(1, 0, 4, true).as_deref(), Some("协作者 运行 1 / 上限 4"));
+        assert_eq!(collaborator_slots(0, 0, 4, true).as_deref(), Some("协作者 运行 0 / 上限 4"));
+        assert_eq!(collaborator_slots(2, 100, 0, true), None);
+        assert_eq!(collaborator_slots(0, 0, 4, false), None);
+    }
 }

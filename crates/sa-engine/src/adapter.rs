@@ -127,6 +127,11 @@ pub struct AdapterError {
 }
 
 impl AdapterError {
+    /// A provider subscription window was exhausted, rather than API billing.
+    pub fn quota_exhausted(&self) -> bool {
+        self.code.as_deref().is_some_and(|c| c.starts_with("quota:"))
+    }
+
     /// The native harness already exhausted its own bounded retries. This
     /// trusted adapter code prevents multiplying the same failed work again.
     pub fn native_retry_exhausted(&self) -> bool {

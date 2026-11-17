@@ -502,7 +502,7 @@ async fn readers_and_one_writer(profile: &str) {
     let running_writers = Arc::new(AtomicUsize::new(0));
     let aborted = Arc::new(AtomicUsize::new(0));
     let (rr, rw, ab) = (running_readers.clone(), running_writers.clone(), aborted.clone());
-    let fx = Fx::new(
+    let fx = Fx::with(
         script(move |c| {
             let (rr, rw, ab, text) = (rr.clone(), rw.clone(), ab.clone(), text.clone());
             async move {
@@ -520,6 +520,13 @@ async fn readers_and_one_writer(profile: &str) {
             }
         }),
         t1_catalog(),
+        sa_engine::EngineOptions {
+            efficiency: sa_store::efficiency::shared(sa_store::efficiency::Settings {
+                max_collaborators: 0,
+                ..Default::default()
+            }),
+            ..quiet()
+        },
     );
     let id = fx.begin(fx.params().profile(profile)).await;
     fx.until(|| running_readers.load(Ordering::SeqCst) == readers && running_writers.load(Ordering::SeqCst) == 1)

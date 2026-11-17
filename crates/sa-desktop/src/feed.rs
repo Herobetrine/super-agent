@@ -7,6 +7,7 @@ use crate::markdown::{self, Block};
 use sa_store::{EventView, JobView, TicketDetail};
 use serde_json::Value;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 /// Progress rows per collapsed group (activity.js uses 24).
 const GROUP_MAX: usize = 24;
@@ -30,6 +31,12 @@ pub enum ControlKind {
     Blocked,
     Learn,
     Exhausted,
+    ReportDone,
+    ReportPartial,
+    ReportBlocked,
+    Ask,
+    CheckPass,
+    CheckFail,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -80,7 +87,8 @@ pub enum Item {
         job: Option<i64>,
         peer: bool,
         role: String,
-        blocks: Vec<Block>,
+        /// Parsed body, shared with [`ParseCache`].
+        blocks: Arc<Vec<Block>>,
         /// Markdown body without control lines (for copying).
         text: String,
         controls: Vec<Control>,
@@ -124,6 +132,44 @@ pub enum Item {
     },
 }
 
+/// Resolve stable dispatch keys only when the snapshot identifies one child.
+fn dispatch_keys(jobs: &[JobView], events: &[EventView]) -> HashMap<(i64, String), i64> {
+    let mut keys = HashMap::new();
+    let sources = events.iter().filter(|e| e.kind == "reply").filter_map(|e| e.job.map(|id| (id, s(&e.payload, "text"))))
+        .chain(jobs.iter().filter_map(|j| j.result.as_ref().map(|text| (j.id, text.clone()))));
+    for (owner, text) in sources {
+        for line in text.lines() {
+            let Some(("SEND", raw)) = control_tag(line) else { continue };
+            let Ok(value) = serde_json::from_str::<Value>(raw) else { continue };
+            let Some(key) = value.get("id").and_then(Value::as_str) else { continue };
+            if value.get("continue").is_some() { continue; }
+            let candidates: Vec<_> = jobs.iter().filter(|j| j.parent == Some(owner) && j.agent == s(&value, "to") && j.body == s(&value, "body")).collect();
+            if let [child] = candidates.as_slice() {
+                keys.insert((owner, key.into()), child.id);
+            }
+        }
+    }
+    keys
+}
+
+fn resolved_reply(text: &str, owner: Option<i64>, keys: &HashMap<(i64, String), i64>) -> (String, Vec<Control>) {
+    let text = text.lines().map(|line| {
+        let Some(("SEND", raw)) = control_tag(line) else { return line.to_string() };
+        let Ok(mut value) = serde_json::from_str::<Value>(raw) else { return line.to_string() };
+        if let Some(after) = value.get_mut("after").and_then(Value::as_array_mut) {
+            for id in after {
+                if let Some(key) = id.as_str()
+                    && let Some(number) = owner.and_then(|owner| keys.get(&(owner, key.to_string())))
+                {
+                    *id = Value::from(*number);
+                }
+            }
+        }
+        format!("SA_SEND {value}")
+    }).collect::<Vec<_>>().join("\n");
+    split_reply(&text)
+}
+
 /// Latest operator-facing activity for the live line.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Latest {
@@ -160,7 +206,7 @@ fn text_payload(p: &Value) -> String {
     }
 }
 
-const TAGS: [&str; 10] = [
+const TAGS: [&str; 12] = [
     "SEND",
     "ROLE",
     "NOTE",
@@ -171,6 +217,8 @@ const TAGS: [&str; 10] = [
     "FINISH",
     "LEARN",
     "EXHAUSTED",
+    "REPORT",
+    "ASK",
 ];
 
 /// Recognise an `SA_<TAG> {json}` control line (same rule as `cleanReply`).
@@ -211,11 +259,17 @@ fn control(tag: &str, raw: &str) -> Control {
         ),
         "SEND" => {
             let to = s(&v, "to");
-            let title = if to.is_empty() {
+            let mut title = if to.is_empty() {
                 "派发".to_string()
             } else {
                 format!("派发 → {}", agent_name(&to))
             };
+            if let Some(target) = v.get("continue") {
+                title = format!("续派给 #{target}");
+            } else if let Some(after) = v.get("after").and_then(Value::as_array).filter(|a| !a.is_empty()) {
+                let ids = after.iter().map(|id| format!("#{}", id.as_str().map(str::to_string).unwrap_or_else(|| id.to_string()))).collect::<Vec<_>>().join("、");
+                title.push_str(&format!("，等 {ids} 完成后开始"));
+            }
             (
                 ControlKind::Send,
                 title,
@@ -223,6 +277,22 @@ fn control(tag: &str, raw: &str) -> Control {
                 (!to.is_empty()).then_some(to),
             )
         }
+        "REPORT" => {
+            let kind = match s(&v, "status").as_str() {
+                "done" => ControlKind::ReportDone,
+                "partial" => ControlKind::ReportPartial,
+                _ => ControlKind::ReportBlocked,
+            };
+            let mut text = s(&v, "summary");
+            for (key, label) in [("verified", "已核对"), ("unverified", "未核对"), ("artifacts", "产物")] {
+                let entries = v.get(key).and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).collect::<Vec<_>>();
+                if !entries.is_empty() {
+                    text.push_str(&format!("\n{label}\n{}", entries.into_iter().map(|item| format!("· {item}")).collect::<Vec<_>>().join("\n")));
+                }
+            }
+            (kind, crate::labels::outcome_status(&s(&v, "status")).into(), text, None)
+        }
+        "ASK" => (ControlKind::Ask, String::new(), format!("向你提问：{}", pick(&["question"])), None),
         "NOTE" => {
             let job = s(&v, "job");
             let title = if job.is_empty() {
@@ -271,7 +341,9 @@ fn control(tag: &str, raw: &str) -> Control {
     Control {
         kind,
         title,
-        text: compact(&text, 600),
+        // Outcome sections are already bounded by the protocol and need their
+        // line breaks and full lists for the result block.
+        text: if tag == "REPORT" { text } else { compact(&text, 600) },
         agent,
     }
 }
@@ -287,6 +359,8 @@ pub fn split_reply(text: &str) -> (String, Vec<Control>) {
             None => body.push(line),
         }
     }
+    // The result is the last block of the reply, after other control lines.
+    controls.sort_by_key(|c| matches!(c.kind, ControlKind::ReportDone | ControlKind::ReportPartial | ControlKind::ReportBlocked));
     (body.join("\n").trim().to_string(), controls)
 }
 
@@ -343,8 +417,62 @@ pub fn group_summary(rows: &[ProgressRow]) -> String {
     out
 }
 
+/// Parsed markdown by reply text, kept across rebuilds. The feed is rebuilt
+/// on every journal change (many times a second while a reply streams);
+/// without this each rebuild would parse every reply of the conversation again.
+#[derive(Default)]
+pub struct ParseCache {
+    /// Text hash -> (text length, blocks). The length guards against a
+    /// colliding hash handing out another reply's blocks.
+    map: HashMap<u64, (usize, Arc<Vec<Block>>)>,
+    used: std::collections::HashSet<u64>,
+}
+
+impl ParseCache {
+    fn parse(&mut self, text: &str) -> Arc<Vec<Block>> {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        text.hash(&mut h);
+        let key = h.finish();
+        self.used.insert(key);
+        match self.map.get(&key) {
+            Some((len, blocks)) if *len == text.len() => blocks.clone(),
+            _ => {
+                let blocks = Arc::new(markdown::parse(text));
+                self.map.insert(key, (text.len(), blocks.clone()));
+                blocks
+            }
+        }
+    }
+
+    /// Forget texts the last build did not use (a streaming reply leaves one
+    /// stale entry per rebuild).
+    fn sweep(&mut self) {
+        let used = std::mem::take(&mut self.used);
+        self.map.retain(|k, _| used.contains(k));
+    }
+
+    #[cfg(test)]
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
+}
+
+/// A build with no earlier parse to reuse; the app always carries a cache.
+#[cfg(test)]
 pub fn build(ticket: &TicketDetail, jobs: &[JobView], events: &[EventView]) -> Feed {
+    build_with(ticket, jobs, events, &mut ParseCache::default())
+}
+
+/// [`build`], reusing markdown parsed by earlier builds of the same ticket.
+pub fn build_with(
+    ticket: &TicketDetail,
+    jobs: &[JobView],
+    events: &[EventView],
+    cache: &mut ParseCache,
+) -> Feed {
     let by_id: HashMap<i64, &JobView> = jobs.iter().map(|j| (j.id, j)).collect();
+    let dispatches = dispatch_keys(jobs, events);
     let mut items: Vec<Item> = Vec::new();
     let mut latest: Option<Latest> = None;
     let mut goal = false;
@@ -441,7 +569,7 @@ pub fn build(ticket: &TicketDetail, jobs: &[JobView], events: &[EventView]) -> F
                         job: Some(j),
                         peer: false,
                         role: String::new(),
-                        blocks: Vec::new(),
+                        blocks: Arc::default(),
                         text: String::new(),
                         controls: Vec::new(),
                         ts: e.ts,
@@ -460,7 +588,7 @@ pub fn build(ticket: &TicketDetail, jobs: &[JobView], events: &[EventView]) -> F
                 }
             }
             "reply" => {
-                let (body, controls) = split_reply(&s(p, "text"));
+                let (body, controls) = resolved_reply(&s(p, "text"), e.job, &dispatches);
                 let peer = job.is_some_and(|j| j.parent.is_some());
                 let reply = Item::Reply {
                     key,
@@ -468,7 +596,7 @@ pub fn build(ticket: &TicketDetail, jobs: &[JobView], events: &[EventView]) -> F
                     job: e.job,
                     peer,
                     role: job.map(|j| j.role.clone()).unwrap_or_default(),
-                    blocks: markdown::parse(&body),
+                    blocks: cache.parse(&body),
                     text: body.clone(),
                     controls,
                     ts: e.ts,
@@ -510,6 +638,13 @@ pub fn build(ticket: &TicketDetail, jobs: &[JobView], events: &[EventView]) -> F
                     ts: e.ts,
                     tone: Tone::Normal,
                 });
+            }
+            k @ ("ask" | "answer" | "ask.withdrawn" | "continued" | "skipped" | "check.started" | "check.result" | "check.bounced" | "auto.stalled") => {
+                if let Some(text) = crate::labels::collaboration_event(k, p) {
+                    latest = Some(Latest { job: e.job, turn: e.turn, label: text.clone(), ts: e.ts, agent: Some(agent.clone()) });
+                    items.push(Item::Line { key, kind: LineKind::Auto, text, agent: None, to: None, ts: e.ts,
+                        tone: if k == "check.bounced" || (k == "check.result" && p.get("ok") == Some(&Value::Bool(false))) { Tone::Error } else { Tone::Normal } });
+                }
             }
             "note" | "note.rejected" => items.push(Item::Line {
                 key,
@@ -648,9 +783,20 @@ pub fn build(ticket: &TicketDetail, jobs: &[JobView], events: &[EventView]) -> F
                     tone: if blocked { Tone::Error } else { Tone::Normal },
                 });
             }
-            "turn.stalled" | "turn.retry_scheduled" | "turn.route_wait" | "turn.gave_up" | "route.rotated"
+            "turn.stalled" | "turn.retry_scheduled" | "turn.route_wait" | "turn.quota_wait" | "turn.deferred" | "turn.gave_up" | "route.rotated"
             | "harness.health" | "turn.loop_warning" | "turn.loop_stopped" | "workspace.result" | "workspace.error" => {
                 if let Some((text, tone)) = resilience_line(&e.kind, p, &agent) {
+                    if let Some(label) = quota_wait_line(&e.kind, p)
+                        && e.job.is_some() && e.turn.is_some() && e.ts.is_finite()
+                    {
+                        latest = Some(Latest {
+                            job: e.job,
+                            turn: e.turn,
+                            label,
+                            ts: e.ts,
+                            agent: None,
+                        });
+                    }
                     items.push(Item::Line {
                         key,
                         kind: LineKind::Retry,
@@ -693,7 +839,7 @@ pub fn build(ticket: &TicketDetail, jobs: &[JobView], events: &[EventView]) -> F
             ..
         }) = items.get_mut(idx)
         {
-            *blocks = markdown::parse(&clean);
+            *blocks = cache.parse(&clean);
             *text = clean;
             *c = controls;
         }
@@ -723,7 +869,7 @@ pub fn build(ticket: &TicketDetail, jobs: &[JobView], events: &[EventView]) -> F
         && matches!(root.state.as_str(), "done" | "partial")
         && let Some(result) = &root.result
     {
-        let (body, controls) = split_reply(result);
+        let (body, controls) = resolved_reply(result, Some(root.id), &dispatches);
         if !body.is_empty() || !controls.is_empty() {
             items.push(Item::Reply {
                 key: i64::MAX,
@@ -731,7 +877,7 @@ pub fn build(ticket: &TicketDetail, jobs: &[JobView], events: &[EventView]) -> F
                 job: Some(root.id),
                 peer: false,
                 role: String::new(),
-                blocks: markdown::parse(&body),
+                blocks: cache.parse(&body),
                 text: body.clone(),
                 controls,
                 ts: 0.0,
@@ -740,12 +886,45 @@ pub fn build(ticket: &TicketDetail, jobs: &[JobView], events: &[EventView]) -> F
             });
         }
     }
+    // Attach platform evidence only to the latest committed reply for each job.
+    let mut seen = std::collections::HashSet::new();
+    for item in items.iter_mut().rev() {
+        if let Item::Reply { job: Some(id), controls, streaming: false, .. } = item
+            && seen.insert(*id)
+            && let Some(job) = by_id.get(id)
+        {
+            if let Some(outcome) = &job.outcome {
+                controls.retain(|c| !matches!(c.kind, ControlKind::ReportDone | ControlKind::ReportPartial | ControlKind::ReportBlocked));
+                controls.push(control("REPORT", &outcome.to_string()));
+            }
+            if let Some(checks) = &job.checks {
+                controls.extend(crate::labels::check_lines(checks).into_iter().map(|(text, ok)| Control {
+                    kind: if ok { ControlKind::CheckPass } else { ControlKind::CheckFail },
+                    title: String::new(), text, agent: None,
+                }));
+            }
+        }
+    }
+    cache.sweep();
     Feed { items, latest }
 }
 
 /// Alert title such as "Codex · 失败".
 pub fn alert_title(kind: &str, agent: &str) -> String {
     format!("{} · {}", agent_name(agent), job_state(kind))
+}
+
+/// Quota waits are normal scheduling holds, separate from route recovery.
+fn quota_wait_line(kind: &str, p: &Value) -> Option<String> {
+    if !matches!(kind, "turn.quota_wait" | "turn.deferred") {
+        return None;
+    }
+    let reason = p.get("reason").and_then(Value::as_str).unwrap_or(if kind == "turn.quota_wait" {
+        "quota_window"
+    } else {
+        ""
+    });
+    crate::labels::quota_wait(reason, p.get("until").and_then(Value::as_f64))
 }
 
 /// Status line of a resilience event (spec §9.2 G); `None` hides it.
@@ -785,6 +964,10 @@ fn resilience_line(kind: &str, p: &Value, agent: &str) -> Option<(String, Tone)>
                 Tone::Normal,
             )
         }
+        "turn.quota_wait" | "turn.deferred" => (
+            format!("{who} · {}", quota_wait_line(kind, p)?),
+            Tone::Normal,
+        ),
         "turn.route_wait" => (
             format!(
                 "{who} · 等待上游恢复 · {} · {class}",
@@ -792,10 +975,15 @@ fn resilience_line(kind: &str, p: &Value, agent: &str) -> Option<(String, Tone)>
             ),
             Tone::Normal,
         ),
-        "turn.gave_up" => (
-            format!("{who} · 已放弃（{class}）· 共尝试 {} 次", num("attempts").unwrap_or(0.0) as i64),
-            Tone::Error,
-        ),
+        "turn.gave_up" => {
+            let reset = num("quota_until").map(crate::labels::reset_time).filter(|s| !s.is_empty());
+            let detail = if let Some(reset) = reset {
+                format!("订阅额度窗口已用尽，预计 {reset} 重置")
+            } else {
+                format!("共尝试 {} 次", num("attempts").unwrap_or(0.0) as i64)
+            };
+            (format!("{who} · 已放弃（{class}）· {detail}"), Tone::Error)
+        },
         "route.rotated" => (
             format!(
                 "{who} · 供应商轮换 · {} → {} · {}{}",
@@ -846,6 +1034,7 @@ mod tests {
             agent_routes: json!({}),
             allow_lead_routing: true,
             pause_status: None,
+            attention: None,
             state: "running".into(),
         }
     }
@@ -864,6 +1053,9 @@ mod tests {
             body: String::new(),
             result: None,
             route: None,
+            outcome: None,
+            checks: None,
+            needs: Vec::new(),
         }
     }
 
@@ -877,6 +1069,74 @@ mod tests {
             agent: None,
             payload,
         }
+    }
+
+    #[test]
+    fn rebuilds_reuse_parsed_replies_and_drop_stale_stream_text() {
+        let jobs = [job(1, "claude", None)];
+        let mut events = vec![
+            ev(1, "user", 1, json!("目标")),
+            ev(2, "reply", 1, json!({"text": "**第一轮** 结论"})),
+            ev(3, "delta", 1, json!("正在")),
+        ];
+        let mut cache = ParseCache::default();
+        let first = build_with(&ticket(), &jobs, &events, &mut cache);
+        let blocks = |feed: &Feed, i: usize| match &feed.items[i] {
+            Item::Reply { blocks, .. } => blocks.clone(),
+            other => panic!("expected a reply, got {other:?}"),
+        };
+        // The finished reply and the streaming one.
+        assert_eq!(cache.len(), 2);
+        events.push(ev(4, "delta", 1, json!("输出")));
+        let second = build_with(&ticket(), &jobs, &events, &mut cache);
+        // Same allocation: the finished reply was not parsed again.
+        assert!(Arc::ptr_eq(&blocks(&first, 1), &blocks(&second, 1)));
+        assert!(matches!(&second.items[2], Item::Reply { text, streaming: true, .. } if text == "正在输出"));
+        // The shorter stream text of the first build is forgotten.
+        assert_eq!(cache.len(), 2);
+        // The cached build equals an uncached one.
+        assert_eq!(second, build(&ticket(), &jobs, &events));
+    }
+
+    #[test]
+    fn folds_outcomes_questions_continuations_and_dependencies() {
+        let (body, controls) = split_reply("正文\nSA_REPORT {\"status\":\"partial\",\"summary\":\"实现完成\",\"verified\":[\"单元检查\"],\"unverified\":[\"窗口\"],\"artifacts\":[\"out.txt\"]}\nSA_ASK {\"question\":\"是否继续\"}\nSA_SEND {\"continue\":12,\"body\":\"修复\"}\nSA_SEND {\"to\":\"codex\",\"after\":[\"impl\",12],\"body\":\"审阅\"}");
+        assert_eq!(body, "正文");
+        assert_eq!(controls[0].kind, ControlKind::Ask);
+        assert_eq!(controls[0].text, "向你提问：是否继续");
+        assert_eq!(controls[1].title, "续派给 #12");
+        assert_eq!(controls[2].title, "派发 → Codex，等 #impl、#12 完成后开始");
+        assert_eq!(controls[3].kind, ControlKind::ReportPartial);
+        assert_eq!(controls[3].title, "部分完成");
+        assert_eq!(controls[3].text, "实现完成\n已核对\n· 单元检查\n未核对\n· 窗口\n产物\n· out.txt");
+    }
+
+    #[test]
+    fn platform_checks_attach_only_to_latest_reply_and_running_checks_are_activity() {
+        let mut root = job(1, "claude", None);
+        root.checks = Some(json!({"ok":true,"cached":false,"runs":[{"argv":["cargo","test"],"ok":true,"seconds":2.0}]}));
+        let events = [
+            ev(1, "reply", 1, json!({"text":"第一轮"})),
+            ev(2, "reply", 1, json!({"text":"第二轮"})),
+            ev(3, "check.started", 1, json!({"argv":["cargo","test"]})),
+        ];
+        let feed = build(&ticket(), &[root], &events);
+        let replies: Vec<_> = feed.items.iter().filter_map(|item| match item { Item::Reply { controls, .. } => Some(controls), _ => None }).collect();
+        assert!(replies[0].is_empty());
+        assert_eq!(replies[1][0].kind, ControlKind::CheckPass);
+        assert_eq!(replies[1][0].text, "平台检查通过 · cargo test · 2.0 秒");
+        assert_eq!(feed.latest.unwrap().label, "正在运行完成检查：cargo test");
+    }
+
+    #[test]
+    fn dependency_keys_resolve_only_with_a_unique_snapshot_child() {
+        let mut child = job(12, "codex", Some(1));
+        child.body = "实现".into();
+        let text = "SA_SEND {\"id\":\"impl\",\"to\":\"codex\",\"body\":\"实现\"}\nSA_SEND {\"id\":\"review\",\"to\":\"claude\",\"after\":[\"impl\"],\"body\":\"审阅\"}";
+        let events = [ev(1, "reply", 1, json!({"text":text}))];
+        let keys = dispatch_keys(&[child], &events);
+        let (_, controls) = resolved_reply(text, Some(1), &keys);
+        assert_eq!(controls[1].title, "派发 → Claude Code，等 #12 完成后开始");
     }
 
     #[test]
@@ -972,6 +1232,39 @@ mod tests {
                 "Codex · 已放弃（认证失败）· 共尝试 3 次",
             ]
         );
+    }
+
+    #[test]
+    fn quota_waits_explain_reset_and_reserve_without_retry_claims() {
+        let jobs = vec![job(1, "codex", None)];
+        let until = 1_800_000_000.0;
+        for kind in ["turn.quota_wait", "turn.deferred"] {
+            for (reason, expected) in [
+                ("quota_window", format!("等待额度重置，预计 {} 继续", crate::labels::stamp(until))),
+                ("quota_reserve", format!("为主控保留额度，预计 {} 后继续", crate::labels::stamp(until))),
+            ] {
+                let feed = build(&ticket(), &jobs, &[ev(1, kind, 1, json!({"reason":reason,"until":until}))]);
+                assert!(matches!(&feed.items[1], Item::Line { text, tone: Tone::Normal, .. } if text == &format!("Codex · {expected}")));
+                assert_eq!(feed.latest.unwrap().label, expected);
+            }
+        }
+        let feed = build(&ticket(), &jobs, &[
+            ev(1, "turn.gave_up", 1, json!({"class":"billing","quota_until":until})),
+        ]);
+        assert!(matches!(&feed.items[1], Item::Line { text, tone: Tone::Error, .. }
+            if text.contains(&format!("预计 {} 重置", crate::labels::reset_time(until))) && !text.contains("0 次")));
+        assert_eq!(resilience_line("turn.deferred", &json!({"reason":"circuit_open","until":until}), "codex"), None);
+    }
+
+    #[test]
+    fn quota_bookkeeping_does_not_replace_latest_or_create_feed_items() {
+        let jobs = vec![job(1, "codex", None)];
+        let feed = build(&ticket(), &jobs, &[
+            ev(1, "reply", 1, json!({"text":"答复"})),
+            ev(2, "quota.window", 1, json!({"provider":"private-provider","used":0.92})),
+        ]);
+        assert_eq!(feed.items.len(), 2);
+        assert_eq!(feed.latest.unwrap().label, "收到回报");
     }
 
     #[test]

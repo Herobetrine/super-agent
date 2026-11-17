@@ -548,6 +548,23 @@ impl Turn {
             }
             return Ok(None);
         }
+        // Account usage is optional for API-key routes and must not fail a turn.
+        if method.is_none() && id.as_ref().and_then(Value::as_i64) == Some(5) {
+            if event.get("error").is_none_or(Value::is_null)
+                && event["result"]["rateLimits"].is_object()
+            {
+                self.emit.journal("native", json!({
+                    "method": "account/rateLimits/read",
+                    "result": {"rateLimits": event["result"]["rateLimits"]}
+                }));
+            }
+            return Ok(None);
+        }
+        if method.is_none() && id.is_some()
+            && !matches!(id.as_ref().and_then(Value::as_i64), Some(1..=4))
+        {
+            return Ok(None);
+        }
         if event.get("error").is_some_and(|e| !e.is_null()) {
             let mut e = rpc_error(&event["error"]);
             e.session_id = self.thread_id.clone();
@@ -628,6 +645,7 @@ impl Turn {
                     "route.selected",
                     json!({"provider": self.provider, "model": self.model, "mode": "cli"}),
                 );
+                self.send(json!({"id": 5, "method": "account/rateLimits/read", "params": {}}));
                 self.send(json!({
                     "id": 3,
                     "method": "turn/start",
@@ -646,6 +664,11 @@ impl Turn {
         let Some(method) = method else {
             return Ok(None);
         };
+        // Account notifications have no thread identity; preserve just this method.
+        if method == "account/rateLimits/updated" {
+            self.emit.journal("native", event);
+            return Ok(None);
+        }
         let Some(thread) = self.thread_id.clone() else {
             return Ok(None);
         };
@@ -880,6 +903,10 @@ const recv = async () => JSON.parse((await lines.next()).value), send = (o) => p
   if (thread.params.sandbox !== 'workspace-write' || thread.params.approvalPolicy !== 'on-request') process.exit(3);
   send({ id: 2, result: { sandbox: { type: 'workspaceWrite', networkAccess: false, writableRoots: [] }, model: 'm', modelProvider: 'p',
     approvalPolicy: 'on-request', approvalsReviewer: 'user', thread: { id: 'thread' } } });
+  const limits = await recv();
+  if (limits.id !== 5 || limits.method !== 'account/rateLimits/read') process.exit(9);
+  send({ id: limits.id, result: { rateLimits: { primary: { usedPercent: 25, resetsAt: 2000000000 } } } });
+  send({ method: 'account/rateLimits/updated', params: { rateLimits: { primary: { usedPercent: 30 } } } });
   const turn = await recv();
   if (turn.params.effort !== 'high') process.exit(8);
   if (turn.params.input[0].text !== 'test' || turn.params.input[1].type !== 'image' ||
@@ -998,6 +1025,74 @@ const recv = async () => JSON.parse((await lines.next()).value), send = (o) => p
             ]
         );
         assert_eq!(session.as_deref(), Some("thread"));
+    }
+
+    #[tokio::test]
+    async fn account_limits_snapshot_updates_and_optional_errors_do_not_block_turns() {
+        let sys = Sys::from_process();
+        let node = sys.which(if cfg!(windows) { "node.exe" } else { "node" })
+            .expect("account-limit fixture requires Node.js");
+        let cwd = std::env::current_dir().unwrap();
+        let snapshot = json!({"rateLimits":{"primary":{"usedPercent":75,"resetsAt":2000000000}},"rateLimitsByLimitId":{}});
+        for (index, response) in [
+            json!({"id":5,"result":snapshot}),
+            json!({"id":5,"error":{"code":-32000,"message":"API-key route has no account limits"}}),
+            json!({"id":5,"result":{"rateLimits":null}}),
+        ].into_iter().enumerate() {
+            let peer = r#"
+const lines = require('node:readline').createInterface({ input: process.stdin })[Symbol.asyncIterator]();
+const recv = async () => JSON.parse((await lines.next()).value), send = o => process.stdout.write(JSON.stringify(o) + '\n');
+(async () => {
+  await recv(); send({id:1,result:{}});
+  await recv(); const thread = await recv();
+  if (!['thread/start','thread/resume'].includes(thread.method)) process.exit(2);
+  send({method:'account/rateLimits/updated',params:{rateLimits:{primary:{usedPercent:80}}}});
+  send({method:'account/unrelated',params:{private:'must not journal'}});
+  send({id:2,result:{sandbox:{type:'readOnly'},approvalPolicy:'never',model:'m',modelProvider:'p',thread:{id:'thread'}}});
+  const limits = await recv();
+  if (limits.id !== 5 || limits.method !== 'account/rateLimits/read') process.exit(3);
+  const turn = await recv(); if (turn.method !== 'turn/start') process.exit(4);
+  send({id:999,error:{code:-32000,message:'unexpected response'}});
+  send({id:'unknown-request',error:{code:-32000,message:'unexpected string response'}});
+  send(__RESPONSE__);
+  send({id:3,result:{turn:{id:'turn'}}});
+  send({method:'item/completed',params:{threadId:'thread',item:{id:'answer',type:'agentMessage',text:'ok'}}});
+  send({method:'turn/completed',params:{threadId:'thread',turn:{id:'turn',status:'completed'}}});
+})();
+"#.replace("__RESPONSE__", &response.to_string());
+            let proc = start(&node, &["-e".into(), peer], &cwd, &sys).unwrap();
+            let req = RunRequest {
+                ticket:1, job:1, turn:1, agent:"codex".into(), prompt:"test".into(),
+                images:vec![], cwd:cwd.clone(),
+                route:sa_engine::adapter::Route {provider:"p".into(),model:"m".into(),mode:"cli".into(),reasoning_effort:None},
+                profile:"readonly".into(), writable:false,
+                session_id:(index == 1).then(|| "thread".into()), bus:None,
+            };
+            let host = Arc::new(Host::default());
+            host.accepted.lock().unwrap().push(7);
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            let outcome = tokio::time::timeout(Duration::from_secs(10), converse(
+                proc, &req, &req.route, policy("readonly", false).unwrap(), Map::new(), host,
+                Emit(tx), CancellationToken::new(),
+            )).await.expect("fixture finished").expect("optional account request preserved turn");
+            assert_eq!(outcome.text, "ok");
+            assert_eq!(outcome.session_id.as_deref(), Some("thread"));
+            let mut native = vec![];
+            while let Ok(event) = rx.try_recv() {
+                if let sa_engine::adapter::AdapterEvent::Journal {kind,data} = event
+                    && kind == "native"
+                { native.push(data); }
+            }
+            assert_eq!(native.iter().filter(|v| v["method"] == "account/rateLimits/updated").count(), 1);
+            assert!(!native.iter().any(|v| v["method"] == "account/unrelated"));
+            let reads: Vec<_> = native.iter().filter(|v| v["method"] == "account/rateLimits/read").collect();
+            if index == 0 {
+                assert_eq!(reads, vec![&json!({"method":"account/rateLimits/read",
+                    "result":{"rateLimits":snapshot["rateLimits"]}})]);
+            } else {
+                assert!(reads.is_empty());
+            }
+        }
     }
 
     #[test]

@@ -17,6 +17,15 @@ pub struct ApprovalWatch {
 
 impl ApprovalWatch {
     pub fn poll(&mut self, ctx: &egui::Context, data: &std::path::Path) -> Vec<Notice> {
+        self.poll_kind(ctx, data, NoticeKind::Approval)
+    }
+
+    fn poll_kind(
+        &mut self,
+        ctx: &egui::Context,
+        data: &std::path::Path,
+        kind: NoticeKind,
+    ) -> Vec<Notice> {
         let mut notices = Vec::new();
         if let Some(result) = self.pending.as_ref().and_then(crate::ops::Pending::poll) {
             self.pending = None;
@@ -29,7 +38,7 @@ impl ApprovalWatch {
                         .collect();
                     notices.extend(tickets.into_iter().map(|ticket| Notice {
                         ticket,
-                        approval: true,
+                        kind,
                         status: String::new(),
                     }));
                 }
@@ -48,8 +57,21 @@ impl ApprovalWatch {
                     rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
                 )?;
                 connection.busy_timeout(std::time::Duration::from_secs(1))?;
-                let mut statement = connection
-                    .prepare("SELECT id,ticket FROM approvals WHERE decision='pending'")?;
+                let sql = match kind {
+                    NoticeKind::Approval => "SELECT id,ticket FROM approvals WHERE decision='pending'",
+                    NoticeKind::Question => {
+                        let exists: bool = connection.query_row(
+                            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='questions')",
+                            [], |row| row.get(0),
+                        )?;
+                        if !exists {
+                            return Ok(Vec::new());
+                        }
+                        "SELECT id,ticket FROM questions WHERE state='pending'"
+                    }
+                    NoticeKind::Completion => unreachable!(),
+                };
+                let mut statement = connection.prepare(sql)?;
                 let rows = statement
                     .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
                     .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -62,20 +84,42 @@ impl ApprovalWatch {
     }
 }
 
+/// Questions share approval polling and its startup baseline, with their own ids.
+#[derive(Default)]
+pub struct QuestionWatch(ApprovalWatch);
+
+impl QuestionWatch {
+    pub fn poll(&mut self, ctx: &egui::Context, data: &std::path::Path) -> Vec<Notice> {
+        self.0.poll_kind(ctx, data, NoticeKind::Question)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NoticeKind {
+    Approval,
+    Question,
+    Completion,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Notice {
     pub ticket: i64,
-    pub approval: bool,
+    pub kind: NoticeKind,
     pub status: String,
 }
 
 impl Notice {
     pub fn title(&self) -> String {
-        if self.approval {
-            format!("工单 #{} 等待审批", self.ticket)
-        } else {
-            format!("工单 #{} {}", self.ticket, self.status)
+        match self.kind {
+            NoticeKind::Approval => format!("工单 #{} 等待审批", self.ticket),
+            NoticeKind::Question => "需要你的回答".into(),
+            NoticeKind::Completion => format!("工单 #{} {}", self.ticket, self.status),
         }
+    }
+
+    #[cfg(any(windows, test))]
+    fn detail(&self) -> String {
+        format!("工单 #{} · 点击返回工作台查看", self.ticket)
     }
 }
 
@@ -324,10 +368,10 @@ mod native {
             text.Item(0)?
                 .AppendChild(&document.CreateTextNode(&HSTRING::from(notice.title()))?)?;
             text.Item(1)?
-                .AppendChild(&document.CreateTextNode(&HSTRING::from("点击返回工作台查看"))?)?;
+                .AppendChild(&document.CreateTextNode(&HSTRING::from(notice.detail()))?)?;
             let toast = ToastNotification::CreateToastNotification(&document)?;
             toast.SetGroup(&self.group)?;
-            let digest = Sha256::digest(format!("{}:{}", notice.ticket, notice.approval));
+            let digest = Sha256::digest(format!("{}:{}", notice.ticket, notice.kind as u8));
             let tag = digest[..8]
                 .iter()
                 .map(|byte| format!("{byte:02x}"))
@@ -382,7 +426,7 @@ mod native {
                 backend.show(
                     Notice {
                         ticket: 1,
-                        approval: false,
+                        kind: crate::notifications::NoticeKind::Completion,
                         status: "通知验证".into(),
                     },
                     tx,
@@ -453,7 +497,7 @@ mod tests {
         assert_eq!(
             Notice {
                 ticket: 8,
-                approval: true,
+                kind: NoticeKind::Approval,
                 status: String::new()
             }
             .title(),
@@ -462,7 +506,7 @@ mod tests {
         assert_eq!(
             Notice {
                 ticket: 8,
-                approval: false,
+                kind: NoticeKind::Completion,
                 status: "已完成".into()
             }
             .title(),
@@ -498,7 +542,7 @@ mod tests {
         let notices = drain(&mut watch);
         assert_eq!(notices.len(), 1);
         assert_eq!(notices[0].ticket, 202);
-        assert!(notices[0].approval);
+        assert_eq!(notices[0].kind, NoticeKind::Approval);
         assert!(
             drain(&mut watch).is_empty(),
             "same pending approval is not repeated"
@@ -513,5 +557,51 @@ mod tests {
                 .collect::<Vec<_>>(),
             [202, 303]
         );
+    }
+    #[test]
+    fn question_notice_contains_only_ticket_identity() {
+        let notice = Notice { ticket: 19, kind: NoticeKind::Question, status: String::new() };
+        assert_eq!(notice.title(), "需要你的回答");
+        assert_eq!(notice.detail(), "工单 #19 · 点击返回工作台查看");
+    }
+
+    fn drain_questions(watch: &mut QuestionWatch, context: &egui::Context, data: &std::path::Path) -> Vec<Notice> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        watch.0.last = None;
+        let mut notices = watch.poll(context, data);
+        while watch.0.pending.is_some() {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            notices.extend(watch.poll(context, data));
+        }
+        notices
+    }
+
+    #[test]
+    fn question_watch_baselines_and_observes_background_replacements() {
+        let directory = tempfile::tempdir().unwrap();
+        let connection = rusqlite::Connection::open(directory.path().join(sa_store::DB_FILE)).unwrap();
+        connection.execute_batch("CREATE TABLE questions(id INTEGER PRIMARY KEY, ticket INTEGER, state TEXT); INSERT INTO questions VALUES(1,101,'pending');").unwrap();
+        let context = egui::Context::default();
+        let mut watch = QuestionWatch::default();
+        assert!(drain_questions(&mut watch, &context, directory.path()).is_empty());
+        connection.execute_batch("UPDATE questions SET state='answered' WHERE id=1; INSERT INTO questions VALUES(2,202,'pending'),(3,202,'pending'),(4,303,'withdrawn');").unwrap();
+        let notices = drain_questions(&mut watch, &context, directory.path());
+        assert_eq!(notices, vec![Notice { ticket: 202, kind: NoticeKind::Question, status: String::new() }]);
+        assert!(drain_questions(&mut watch, &context, directory.path()).is_empty());
+        connection.execute_batch("INSERT INTO questions VALUES(5,303,'pending');").unwrap();
+        assert_eq!(drain_questions(&mut watch, &context, directory.path())[0].ticket, 303);
+    }
+
+    #[test]
+    fn question_watch_tolerates_a_legacy_journal_without_questions() {
+        let directory = tempfile::tempdir().unwrap();
+        let connection = rusqlite::Connection::open(directory.path().join(sa_store::DB_FILE)).unwrap();
+        connection.execute_batch("CREATE TABLE legacy(id INTEGER);").unwrap();
+        let context = egui::Context::default();
+        let mut watch = QuestionWatch::default();
+        assert!(drain_questions(&mut watch, &context, directory.path()).is_empty());
+        assert_eq!(watch.0.seen, Some(Default::default()));
+        assert_eq!(connection.query_row("SELECT COUNT(*) FROM sqlite_master WHERE name='questions'", [], |row| row.get::<_, i64>(0)).unwrap(), 0);
     }
 }

@@ -103,6 +103,15 @@ impl JobCtx {
     }
 }
 
+/// Dependencies follow failover chains at read/admission time, so replacements
+/// retain the original ordering contract without rewriting dispatch receipts.
+pub(crate) const EFFECTIVE_DEPS_SQL: &str = "WITH RECURSIVE dependency_chain(job,needs) AS (
+  SELECT job,needs FROM job_deps
+  UNION SELECT d.job,f.replacement FROM dependency_chain d JOIN job_failovers f ON f.original=d.needs
+), effective_deps(job,needs) AS (
+  SELECT d.job,d.needs FROM dependency_chain d WHERE NOT EXISTS(SELECT 1 FROM job_failovers f WHERE f.original=d.needs)
+)";
+
 fn parse(text: &str) -> Value {
     serde_json::from_str(text).unwrap_or(Value::Null)
 }
@@ -111,7 +120,7 @@ fn parse(text: &str) -> Value {
 /// retry events since the child's last reply. `None` when not applicable.
 fn failure_of(q: &Q, child: i64, state: &str) -> Result<Option<Value>> {
     let rows = q.all(
-        "SELECT kind,payload FROM events WHERE job=? AND kind IN ('turn.retry_scheduled','route.rotated','turn.gave_up')
+        "SELECT kind,payload FROM events WHERE job=? AND kind IN ('turn.retry_scheduled','route.rotated','turn.gave_up','turn.quota_wait')
       AND seq>coalesce((SELECT max(seq) FROM events WHERE job=? AND kind='reply'),0) ORDER BY seq",
         &[&child, &child],
     )?;
@@ -125,6 +134,9 @@ fn failure_of(q: &Q, child: i64, state: &str) -> Result<Option<Value>> {
     for r in &rows {
         let payload = parse(str_of(r, "payload"));
         match str_of(r, "kind") {
+            "turn.quota_wait" => {
+                class = payload.get("reason").cloned().unwrap_or(Value::Null);
+            }
             "turn.gave_up" => {
                 gave_up = true;
                 class = payload.get("class").cloned().unwrap_or(Value::Null);
@@ -152,7 +164,7 @@ fn failure_of(q: &Q, child: i64, state: &str) -> Result<Option<Value>> {
 fn recovery_of(q: &Q, j: &JobCtx) -> Result<Value> {
     let row = q.one(
         "SELECT kind,payload,turn FROM events WHERE job=? AND kind IN
-      ('turn.retry_scheduled','route.rotated','turn.route_wait','auto.recover','interrupted')
+      ('turn.retry_scheduled','route.rotated','turn.route_wait','turn.quota_wait','auto.recover','interrupted')
       AND seq>coalesce((SELECT max(seq) FROM events WHERE job=? AND kind IN ('reply','user.follow')),0)
       ORDER BY seq DESC LIMIT 1",
         &[&j.id, &j.id],
@@ -163,6 +175,7 @@ fn recovery_of(q: &Q, j: &JobCtx) -> Result<Value> {
     let class = match kind {
         "route.rotated" => payload.get("reason").cloned(),
         "auto.recover" | "interrupted" => Some(json!("interrupted")),
+        "turn.quota_wait" => payload.get("reason").cloned(),
         _ => payload.get("class").cloned(),
     }
     .unwrap_or(Value::Null);
@@ -192,13 +205,19 @@ pub fn envelope(q: &Q, j: &JobCtx, harness_health: Value) -> Result<Map<String, 
     let floor = c.as_ref().map(|c| int_of(c, "boundary_job")).unwrap_or(0);
     let mut reports = vec![];
     for r in q.all(
-        "SELECT j.id,j.agent AS sender,j.role,j.body AS assignment,j.state,j.result,f.replacement
-      FROM jobs j LEFT JOIN job_failovers f ON f.original=j.id WHERE j.parent=? AND j.id>? ORDER BY j.id",
+        "SELECT j.id,j.agent AS sender,j.role,j.body AS assignment,j.state,j.result,f.replacement,o.payload AS outcome,k.payload AS checks
+      FROM jobs j LEFT JOIN job_failovers f ON f.original=j.id LEFT JOIN job_outcomes o ON o.job=j.id LEFT JOIN job_checks k ON k.job=j.id WHERE j.parent=? AND j.id>? ORDER BY j.id",
         &[&j.id, &floor],
     )? {
         let failure = failure_of(q, int_of(&r, "id"), str_of(&r, "state"))?;
         let mut r = r;
         let replacement = r.remove("replacement").filter(|v| !v.is_null());
+        if let Some(outcome) = r.remove("outcome").and_then(|value| value.as_str().map(parse)) {
+            r.insert("outcome".into(), outcome);
+        }
+        if let Some(checks) = r.remove("checks").and_then(|value| value.as_str().map(parse)) {
+            r.insert("checks".into(), checks);
+        }
         if let Some(f) = failure {
             r.insert("failure".into(), f);
         }
@@ -289,6 +308,33 @@ pub fn envelope(q: &Q, j: &JobCtx, harness_health: Value) -> Result<Map<String, 
     m.insert("objective".into(), objective);
     m.insert("previous_reply".into(), json!(j.result));
     m.insert("reports".into(), Value::Array(reports));
+    if let Some(question) = q.one(
+        "SELECT msgkey AS key,question,asked FROM questions WHERE job=? AND state='pending' ORDER BY id LIMIT 1",
+        &[&j.id],
+    )? {
+        m.insert("open_question".into(), Value::Object(question));
+    }
+    if let Some(row) = q.one("SELECT payload FROM job_checks WHERE job=?", &[&j.id])? {
+        m.insert("checks".into(), parse(str_of(&row, "payload")));
+    }
+    let commands = crate::checks::configured(q, str_of(&t, "cwd"))?;
+    if !commands.is_empty() { m.insert("completion_checks".into(), json!(commands)); }
+    let prerequisites: Vec<Value> = q.all(
+        &format!("{EFFECTIVE_DEPS_SQL} SELECT n.id AS job,n.agent,n.role,n.state,o.payload AS outcome,n.result,k.payload AS checks
+      FROM effective_deps d JOIN jobs n ON n.id=d.needs LEFT JOIN job_outcomes o ON o.job=n.id LEFT JOIN job_checks k ON k.job=n.id
+      WHERE d.job=? ORDER BY n.id"),
+        &[&j.id],
+    )?.into_iter().map(|mut row| {
+        let outcome = row.get("outcome").and_then(Value::as_str).map(parse).unwrap_or(Value::Null);
+        row.insert("outcome".into(), outcome);
+        if let Some(checks) = row.remove("checks").and_then(|value| value.as_str().map(parse)) {
+            row.insert("checks".into(), checks);
+        }
+        Value::Object(row)
+    }).collect();
+    if !prerequisites.is_empty() {
+        m.insert("prerequisites".into(), Value::Array(prerequisites));
+    }
     m.insert("permission_profile".into(), json!(j.profile));
     m.insert("allow_lead_routing".into(), json!(routing && j.is_root()));
     m.insert(

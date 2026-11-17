@@ -14,7 +14,7 @@ use sa_engine::adapter::{
     Adapter, AdapterError, Catalog, ErrorClass, EventSink, RunOutcome, RunRequest, TurnHost,
 };
 use sa_engine::resilience::classify::{
-    classified, classify_text, claude_api_retry, from_http_status,
+    MAX_QUOTA_RESET, classified, classify_text, claude_api_retry, from_http_status, quota,
 };
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
@@ -1029,6 +1029,8 @@ async fn collect_turn(
     let mut terminal: Option<Value> = None;
     let mut last_retry: Option<Value> = None;
     let mut assistant_error: Option<AdapterError> = None;
+    let mut last_rate_limit: Option<Value> = None;
+    let mut usage_limit_reached = false;
     let mut session: Option<String> = expected_session.map(str::to_owned);
     // Shared with the steering tick: a note written while a tool runs joins
     // the same turn (Claude Code adds it to the request after the tool
@@ -1036,6 +1038,14 @@ async fn collect_turn(
     let open_tools: std::sync::Mutex<HashSet<String>> = std::sync::Mutex::default();
     let mut on_event = |e: Value| {
         emit.journal("native", e.clone());
+        if e["rate_limit_info"].is_object() {
+            last_rate_limit = Some(e["rate_limit_info"].clone());
+        }
+        if matches!(e["type"].as_str(), Some("assistant" | "result"))
+            && e["api_error"] == "usage_limit_reached"
+        {
+            usage_limit_reached = true;
+        }
         if e["type"] == json!("stream_event") {
             if e["event"]["delta"]["type"] == json!("text_delta") {
                 emit.journal("delta", e["event"]["delta"]["text"].clone());
@@ -1123,6 +1133,7 @@ async fn collect_turn(
                 err = native_error;
             }
         }
+        err = quota_failure(err, last_rate_limit.as_ref(), usage_limit_reached);
         err.session_id = err
             .session_id
             .or_else(|| t["session_id"].as_str().map(str::to_owned))
@@ -1140,7 +1151,10 @@ async fn collect_turn(
         && t["session_id"].as_str().is_some_and(|s| !s.is_empty());
     if !ok {
         let mut err = terminal_error(&t, assistant_error, last_retry.as_ref());
-        err.message = "Claude 未返回匹配会话的成功终态".into();
+        err = quota_failure(err, last_rate_limit.as_ref(), usage_limit_reached);
+        if !err.quota_exhausted() {
+            err.message = "Claude 未返回匹配会话的成功终态".into();
+        }
         err.session_id = t["session_id"].as_str().map(str::to_string).or(session);
         return Err(err);
     }
@@ -1148,6 +1162,26 @@ async fn collect_turn(
         text: t["result"].as_str().unwrap_or_default().to_string(),
         session_id: t["session_id"].as_str().map(str::to_string),
     })
+}
+
+fn quota_failure(error: AdapterError, info: Option<&Value>, usage_limit_reached: bool) -> AdapterError {
+    let rejected = info.is_some_and(|v| v["status"] == "rejected" && v["isUsingOverage"] != true);
+    if error.class == ErrorClass::Cancelled || !(usage_limit_reached || rejected || error.quota_exhausted()) {
+        return error;
+    }
+    let kind = info
+        .and_then(|v| v["rateLimitType"].as_str())
+        .unwrap_or("window");
+    let reset = info
+        .and_then(|v| v["resetsAt"].as_f64())
+        .zip(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|(at, now)| at - now.as_secs_f64())
+        .filter(|secs| secs.is_finite() && *secs > 0.0)
+        .map(|secs| Duration::from_secs_f64(secs.min(MAX_QUOTA_RESET.as_secs_f64())))
+        .or(error.retry_after);
+    let mut limited = quota(kind, reset);
+    limited.session_id = error.session_id;
+    limited
 }
 
 fn terminal_reports_error(terminal: &Value) -> bool {
@@ -1158,6 +1192,10 @@ fn terminal_reports_error(terminal: &Value) -> bool {
 }
 
 fn classify_claude_text(text: &str) -> AdapterError {
+    let error = classify_text(text);
+    if error.quota_exhausted() {
+        return error;
+    }
     // Claude's native API-error assistant frame carries an explicit HTTP status.
     // Inspect only this envelope and keep the provider body out of operator errors.
     if let Some(status) = text
@@ -1169,7 +1207,7 @@ fn classify_claude_text(text: &str) -> AdapterError {
     {
         return from_http_status(status, None);
     }
-    classify_text(text)
+    error
 }
 
 fn terminal_error(
@@ -1323,6 +1361,95 @@ mod terminal_tests {
         assert_eq!(error.class, ErrorClass::Network);
         assert!(!error.message.contains("fixture-private"));
     }
+    #[tokio::test]
+    async fn rejected_subscription_window_refines_failure_and_preserves_early_session() {
+        let future = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()
+            + 20 * 86_400;
+        let info = json!({"type":"rate_limit_event","rate_limit_info":{
+            "status":"rejected","rateLimitType":"seven_day","resetsAt":future,"isUsingOverage":false
+        }});
+        let mut terminal = result(true);
+        terminal.as_object_mut().unwrap().remove("session_id");
+        let error = fake_cli(vec![json!({"type":"system","subtype":"init","session_id":"early-session"}),
+            info, terminal], 1, "").await.unwrap_err();
+        assert!(error.quota_exhausted());
+        assert_eq!(error.class, ErrorClass::Billing);
+        assert_eq!(error.code.as_deref(), Some("quota:seven_day"));
+        assert_eq!(error.retry_after, Some(Duration::from_secs(8 * 86_400)));
+        assert_eq!(error.session_id.as_deref(), Some("early-session"));
+        assert_eq!(error.message, "订阅额度窗口已用尽，等待额度重置后继续");
+    }
+
+    #[tokio::test]
+    async fn usage_limit_markers_in_assistant_or_terminal_and_prose_become_quota() {
+        for assistant in [false, true] {
+            let mut terminal = result(true);
+            let mut records = vec![];
+            if assistant {
+                records.push(json!({"type":"assistant","api_error":"usage_limit_reached",
+                    "message":{"content":[{"type":"text","text":"private provider error"}]}}));
+            } else {
+                terminal["api_error"] = json!("usage_limit_reached");
+            }
+            records.push(terminal);
+            let error = fake_cli(records, 0, "").await.unwrap_err();
+            assert!(error.quota_exhausted());
+            assert_eq!(error.code.as_deref(), Some("quota:window"));
+            assert_eq!(error.session_id.as_deref(), Some("fixture-session"));
+            assert_eq!(error.retry_after, None);
+            assert!(!error.message.contains("private"));
+        }
+        let mut terminal = result(true);
+        terminal["result"] = json!("API Error: 429 usage_limit_reached; try again in45minutes");
+        let error = fake_cli(vec![terminal], 1, "").await.unwrap_err();
+        assert!(error.quota_exhausted());
+        assert_eq!(error.retry_after, Some(Duration::from_secs(45 * 60)));
+    }
+
+    #[tokio::test]
+    async fn latest_window_overage_success_and_past_reset_keep_their_contracts() {
+        let rejected = json!({"type":"rate_limit_event","rate_limit_info":{
+            "status":"rejected","rateLimitType":"five_hour","resetsAt":1,"isUsingOverage":false
+        }});
+        let allowed = json!({"type":"rate_limit_event","rate_limit_info":{"status":"allowed"}});
+        let mut overage = rejected.clone();
+        overage["rate_limit_info"]["isUsingOverage"] = json!(true);
+        for records in [
+            vec![rejected.clone(), allowed, assistant_error(), result(true)],
+            vec![overage, assistant_error(), result(true)],
+        ] {
+            let error = fake_cli(records, 1, "").await.unwrap_err();
+            assert_eq!(error.class, ErrorClass::Protocol);
+            assert!(!error.quota_exhausted());
+        }
+        assert!(fake_cli(vec![rejected.clone(), result(false)], 0, "").await.is_ok());
+        let error = fake_cli(vec![rejected, result(true)], 0, "").await.unwrap_err();
+        assert!(error.quota_exhausted());
+        assert_eq!(error.code.as_deref(), Some("quota:five_hour"));
+        assert_eq!(error.retry_after, None);
+    }
+
+    #[test]
+    fn quota_reset_accepts_fractional_unix_seconds_and_clamps_before_duration() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs_f64();
+        let info = json!({"status":"rejected","resetsAt":now + 3600.25});
+        assert!(info["resetsAt"].as_u64().is_none());
+        let error = quota_failure(classified(ErrorClass::Other, "fixture"), Some(&info), false);
+        let reset = error.retry_after.expect("fractional future reset preserved").as_secs_f64();
+        assert!((3590.0..=3600.25).contains(&reset));
+        let huge = json!({"status":"rejected","resetsAt":1e300});
+        let error = quota_failure(classified(ErrorClass::Other, "fixture"), Some(&huge), false);
+        assert_eq!(error.retry_after, Some(MAX_QUOTA_RESET));
+    }
+
+    #[test]
+    fn cancelled_turn_is_not_relabelled_as_quota() {
+        let error = quota_failure(classified(ErrorClass::Cancelled, "cancelled"), None, true);
+        assert_eq!(error.class, ErrorClass::Cancelled);
+        assert!(!error.quota_exhausted());
+    }
+
     #[test]
     fn gateway_capabilities_follow_file_precedence_without_copying_other_env() {
         let data = tempfile::tempdir().unwrap();

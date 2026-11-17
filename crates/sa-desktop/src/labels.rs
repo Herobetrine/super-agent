@@ -28,6 +28,9 @@ pub fn error_class(class: &str) -> String {
         "route_unavailable" => "供应商或模型不可用".into(),
         "auth" => "认证失败".into(),
         "billing" => "额度或计费问题".into(),
+        "quota_exhausted" => "额度已用尽".into(),
+        "quota_window" => "等待额度重置".into(),
+        "quota_reserve" => "为主控保留额度".into(),
         "permission" => "权限不足".into(),
         "protocol" => "协议错误".into(),
         "input_too_large" => "输入过长".into(),
@@ -36,6 +39,21 @@ pub fn error_class(class: &str) -> String {
         "" => "未知原因".into(),
         other => other.into(),
     }
+}
+
+/// Why a quota-held turn is waiting, with its local continuation time when known.
+pub fn quota_wait(reason: &str, until: Option<f64>) -> Option<String> {
+    let (label, suffix) = match reason {
+        "quota_window" => ("等待额度重置", "继续"),
+        "quota_reserve" => ("为主控保留额度", "后继续"),
+        _ => return None,
+    };
+    let time = until.map(stamp).unwrap_or_default();
+    Some(if time.is_empty() {
+        label.into()
+    } else {
+        format!("{label}，预计 {time} {suffix}")
+    })
 }
 
 /// `provider / model` of a journaled route object.
@@ -131,6 +149,71 @@ pub fn event_label(kind: &str) -> Option<&'static str> {
         "auto.retry" => "安排自动重试",
         "auto.backoff" => "等待重试",
         "auto.milestone" => "收到阶段回报",
+        "ask" => "向你提问",
+        "answer" => "你的回答已送达",
+        "ask.withdrawn" => "问题已撤回",
+        "report" => "已提交任务结论",
+        "continued" => "续派任务",
+        "skipped" => "前置任务未完成，未执行",
+        "check.started" => "正在运行完成检查",
+        "check.result" => "完成检查已结束",
+        "check.bounced" => "检查未通过，已退回修复",
+        "auto.stalled" => "连续给出相同的下一步，已暂停等待你决定",
+        _ => return None,
+    })
+}
+
+/// Agent-declared outcome wording, kept distinct from platform evidence.
+pub fn outcome_status(status: &str) -> &'static str {
+    match status {
+        "done" => "已完成",
+        "partial" => "部分完成",
+        "blocked" => "受阻",
+        _ => "结果",
+    }
+}
+
+pub fn argv(payload: &serde_json::Value) -> String {
+    payload.get("argv").and_then(serde_json::Value::as_array)
+        .into_iter().flatten().filter_map(serde_json::Value::as_str)
+        .collect::<Vec<_>>().join(" ")
+}
+
+/// One platform-owned check result; a cached pass has no new command run.
+pub fn check_result(payload: &serde_json::Value) -> String {
+    if payload.get("cached").and_then(serde_json::Value::as_bool) == Some(true) {
+        return "平台检查通过（文件未变，沿用上次结果）".into();
+    }
+    let command = argv(payload);
+    if payload.get("ok").and_then(serde_json::Value::as_bool) == Some(true) {
+        let seconds = payload.get("seconds").and_then(serde_json::Value::as_f64).unwrap_or(0.0);
+        format!("平台检查通过 · {command} · {seconds:.1} 秒")
+    } else {
+        format!("平台检查未通过 · {command}")
+    }
+}
+
+pub fn check_lines(payload: &serde_json::Value) -> Vec<(String, bool)> {
+    if payload.get("cached").and_then(serde_json::Value::as_bool) == Some(true) {
+        return vec![(check_result(payload), true)];
+    }
+    payload.get("runs").and_then(serde_json::Value::as_array).into_iter().flatten()
+        .map(|run| (check_result(run), run.get("ok").and_then(serde_json::Value::as_bool) == Some(true)))
+        .collect()
+}
+
+/// Payload-aware journal labels also supply the running check's activity.
+pub fn collaboration_event(kind: &str, payload: &serde_json::Value) -> Option<String> {
+    Some(match kind {
+        "ask" => "向你提问".into(),
+        "answer" => "你的回答已送达".into(),
+        "ask.withdrawn" => "问题已撤回".into(),
+        "continued" => format!("续派给 #{}", payload.get("job")?),
+        "skipped" => "前置任务未完成，未执行".into(),
+        "check.started" => format!("正在运行完成检查：{}", argv(payload)),
+        "check.result" => check_result(payload),
+        "check.bounced" => format!("检查未通过，已退回修复（第 {} 次）", payload.get("attempt")?),
+        "auto.stalled" => "连续给出相同的下一步，已暂停等待你决定".into(),
         _ => return None,
     })
 }
@@ -168,6 +251,13 @@ fn local(ts: f64) -> Option<DateTime<Local>> {
 pub fn stamp(ts: f64) -> String {
     local(ts)
         .map(|d| d.format("%H:%M").to_string())
+        .unwrap_or_default()
+}
+
+/// Local reset time including the date for windows lasting more than one day.
+pub fn reset_time(ts: f64) -> String {
+    local(ts)
+        .map(|d| d.format("%Y-%m-%d %H:%M").to_string())
         .unwrap_or_default()
 }
 
@@ -242,9 +332,48 @@ mod tests {
     use super::*;
 
     #[test]
+    fn collaboration_events_and_platform_evidence_have_operator_labels() {
+        use serde_json::json;
+        let cases = [
+            ("ask", json!({}), "向你提问"),
+            ("answer", json!({}), "你的回答已送达"),
+            ("ask.withdrawn", json!({}), "问题已撤回"),
+            ("continued", json!({"job":12}), "续派给 #12"),
+            ("skipped", json!({}), "前置任务未完成，未执行"),
+            ("check.started", json!({"argv":["cargo","test"]}), "正在运行完成检查：cargo test"),
+            ("check.result", json!({"argv":["cargo","test"],"ok":true,"seconds":1.5}), "平台检查通过 · cargo test · 1.5 秒"),
+            ("check.bounced", json!({"attempt":2}), "检查未通过，已退回修复（第 2 次）"),
+            ("auto.stalled", json!({}), "连续给出相同的下一步，已暂停等待你决定"),
+        ];
+        for (kind, payload, expected) in cases {
+            assert!(event_label(kind).is_some(), "{kind}");
+            assert_eq!(collaboration_event(kind, &payload).as_deref(), Some(expected));
+        }
+        assert_eq!(check_result(&json!({"argv":["cargo","test"],"ok":false})), "平台检查未通过 · cargo test");
+        assert_eq!(check_lines(&json!({"ok":true,"cached":true,"runs":[]})), vec![("平台检查通过（文件未变，沿用上次结果）".into(), true)]);
+        assert_eq!(outcome_status("blocked"), "受阻");
+    }
+
+    #[test]
     fn compact_cuts_and_collapses() {
         assert_eq!(compact("a  b\n c", 10), "a b c");
         assert_eq!(compact("一二三四五六", 4), "一二三…");
+    }
+
+    #[test]
+    fn quota_wait_uses_local_stamp_and_preserves_unknown_time() {
+        let until = 1_800_000_000.0;
+        assert_eq!(
+            quota_wait("quota_window", Some(until)).unwrap(),
+            format!("等待额度重置，预计 {} 继续", stamp(until))
+        );
+        assert_eq!(
+            quota_wait("quota_reserve", Some(until)).unwrap(),
+            format!("为主控保留额度，预计 {} 后继续", stamp(until))
+        );
+        assert_eq!(quota_wait("quota_window", None).as_deref(), Some("等待额度重置"));
+        assert_eq!(quota_wait("quota_reserve", Some(f64::NAN)).as_deref(), Some("为主控保留额度"));
+        assert_eq!(quota_wait("circuit_open", Some(until)), None);
     }
 
     #[test]

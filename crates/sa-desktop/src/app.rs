@@ -20,6 +20,22 @@ use std::time::{Duration, Instant};
 /// Events kept per ticket in memory (the snapshot window is 180).
 const KEEP_EVENTS: usize = 1500;
 
+fn activity_badge(activity: &sa_engine::JobActivity, now: f64, pal: &Palette) -> (String, theme::Tone) {
+    if activity.phase == sa_engine::ActivityPhase::RetryWait
+        && activity.retry.as_ref().is_some_and(|retry| matches!(retry.class.as_str(), "quota_window" | "quota_reserve"))
+    {
+        return ("等待额度重置".into(), pal.wait);
+    }
+    let tone = match activity.badge().1 {
+        sa_engine::BadgeTone::Active => pal.run,
+        sa_engine::BadgeTone::Waiting => pal.wait,
+        sa_engine::BadgeTone::Busy => pal.report,
+        sa_engine::BadgeTone::Warning => pal.warn,
+        sa_engine::BadgeTone::Danger => pal.fail,
+    };
+    (activity.badge_text(now), tone)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tab {
     Collab,
@@ -54,12 +70,15 @@ impl Tab {
     }
 }
 
-/// The observed ticket.
+/// The observed ticket. The snapshot and the feed are shared with the
+/// frame that draws them, so painting never copies the conversation.
 pub struct TicketView {
     pub id: i64,
-    pub snap: Option<Snapshot>,
+    pub snap: Option<Arc<Snapshot>>,
     pub events: Vec<EventView>,
-    pub feed: Feed,
+    pub feed: Arc<Feed>,
+    /// Markdown parsed by earlier feed builds.
+    pub parsed: feed::ParseCache,
     pub error: Option<String>,
     /// More events exist before the first loaded one.
     pub partial_history: bool,
@@ -128,6 +147,7 @@ pub struct App {
     pub knowledge: crate::knowledge::KnowledgeState,
     pub providers: Option<crate::providers::ProvidersDialog>,
     pub efficiency: Option<crate::efficiency::EfficiencyDialog>,
+    pub observer_efficiency: crate::efficiency::ObserverEfficiency,
     pub palette: Option<crate::palette::PaletteState>,
     /// Focus the sidebar search on the next frame.
     pub focus_search: bool,
@@ -141,6 +161,7 @@ pub struct App {
     notifications: crate::notifications::Notifications,
     notifications_enabled: bool,
     approval_watch: crate::notifications::ApprovalWatch,
+    question_watch: crate::notifications::QuestionWatch,
     pub extensions: Option<crate::extensions::ExtDialog>,
     /// For background work started outside `update`.
     pub ctx: egui::Context,
@@ -215,6 +236,7 @@ impl App {
             knowledge: Default::default(),
             providers: None,
             efficiency: None,
+            observer_efficiency: Default::default(),
             palette: None,
             focus_search: false,
             show_archived: false,
@@ -224,6 +246,7 @@ impl App {
             notifications: Default::default(),
             notifications_enabled: cfg!(windows) && get("notifications").as_deref() != Some("0"),
             approval_watch: Default::default(),
+            question_watch: Default::default(),
             extensions: None,
             ctx: cc.egui_ctx.clone(),
             host_error: host.as_ref().err().cloned(),
@@ -269,7 +292,8 @@ impl App {
             id,
             snap: None,
             events: Vec::new(),
-            feed: Feed::default(),
+            feed: Arc::default(),
+            parsed: Default::default(),
             error: None,
             partial_history: false,
             open_groups: HashSet::new(),
@@ -367,7 +391,7 @@ impl App {
                             v.partial_history = true;
                         }
                     }
-                    v.feed = feed::build(&snap.ticket, &snap.jobs, &v.events);
+                    v.feed = Arc::new(feed::build_with(&snap.ticket, &snap.jobs, &v.events, &mut v.parsed));
                     if self.opts.expand_all {
                         for item in &v.feed.items {
                             if let feed::Item::Progress { key, .. } = item {
@@ -377,7 +401,7 @@ impl App {
                         v.open_jobs.extend(snap.jobs.iter().map(|j| j.id));
                     }
                     v.error = None;
-                    v.snap = Some(snap);
+                    v.snap = Some(Arc::new(snap));
                 }
                 Msg::SnapshotError {
                     epoch,
@@ -679,7 +703,7 @@ impl App {
             if prev.as_deref().is_some_and(labels::is_active) && !labels::is_active(&r.state) {
                 self.post_notice(crate::notifications::Notice {
                     ticket: r.id,
-                    approval: false,
+                    kind: crate::notifications::NoticeKind::Completion,
                     status: labels::job_state(&r.state).to_string(),
                 });
                 done = Some(format!(
@@ -691,7 +715,12 @@ impl App {
             }
         }
         if let Some(text) = done {
-            self.composer.message = Some((text, false));
+            // The reader now sees a ticket finish within milliseconds, often in
+            // the same frame as the receipt of the action that started it; the
+            // receipt (or an error) is what the operator is waiting to read.
+            if self.composer.message.is_none() {
+                self.composer.message = Some((text, false));
+            }
             self.attention(false);
         }
     }
@@ -725,14 +754,7 @@ impl App {
             .map(|(_, _, list)| {
                 list.iter()
                     .map(|a| {
-                        let tone = match a.badge().1 {
-                            sa_engine::BadgeTone::Active => pal.run,
-                            sa_engine::BadgeTone::Waiting => pal.wait,
-                            sa_engine::BadgeTone::Busy => pal.report,
-                            sa_engine::BadgeTone::Warning => pal.warn,
-                            sa_engine::BadgeTone::Danger => pal.fail,
-                        };
-                        (a.job, (a.badge_text(now), tone))
+                        (a.job, activity_badge(a, now, pal))
                     })
                     .collect()
             })
@@ -772,7 +794,9 @@ impl App {
     fn poll_ops(&mut self) {
         if self.writable() && !self.opts.demo && self.shot.is_none() {
             let data = self.opts.data.clone().unwrap_or_else(sa_store::default_data_dir);
-            for notice in self.approval_watch.poll(&self.ctx, &data) {
+            let notices = self.approval_watch.poll(&self.ctx, &data).into_iter()
+                .chain(self.question_watch.poll(&self.ctx, &data));
+            for notice in notices {
                 self.attention(true);
                 self.post_notice(notice);
             }
@@ -989,5 +1013,40 @@ impl App {
                 });
             });
         });
+    }
+}
+
+#[cfg(test)]
+mod usage_tests {
+    use super::*;
+
+    #[test]
+    fn queued_quota_badges_are_waits_and_route_recovery_keeps_its_badge() {
+        let pal = Palette::light();
+        let mut activity = sa_engine::JobActivity {
+            job: 1,
+            agent: "codex".into(),
+            phase: sa_engine::ActivityPhase::RetryWait,
+            idle_ms: 0,
+            open_tools: Vec::new(),
+            last_frame_at: None,
+            started_at: None,
+            threshold_ms: None,
+            health: sa_engine::resilience::Health::Open,
+            retry: Some(sa_engine::RetryInfo {
+                attempt: 0, max: None, class: "quota_window".into(), next_at: 1060.0,
+            }),
+        };
+        for reason in ["quota_window", "quota_reserve"] {
+            activity.retry.as_mut().unwrap().class = reason.into();
+            let (label, tone) = activity_badge(&activity, 1000.0, &pal);
+            assert_eq!(label, "等待额度重置");
+            assert_eq!(tone.fg, pal.wait.fg);
+        }
+        activity.retry.as_mut().unwrap().class = "circuit_open".into();
+        let (label, tone) = activity_badge(&activity, 1000.0, &pal);
+        assert_eq!(label, activity.badge_text(1000.0));
+        assert!(label.starts_with("执行端熔断"));
+        assert_eq!(tone.fg, pal.fail.fg);
     }
 }

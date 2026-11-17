@@ -162,6 +162,12 @@ pub fn advance(
         "UPDATE continuous_runs SET stalls=?,last_signal=? WHERE ticket=?",
         &[&stalls, &body, &ticket],
     )?;
+    if stalls >= 3 {
+        let signal: String = body.chars().take(200).collect();
+        q.platform_question(who, "auto-stalled", &format!("主控连续 3 次给出相同的下一步且没有新结果：{signal}。要怎么继续？"), &["继续", "停止"])?;
+        q.log(who, "auto.stalled", &json!({"stalls":stalls,"signal":body}))?;
+        return Ok(Decision { state: "waiting", reset: false });
+    }
     if stalls > 0 {
         let delay = 300f64.min(2f64.powi(stalls.min(9) as i32));
         q.run(

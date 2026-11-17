@@ -15,6 +15,7 @@
 use crate::activity::{ActivityPhase, JobActivity, RetryInfo, Tracker};
 use crate::adapter::{AGENTS, Adapter, AdapterError, AdapterEvent, ErrorClass, Route, RunRequest, TurnHost};
 use crate::autonomy;
+use crate::checks;
 use crate::context::{self, MAX_PROMPT_BYTES};
 use crate::db::{BeginBusy, Db, Q, Who, int_of, now, sqlite_error_codes, str_of, who_of};
 use crate::dispatch::{self, CmdError};
@@ -62,7 +63,7 @@ static TRANSIENT: LazyLock<Regex> = LazyLock::new(|| {
     .expect("valid regex")
 });
 static CONTROL_LINE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^SA_(SEND|NOTE|ROLE|TOOL|PROGRESS|MEMO|CANCEL) ").expect("valid regex"));
+    LazyLock::new(|| Regex::new(r"^SA_(SEND|NOTE|ROLE|TOOL|PROGRESS|MEMO|CANCEL|REPORT|ASK) ").expect("valid regex"));
 
 /// Admission-loop status, independent of ticket pause and model activity.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -284,6 +285,8 @@ enum TurnError {
     Adapter(AdapterError),
     /// The route's breaker is open; requeue without spending an attempt.
     Wait(f64),
+    /// Subscription holds preserve the route's retry and breaker budgets.
+    Quota { until: f64, kind: String, reserve: bool },
     Engine(anyhow::Error),
 }
 
@@ -292,6 +295,9 @@ impl TurnError {
         match self {
             Self::Adapter(e) => e.message.clone(),
             Self::Wait(_) => classify::message_for(ErrorClass::RouteUnavailable).into(),
+            Self::Quota { until, reserve, .. } => format!("{}，预计 {} 后继续",
+                if *reserve { "为主控保留订阅额度" } else { "订阅额度窗口已用尽" },
+                classify::utc_minute(*until as i64)),
             Self::Engine(e) => e.to_string(),
         }
     }
@@ -526,19 +532,7 @@ impl Engine {
     /// `cancel({ticket})` (E:63-73).
     pub fn cancel(&self, ticket: i64) -> Result<()> {
         self.inner.db.tx(|q| {
-            q.root(ticket)?;
-            q.run(
-                "UPDATE approvals SET decision='expired' WHERE ticket=? AND decision='pending'",
-                &[&ticket],
-            )?;
-            for job in q.all(
-                &format!("SELECT * FROM jobs WHERE ticket=? AND state NOT IN {END_SQL}"),
-                &[&ticket],
-            )? {
-                q.run("UPDATE jobs SET state='cancelled' WHERE id=?", &[&int_of(&job, "id")])?;
-                q.log(who_of(&job), "cancelled", &json!("用户停止了工单"))?;
-            }
-            Ok(())
+            cancel_ticket(q, ticket)
         })?;
         for slot in lock(&self.inner.sched).active.values() {
             if slot.ticket == ticket {
@@ -850,6 +844,7 @@ impl Engine {
                 q.run("INSERT OR REPLACE INTO job_files(job,manifest) VALUES(?,?)", &[&id, &stringify(&json!(manifest))])?;
                 q.log(who_of(&root), "files", &json!(manifest))?;
             }
+            q.withdraw_question(who_of(&root))?;
             let seq = q.log(who_of(&root), "user.follow", &json!(body))?;
             if cont {
                 q.run(
@@ -895,6 +890,7 @@ impl Engine {
                 if str_of(&row, "state") != "draining" {
                     q.run("UPDATE jobs SET state='waiting' WHERE id=?", &[&pid])?;
                 }
+                q.run("UPDATE questions SET parked=0 WHERE job=? AND state='pending'", &[&pid])?;
                 parent = row.get("parent").and_then(Value::as_i64);
             }
             q.run("UPDATE jobs SET state='queued',ready_after=0 WHERE id=?", &[&id])?;
@@ -910,6 +906,55 @@ impl Engine {
             .tx(|q| q.record_note(ticket, Some(&json!(job)), Some(&json!(body)), None, None))
     }
 
+    /// Answering and delivery share a transaction so a retry cannot deliver
+    /// the same operator answer twice or lose it after closing the question.
+    pub fn answer(&self, question: i64, body: &str) -> Result<()> {
+        ensure!(p::valid_str(body, 4000), "回答不能为空且不得超过 4000 个 UTF-16 单位");
+        let stopped = self.inner.db.tx(|q| {
+            let row = q.one("SELECT a.msgkey AS question_key,a.origin AS question_origin,j.* FROM questions a JOIN jobs j ON j.id=a.job
+                WHERE a.id=? AND a.state='pending'", &[&question])?
+                .filter(|row| !p::is_terminal(str_of(row, "state")))
+                .ok_or_else(|| anyhow!("问题已关闭或提问任务已结束"))?;
+            q.run("UPDATE questions SET state='answered',parked=0,answer=?,closed=? WHERE id=?", &[&body, &now(), &question])?;
+            let key = str_of(&row, "question_key");
+            q.log(who_of(&row), "answer", &json!({"id":question,"key":key,"answer":body}))?;
+            let ticket = int_of(&row, "ticket");
+            let platform = str_of(&row, "question_origin") == "platform";
+            if platform && body.trim() == "停止" {
+                cancel_ticket(q, ticket)?;
+                return Ok(Some(ticket));
+            }
+            let note = if platform {
+                q.run("UPDATE continuous_runs SET stalls=0,last_signal='' WHERE ticket=?", &[&ticket])?;
+                q.run("UPDATE jobs SET ready_after=0 WHERE id=?", &[&int_of(&row, "id")])?;
+                q.run("DELETE FROM check_bounces WHERE job=?", &[&int_of(&row, "id")])?;
+                format!("Operator decision after the platform paused this task: {body}")
+            } else {
+                format!("Answer to your question \"{key}\": {body}")
+            };
+            q.record_answer_note(ticket, int_of(&row, "id"), &note)?;
+            Ok(None)
+        })?;
+        if let Some(ticket) = stopped {
+            for slot in lock(&self.inner.sched).active.values() {
+                if slot.ticket == ticket { slot.cancel.cancel(); }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn questions(&self, ticket: i64) -> Result<Vec<Value>> {
+        self.inner.db.with(|q| {
+            q.root(ticket)?;
+            q.all("SELECT *,msgkey AS key FROM questions
+                WHERE ticket=? AND state='pending' ORDER BY id", &[&ticket])?.into_iter().map(|mut row| {
+                let options: Value = serde_json::from_str(str_of(&row, "options"))?;
+                row.insert("options".into(), options);
+                Ok(Value::Object(row))
+            }).collect()
+        })
+    }
+
     /// `notes(id)` (S:276-283).
     pub fn notes(&self, job: i64) -> Result<Vec<Value>> {
         self.inner.db.with(|q| q.notes(job, false))
@@ -918,6 +963,27 @@ impl Engine {
     /// `root(ticket)`.
     pub fn root(&self, ticket: i64) -> Result<Map<String, Value>> {
         self.inner.db.with(|q| q.root(ticket))
+    }
+
+    /// Operator-owned checks. Protocol control lines cannot change this setting.
+    pub fn project_checks(&self, cwd: &str) -> Result<Vec<Vec<String>>> {
+        let project = project_key(cwd);
+        self.inner.db.with(|q| checks::configured(q, &project))
+    }
+
+    pub fn set_project_checks(&self, cwd: &str, commands: Vec<Vec<String>>) -> Result<()> {
+        ensure!(commands.len() <= 4, "项目完成检查最多 4 条命令");
+        for argv in &commands { crate::workspaces::validate_command(argv)?; }
+        let project = project_key(cwd);
+        self.inner.db.tx(|q| {
+            if commands.is_empty() {
+                q.run("DELETE FROM project_checks WHERE project=?", &[&project])?;
+            } else {
+                q.run("INSERT OR REPLACE INTO project_checks(project,checks,updated) VALUES(?,?,?)",
+                    &[&project, &stringify(&json!(commands)), &now()])?;
+            }
+            Ok(())
+        })
     }
 
     /// Project knowledge entries of `cwd` (canonicalized when it exists),
@@ -1056,7 +1122,7 @@ fn scheduled_retries(q: &Q, ticket: i64, at: f64) -> Result<Vec<ScheduledRetry>>
         let id = int_of(&j, "id");
         let rows = q.all(
             "SELECT kind,payload FROM events WHERE ticket=? AND job=? AND kind IN
-        ('turn.retry_scheduled','route.rotated','turn.route_wait','turn.deferred','auto.retry')
+        ('turn.retry_scheduled','route.rotated','turn.route_wait','turn.deferred','turn.quota_wait','auto.retry')
         AND seq>coalesce((SELECT max(seq) FROM events WHERE ticket=? AND job=? AND kind IN
         ('reply','user.follow','retry','turn.gave_up')),0) ORDER BY seq",
             &[&ticket, &id, &ticket, &id],
@@ -1085,7 +1151,8 @@ fn scheduled_retries(q: &Q, ticket: i64, at: f64) -> Result<Vec<ScheduledRetry>>
                         attempts,
                     ),
                     "route.rotated" => (field("reason"), None, attempts),
-                    "turn.deferred" => (Some("circuit_open".into()), None, attempts),
+                    "turn.deferred" => (field("reason"), None, attempts),
+                    "turn.quota_wait" => (field("reason"), None, attempts),
                     _ => (field("class"), None, attempts),
                 }
             }
@@ -1270,26 +1337,42 @@ impl Inner {
         if !self.started.load(Ordering::SeqCst) || self.stopping.load(Ordering::SeqCst) || lock(&self.fault).is_some() {
             return Ok(0);
         }
+        let efficiency = self.opts.efficiency.read().unwrap_or_else(|e| e.into_inner()).clone();
         let health = self.health_value();
         let mut aborts = vec![];
         let admitted = self.db.admission_tx(|q| {
             if !self.started.load(Ordering::SeqCst) || self.stopping.load(Ordering::SeqCst) || lock(&self.fault).is_some() {
                 return Ok(vec![]);
             }
+            q.skip_dependents()?;
             q.wake()?;
             pause::reconcile(q)?;
-            let queued = "SELECT j.*,t.cwd,t.claude_route,t.follow_config,t.agent_routes,t.allow_lead_routing,t.writes,
+            let mut collaborators = HashMap::new();
+            if efficiency.max_collaborators > 0 {
+                for row in q.all("SELECT ticket,count(*) AS n FROM jobs WHERE state='running' AND parent IS NOT NULL GROUP BY ticket", &[])? {
+                    collaborators.insert(int_of(&row, "ticket"), int_of(&row, "n"));
+                }
+            }
+            // Full tickets must not occupy the bounded reader slice.
+            let mut full: Vec<i64> = collaborators.iter().filter_map(|(&ticket, &n)|
+                (n >= i64::from(efficiency.max_collaborators)).then_some(ticket)).collect();
+            full.sort_unstable();
+            let exclusion = if full.is_empty() { String::new() } else {
+                format!(" AND (j.parent IS NULL OR j.ticket NOT IN ({}))", full.iter().map(i64::to_string).collect::<Vec<_>>().join(","))
+            };
+            let queued = format!("{} SELECT j.*,t.cwd,t.claude_route,t.follow_config,t.agent_routes,t.allow_lead_routing,t.writes,
         t.permission_profile AS ticket_profile,coalesce(j.permission_override,t.permission_profile) AS profile,
         t.auto_cycles,r.route AS bound_route,c.ticket AS continuous_ticket,coalesce(c.boundary_job,0) AS floor
         FROM jobs j JOIN tickets t ON t.id=j.ticket LEFT JOIN native_routes r ON r.job=j.id
         LEFT JOIN continuous_runs c ON c.ticket=j.ticket
         WHERE j.state='queued' AND j.ready_after<=? AND j.writing=?
+        AND NOT EXISTS(SELECT 1 FROM effective_deps d JOIN jobs n ON n.id=d.needs WHERE d.job=j.id AND n.state!='done')
         AND NOT EXISTS(SELECT 1 FROM ticket_pause p WHERE p.ticket=j.ticket
           AND (j.parent IS NOT NULL OR p.state='paused' OR p.state='draining'))
-        ORDER BY j.id LIMIT ?";
+        {exclusion} ORDER BY j.id LIMIT ?", crate::job::EFFECTIVE_DEPS_SQL);
             let time = now();
-            let mut candidates = q.all(queued, &[&time, &0, &(READS_PER_SLICE as i64)])?;
-            candidates.extend(q.all(queued, &[&time, &1, &256])?);
+            let mut candidates = q.all(&queued, &[&time, &0, &(READS_PER_SLICE as i64)])?;
+            candidates.extend(q.all(&queued, &[&time, &1, &256])?);
             candidates.sort_by_key(|r| int_of(r, "id"));
             let plan = q.exists("SELECT 1 FROM sqlite_master WHERE type='table' AND name='studio_plan'", &[])?;
             let mut slots = vec![];
@@ -1309,6 +1392,10 @@ impl Inner {
                 let key = crate::workspaces::scope(&job.cwd);
                 if sched.maintenance.iter().any(|s| crate::workspaces::overlaps(s,&key))
                     || (job.writing && occupied.iter().any(|s| crate::workspaces::overlaps(s,&key))) { continue; }
+                if !job.is_root() && efficiency.max_collaborators > 0
+                    && collaborators.get(&job.ticket).copied().unwrap_or(0) >= i64::from(efficiency.max_collaborators) {
+                    continue;
+                }
                 if let Some(until) = self.route_blocked(&job, time) {
                     if pause::after_failure(q, &job, "交接时执行路由熔断，暂停后续恢复尝试。")? {
                         continue;
@@ -1321,15 +1408,34 @@ impl Inner {
                     q.log(job.who(), "turn.deferred", &json!({"until": p::seconds_json(until), "reason": "circuit_open"}))?;
                     continue;
                 }
+                if efficiency.quota_guard
+                    && let Ok(route) = p::route(Some(&parse(job.bound_route.as_deref())))
+                    && let Some((until, kind, reserve)) = quota_hold(q, &job, &route, time)?
+                {
+                    if pause::after_failure(q, &job, "订阅额度窗口已用尽，暂停后续恢复尝试。")? {
+                        continue;
+                    }
+                    if let Some(ids) = self.failover(q, &job, "quota_exhausted")? {
+                        aborts.extend(ids);
+                        continue;
+                    }
+                    let until = until + 60.0;
+                    q.run("UPDATE jobs SET ready_after=? WHERE id=?", &[&until, &job.id])?;
+                    q.log(job.who(), "turn.deferred", &json!({"until": p::seconds_json(until),
+                        "reason": if reserve { "quota_reserve" } else { "quota_window" }, "window": kind}))?;
+                    continue;
+                }
                 if job.auto_root() {
                     if !job.continuous && job.auto_cycles >= 64 {
                         let state = if q.pending_children(job.id)? { "draining" } else { "failed" };
                         q.run("UPDATE jobs SET state=?,result=? WHERE id=?", &[&state, &BUDGET_REASON, &job.id])?;
+                        if p::is_terminal(state) { q.withdraw_question(job.who())?; }
                         q.log(job.who(), state, &json!(BUDGET_REASON))?;
                         continue;
                     }
                     q.run("UPDATE tickets SET auto_cycles=auto_cycles+1 WHERE id=?", &[&job.ticket])?;
                 }
+                q.run("UPDATE questions SET parked=0 WHERE job=? AND state='pending'", &[&job.id])?;
                 let mut packet = envelope(q, &job, health.clone())?;
                 if job.is_root() && let Some(control) = pause::resumed_control(q, job.ticket)? {
                     packet.insert("pause_control".into(), control);
@@ -1359,6 +1465,9 @@ impl Inner {
                     .cloned()
                     .unwrap_or_default();
                 if job.writing { occupied.push(key); }
+                if !job.is_root() && efficiency.max_collaborators > 0 {
+                    *collaborators.entry(job.ticket).or_insert(0) += 1;
+                }
                 slots.push(Turn {
                     inner: Arc::downgrade(self),
                     job,
@@ -1553,11 +1662,22 @@ impl Inner {
             self.db.tx(|q| crate::workspaces::save(q,&ready))?;
             turn.packet().insert("workspace".into(),json!(ready));
         }
+        let project = project_key(turn.packet().get("project").and_then(Value::as_str).unwrap_or(&job.cwd));
+        let commands = self.db.with(|q| checks::configured(q, &project))?;
+        let start_fingerprint = if checks::writer(job) && !commands.is_empty() {
+            self.check_fingerprint(turn).await?
+        } else { None };
         let (route, fresh) = self.execution_route(turn).await?;
         if fresh && let Some(until) = self.opts.runner.admission_blocked_until(&job.agent, &route, now()) {
             return Err(TurnError::Wait(until));
         }
         let efficiency = self.opts.efficiency.read().unwrap_or_else(|e| e.into_inner()).clone();
+        if fresh && efficiency.quota_guard {
+            let hold = self.db.with(|q| quota_hold(q, job, &route, now()))?;
+            if let Some((until, kind, reserve)) = hold {
+                return Err(TurnError::Quota { until, kind, reserve });
+            }
+        }
         let mut guide = guides::base(efficiency.concise_handoffs);
         if primary {
             guide.push('\n');
@@ -1566,11 +1686,18 @@ impl Inner {
             guide.push('\n');
             guide.push_str(guides::LEGACY_AUTO);
         }
+        guide.push_str(guides::ECONOMY);
         guide.push_str(guides::KNOWLEDGE);
+        if !commands.is_empty() { guide.push_str(guides::CHECKS); }
         let mut packet = turn.packet().clone();
+        packet.remove("completion_checks");
+        if !commands.is_empty() { packet.insert("completion_checks".into(), json!(commands)); }
         packet.insert("collaboration_preferences".into(), json!({
             "concise_handoffs": efficiency.concise_handoffs,
         }));
+        if let Some(budget) = self.db.with(|q| usage_budget(q, &efficiency, now()))? {
+            packet.insert("usage_budget".into(), budget);
+        }
         if primary && packet.get("autonomy").and_then(|a| a.get("phase")).and_then(Value::as_str) == Some("discover") {
             guide.push_str(guides::DISCOVERY);
         }
@@ -1784,6 +1911,11 @@ impl Inner {
         }
         turn.ensure_current()?;
         self.opts.runner.on_success(&job.agent, &route);
+        // The native runner and its wall-clock select have completed. Checks
+        // have independent command deadlines and retain the admission slot.
+        let checked = self.completion_gate(turn, &project, start_fingerprint, &outcome.text, &stream.correction_notes).await?;
+        // A completed gate is part of the returned reply. Shutdown after this
+        // point must preserve finished work; ticket cancellation still uses live.
         self.db.tx(|q| {
             if !q.live(job.who())? { return Ok(()); }
             self.log_transitions(q, job.who())?;
@@ -1796,7 +1928,8 @@ impl Inner {
                     &[&job.turn, seq, &job.id],
                 )?;
             }
-            self.commit_reply(q, turn, &outcome.text, outcome.session_id.as_deref(), &stream.invalid)?;
+            self.commit_reply(q, turn, &outcome.text, outcome.session_id.as_deref(), &stream.invalid, checked.as_ref())?;
+            q.run("DELETE FROM quota_windows WHERE agent=? AND provider=? AND exhausted=1", &[&job.agent, &route.provider])?;
             let same_session = !(incremental || recovery_delivery) || outcome.session_id == job.session;
             context::delivery::acknowledge(q, job.who(), &route, json!({
                 "snapshot_seq": snapshot_seq, "snapshot_sha256": snapshot_sha256,
@@ -1807,6 +1940,72 @@ impl Inner {
             }))
         })?;
         Ok(())
+    }
+
+    async fn check_fingerprint(self: &Arc<Self>, turn: &Arc<Turn>) -> Result<Option<String>, TurnError> {
+        let owner = self.clone();
+        let turn = turn.clone();
+        Ok(tokio::task::spawn_blocking(move || {
+            crate::workspaces::fingerprint(Path::new(&turn.job.cwd), &||
+                turn.aborted() || owner.stopping.load(Ordering::SeqCst))
+        }).await.map_err(|_| anyhow!("工作树指纹计算异常"))??)
+    }
+
+    async fn completion_gate(
+        self: &Arc<Self>, turn: &Arc<Turn>, project: &str, start: Option<String>, text: &str, corrections: &[i64],
+    ) -> Result<Option<checks::Outcome>, TurnError> {
+        let job = &turn.job;
+        let plan = self.db.tx(|q| checks::plan(q, job, project, text,
+            turn.tool_follow.load(Ordering::SeqCst), corrections))?;
+        let Some(plan) = plan else { return Ok(None); };
+        let fingerprint = self.check_fingerprint(turn).await?;
+        // A bounced check can fail for reasons outside Git or recover without
+        // a tree change. Keep checking that claim until its bounce is resolved.
+        if !plan.has_bounce && fingerprint.is_some() && fingerprint == start { return Ok(None); }
+        let cached = plan.cached(fingerprint.as_deref());
+        let mut runs = vec![];
+        let mut failure = None;
+        if !cached {
+            for argv in &plan.commands {
+                turn.ensure_current()?;
+                self.db.tx(|q| {
+                    ensure!(!turn.aborted() && q.live(job.who())?, "任务已中止");
+                    q.log(job.who(), "check.started", &json!({"argv":argv}))?;
+                    Ok(())
+                })?;
+                let owner = self.clone();
+                let running = turn.clone();
+                let command = argv.clone();
+                let started = Instant::now();
+                let result = tokio::task::spawn_blocking(move || {
+                    crate::workspaces::command_with_cancel(Path::new(&running.job.cwd), &command,
+                        Duration::from_secs(600), Some(&|| running.aborted() || owner.stopping.load(Ordering::SeqCst)))
+                }).await.map_err(|_| anyhow!("完成检查执行异常"))?;
+                // The runner reports interruption while owning the process tree.
+                // A later shutdown must preserve a command that already finished.
+                let (ok, exit, bytes) = match result {
+                    Ok(result) => {
+                        if result.cancelled { return Err(anyhow!("任务已中止").into()); }
+                        (result.ok, result.exit, result.output)
+                    }
+                    Err(error) => (false, None, error.to_string().into_bytes()),
+                };
+                let tail = String::from_utf8_lossy(&bytes[bytes.len().saturating_sub(4000)..]).into_owned();
+                let seconds = started.elapsed().as_secs_f64();
+                self.db.tx(|q| {
+                    ensure!(q.live(job.who())?, "任务已中止");
+                    q.log(job.who(), "check.result", &json!({"argv":argv,"ok":ok,"exit":exit,"seconds":seconds,"tail":tail}))?;
+                    Ok(())
+                })?;
+                runs.push(json!({"argv":argv,"ok":ok,"exit":exit,"seconds":seconds}));
+                if !ok {
+                    failure = Some((argv.clone(), exit, tail));
+                    break;
+                }
+            }
+        }
+        let payload = json!({"ok":failure.is_none(),"cached":cached,"attempt":plan.attempt,"runs":runs});
+        Ok(Some(checks::Outcome { plan, fingerprint, payload, failure }))
     }
 
     /// `executionRoute(ctx)` (E:219-262). Returns the route and whether it was
@@ -1933,8 +2132,10 @@ impl Inner {
                 }
             }
         }
+        let windows: Vec<_> = journal.iter().filter(|(kind, data)| kind == "native" && quota_frame(data))
+            .flat_map(|(_, data)| sa_store::quota::windows_from_native(&job.agent, data)).collect();
         let route_text = stringify(&route_json(route));
-        let saved = self.db.tx(|q| {
+        let record = |q: &Q| {
             if !q.live(job.who())? {
                 return Ok(false);
             }
@@ -1954,6 +2155,9 @@ impl Inner {
                     )?;
                 }
             }
+            if !windows.is_empty() {
+                observe_windows(q, job.who(), &job.agent, &route.provider, &windows, now())?;
+            }
             // Early-persisted native session (spec §9.2 D.1).
             for s in &sessions {
                 q.run(
@@ -1962,7 +2166,14 @@ impl Inner {
                 )?;
             }
             Ok(true)
-        });
+        };
+        // A native session id is what a restart resumes from, so it is forced
+        // to disk; a batch of stream frames alone is telemetry.
+        let saved = if sessions.is_empty() && windows.is_empty() {
+            self.db.telemetry_tx(record)
+        } else {
+            self.db.tx(record)
+        };
         match saved {
             Ok(true) => {}
             Ok(false) => return,
@@ -2009,7 +2220,7 @@ impl Inner {
         }
         // External effects and shared knowledge require the authoritative
         // final reply.
-        if streaming && (line.starts_with("SA_TOOL ") || line.starts_with("SA_MEMO ")) {
+        if streaming && (line.starts_with("SA_TOOL ") || line.starts_with("SA_MEMO ") || line.starts_with("SA_REPORT ") || line.starts_with("SA_ASK ")) {
             return;
         }
         if st.fatal.is_some() || turn.aborted() {
@@ -2017,7 +2228,13 @@ impl Inner {
         }
         let job = &turn.job;
         let cleaned = line.strip_suffix('\r').unwrap_or(line);
-        let Err(err) = dispatch::command(turn, cleaned, streaming).await else {
+        let final_control = cleaned.split_once(' ').filter(|(tag, _)| matches!(*tag, "SA_REPORT" | "SA_ASK"));
+        let result = if let Some((tag, body)) = final_control {
+            p::final_control(tag, body).map(|_| ()).map_err(CmdError::Rejected)
+        } else {
+            dispatch::command(turn, cleaned, streaming).await
+        };
+        let Err(err) = result else {
             return;
         };
         let tag = line.split(' ').next().unwrap_or_default().to_string();
@@ -2032,7 +2249,9 @@ impl Inner {
                 .map(|_| None)
         } else {
             let reason = err.message();
-            if job.primary() {
+            // Final-only declarations are independent of autonomy controls.
+            // Their rejection receipt must not invalidate a valid SA_FINISH.
+            if job.primary() && !matches!(tag.as_str(), "SA_REPORT" | "SA_ASK") {
                 match st.invalid.iter_mut().find(|(t, _)| *t == tag) {
                     Some(entry) => entry.1 = reason.clone(),
                     None => st.invalid.push((tag.clone(), reason.clone())),
@@ -2111,10 +2330,25 @@ impl Inner {
         text: &str,
         session: Option<&str>,
         invalid: &[(String, String)],
+        checked: Option<&checks::Outcome>,
     ) -> Result<()> {
         let job = &turn.job;
         if !q.live(job.who())? {
             return Ok(());
+        }
+        let check_failed = checked.is_some_and(checks::Outcome::failed);
+        let bounce = checked.is_some_and(checks::Outcome::bounced);
+        if let Some(checked) = checked { checked.save(q, job)?; }
+        else { q.run("DELETE FROM job_checks WHERE job=?", &[&job.id])?; }
+        // A bounced completion claim has no accepted agent outcome yet.
+        let outcome = if bounce { None } else { p::last_final_control(text, "SA_REPORT") };
+        let ask = p::last_final_control(text, "SA_ASK");
+        if let Some(outcome) = &outcome {
+            let payload = stringify(outcome);
+            q.run("INSERT OR REPLACE INTO job_outcomes(job,turn,payload) VALUES(?,?,?)", &[&job.id, &job.turn, &payload])?;
+            q.log(job.who(), "report", outcome)?;
+        } else {
+            q.run("DELETE FROM job_outcomes WHERE job=?", &[&job.id])?;
         }
         let reports = &turn.reports;
         let seen: HashMap<i64, &Value> = reports
@@ -2144,7 +2378,7 @@ impl Inner {
         };
         let mut session = session.map(str::to_string);
         let primary = job.primary();
-        if job.auto_root() && !follow {
+        if job.auto_root() && !follow && ask.is_none() && !check_failed {
             let mut actions = Map::new();
             let mut correction = None;
             let parsed = if invalid.is_empty() {
@@ -2202,13 +2436,40 @@ impl Inner {
             && children.iter().any(|c| {
                 matches!(str_of(c, "state"), "partial" | "failed" | "cancelled")
                     && c.get("replacement").is_none_or(Value::is_null)
+                    && !outcome.as_ref().and_then(|o| o.get("resolved")).and_then(Value::as_array)
+                        .is_some_and(|rows| rows.iter().any(|row| row["job"] == c["id"]))
             })
+        {
+            state = "partial";
+        }
+        // A question takes the completion slot before the reply can become
+        // terminal, including when an unresolved child would make it partial:
+        // otherwise the question would be withdrawn before the person saw it.
+        let parked = ask.is_some() && matches!(state, "done" | "partial");
+        if parked { state = "waiting"; }
+        if state == "done" && !job.auto_root()
+            && outcome.as_ref().is_some_and(|o| matches!(o["status"].as_str(), Some("partial" | "blocked")))
         {
             state = "partial";
         }
         let redirect = job.profile == "auto" && follow;
         if redirect {
             state = "queued";
+        }
+        // advance may have parked a continuous primary on a platform question.
+        let platform_parked = q.exists("SELECT 1 FROM questions WHERE job=? AND turn=? AND state='pending' AND origin='platform' AND parked=1", &[&job.id, &job.turn])?;
+        if !platform_parked { q.commit_question(job.who(), ask.as_ref(), parked && !redirect)?; }
+        if check_failed {
+            let checked = checked.expect("failed check outcome");
+            if bounce {
+                state = if redirect { "queued" } else { "waiting" };
+                platform_note(q, job, job.id, &checked.note())?;
+                q.log(job.who(), "check.bounced", &json!({"attempt":checked.plan.attempt}))?;
+            } else if job.auto_root() && !follow {
+                let argv = &checked.failure.as_ref().expect("failed command").0;
+                q.platform_question(job.who(), "completion-checks", &format!("完成检查连续 3 次未通过：{}。要怎么继续？", argv.join(" ")), &["继续修复", "停止"])?;
+                state = "waiting";
+            } else if state == "done" { state = "partial"; }
         }
         if job.is_root() {
             knowledge::root_progress(q, job, state, text)?;
@@ -2217,6 +2478,7 @@ impl Inner {
             "UPDATE jobs SET result=?,session=?,state=?,dispatch_turn=NULL,turn=turn+? WHERE id=?",
             &[&text, &session, &state, &(redirect as i64), &job.id],
         )?;
+        if p::is_terminal(state) { q.withdraw_question(job.who())?; }
         q.log(
             job.who(),
             "reply",
@@ -2274,6 +2536,17 @@ impl Inner {
                 "route": route.as_ref().map(route_json),
             }));
         }
+        if let TurnError::Quota { until, kind, reserve } = err {
+            if let Some(ids) = self.failover(q, job, "quota_exhausted")? {
+                lock(&self.pending_aborts).extend(ids);
+                return Ok(());
+            }
+            return self.requeue(q, job, *until + 60.0, None, "turn.quota_wait", json!({
+                "until": p::seconds_json(*until + 60.0), "window": kind,
+                "reason": if *reserve { "quota_reserve" } else { "quota_window" },
+                "route": route.as_ref().map(route_json),
+            }));
+        }
         if let (TurnError::Adapter(e), false) = (err, timed_out) {
             // Catalog probes fail before a route is chosen; give them their
             // own breaker key per harness.
@@ -2283,6 +2556,9 @@ impl Inner {
                 mode: "cli".into(),
                 reasoning_effort: None,
             });
+            let quota = if e.quota_exhausted() {
+                Some(record_quota_failure(q, job, &route, e, now())?)
+            } else { None };
             let mut ledger = ledger(q, job.id)?;
             let rotation = self.opts.rotation.candidates(&job.agent);
             let decision = self.opts.runner.decide(&mut ledger, &job.agent, &route, e, &rotation, now());
@@ -2302,6 +2578,9 @@ impl Inner {
                         && r.model == route.model && r.mode == route.mode && *h == Health::Open);
             let reason = if rotating {
                 None
+            } else if e.quota_exhausted()
+                && self.opts.efficiency.read().unwrap_or_else(|e| e.into_inner()).quota_guard {
+                Some("quota_exhausted")
             } else if e.class == ErrorClass::RouteUnavailable {
                 Some("route_unavailable")
             } else if open {
@@ -2316,7 +2595,7 @@ impl Inner {
                 return Ok(());
             }
             if let Some(decision) = decision {
-                return self.recover(q, job, &route, e, decision, ledger.failures);
+                return self.recover(q, job, &route, e, decision, ledger.failures, quota.as_ref());
             }
         }
         if let TurnError::Adapter(e) = err && e.native_retry_exhausted() {
@@ -2343,6 +2622,7 @@ impl Inner {
     fn give_up(&self, q: &Q, job: &JobCtx, reason: &str) -> Result<()> {
         let state = if q.pending_children(job.id)? { "draining" } else { "failed" };
         q.run("UPDATE jobs SET state=?,result=? WHERE id=?", &[&state, &reason, &job.id])?;
+        if p::is_terminal(state) { q.withdraw_question(job.who())?; }
         q.log(job.who(), state, &json!(reason))?;
         Ok(())
     }
@@ -2472,6 +2752,7 @@ impl Inner {
             "INSERT INTO job_failovers(original,replacement) VALUES(?,?)",
             &[&job.id, &sibling],
         )?;
+        q.run("INSERT INTO job_deps(job,needs) SELECT ?,needs FROM job_deps WHERE job=?", &[&sibling, &job.id])?;
         let note = format!("执行端 {} 不可用，已自动改派给 {target}（任务 #{sibling}）", job.agent);
         Ok(Some(q.cancel_subtree(job.id, &note)?))
     }
@@ -2491,6 +2772,7 @@ impl Inner {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn recover(
         &self,
         q: &Q,
@@ -2499,6 +2781,7 @@ impl Inner {
         err: &AdapterError,
         decision: Recovery,
         failures: u32,
+        quota: Option<&sa_store::quota::Window>,
     ) -> Result<()> {
         let at = now();
         let notice = |q: &Q, delay: f64| -> Result<()> {
@@ -2550,6 +2833,32 @@ impl Inner {
                 "route": route_json(route),
             })),
             Recovery::GiveUp { class, attempts } => {
+                let guard = self.opts.efficiency.read().unwrap_or_else(|e| e.into_inner()).quota_guard;
+                if guard && err.quota_exhausted() && let Some(window) = quota {
+                    let until = window.resets_at.unwrap_or(at + 1800.0) + 60.0;
+                    if until - at > QUOTA_WAIT_MAX {
+                        q.log(job.who(), "turn.gave_up", &json!({"class": "billing", "attempts": attempts,
+                            "code": err.code, "quota_until": p::seconds_json(until)}))?;
+                        return self.give_up(q, job, &format!("订阅额度窗口已用尽，预计 {} 重置；等待时间超过 6 小时，请在重置后继续或改用其他供应商",
+                            classify::utc_minute(window.resets_at.unwrap_or(until) as i64)));
+                    }
+                    let waits = q.int("SELECT count(*) FROM events WHERE job=? AND kind='turn.quota_wait' AND seq>
+                        coalesce((SELECT max(seq) FROM events WHERE job=? AND kind IN ('reply','user.follow','retry')),0)", &[&job.id, &job.id])?;
+                    if waits < 12 {
+                        // The first refused turn can establish a native session too.
+                        if let Some(session) = err.session_id.as_deref() {
+                            q.run("UPDATE jobs SET session=? WHERE id=?", &[&session, &job.id])?;
+                        }
+                        self.requeue(q, job, until, None, "turn.quota_wait", json!({
+                            "until": p::seconds_json(until), "window": window.kind, "reason": "quota_window",
+                            "class": "billing", "route": route_json(route), "code": err.code,
+                        }))?;
+                        if waits == 0 {
+                            notify_parent_as(q, job, json!("quota_window"), 1, until)?;
+                        }
+                        return Ok(());
+                    }
+                }
                 // A continuous project keeps retrying transient failures,
                 // bounded per hour (spec §9.2 A).
                 if job.primary() && classify::is_retryable(class) && !err.native_retry_exhausted()
@@ -2582,6 +2891,132 @@ impl Inner {
             }
         }
     }
+}
+
+/// The longest the scheduler holds or parks work for a usage window. Beyond
+/// it (a weekly limit, typically) the work runs and, if refused, fails with
+/// the reset time instead of sitting queued for days.
+const QUOTA_WAIT_MAX: f64 = 6.0 * 3600.0;
+
+/// Most frames contain no account-level observation; avoid parsing them twice.
+fn quota_frame(data: &Value) -> bool {
+    data.get("rate_limit_info").is_some()
+        || data.get("type").and_then(Value::as_str) == Some("rate_limit_event")
+        || data.get("method").and_then(Value::as_str).is_some_and(|m| m.starts_with("account/rateLimits/"))
+}
+
+fn observe_windows(q: &Q, who: Who, agent: &str, provider: &str, windows: &[sa_store::quota::Window], at: f64) -> Result<()> {
+    let mut changed = false;
+    for window in windows {
+        changed |= sa_store::quota::upsert(q.conn(), agent, provider, window, at)?;
+    }
+    if changed {
+        q.log(who, "quota.window", &json!({"agent": agent, "provider": provider, "windows": windows}))?;
+    }
+    Ok(())
+}
+
+enum QuotaStatus {
+    Exhausted { until: f64, kind: String },
+    Reserve { until: f64, kind: String },
+    Clear,
+}
+
+/// Admission reads the same transaction that claims a collaborator slot.
+fn quota_status(q: &Q, agent: &str, provider: &str, at: f64, latest_reset: Option<f64>) -> Result<QuotaStatus> {
+    let rows = q.all("SELECT kind,resets_at,observed_at,exhausted,used FROM quota_windows
+        WHERE agent=? AND provider=? AND (resets_at>? OR (resets_at IS NULL AND observed_at>=?))
+        AND (? IS NULL OR coalesce(resets_at,observed_at+1800)<=?)
+        ORDER BY exhausted DESC,coalesce(resets_at,observed_at+1800) DESC,kind",
+        &[&agent, &provider, &at, &(at - 21600.0), &latest_reset, &latest_reset])?;
+    let mut reserve = QuotaStatus::Clear;
+    for row in rows {
+        let reset = row.get("resets_at").and_then(Value::as_f64);
+        let kind = str_of(&row, "kind").to_string();
+        if int_of(&row, "exhausted") != 0 {
+            let until = reset.unwrap_or_else(|| row.get("observed_at").and_then(Value::as_f64).unwrap_or(at) + 1800.0);
+            // An observation without a reset authorizes a probe after 30 minutes.
+            // Keeping it exhausted beyond that time would requeue to the past.
+            if until > at { return Ok(QuotaStatus::Exhausted { until, kind }); }
+            continue;
+        }
+        if matches!(reserve, QuotaStatus::Clear)
+            && row.get("used").and_then(Value::as_f64).is_some_and(|used| used >= 0.90)
+            && let Some(until) = reset {
+            reserve = QuotaStatus::Reserve { until, kind };
+        }
+    }
+    Ok(reserve)
+}
+
+fn quota_hold(q: &Q, job: &JobCtx, route: &Route, at: f64) -> Result<Option<(f64, String, bool)>> {
+    // Filter before selecting a window so a distant weekly reset cannot
+    // hide a shorter window that still requires an admission hold.
+    match quota_status(q, &job.agent, &route.provider, at, Some(at + QUOTA_WAIT_MAX))? {
+        QuotaStatus::Exhausted { until, kind } => Ok(Some((until, kind, false))),
+        QuotaStatus::Reserve { until, kind } if !job.is_root() => {
+            let root = q.one("SELECT j.agent,r.route FROM jobs j JOIN native_routes r ON r.job=j.id
+                WHERE j.ticket=? AND j.parent IS NULL", &[&job.ticket])?;
+            let shared = root.as_ref().is_some_and(|root| str_of(root, "agent") == job.agent
+                && p::route(Some(&parse(root.get("route").and_then(Value::as_str))))
+                    .is_ok_and(|root_route| root_route.provider == route.provider));
+            Ok(shared.then_some((until, kind, true)))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn record_quota_failure(q: &Q, job: &JobCtx, route: &Route, err: &AdapterError, at: f64) -> Result<sa_store::quota::Window> {
+    let mut kind = err.code.as_deref().and_then(|code| code.strip_prefix("quota:")).unwrap_or("window").to_string();
+    let reset = if let Some(delay) = err.retry_after {
+        at + delay.as_secs_f64()
+    } else if let Some(row) = q.one("SELECT kind,resets_at FROM quota_windows WHERE agent=? AND provider=?
+        AND resets_at>? AND (used>=0.95 OR exhausted=1) ORDER BY resets_at LIMIT 1", &[&job.agent, &route.provider, &at])? {
+        kind = str_of(&row, "kind").to_string();
+        row.get("resets_at").and_then(Value::as_f64).unwrap_or(at + 1800.0)
+    } else {
+        // A probe time is not a provider-reported reset for a named window.
+        kind = "unknown".into();
+        at + 1800.0
+    };
+    let previous = q.one("SELECT used,minutes FROM quota_windows WHERE agent=? AND provider=? AND kind=?",
+        &[&job.agent, &route.provider, &kind])?;
+    let window = sa_store::quota::Window {
+        kind,
+        used: previous.as_ref().and_then(|row| row.get("used")).and_then(Value::as_f64),
+        resets_at: Some(reset),
+        exhausted: true,
+        minutes: previous.as_ref().and_then(|row| row.get("minutes")).and_then(Value::as_i64),
+    };
+    observe_windows(q, job.who(), &job.agent, &route.provider, std::slice::from_ref(&window), at)?;
+    Ok(window)
+}
+
+fn usage_budget(q: &Q, settings: &sa_store::efficiency::Settings, at: f64) -> Result<Option<Value>> {
+    let mut budget = Map::new();
+    if settings.max_collaborators > 0 {
+        budget.insert("max_parallel_collaborators".into(), json!(settings.max_collaborators));
+    }
+    if settings.quota_guard {
+        let mut windows = vec![];
+        for observed in sa_store::quota::load(q.conn(), at)? {
+            let window = observed.window;
+            if !window.exhausted && !window.used.is_some_and(|used| used >= 0.5) {
+                continue;
+            }
+            // "reserve" is announced only where admission actually holds work.
+            let soon = window.resets_at.is_some_and(|reset| reset - at <= QUOTA_WAIT_MAX);
+            let state = if window.exhausted { "exhausted" }
+                else if soon && window.used.is_some_and(|used| used >= 0.90) { "reserve" } else { "ok" };
+            let mut item = json!({"agent": observed.agent, "provider": observed.provider, "state": state});
+            if let Some(minutes) = window.minutes { item["window_minutes"] = json!(minutes); }
+            if let Some(used) = window.used { item["used_percent"] = json!(((used * 20.0).round() * 5.0) as i64); }
+            if let Some(reset) = window.resets_at { item["resets_in_minutes"] = json!((((reset - at) / 300.0).round() * 5.0) as i64); }
+            windows.push(item);
+        }
+        if !windows.is_empty() { budget.insert("windows".into(), Value::Array(windows)); }
+    }
+    Ok((!budget.is_empty()).then_some(Value::Object(budget)))
 }
 
 /// Rebuild the logical turn's [`TurnLedger`] from journaled recoveries since
@@ -2618,6 +3053,17 @@ fn ledger(q: &Q, job: i64) -> Result<TurnLedger> {
     Ok(l)
 }
 
+fn cancel_ticket(q: &Q, ticket: i64) -> Result<()> {
+    q.root(ticket)?;
+    q.run("UPDATE approvals SET decision='expired' WHERE ticket=? AND decision='pending'", &[&ticket])?;
+    for job in q.all(&format!("SELECT * FROM jobs WHERE ticket=? AND state NOT IN {END_SQL}"), &[&ticket])? {
+        q.run("UPDATE jobs SET state='cancelled' WHERE id=?", &[&int_of(&job, "id")])?;
+        q.withdraw_question(who_of(&job))?;
+        q.log(who_of(&job), "cancelled", &json!("用户停止了工单"))?;
+    }
+    Ok(())
+}
+
 /// Early wake of the parent after a child's first failed attempt (spec §9.2
 /// F). `source=NULL` keeps it outside the 128-note budget.
 fn platform_note(q: &Q, job: &JobCtx, target: i64, body: &str) -> Result<i64> {
@@ -2627,6 +3073,10 @@ fn platform_note(q: &Q, job: &JobCtx, target: i64, body: &str) -> Result<i64> {
 }
 
 fn notify_parent(q: &Q, job: &JobCtx, class: ErrorClass, attempt: u32, until: f64) -> Result<()> {
+    notify_parent_as(q, job, class_name(class), attempt, until)
+}
+
+fn notify_parent_as(q: &Q, job: &JobCtx, class: Value, attempt: u32, until: f64) -> Result<()> {
     let Some(parent) = job.parent else { return Ok(()) };
     let open = q.exists(
         "SELECT 1 FROM jobs WHERE id=? AND ticket=? AND state IN ('queued','running','waiting')",
@@ -2637,7 +3087,7 @@ fn notify_parent(q: &Q, job: &JobCtx, class: ErrorClass, attempt: u32, until: f6
     }
     let body = stringify(&json!({
         "child": job.id,
-        "class": class_name(class),
+        "class": class,
         "attempt": attempt,
         "retrying_until": p::seconds_json(until.round()),
     }));
@@ -2972,6 +3422,12 @@ impl Engine {
             Ok((crate::advice::choose(q, ticket)?, str_of(&cwd, "cwd").to_string()))
         })?;
         let adapter = inner.adapters.get(&advisor.agent).cloned().ok_or_else(|| anyhow!("顾问执行端不可用：{}", advisor.agent))?;
+        if inner.opts.efficiency.read().unwrap_or_else(|e| e.into_inner()).quota_guard
+            && let QuotaStatus::Exhausted { until, .. } =
+                inner.db.with(|q| quota_status(q, &advisor.agent, &advisor.route.provider, now(), None))?
+        {
+            bail!("顾问所在供应商的订阅额度窗口已用尽，预计 {} 后恢复；请自行判断或向上级求助", classify::utc_minute(until as i64));
+        }
         let label = json!({"agent": advisor.agent, "provider": advisor.route.provider, "model": advisor.route.model,
             "reasoning_effort": advisor.route.reasoning_effort, "source": advisor.source});
         inner.db.with(|q| q.log(who, "advice.started", &json!({"advisor": label, "brief_bytes": brief.len(), "brief_sha256": digest(brief)})))?;

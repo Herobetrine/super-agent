@@ -3,6 +3,24 @@
 use crate::{app::App, host::Action, ops::Pending, theme, widgets};
 use egui::{RichText, Ui};
 use sa_store::efficiency::{self, Settings, Ttl};
+use std::time::{Duration, Instant};
+
+#[derive(Default)]
+pub struct ObserverEfficiency {
+    settings: Option<Settings>,
+    loading: Option<Pending<Settings>>,
+    checked: Option<Instant>,
+}
+
+fn read_settings(ctx: &egui::Context, data: std::path::PathBuf) -> Pending<Settings> {
+    Pending::spawn(ctx, move || {
+        let conn = rusqlite::Connection::open_with_flags(
+            data.join(sa_store::DB_FILE),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?;
+        efficiency::load(&conn)
+    })
+}
 
 pub struct EfficiencyDialog {
     pub draft: Settings,
@@ -24,6 +42,32 @@ fn description(ui: &mut Ui, text: &str, pal: &theme::Palette) {
 }
 
 impl App {
+    /// Read saved settings without blocking a frame or exposing dialog drafts.
+    pub(crate) fn saved_efficiency(&mut self) -> Option<Settings> {
+        if let Some(host) = &self.host {
+            return Some(host.efficiency_settings());
+        }
+        if self.opts.demo {
+            return Some(Settings::default());
+        }
+        let cache = &mut self.observer_efficiency;
+        if let Some(result) = cache.loading.as_ref().and_then(Pending::poll) {
+            cache.loading = None;
+            if let Ok(settings) = result {
+                cache.settings = Some(settings);
+            }
+        }
+        if cache.loading.is_none()
+            && cache.checked.is_none_or(|at| at.elapsed() >= Duration::from_secs(5))
+        {
+            let data = self.opts.data.clone().unwrap_or_else(sa_store::default_data_dir);
+            cache.loading = Some(read_settings(&self.ctx, data));
+            cache.checked = Some(Instant::now());
+        }
+        self.ctx.request_repaint_after(Duration::from_secs(5));
+        cache.settings.clone()
+    }
+
     pub fn open_efficiency(&mut self) {
         if self.efficiency.is_some() {
             return;
@@ -38,13 +82,7 @@ impl App {
                 .data
                 .clone()
                 .unwrap_or_else(sa_store::default_data_dir);
-            Some(Pending::spawn(&self.ctx, move || {
-                let conn = rusqlite::Connection::open_with_flags(
-                    dir.join(sa_store::DB_FILE),
-                    rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-                )?;
-                efficiency::load(&conn)
-            }))
+            Some(read_settings(&self.ctx, dir))
         };
         self.efficiency = Some(EfficiencyDialog {
             draft: settings.unwrap_or_default(),
@@ -146,6 +184,30 @@ impl App {
                         description(ui, "Claude 主控等待协作者超过缓存时长时，在过期前用不保存的分叉会话发一条极短请求，按缓存读取计费以刷新缓存，避免整段上下文过期重写。每次等待最多 10 次，有真实请求后重新计数。", &pal);
                         ui.add_space(8.0);
                         description(ui, "Codex、DeepSeek 等执行端沿用各自的服务端缓存策略。", &pal);
+                        ui.add_space(16.0);
+                        widgets::rule(ui, pal.line_soft);
+                        ui.add_space(16.0);
+                        widgets::section(ui, "用量调度", &pal);
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            let label = ui.label("协作者并发上限");
+                            ui.add(
+                                egui::DragValue::new(&mut dialog.draft.max_collaborators)
+                                    .range(0..=16)
+                                    .clamp_existing_to_range(false)
+                                    .speed(1.0)
+                                    .custom_formatter(|value, _| {
+                                        if value == 0.0 { "不限制".into() } else { format!("{value:.0}") }
+                                    })
+                                    .custom_parser(|text| {
+                                        if text.trim() == "不限制" { Some(0.0) } else { text.trim().parse().ok() }
+                                    }),
+                            ).labelled_by(label.id);
+                        });
+                        description(ui, "同一工单同时运行的协作者数量，主控不计入；其余派工排队等待。", &pal);
+                        ui.add_space(12.0);
+                        ui.add(widgets::Check::new(&mut dialog.draft.quota_guard, "额度保护"));
+                        description(ui, "订阅额度窗口用尽时等待重置后继续，而不是判任务失败；接近用尽时为主控保留余量。", &pal);
                     });
                 });
                 if let Some(error) = &dialog.error {

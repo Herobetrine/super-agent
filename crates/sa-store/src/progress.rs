@@ -20,6 +20,16 @@ pub(crate) const VISIBLE: &[&str] = &[
     "delta",
     "reply",
     "send",
+    "ask",
+    "answer",
+    "ask.withdrawn",
+    "report",
+    "continued",
+    "skipped",
+    "check.started",
+    "check.result",
+    "check.bounced",
+    "auto.stalled",
     "role",
     "note",
     "note.rejected",
@@ -43,6 +53,8 @@ pub(crate) const VISIBLE: &[&str] = &[
     "turn.stalled",
     "turn.retry_scheduled",
     "turn.route_wait",
+    "turn.quota_wait",
+    "turn.deferred",
     "turn.gave_up",
     "turn.loop_warning",
     "turn.loop_stopped",
@@ -69,6 +81,16 @@ fn stage(kind: &str) -> Option<(&'static str, &'static str, &'static str)> {
         "adapter.route" => ("已绑定执行路由", "run", "running"),
         "files" => ("附件快照已就绪", "run", "running"),
         "send" => ("已派发协作任务", "task", "running"),
+        "ask" => ("等待你回答问题", "task", "waiting"),
+        "answer" => ("已收到问题回答", "task", "completed"),
+        "ask.withdrawn" => ("未回答的问题已撤回", "task", "stopped"),
+        "report" => ("已提交任务结论", "task", "completed"),
+        "continued" => ("协作任务已安排继续", "task", "running"),
+        "skipped" => ("前置任务未完成，已跳过任务", "task", "stopped"),
+        "check.started" => ("正在运行完成检查", "task", "running"),
+        "check.result" => ("完成检查已通过", "task", "completed"),
+        "check.bounced" => ("完成检查未通过，已退回修复", "task", "running"),
+        "auto.stalled" => ("主控重复下一步，等待你决定", "task", "waiting"),
         "reply" => ("本轮已返回答复", "run", "completed"),
         "role" => ("已更新任务分工", "task", "running"),
         "note" => ("已投递定向留言", "task", "running"),
@@ -143,7 +165,40 @@ pub(crate) fn platform_activity(row: &PlatformRow) -> Option<Activity> {
         label = "已记录阻塞原因";
         state = "stopped";
     }
+    if row.kind == "check.result" && row.status != Some("done") {
+        label = "完成检查未通过";
+        state = "failed";
+    }
+    if row.kind == "report" {
+        match row.status {
+            Some("partial") => {
+                label = "任务部分完成";
+                state = "stopped";
+            }
+            Some("blocked") => {
+                label = "任务受阻，等待处理";
+                state = "stopped";
+            }
+            _ => {}
+        }
+    }
     Some(Activity::new(label, category, state))
+}
+
+/// Quota metadata is projected to fixed operational labels only.
+fn quota_activity(kind: &str, payload: Option<&str>) -> Option<Activity> {
+    if !matches!(kind, "turn.quota_wait" | "turn.deferred") {
+        return None;
+    }
+    let payload = payload.and_then(|p| serde_json::from_str::<serde_json::Value>(p).ok());
+    let reason = payload.as_ref().and_then(|p| p.get("reason")).and_then(serde_json::Value::as_str)
+        .unwrap_or(if kind == "turn.quota_wait" { "quota_window" } else { "" });
+    let label = match reason {
+        "quota_window" => "等待额度重置",
+        "quota_reserve" => "为主控保留额度",
+        _ => return None,
+    };
+    Some(Activity::new(label, "run", "waiting"))
 }
 
 /// Row of the `progress_view` projection.
@@ -192,10 +247,12 @@ impl Entry {
                 payload: row.payload.as_deref(),
             })
         } else {
-            platform_activity(&PlatformRow {
-                kind: &row.kind,
-                summary: row.summary.as_deref(),
-                status: row.status.as_deref(),
+            quota_activity(&row.kind, row.payload.as_deref()).or_else(|| {
+                platform_activity(&PlatformRow {
+                    kind: &row.kind,
+                    summary: row.summary.as_deref(),
+                    status: row.status.as_deref(),
+                })
             })
         };
         if let Some(item) = item {
@@ -262,6 +319,39 @@ mod tests {
     }
 
     #[test]
+    fn quota_waits_are_waiting_progress_and_bookkeeping_stays_hidden() {
+        for kind in ["turn.quota_wait", "turn.deferred"] {
+            assert!(VISIBLE.contains(&kind));
+            for (reason, label) in [
+                ("quota_window", "等待额度重置"),
+                ("quota_reserve", "为主控保留额度"),
+            ] {
+                let payload = serde_json::json!({"reason":reason,"until":1_800_000_000,"route":{"provider":"PRIVATE"}}).to_string();
+                let item = quota_activity(kind, Some(&payload)).unwrap();
+                assert_eq!((item.label.as_str(), item.category, item.state), (label, "run", "waiting"));
+                assert!(!item.to_value().to_string().contains("PRIVATE"));
+            }
+        }
+        assert_eq!(quota_activity("turn.deferred", Some(r#"{"reason":"circuit_open"}"#)), None);
+        assert_eq!(quota_activity("turn.quota_wait", None).unwrap().label, "等待额度重置");
+        assert!(!VISIBLE.contains(&"quota.window"));
+        assert_eq!(platform_activity(&PlatformRow { kind: "quota.window", summary: None, status: None }), None);
+        let mut entry = Entry::default();
+        for (index, kind, payload) in [
+            (1, "quota.window", r#"{"used":0.92,"provider":"PRIVATE"}"#),
+            (2, "native", r#"{"method":"account/rateLimits/updated","params":{"rateLimits":{"usedPercent":92}}}"#),
+            (3, "turn.quota_wait", r#"{"reason":"quota_reserve","until":1800000000}"#),
+        ] {
+            entry.absorb(ScanRow { seq: index, job: Some(1), turn: Some(1), ts: index as f64, kind: kind.into(), agent: Some("codex".into()), payload: Some(payload.into()), summary: None, status: None });
+        }
+        let rows = entry.read(0, 3, false, 10, false);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].payload["label"], "为主控保留额度");
+        assert_eq!(rows[0].payload["state"], "waiting");
+        assert!(entry.read(0, 3, false, 10, true).is_empty());
+    }
+
+    #[test]
     fn stage_labels_and_overrides() {
         assert_eq!(act("plan.add", None).label, "已添加计划项");
         assert_eq!(act("reply", None).state, "completed");
@@ -313,5 +403,38 @@ mod tests {
             }),
             None
         );
+    }
+
+    #[test]
+    fn completion_checks_and_stalls_have_fixed_progress_labels() {
+        for (kind, status, label, state) in [
+            ("check.started", None, "正在运行完成检查", "running"),
+            ("check.result", Some("done"), "完成检查已通过", "completed"),
+            ("check.result", Some("failed"), "完成检查未通过", "failed"),
+            ("check.bounced", None, "完成检查未通过，已退回修复", "running"),
+            ("auto.stalled", None, "主控重复下一步，等待你决定", "waiting"),
+        ] {
+            assert!(VISIBLE.contains(&kind));
+            let item = act(kind, status);
+            assert_eq!((item.label.as_str(), item.state), (label, state));
+        }
+    }
+
+    #[test]
+    fn collaboration_protocol_events_have_fixed_progress_labels() {
+        for (kind, label, state) in [
+            ("ask", "等待你回答问题", "waiting"),
+            ("answer", "已收到问题回答", "completed"),
+            ("ask.withdrawn", "未回答的问题已撤回", "stopped"),
+            ("report", "已提交任务结论", "completed"),
+            ("continued", "协作任务已安排继续", "running"),
+            ("skipped", "前置任务未完成，已跳过任务", "stopped"),
+        ] {
+            assert!(VISIBLE.contains(&kind));
+            let item = act(kind, None);
+            assert_eq!((item.label.as_str(), item.state), (label, state));
+        }
+        assert_eq!(act("report", Some("partial")).label, "任务部分完成");
+        assert_eq!(act("report", Some("blocked")).state, "stopped");
     }
 }

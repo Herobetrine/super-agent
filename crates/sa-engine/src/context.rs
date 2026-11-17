@@ -42,6 +42,10 @@ const CONTROL: &[&str] = &[
     "workspace",
     "scm_feedback",
     "scm_notice",
+    "open_question",
+    "checks",
+    "completion_checks",
+    "prerequisites",
 ];
 const HISTORY: &[&str] = &["user_updates", "reports", "notes", "roster", "mcp_results", "plan"];
 

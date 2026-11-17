@@ -9,6 +9,7 @@ pub mod model;
 mod native_activity;
 mod progress;
 pub mod providers;
+pub mod quota;
 pub mod schema;
 pub mod store;
 pub mod usage;

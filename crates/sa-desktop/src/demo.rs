@@ -8,7 +8,7 @@ use crate::data::DataSource;
 use anyhow::{Result, bail};
 use sa_store::{
     Approval, ContinuousRun, EventView, JobView, JobsPage, LatestActivity, NativeActivity,
-    NativeTask, PlanItem, Snapshot, TicketDetail, TicketSummary,
+    NativeTask, PlanItem, Question, Snapshot, TicketDetail, TicketSummary,
 };
 use serde_json::{Value, json};
 use std::time::Instant;
@@ -18,6 +18,7 @@ struct Ticket {
     jobs: Vec<JobView>,
     events: Vec<EventView>,
     approvals: Vec<Approval>,
+    questions: Vec<Question>,
     run: Option<ContinuousRun>,
     plan: Vec<PlanItem>,
     native: NativeActivity,
@@ -31,6 +32,28 @@ pub struct DemoSource {
 
 fn route(provider: &str, model: &str, mode: &str) -> Option<Value> {
     Some(json!({"provider": provider, "model": model, "mode": mode}))
+}
+
+/// Usage windows shown by the demo: a five-hour window that is running low
+/// and a weekly one with room left.
+fn sample_quota() -> Vec<sa_store::quota::Observed> {
+    let now = crate::labels::now_secs();
+    let window = |agent: &str, kind: &str, used: f64, minutes: i64, reset_in: f64| sa_store::quota::Observed {
+        agent: agent.into(),
+        provider: "demo".into(),
+        window: sa_store::quota::Window {
+            kind: kind.into(),
+            used: Some(used),
+            resets_at: Some(now + reset_in),
+            exhausted: false,
+            minutes: Some(minutes),
+        },
+        observed_at: now,
+    };
+    vec![
+        window("claude", "five_hour", 0.85, 300, 95.0 * 60.0),
+        window("codex", "primary", 0.53, 10080, 3.0 * 86_400.0),
+    ]
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -58,6 +81,9 @@ fn job(
         body: body.into(),
         result: result.map(str::to_string),
         route: r,
+        outcome: None,
+        checks: None,
+        needs: Vec::new(),
     }
 }
 
@@ -122,6 +148,7 @@ fn detail(
         agent_routes: json!({}),
         allow_lead_routing: true,
         pause_status: None,
+        attention: None,
         state: state.into(),
     }
 }
@@ -163,7 +190,8 @@ const PEER_REPLY: &str = r#"审查完成，`sa-store` 的查询与 `studio.cjs` 
 2. `history` 的 LIKE 转义需要同时处理 `\`、`%` 和 `_`。
 
 其余部分（任务排序、审批筛选、计划读取）均已对照测试通过。
-SA_PROGRESS {"id":"review","summary":"查询语义已核对，发现 2 处边界问题"}"#;
+SA_PROGRESS {"id":"review","summary":"查询语义已核对，发现 2 处边界问题"}
+SA_REPORT {"status":"done","summary":"只读查询核对完成","verified":["增量游标与 LIKE 转义"],"unverified":["真实窗口显示"],"artifacts":["crates/sa-store/src/store.rs"]}"#;
 
 const LEAD_REPLY_2: &str = r#"收到补充要求。暗色主题已按同一套品牌色派生，正文与背景的对比度保持在 **7:1** 以上，次要文字不低于 *4.5:1*。
 
@@ -180,7 +208,7 @@ SA_LEARN {"lesson":"egui 的标签在右对齐布局中不会自动收缩，气�
 impl DemoSource {
     pub fn new() -> Self {
         let now = crate::labels::now_secs();
-        let tickets = vec![
+        let mut tickets = vec![
             main_ticket(now),
             simple(
                 41,
@@ -253,6 +281,7 @@ impl DemoSource {
                 1,
             ),
         ];
+        tickets[1].detail.attention = Some("question".into());
         Self {
             tickets,
             started: Instant::now(),
@@ -444,6 +473,7 @@ fn simple(
         jobs,
         events: log.events,
         approvals: vec![],
+        questions: vec![],
         run: None,
         plan: vec![],
         native: NativeActivity::default(),
@@ -586,6 +616,7 @@ fn main_ticket(now: f64) -> Ticket {
     );
     log.act(1.0, 102, 1, "codex", json!({"label":"进展汇报 · 查询语义已核对，发现 2 处边界问题","category":"report","state":"reported"}));
     log.push(30.0, "reply", 102, 1, None, json!({"text": PEER_REPLY}));
+    log.push(1.0, "reply", 105, 1, None, json!({"text":"完成检查未通过，保留失败用例供后续修复。"}));
     log.push(20.0, "failed", 105, 1, None, json!("cargo test 失败：3 个用例未通过\n\nthread 'feed::tests::groups_progress' panicked at src/feed.rs:212:9"));
     log.push(
         5.0,
@@ -717,7 +748,7 @@ fn main_ticket(now: f64) -> Ticket {
         json!("对话列保持不少于 520 像素……"),
     );
 
-    let jobs = vec![
+    let mut jobs = vec![
         job(
             101,
             "claude",
@@ -785,6 +816,10 @@ fn main_ticket(now: f64) -> Ticket {
             route("anthropic", "claude-sonnet-4-5", "cli"),
         ),
     ];
+    jobs[1].outcome = Some(json!({"status":"done","summary":"只读查询核对完成","verified":["增量游标与 LIKE 转义"],"unverified":["真实窗口显示"],"artifacts":["crates/sa-store/src/store.rs"]}));
+    jobs[1].checks = Some(json!({"ok":true,"cached":false,"attempt":1,"runs":[{"argv":["cargo","test","-p","sa-store"],"ok":true,"exit":0,"seconds":2.4}]}));
+    jobs[3].needs = vec![103];
+    jobs[4].checks = Some(json!({"ok":false,"cached":false,"attempt":3,"runs":[{"argv":["cargo","test","-p","sa-desktop"],"ok":false,"exit":1,"seconds":3.1}]}));
     let t0 = now - 600.0;
     let native = NativeActivity {
         tasks: vec![
@@ -838,6 +873,7 @@ fn main_ticket(now: f64) -> Ticket {
         "auto",
         "running",
     );
+    d.attention = Some("approval".into());
     d.objective = Some("桌面端以纯 Rust 只读观察全部工单，并与现有调度保持兼容".into());
     d.agent_routes =
         json!({"claude":{"provider":"anthropic","model":"claude-opus-4-5","mode":"cli"}});
@@ -850,6 +886,12 @@ fn main_ticket(now: f64) -> Ticket {
             job: 102,
             action: json!({"tool":"Bash","command":"cargo clean -p sa-desktop","cwd":"E:\\Projects\\Super Agent",
                 "reason":"清理旧的构建产物后重新测量编译时间"}),
+        }],
+        questions: vec![Question {
+            id: 8, job: 101, key: "window-size".into(),
+            question: "先核对哪种窗口布局？".into(),
+            options: vec!["先核对窄窗口".into(), "先核对宽窗口".into()],
+            fallback: Some("先核对窄窗口".into()), origin: "agent".into(), asked: now - 10.0,
         }],
         run: Some(ContinuousRun {
             phase: "work".into(),
@@ -913,6 +955,7 @@ impl DataSource for DemoSource {
                 title: None,
                 pinned: false,
                 archived: false,
+                attention: t.detail.attention.clone(),
             })
             .collect())
     }
@@ -956,9 +999,14 @@ impl DataSource for DemoSource {
             total_jobs,
             native_activity: t.native.clone(),
             usage: Default::default(),
+            // Sample windows on the first ticket only, so both the footer
+            // segment and a ticket without any window can be looked at.
+            quota: if self.tickets.first().is_some_and(|first| first.detail.id == ticket) { sample_quota() } else { Vec::new() },
+            queued_peers: t.jobs.iter().filter(|j| j.parent.is_some() && j.state == "queued" && j.needs.iter().all(|id| t.jobs.iter().any(|p| p.id == *id && p.state == "done"))).count() as i64,
             events,
             cursor: cursor.max(after),
             approvals: t.approvals.clone(),
+            questions: t.questions.clone(),
             run: t.run.clone(),
             plan: t.plan.clone(),
         })

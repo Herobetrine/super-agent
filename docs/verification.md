@@ -1,5 +1,57 @@
 # 验证方法
 
+## 协作闭环（2026-11-17）
+
+实现、规则与边界见 [协作闭环](dev/collaboration-loop.md)。
+
+- `build --workspace`、`test --workspace`（630 通过、0 失败、6 忽略）、`clippy --workspace --all-targets -- -D warnings` 通过。此前用量调度器一轮为 562 通过。
+- 新增离线测试（假执行端经真实调度器，不调用模型）：
+  - `sa-engine/tests/collab_loop.rs` 23 项：结论行的状态效果、`resolved`、无效行回执与终稿最后一条生效；提问后停驻、多轮调度不再准入、回答送达且只能回答一次、重复与替换、追加指令撤回、有未解决子任务时仍停驻、自动模式主控提问不推进阶段；续派沿用平台记录的原生会话标识并拒绝不合法目标；依赖派工的等待、前置失败后跳过、改派链跟随、不占槽位；以上状态在关闭并重开引擎后保持。
+  - `sa-engine/tests/completion_checks.rs` 13 项，使用真实临时 Git 仓库和真实子进程：通过、退回原会话后通过、三次失败记为部分完成、有未了结退回时文件未变也重跑、沿用上次通过结果、只读任务与非完成声明不触发、停止工单时终止检查进程树、配置校验。
+  - `sa-engine/tests/stall_handling.rs` 4 项：重复的下一步触发平台提问后不再调用执行端，回答“继续”恢复，回答“停止”取消工单，重启后保持。
+  - `sa-engine` 单元测试：工作树指纹覆盖未跟踪文件内容和二进制改动。
+  - `sa-store`：新快照字段、`attention`、缺少新表的旧工单库、排队计数排除等待前置的任务。
+  - `sa-desktop`（egui_kittest 经无障碍树驱动）：点选项和输入回答会提交回答动作，观察与演示模式没有控件；侧栏“待你处理”只在有内容时出现且不重复列出；协作页的等待前置、结论和平台检查文案；完成检查编辑器的增删保存与 4 条上限；问题通知的启动基线与新问题。
+- 本机已安装的 Claude Code 2.1.325 与 Codex 0.169.0 对回环假模型：`bus_cli` 7 项与 `gateway_compat` 1 项通过，说明加长后的引导文字没有破坏请求前缀检查和总线工具调用。其中 3 个 `live_*` 因环境开关未设置而提前返回，不算真实模型验证。
+- 真实工单库经只读 SQLite backup 复制后，`SA_LEGACY_COPY=… test -p sa-desktop legacy` 通过；副本原本没有本轮新增的表。没有在真实库上启动测试调度器。
+- 界面截图已查看：`--demo --inspector collab` 亮色与暗色 1280×860、880×600，以及 1440×900 对话视图。可见“待你处理”分组、问题卡片、结论与平台检查行、“等待 #103 完成”。演示模式只读，卡片上的选项按钮和输入框、完成检查编辑器的展开状态只由界面测试覆盖，没有截图。
+
+未验证：真实模型是否会按引导写出 `SA_REPORT`、`SA_ASK`、`continue` 和 `after`；真实执行端下续派对原生会话的实际复用；主控轮次、用量和产出质量的实际变化；Windows 系统通知“需要你的回答”的实际弹出；用户验收。
+
+专项复验：
+
+```powershell
+scripts\cargo.cmd test -p sa-engine --test collab_loop --test completion_checks --test stall_handling
+scripts\cargo.cmd test -p sa-store --test collaboration --test completion_checks --test queued_projection
+scripts\cargo.cmd test -p sa-desktop ui_tests::
+scripts\cargo.cmd test -p sa-desktop workflow_tests
+target\debug\super-agent.exe --demo --inspector collab --screenshot collab.png --size 1280x860
+```
+
+## 用量调度器与读路径（2026-11-17）
+
+实现与边界见 [用量调度器](dev/usage-governor.md)。同一批改动还包含界面读路径：读线程按账本变更计数刷新（40 ms 检查一次，不再固定每秒轮询）、Markdown 解析结果跨刷新复用，以及流式遥测批次以 `synchronous=NORMAL` 提交（见 [引擎规格 §1.1](dev/engine-spec.md)）。
+
+- `build --workspace`、`test --workspace`（562 通过、0 失败、6 忽略）、`clippy --workspace --all-targets -- -D warnings` 通过。其中 3 个 `live_*` 总线测试因环境开关未设置而提前返回，不算真实模型验证。
+- 新增离线测试：`sa-engine/tests/usage_governor.rs` 16 项（槽位上限与多工单公平、额度等待后沿用同一原生会话续跑、超过 6 小时放弃、12 次等待上限、主控保留只拦同供应商协作者、远期周窗口不拦截、等待只通知上级一次、`usage_budget` 取整）；`sa-store` 中窗口解析、过期和快照相关的 13 项；Claude 与 Codex 适配器的额度帧处理；桌面设置面板、页脚、事件文案。短窗口续跑测试在测试库里提前了 `ready_after`，没有真实等待 60 秒的重置余量。
+- 本机已安装的 Claude Code 2.1.325 与 Codex 0.169.0 对回环假模型：`SA_LOCAL_GATEWAY_CLI=1 … --test bus_cli` 中 4 项回环测试与 `--test gateway_compat` 通过，说明真实 Codex app-server 在 `turn/start` 之前接受新增的 `account/rateLimits/read` 请求，Claude 的请求前缀检查不受新引导文字影响。不调用真实模型。
+- 用本机 `codex app-server` 直接请求一次 `account/rateLimits/read`（不调用模型），返回 `primary.usedPercent`、`windowDurationMins`、`resetsAt`，解析测试使用了该实际形状。
+- 真实工单库经只读 SQLite backup 复制后，`SA_LEGACY_COPY=… test -p sa-desktop legacy` 通过（副本原本没有 `quota_windows` 表）。没有在真实库上启动测试调度器。
+- 界面：`--dialog efficiency` 与 `--demo --inspector collab` 截图已查看（亮色、暗色，1280×860 与 880×600）。演示数据里的两个额度窗口是示例值。
+
+未验证：真实订阅额度耗尽后的等待与自动续跑；Claude `rate_limit_event` 帧的真实样本（本机 Claude 走本地网关，账本最近 40 万条事件里没有这类帧，字段名取自已安装 CLI 的类型定义）；引导文字对主控实际派工数量、质量和用量的影响；用户验收。
+
+专项复验：
+
+```powershell
+scripts\cargo.cmd test -p sa-engine --test usage_governor
+scripts\cargo.cmd test -p sa-store quota
+scripts\cargo.cmd test -p sa-desktop efficiency_tests
+$env:SA_LOCAL_GATEWAY_CLI='1'
+scripts\cargo.cmd test -p sa-adapters --test bus_cli -- --nocapture
+Remove-Item Env:SA_LOCAL_GATEWAY_CLI
+```
+
 ## 社区能力集成验收（2026-11-09）
 
 本轮实现入口和边界见[社区机制吸纳](dev/community-integration.md)。`build --workspace`、`test --workspace`、`clippy --workspace --all-targets -- -D warnings` 已通过；环境门控提前返回的真实调用不计为实测。新增针对实际 App 的分支确认、取消、选中新工单、迟到回执和重复提交回归通过。离线场景覆盖真实临时 Git、Windows 子进程树、SQLite 重启和 MCP/ACP stdio 进程，不以模型自述代替断言。

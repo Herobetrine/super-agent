@@ -30,8 +30,24 @@ pub const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS cancel_receipts(
   job INTEGER NOT NULL,source_turn INTEGER NOT NULL,msgkey TEXT NOT NULL,target INTEGER,
   seq INTEGER NOT NULL,PRIMARY KEY(job,source_turn,msgkey)) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS ticket_failover(ticket INTEGER PRIMARY KEY,mode TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS quota_windows(agent TEXT NOT NULL,provider TEXT NOT NULL,kind TEXT NOT NULL,
+  used REAL,resets_at REAL,exhausted INTEGER NOT NULL DEFAULT 0,minutes INTEGER,observed_at REAL NOT NULL,
+  PRIMARY KEY(agent,provider,kind));
 CREATE TABLE IF NOT EXISTS job_failovers(original INTEGER PRIMARY KEY,replacement INTEGER NOT NULL);
-CREATE INDEX IF NOT EXISTS job_failovers_replacement ON job_failovers(replacement);";
+CREATE INDEX IF NOT EXISTS job_failovers_replacement ON job_failovers(replacement);
+CREATE TABLE IF NOT EXISTS job_outcomes(job INTEGER PRIMARY KEY,turn INTEGER NOT NULL,payload TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS questions(id INTEGER PRIMARY KEY,ticket INTEGER NOT NULL,job INTEGER NOT NULL,
+  turn INTEGER NOT NULL,msgkey TEXT NOT NULL,question TEXT NOT NULL,options TEXT NOT NULL DEFAULT '[]',
+  fallback TEXT,origin TEXT NOT NULL DEFAULT 'agent',state TEXT NOT NULL DEFAULT 'pending',
+  parked INTEGER NOT NULL DEFAULT 0,answer TEXT,asked REAL NOT NULL,closed REAL);
+CREATE UNIQUE INDEX IF NOT EXISTS questions_pending_job ON questions(job) WHERE state='pending';
+CREATE INDEX IF NOT EXISTS questions_ticket_state ON questions(ticket,state);
+CREATE TABLE IF NOT EXISTS job_deps(job INTEGER NOT NULL,needs INTEGER NOT NULL,PRIMARY KEY(job,needs));
+CREATE TABLE IF NOT EXISTS project_checks(project TEXT PRIMARY KEY,checks TEXT NOT NULL,updated REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS check_passes(project TEXT NOT NULL,directory TEXT NOT NULL,fingerprint TEXT NOT NULL,
+  checks_sha TEXT NOT NULL,at REAL NOT NULL,PRIMARY KEY(project,directory));
+CREATE TABLE IF NOT EXISTS job_checks(job INTEGER PRIMARY KEY,turn INTEGER NOT NULL,attempt INTEGER NOT NULL,payload TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS check_bounces(job INTEGER PRIMARY KEY,attempt INTEGER NOT NULL);";
 
 pub const INTERRUPT_REASON: &str = "上次执行中断，可能已经产生副作用，继续前请核对实际状态。";
 
@@ -103,18 +119,48 @@ impl Db {
 
     /// `transaction(db, fn)`: BEGIN IMMEDIATE, COMMIT, ROLLBACK on error.
     pub fn tx<T>(&self, f: impl FnOnce(&Q) -> Result<T>) -> Result<T> {
-        self.transaction(f, false)
+        self.transaction(f, false, false)
     }
 
     /// Admission alone can retry a BUSY begin: its transaction body has not
     /// run and therefore cannot have claimed an in-memory breaker probe.
     pub(crate) fn admission_tx<T>(&self, f: impl FnOnce(&Q) -> Result<T>) -> Result<T> {
-        self.transaction(f, true)
+        self.transaction(f, true, false)
     }
 
-    fn transaction<T>(&self, f: impl FnOnce(&Q) -> Result<T>, classify_begin_busy: bool) -> Result<T> {
+    /// A transaction for stream telemetry only: model text deltas and raw
+    /// adapter frames, which record what a harness already did and decide
+    /// nothing. It commits with `synchronous=NORMAL`, so the WAL is not forced
+    /// to disk (about 2 ms per commit on the machines measured, against 0.02 ms).
+    ///
+    /// Every other transaction stays `FULL` and syncs the whole WAL, including
+    /// the telemetry before it, so durability is still a prefix of commit
+    /// order: a power loss can drop only the newest telemetry, exactly as if it
+    /// had happened a moment earlier. A process crash loses nothing in either
+    /// mode. Never use this for state transitions, receipts or anything a
+    /// later decision reads.
+    pub(crate) fn telemetry_tx<T>(&self, f: impl FnOnce(&Q) -> Result<T>) -> Result<T> {
+        self.transaction(f, false, true)
+    }
+
+    fn transaction<T>(&self, f: impl FnOnce(&Q) -> Result<T>, classify_begin_busy: bool, relaxed: bool) -> Result<T> {
         let guard = self.lock();
         let conn = guard.as_ref().ok_or_else(|| anyhow!("调度台已关闭"))?;
+        // `synchronous` cannot change inside a transaction: relax it before
+        // BEGIN and restore it after the transaction ends, on every path.
+        // Declared first so it is dropped after the transaction below.
+        struct Strict<'a>(&'a Connection);
+        impl Drop for Strict<'_> {
+            fn drop(&mut self) {
+                let _ = self.0.execute_batch("PRAGMA synchronous=FULL");
+            }
+        }
+        let _strict = if relaxed && conn.is_autocommit() {
+            conn.execute_batch("PRAGMA synchronous=NORMAL")?;
+            Some(Strict(conn))
+        } else {
+            None
+        };
         // The transaction rolls back on ordinary errors, commit errors and
         // unwinding. Its lifetime ends before the connection mutex is released.
         let was_autocommit = conn.is_autocommit();
@@ -302,6 +348,7 @@ impl Q<'_> {
                 &[&id],
             )?;
             self.run("UPDATE jobs SET state='cancelled' WHERE id=?", &[&id])?;
+            self.withdraw_question(who_of(&job))?;
             self.log(who_of(&job), "cancelled", &json!(reason))?;
             ids.push(id);
         }
@@ -392,6 +439,27 @@ impl Q<'_> {
         key: Option<&str>,
         budget: i64,
     ) -> Result<i64> {
+        self.record_note_checked(ticket, dest, body, source, key, NoteDelivery { budget, answering: false })
+    }
+
+    /// A pending question can outlive an interrupted or draining turn. Its
+    /// answer remains deliverable while that job is non-terminal.
+    pub fn record_answer_note(&self, ticket: i64, job: i64, body: &str) -> Result<i64> {
+        self.record_note_checked(
+            ticket, Some(&json!(job)), Some(&json!(body)), None, None,
+            NoteDelivery { budget: 128, answering: true },
+        )
+    }
+
+    fn record_note_checked(
+        &self,
+        ticket: i64,
+        dest: Option<&Value>,
+        body: Option<&Value>,
+        source: Option<&NoteSource>,
+        key: Option<&str>,
+        delivery: NoteDelivery,
+    ) -> Result<i64> {
         let dest = match p::safe_int(dest) {
             Some(d) if d > 0 && p::valid_text(body, usize::MAX) => d,
             _ => return Err(crate::dispatch::rejected("收件任务或正文无效")),
@@ -416,9 +484,10 @@ impl Q<'_> {
         }
         let receiver = self.one("SELECT * FROM jobs WHERE id=? AND ticket=?", &[&dest, &ticket])?;
         let mut rejection: Option<&str> = None;
-        let inbox = receiver
-            .as_ref()
-            .is_some_and(|r| matches!(str_of(r, "state"), "queued" | "running" | "waiting"));
+        let inbox = receiver.as_ref().is_some_and(|r| {
+            if delivery.answering { !p::is_terminal(str_of(r, "state")) }
+            else { matches!(str_of(r, "state"), "queued" | "running" | "waiting") }
+        });
         if !inbox {
             rejection = Some("目标不属于本工单或已停止收信");
         } else if source.is_some() {
@@ -430,7 +499,7 @@ impl Q<'_> {
                 ),
                 &[&ticket, &ticket],
             )?;
-            if n >= budget {
+            if n >= delivery.budget {
                 rejection = Some("自动信箱达到预算");
             }
         }
@@ -472,22 +541,99 @@ impl Q<'_> {
         Ok(seq)
     }
 
+    /// A question survives unrelated turns only when the agent repeats it.
+    /// Call in the same transaction as the state change that closes it.
+    pub fn withdraw_question(&self, who: Who) -> Result<()> {
+        if let Some(row) = self.one("SELECT id FROM questions WHERE job=? AND state='pending'", &[&who.id])? {
+            let id = int_of(&row, "id");
+            self.run("UPDATE questions SET state='withdrawn',parked=0,closed=? WHERE id=?", &[&now(), &id])?;
+            self.log(who, "ask.withdrawn", &json!({"id": id}))?;
+        }
+        Ok(())
+    }
+
+    /// Platform pauses share the durable question/wake contract with agent asks.
+    pub(crate) fn platform_question(&self, who: Who, key: &str, question: &str, options: &[&str]) -> Result<()> {
+        self.withdraw_question(who)?;
+        let options = json!(options);
+        let id = self.insert(
+            "INSERT INTO questions(ticket,job,turn,msgkey,question,options,origin,parked,asked)
+             VALUES(?,?,?,?,?,?,'platform',1,?)",
+            &[&who.ticket, &who.id, &who.turn, &key, &question, &stringify(&options), &now()],
+        )?;
+        self.log(who, "ask", &json!({"id":id,"key":key,"question":question,"options":options,"origin":"platform"}))?;
+        self.run("UPDATE jobs SET state='waiting',ready_after=0 WHERE id=?", &[&who.id])?;
+        Ok(())
+    }
+
+    pub fn commit_question(&self, who: Who, ask: Option<&Value>, parked: bool) -> Result<()> {
+        let pending = self.one("SELECT * FROM questions WHERE job=? AND state='pending'", &[&who.id])?;
+        if let (Some(row), Some(ask)) = (&pending, ask) {
+            let options: Value = serde_json::from_str(str_of(row, "options"))?;
+            if row.get("msgkey") == ask.get("id") && row.get("question") == ask.get("question")
+                && options == ask["options"]
+            {
+                self.run("UPDATE questions SET parked=? WHERE id=?", &[&i64::from(parked), &int_of(row, "id")])?;
+                return Ok(());
+            }
+        }
+        self.withdraw_question(who)?;
+        if let Some(ask) = ask {
+            let id = self.insert(
+                "INSERT INTO questions(ticket,job,turn,msgkey,question,options,fallback,parked,asked) VALUES(?,?,?,?,?,?,?,?,?)",
+                &[&who.ticket, &who.id, &who.turn, &ask["id"].as_str(), &ask["question"].as_str(),
+                    &stringify(&ask["options"]), &ask.get("default").and_then(Value::as_str), &i64::from(parked), &now()],
+            )?;
+            self.log(who, "ask", &json!({"id":id, "key":ask["id"], "question":ask["question"],
+                "options":ask["options"], "default":ask.get("default")}))?;
+        }
+        Ok(())
+    }
+
+    /// Failed prerequisites cancel queued work before admission. A later pass
+    /// propagates the cancellation along the dependency chain.
+    pub fn skip_dependents(&self) -> Result<()> {
+        let rows = self.all(&format!("{} SELECT j.*,n.id AS needs,n.state AS needs_state
+            FROM jobs j JOIN effective_deps d ON d.job=j.id JOIN jobs n ON n.id=d.needs
+            WHERE j.state='queued' AND n.state IN ('partial','failed','cancelled') ORDER BY j.id,n.id",
+            crate::job::EFFECTIVE_DEPS_SQL), &[])?;
+        for row in rows {
+            let who = who_of(&row);
+            let needs = int_of(&row, "needs");
+            let state = str_of(&row, "needs_state");
+            let result = format!("前置任务 #{needs} 以「{state}」结束，本任务未执行。");
+            if self.run("UPDATE jobs SET state='cancelled',result=? WHERE id=? AND state='queued'", &[&result, &who.id])? > 0 {
+                self.withdraw_question(who)?;
+                self.log(who, "skipped", &json!({"needs":needs,"state":state}))?;
+            }
+        }
+        Ok(())
+    }
+
     /// `wake()` (E:126-137).
     pub fn wake(&self) -> Result<()> {
         let settled =
             format!("NOT EXISTS(SELECT 1 FROM jobs c WHERE c.parent=p.id AND c.state NOT IN {END_SQL})");
         self.run(
             &format!(
-                "UPDATE jobs AS p SET state='queued',turn=turn+1 WHERE state='waiting' AND ({settled} OR EXISTS(SELECT 1 FROM mailbox m WHERE m.target=p.id AND m.consumed_turn IS NULL))"
+                "UPDATE jobs AS p SET state='queued',turn=turn+1 WHERE state='waiting' AND (({settled} AND NOT EXISTS(SELECT 1 FROM questions a WHERE a.job=p.id AND a.state='pending' AND a.parked=1)) OR EXISTS(SELECT 1 FROM mailbox m JOIN events e ON e.seq=m.seq WHERE m.target=p.id AND m.consumed_turn IS NULL
+            AND (NOT EXISTS(SELECT 1 FROM questions a WHERE a.job=p.id AND a.state='pending' AND a.origin='platform' AND a.parked=1)
+              OR (m.source IS NULL AND json_extract(e.payload,'$.sender')='user'))))"
             ),
             &[],
         )?;
         for j in self.all(&format!("SELECT p.* FROM jobs p WHERE state='draining' AND {settled}"), &[])? {
             self.run("UPDATE jobs SET state='failed' WHERE id=?", &[&j["id"].as_i64()])?;
+            self.withdraw_question(who_of(&j))?;
             self.log(who_of(&j), "failed", &j["result"])?;
         }
         Ok(())
     }
+}
+
+struct NoteDelivery {
+    budget: i64,
+    answering: bool,
 }
 
 /// Source of an agent note: the sending job and its logical turn.
@@ -518,5 +664,47 @@ pub fn who_of(m: &Map<String, Value>) -> Who {
         ticket: int_of(m, "ticket"),
         id: int_of(m, "id"),
         turn: int_of(m, "turn"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn synchronous(db: &Db) -> i64 {
+        db.with(|q| q.int("PRAGMA synchronous", &[])).unwrap()
+    }
+
+    #[test]
+    fn telemetry_commits_are_relaxed_only_for_their_own_transaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path()).unwrap();
+        assert_eq!(synchronous(&db), 2);
+        // A table of its own: events need an existing ticket and job.
+        db.tx(|q| q.run("CREATE TABLE telemetry_probe(text TEXT NOT NULL)", &[])).unwrap();
+        let rows = |db: &Db| db.with(|q| q.int("SELECT count(*) FROM telemetry_probe", &[])).unwrap();
+
+        // Inside the transaction the connection does not force the WAL.
+        let inside = db
+            .telemetry_tx(|q| {
+                q.run("INSERT INTO telemetry_probe VALUES(?)", &[&"片段"])?;
+                q.int("PRAGMA synchronous", &[])
+            })
+            .unwrap();
+        assert_eq!(inside, 1);
+        assert_eq!(synchronous(&db), 2, "strict durability restored after commit");
+        assert_eq!(rows(&db), 1);
+
+        // A failed telemetry transaction rolls back and still restores it.
+        let failed: Result<()> = db.telemetry_tx(|q| {
+            q.run("INSERT INTO telemetry_probe VALUES(?)", &[&"丢弃"])?;
+            Err(anyhow!("stop"))
+        });
+        assert!(failed.is_err());
+        assert_eq!(synchronous(&db), 2, "strict durability restored after rollback");
+        assert_eq!(rows(&db), 1);
+
+        // Ordinary transactions never run relaxed.
+        assert_eq!(db.tx(|q| q.int("PRAGMA synchronous", &[])).unwrap(), 2);
     }
 }

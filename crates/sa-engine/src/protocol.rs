@@ -404,6 +404,80 @@ pub fn controls(text: &str, continuous: bool) -> Result<Map<String, Value>, Stri
     Ok(out)
 }
 
+/// Validate final-only controls independently so a bad line does not hide a
+/// later valid outcome or question. Unknown fields do not enter durable state.
+pub fn final_control(tag: &str, text: &str) -> Result<Value, String> {
+    let cmd: Value = serde_json::from_str(text).map_err(parse_err)?;
+    if !cmd.is_object() {
+        return Err(format!("{tag} 必须是 JSON 对象"));
+    }
+    let mut out = Map::new();
+    let fields: &[&str] = match tag {
+        "SA_REPORT" => {
+            if !matches!(cmd["status"].as_str(), Some("done" | "partial" | "blocked"))
+                || !valid_text(cmd.get("summary"), 600)
+            {
+                return Err("SA_REPORT 的状态或摘要无效".into());
+            }
+            for (key, count, length) in [("verified", 8, 300), ("unverified", 8, 300), ("artifacts", 16, 260)] {
+                if let Some(value) = cmd.get(key)
+                    && !value.as_array().is_some_and(|rows| rows.len() <= count
+                        && rows.iter().all(|row| valid_text(Some(row), length)))
+                {
+                    return Err(format!("SA_REPORT 的 {key} 无效"));
+                }
+            }
+            if let Some(value) = cmd.get("resolved")
+                && !value.is_null() && !value.as_array().is_some_and(|rows| rows.iter().all(|row|
+                    safe_int(row.get("job")).is_some() && valid_text(row.get("evidence"), usize::MAX)))
+            {
+                return Err("resolved 必须引用工单中的任务并提供核验依据".into());
+            }
+            &["status", "summary", "verified", "unverified", "artifacts", "resolved"]
+        }
+        "SA_ASK" => {
+            if !valid_text(cmd.get("id"), 96) || !valid_text(cmd.get("question"), 500) {
+                return Err("SA_ASK 的 ID 或问题无效".into());
+            }
+            if let Some(value) = cmd.get("options")
+                && !value.as_array().is_some_and(|rows| rows.len() <= 4
+                    && rows.iter().all(|row| valid_text(Some(row), 80)))
+            {
+                return Err("SA_ASK 的选项无效".into());
+            }
+            if let Some(value) = cmd.get("default")
+                && !value.as_str().is_some_and(|text| utf16_len(text) <= 300)
+            {
+                return Err("SA_ASK 的默认做法无效".into());
+            }
+            &["id", "question", "options", "default"]
+        }
+        _ => return Err("未知的最终回复指令".into()),
+    };
+    for key in fields {
+        if let Some(value) = cmd.get(*key) {
+            out.insert((*key).into(), value.clone());
+        }
+    }
+    if tag == "SA_ASK" {
+        out.entry("options").or_insert_with(|| json!([]));
+    }
+    if let Some(rows) = out.get_mut("resolved").and_then(Value::as_array_mut) {
+        for row in rows {
+            *row = json!({"job": safe_int(row.get("job")), "evidence": row["evidence"]});
+        }
+    }
+    Ok(Value::Object(out))
+}
+
+/// Only the authoritative final reply calls this helper. The last valid line
+/// wins even when a subsequent malformed line has its own rejection receipt.
+pub fn last_final_control(text: &str, tag: &str) -> Option<Value> {
+    let prefix = format!("{tag} ");
+    text.split('\n').rev().find_map(|line| line.strip_prefix(prefix.as_str())
+        .and_then(|body| final_control(tag, body).ok()))
+}
+
 /// `unresolved(reports, cmd)` (PR:127-134). Rust port: a child replaced by
 /// automatic failover (`replaced_by`) is resolved by its sibling's report.
 pub fn unresolved(reports: &[Value], cmd: &Value) -> Vec<i64> {
@@ -442,6 +516,31 @@ pub fn seconds_json(secs: f64) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn final_controls_validate_utf16_limits_and_keep_the_last_valid_line() {
+        let report = json!({"status":"done","summary":"🧭".repeat(300),
+            "verified":vec!["v".repeat(300); 8],"unverified":[],"artifacts":vec!["x".repeat(260); 16],
+            "resolved":[{"job":12.0,"evidence":"verified","ignored":true}],"ignored":true});
+        let normalized = final_control("SA_REPORT", &stringify(&report)).unwrap();
+        assert!(normalized.get("ignored").is_none());
+        assert_eq!(normalized["resolved"], json!([{"job":12,"evidence":"verified"}]));
+        let mut invalid = report.clone();
+        invalid["summary"] = json!("🧭".repeat(301));
+        assert!(final_control("SA_REPORT", &stringify(&invalid)).is_err());
+        let text = format!("SA_REPORT {}\nSA_REPORT {}\nSA_REPORT invalid", stringify(&report), stringify(&invalid));
+        assert_eq!(last_final_control(&text,"SA_REPORT"), Some(normalized));
+        let ask = final_control("SA_ASK", r#"{"id":"scope","question":"范围？","default":""}"#).unwrap();
+        assert_eq!(ask["options"], json!([]));
+        for invalid in [
+            json!({"id":"scope","question":"🧭".repeat(251)}),
+            json!({"id":"scope","question":"范围？","options":["a","b","c","d","e"]}),
+            json!({"id":"scope","question":"范围？","options":[""]}),
+            json!({"id":"scope","question":"范围？","default":null}),
+        ] {
+            assert!(final_control("SA_ASK", &stringify(&invalid)).is_err());
+        }
+    }
 
     #[test]
     fn lengths_are_utf16() {

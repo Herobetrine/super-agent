@@ -17,6 +17,11 @@ pub trait DataSource {
     fn snapshot(&mut self, ticket: i64, after: i64) -> Result<Snapshot>;
     /// Collaboration jobs, newest first, 80 per page.
     fn jobs_page(&mut self, ticket: i64, before: Option<i64>) -> Result<JobsPage>;
+    /// A value that changes when the underlying data does, or `None` when the
+    /// source cannot tell cheaply (it is then read on a fixed cadence).
+    fn version(&mut self) -> Option<i64> {
+        None
+    }
 }
 
 /// Opens a source on the worker thread. Called again after failures.
@@ -62,5 +67,9 @@ impl DataSource for StoreSource {
 
     fn jobs_page(&mut self, ticket: i64, before: Option<i64>) -> Result<JobsPage> {
         self.store.jobs_page(ticket, before)
+    }
+
+    fn version(&mut self) -> Option<i64> {
+        self.store.data_version().ok()
     }
 }

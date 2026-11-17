@@ -16,7 +16,7 @@ const CURRENT: &[&str] = &[
     "permission_profile", "allow_lead_routing", "allowed_child_permissions",
     "can_assign_write", "this_turn_can_write", "execution_directory",
     "selected_execution", "claude_route", "isolated_writers", "workspace",
-    "harness_health", "recovery", "next_step", "scm_notice", "collaboration_preferences",
+    "harness_health", "recovery", "next_step", "scm_notice", "collaboration_preferences", "usage_budget",
 ];
 const APPEND: &[&str] = &["notes", "user_updates", "mcp_results"];
 const DELTA_GUIDE: &str = "继续同一原生会话。context_delivery.mode=delta 时将本包合并到已确认上下文。未列字段沿用旧值，removed_fields 删除旧字段。array_modes 指定 append 追加、upsert 按 id（roster 按 job）更新。object_modes 指定逐字段合并并按其 removed_fields 删除子字段。其余字段整项替换。reports 只含变化项，不能据此认定其他任务消失。若旧上下文已被压缩或缺失，先按 full_context 读取完整快照；读取失败应明确报告缺失并请求恢复完整上下文。";
@@ -396,4 +396,78 @@ pub fn acknowledge(
     receipt["route"] = serde_json::to_value(route)?;
     q.log(who, "context.delivered", &receipt)?;
     Ok(())
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn baseline(packet: Value) -> Baseline {
+        Baseline {
+            packet: packet.as_object().unwrap().clone(),
+            guide_sha256: digest("guide"),
+            snapshot_sha256: "baseline".into(),
+            reply: "reply".into(),
+            lazy_mcp_schemas: false,
+            needs_recovery: false,
+        }
+    }
+
+    #[test]
+    fn collaboration_fields_and_changed_outcomes_survive_delta() {
+        let old = baseline(json!({
+            "reports":[{"id":2,"state":"partial","result":"complete report","outcome":{"status":"blocked"}}],
+            "prerequisites":[{"job":3,"state":"done","result":"old"}],
+        }));
+        let current = json!({
+            "reports":[{"id":2,"state":"partial","result":"complete report","outcome":{"status":"partial"}}],
+            "prerequisites":[{"job":3,"state":"done","result":"full prerequisite report","outcome":{"status":"done"}}],
+            "open_question":{"key":"decision","question":"Choose one","asked":123.0},
+        });
+        let (view, _) = delta(current.as_object().unwrap(), "guide", &old);
+        assert_eq!(view["reports"], current["reports"]);
+        assert_eq!(view["context_delivery"]["array_modes"]["reports"], "upsert");
+        assert_eq!(view["prerequisites"], current["prerequisites"]);
+        assert_eq!(view["open_question"], current["open_question"]);
+    }
+
+    #[test]
+    fn closing_question_and_clearing_outcome_are_explicit_in_delta() {
+        let old = baseline(json!({
+            "reports":[{"id":2,"state":"done","result":"same","outcome":{"status":"done"}}],
+            "open_question":{"key":"decision","question":"Choose one","asked":123.0},
+        }));
+        let current = json!({"reports":[{"id":2,"state":"done","result":"same"}]});
+        let (view, _) = delta(current.as_object().unwrap(), "guide", &old);
+        assert_eq!(view["reports"], current["reports"]);
+        assert!(view["reports"][0].get("outcome").is_none());
+        assert_eq!(view["context_delivery"]["array_modes"]["reports"], "upsert");
+        assert_eq!(view["context_delivery"]["removed_fields"], json!(["open_question"]));
+    }
+    #[test]
+    fn completion_evidence_and_settings_are_replaced_and_removed_in_delta() {
+        let old = baseline(json!({
+            "checks":{"ok":false,"cached":false,"attempt":1,"runs":[]},
+            "completion_checks":[["old-check"]],
+            "reports":[{"id":2,"checks":{"ok":false}}],
+            "prerequisites":[{"job":2,"checks":{"ok":false}}],
+        }));
+        let current = json!({
+            "checks":{"ok":true,"cached":true,"attempt":2,"runs":[]},
+            "completion_checks":[["new-check","--arg"]],
+            "reports":[{"id":2,"checks":{"ok":true}}],
+            "prerequisites":[{"job":2,"checks":{"ok":true}}],
+        });
+        let (view, _) = delta(current.as_object().unwrap(), "guide", &old);
+        for field in ["checks", "completion_checks", "reports", "prerequisites"] {
+            assert_eq!(view[field], current[field]);
+        }
+        let cleared = json!({"reports":[{"id":2}],"prerequisites":[{"job":2}]});
+        let (view, _) = delta(cleared.as_object().unwrap(), "guide", &old);
+        assert_eq!(view["context_delivery"]["removed_fields"], json!(["checks","completion_checks"]));
+        assert!(view["reports"][0].get("checks").is_none());
+        assert!(view["prerequisites"][0].get("checks").is_none());
+    }
+
 }

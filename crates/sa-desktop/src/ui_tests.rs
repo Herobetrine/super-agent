@@ -8,7 +8,7 @@ use crate::host::{Host, tests::fakes};
 use crate::worker;
 use egui::accesskit::Role;
 use egui_kittest::Harness;
-use egui_kittest::kittest::Queryable;
+use egui_kittest::kittest::{NodeT, Queryable};
 use serde_json::Value;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -1603,4 +1603,148 @@ fn lead_routing_policy_roundtrips_defaults_draft_and_active_ticket() {
         .open_models(crate::models::Scope::Ticket(ticket));
     h.run_steps(3);
     assert!(!h.state().models.as_ref().unwrap().allow_lead_routing);
+}
+
+fn question_fixture(h: &mut Harness<'_, App>, project: &std::path::Path) -> i64 {
+    let (ticket, _) = fork_source(h, project);
+    let id = h.state().host.as_ref().unwrap().engine().db().tx(|q| {
+        let job: i64 = q.conn().query_row("SELECT id FROM jobs WHERE ticket=? AND parent IS NULL", [ticket], |r| r.get(0))?;
+        q.conn().execute("UPDATE jobs SET state='waiting' WHERE id=?", [job])?;
+        q.conn().execute("INSERT INTO questions(ticket,job,turn,msgkey,question,options,fallback,parked,asked) VALUES(?,?,1,'ui-scope','选择核对范围',?, '保持当前范围',1,1)", rusqlite::params![ticket,job, r#"["只核对界面","核对全部"]"#])?;
+        Ok(q.conn().last_insert_rowid())
+    }).unwrap();
+    let _ = h.state().worker.tx.send(worker::Cmd::Refresh);
+    until(h, "pending question", |app| app.view.as_ref().and_then(|v| v.snap.as_ref()).is_some_and(|s| s.questions.iter().any(|q| q.id == id)));
+    h.run_steps(3);
+    id
+}
+
+fn submitted_answer(h: &Harness<'_, App>, id: i64) -> Option<String> {
+    h.state().host.as_ref().unwrap().engine().db().with(|q| {
+        Ok(q.conn().query_row("SELECT answer FROM questions WHERE id=?", [id], |r| r.get(0))?)
+    }).unwrap()
+}
+
+#[test]
+fn question_option_and_typed_answer_reach_the_original_question() {
+    for typed in [false, true] {
+        let data = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let mut h = harness(data.path(), "readonly");
+        let id = question_fixture(&mut h, project.path());
+        assert!(h.query_by_label("选择核对范围").is_some());
+        if typed {
+            h.get_by_label(&format!("回答问题 #{id}")).focus();
+            h.get_by_label(&format!("回答问题 #{id}")).type_text("先核对输入区");
+            h.run_steps(2);
+            h.key_press(egui::Key::Enter);
+        } else {
+            h.get_by_role_and_label(Role::Button, "只核对界面").click();
+        }
+        until(&mut h, "answer delivered", |app| app.view.as_ref().and_then(|v| v.snap.as_ref()).is_some_and(|s| s.questions.is_empty()));
+        assert_eq!(submitted_answer(&h, id).as_deref(), Some(if typed { "先核对输入区" } else { "只核对界面" }));
+    }
+}
+
+#[test]
+fn observer_and_demo_questions_have_no_answer_controls_at_small_size() {
+    use crate::data::DataSource;
+    for demo in [false, true] {
+        let mut source = crate::demo::DemoSource::new();
+        let snapshot = Arc::new(source.snapshot(42, 0).unwrap());
+        let mut h = Harness::builder().with_size(egui::vec2(880.0, 600.0)).build_eframe(move |cc| {
+            crate::theme::install_fonts(&cc.egui_ctx);
+            let worker = worker::spawn(Box::new(|| Ok(Box::new(FrozenDemo::new()) as Box<dyn DataSource>)), cc.egui_ctx.clone());
+            let mut app = App::new(cc, Options { demo, observe: !demo, ..Default::default() }, worker, Arc::new(Mutex::new(None)), Err("只读观察".into()));
+            app.select(Some(42));
+            app.view.as_mut().unwrap().snap = Some(snapshot.clone());
+            app
+        });
+        h.run_steps(4);
+        assert!(h.query_by_label("先核对哪种窗口布局？").is_some());
+        assert!(h.query_by_role_and_label(Role::Button, "先核对窄窗口").is_none());
+        assert!(h.query_by_label("回答问题 #8").is_none());
+        assert!(h.query_by_role_and_label(Role::Button, "回答").is_none());
+    }
+}
+/// Freeze the source before any UI mutation so slow font loading cannot tick
+/// the demo and overwrite a test's selected projection.
+struct FrozenDemo {
+    history: Vec<sa_store::TicketSummary>,
+    snapshots: std::collections::HashMap<i64, sa_store::Snapshot>,
+}
+impl FrozenDemo {
+    fn new() -> Self {
+        use crate::data::DataSource;
+        let mut demo = crate::demo::DemoSource::new();
+        let history = demo.history("").unwrap();
+        let snapshots = history.iter().map(|row| (row.id, demo.snapshot(row.id, 0).unwrap())).collect();
+        Self { history, snapshots }
+    }
+}
+impl crate::data::DataSource for FrozenDemo {
+    fn label(&self) -> String { "固定演示数据".into() }
+    fn history(&mut self, _: &str) -> anyhow::Result<Vec<sa_store::TicketSummary>> { Ok(self.history.clone()) }
+    fn snapshot(&mut self, ticket: i64, after: i64) -> anyhow::Result<sa_store::Snapshot> {
+        let mut snap = self.snapshots[&ticket].clone();
+        snap.events.retain(|event| event.seq > after);
+        Ok(snap)
+    }
+    fn jobs_page(&mut self, ticket: i64, _: Option<i64>) -> anyhow::Result<sa_store::JobsPage> {
+        Ok(sa_store::JobsPage { jobs: self.snapshots[&ticket].jobs.clone(), more: false, next: None })
+    }
+    fn version(&mut self) -> Option<i64> { Some(1) }
+}
+fn demo_harness() -> Harness<'static, App> {
+    Harness::builder().with_size(egui::vec2(1280.0, 1100.0)).build_eframe(|cc| {
+        crate::theme::install_fonts(&cc.egui_ctx);
+        let worker = worker::spawn(Box::new(|| Ok(Box::new(FrozenDemo::new()) as Box<dyn crate::data::DataSource>)), cc.egui_ctx.clone());
+        App::new(cc, Options { demo: true, ticket: Some(42), ..Default::default() }, worker, Arc::new(Mutex::new(None)), Err("演示数据".into()))
+    })
+}
+
+#[test]
+fn attention_sidebar_has_only_actionable_tickets_and_no_duplicate_rows() {
+    let mut h = demo_harness();
+    until(&mut h, "demo history", |app| app.history_loaded && !app.history.is_empty());
+    h.state_mut().sidebar_open = true;
+    h.state_mut().inspector_open = false;
+    h.state_mut().history.truncate(3);
+    for (i, row) in h.state_mut().history.iter_mut().enumerate() {
+        row.title = Some(format!("侧栏测试 {i}"));
+        row.pinned = true;
+        row.attention = match i { 0 => Some("approval".into()), 1 => Some("question".into()), _ => Some("failed".into()) };
+    }
+    h.run_steps(3);
+    assert!(h.query_by_label("待你处理").is_some());
+    for label in ["侧栏测试 0 · 待审批", "侧栏测试 1 · 等你回答", "侧栏测试 2"] {
+        assert_eq!(h.get_all_by_role(Role::Button).filter(|node| node.accesskit_node().label().as_deref() == Some(label)).count(), 1);
+    }
+    h.get_by_role_and_label(Role::Button, "侧栏测试 1 · 等你回答").click();
+    h.run_steps(2);
+    assert_eq!(h.state().view.as_ref().unwrap().id, 41);
+    for row in &mut h.state_mut().history { row.attention = Some("partial".into()); }
+    h.run_steps(3);
+    assert!(h.query_by_label("待你处理").is_none());
+}
+
+#[test]
+fn collaboration_shows_dependency_outcome_and_platform_evidence() {
+    let mut h = demo_harness();
+    until(&mut h, "demo snapshot", |app| app.view.as_ref().and_then(|v| v.snap.as_ref()).is_some());
+    h.state_mut().sidebar_open = false;
+    h.state_mut().inspector_open = true;
+    h.state_mut().tab = Tab::Collab;
+    // Keep all new row types visible without needing to scroll unrelated jobs.
+    let snapshot = Arc::make_mut(h.state_mut().view.as_mut().unwrap().snap.as_mut().unwrap());
+    snapshot.jobs.retain(|j| matches!(j.id, 101 | 102 | 104 | 105));
+    // Isolate the collaboration panel: the conversation intentionally shows
+    // the same platform evidence and is covered by the feed tests.
+    h.state_mut().view.as_mut().unwrap().feed = Arc::default();
+    h.run_steps(3);
+    for label in [
+        "等你回答", "等待 #103 完成", "已完成 · 只读查询核对完成",
+        "平台检查通过 · cargo test -p sa-store · 2.4 秒",
+        "平台检查未通过 · cargo test -p sa-desktop",
+    ] { assert!(h.query_by_label(label).is_some(), "missing collaboration wording: {label}"); }
 }

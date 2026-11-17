@@ -26,6 +26,9 @@ pub struct TicketSummary {
     pub pinned: bool,
     #[serde(default)]
     pub archived: bool,
+    /// Operator attention reason: approval | question | failed | partial.
+    #[serde(default)]
+    pub attention: Option<String>,
 }
 
 /// Ticket header of a snapshot.
@@ -46,6 +49,8 @@ pub struct TicketDetail {
     /// Durable admission gate, independent of the current root job state.
     #[serde(default)]
     pub pause_status: Option<String>,
+    #[serde(default)]
+    pub attention: Option<String>,
 }
 
 /// A job row with bounded body/result previews (`JOB_DETAILS`).
@@ -66,6 +71,13 @@ pub struct JobView {
     pub result: Option<String>,
     /// Native route `{provider, model, mode}` actually bound to the job.
     pub route: Option<Value>,
+    #[serde(default)]
+    pub outcome: Option<Value>,
+    /// Latest platform completion-check result, separate from the agent outcome.
+    #[serde(default)]
+    pub checks: Option<Value>,
+    #[serde(default)]
+    pub needs: Vec<i64>,
 }
 
 /// A visible journal event or a derived progress row (`kind == "activity"`).
@@ -124,6 +136,27 @@ pub struct Approval {
     pub action: Value,
 }
 
+/// A pending operator question, with a stable agent-supplied key.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct Question {
+    #[serde(default)]
+    pub id: i64,
+    #[serde(default)]
+    pub job: i64,
+    #[serde(default)]
+    pub key: String,
+    #[serde(default)]
+    pub question: String,
+    #[serde(default)]
+    pub options: Vec<String>,
+    #[serde(default)]
+    pub fallback: Option<String>,
+    #[serde(default)]
+    pub origin: String,
+    #[serde(default)]
+    pub asked: f64,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct ContinuousRun {
     pub phase: String,
@@ -145,14 +178,22 @@ pub struct Snapshot {
     pub jobs: Vec<JobView>,
     pub total_jobs: i64,
     pub running_peers: i64,
+    /// Ready queued collaborators across the whole ticket, excluding dependency waits and the root.
+    #[serde(default)]
+    pub queued_peers: i64,
     pub native_activity: NativeActivity,
     #[serde(default)]
     pub usage: crate::usage::TicketUsage,
+    /// Current subscription windows for harnesses used by this ticket.
+    #[serde(default)]
+    pub quota: Vec<crate::quota::Observed>,
     /// Ascending by seq; at most 180.
     pub events: Vec<EventView>,
     /// Pass back as `after` to receive only newer events.
     pub cursor: i64,
     pub approvals: Vec<Approval>,
+    #[serde(default)]
+    pub questions: Vec<Question>,
     pub run: Option<ContinuousRun>,
     pub plan: Vec<PlanItem>,
 }

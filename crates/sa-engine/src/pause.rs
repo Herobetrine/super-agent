@@ -142,7 +142,7 @@ pub(crate) fn resumed_control(q: &Q, ticket: i64) -> Result<Option<Value>> {
 fn queued_recovery(q: &Q, root: &Map<String, Value>) -> Result<bool> {
     Ok(q.one(
         "SELECT kind,payload FROM events WHERE job=? AND kind IN
-         ('turn.retry_scheduled','route.rotated','turn.route_wait','turn.deferred','auto.retry',
+         ('turn.retry_scheduled','route.rotated','turn.route_wait','turn.quota_wait','turn.deferred','auto.retry',
           'reply','user.follow','retry','turn.admitted','turn.pause_failure','ticket.handoff_started') ORDER BY seq DESC LIMIT 1",
         &[&int_of(root, "id")],
     )?.is_some_and(|event| {
@@ -151,14 +151,14 @@ fn queued_recovery(q: &Q, root: &Map<String, Value>) -> Result<bool> {
             return payload["reason"] != "按新追加的要求重新核对。";
         }
         matches!(str_of(&event, "kind"),
-            "turn.retry_scheduled" | "route.rotated" | "turn.route_wait" | "turn.deferred")
+            "turn.retry_scheduled" | "route.rotated" | "turn.route_wait" | "turn.quota_wait" | "turn.deferred")
     }))
 }
 
 /// Persist the failed boundary while allowing existing children to finish.
 fn settle_failure(q: &Q, root: &Map<String, Value>, reason: &str) -> Result<()> {
     let recovery_reason = if str_of(root, "state") == "queued" {
-        q.one("SELECT payload FROM events WHERE job=? AND kind IN ('auto.retry','turn.retry_scheduled','route.rotated','turn.route_wait') AND seq>
+        q.one("SELECT payload FROM events WHERE job=? AND kind IN ('auto.retry','turn.retry_scheduled','route.rotated','turn.route_wait','turn.quota_wait') AND seq>
             coalesce((SELECT max(seq) FROM events WHERE job=? AND kind IN ('reply','user.follow','retry')),0)
             ORDER BY seq DESC LIMIT 1", &[&int_of(root, "id"), &int_of(root, "id")])?
             .and_then(|row| serde_json::from_str::<Value>(str_of(&row, "payload")).ok())
@@ -168,6 +168,7 @@ fn settle_failure(q: &Q, root: &Map<String, Value>, reason: &str) -> Result<()> 
     let pending = children_running(q, int_of(root, "ticket"))?;
     let state = if pending { "waiting" } else { "failed" };
     q.run("UPDATE jobs SET state=?,result=? WHERE id=?", &[&state, &reason, &int_of(root, "id")])?;
+    if crate::protocol::is_terminal(state) { q.withdraw_question(who_of(root))?; }
     q.log(who_of(root), "turn.pause_failure", &json!({"reason": reason, "state": state}))?;
     set(q, root, if pending { "draining" } else { "paused" }, false,
         if pending { "ticket.pause_draining" } else { "ticket.paused" })

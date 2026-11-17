@@ -15,8 +15,12 @@ fn old_readonly_journal_uses_defaults_without_writing() {
 fn settings_roundtrip_all_values_and_survive_reopen() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("settings.sqlite3");
-    for ttl in [Ttl::Inherit, Ttl::FiveMinutes, Ttl::OneHour] {
-        let settings = Settings { incremental_context: false, lazy_mcp_schemas: false, concise_handoffs: false, claude_cache_ttl: ttl, claude_keepalive: false };
+    for (ttl, max_collaborators, quota_guard) in [
+        (Ttl::Inherit, 0, false),
+        (Ttl::FiveMinutes, 7, true),
+        (Ttl::OneHour, u32::MAX, false),
+    ] {
+        let settings = Settings { incremental_context: false, lazy_mcp_schemas: false, concise_handoffs: false, claude_cache_ttl: ttl, claude_keepalive: false, max_collaborators, quota_guard };
         {
             let mut conn = Connection::open(&path).unwrap();
             efficiency::init(&conn).unwrap();
@@ -36,6 +40,12 @@ fn defaults_allow_older_partial_settings_and_reject_invalid_ttl() {
     assert_eq!(efficiency::load(&conn).unwrap(), Settings::default());
     conn.execute("INSERT INTO studio_efficiency VALUES(1,?1)", [r#"{"incremental_context":false}"#]).unwrap();
     assert_eq!(efficiency::load(&conn).unwrap(), Settings { incremental_context: false, ..Default::default() });
+    conn.execute("UPDATE studio_efficiency SET settings=?1", [r#"{"incremental_context":false,"lazy_mcp_schemas":false,"concise_handoffs":false,"claude_cache_ttl":"one_hour","claude_keepalive":false}"#]).unwrap();
+    let old = efficiency::load(&conn).unwrap();
+    assert_eq!(old.max_collaborators, 4);
+    assert!(old.quota_guard);
+    assert_eq!(old.claude_cache_ttl, Ttl::OneHour);
+    assert!(!old.claude_keepalive);
     conn.execute("UPDATE studio_efficiency SET settings=?1", [r#"{"claude_cache_ttl":"2h"}"#]).unwrap();
     assert!(efficiency::load(&conn).is_err());
 }

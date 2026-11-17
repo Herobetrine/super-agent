@@ -9,7 +9,7 @@ use crate::{
     workflow::WorkflowState,
 };
 use egui::accesskit::Role;
-use egui_kittest::{Harness, kittest::Queryable};
+use egui_kittest::{Harness, kittest::{NodeT, Queryable}};
 use sa_engine::db::{Db, Who};
 use serde_json::json;
 use std::{
@@ -39,6 +39,7 @@ struct State {
     actions: Vec<Action>,
     /// App fonts are installed on the first frame.
     fonts: bool,
+    checks: bool,
 }
 
 fn harness(data: &Path) -> Harness<'static, State> {
@@ -53,10 +54,12 @@ fn harness(data: &Path) -> Harness<'static, State> {
                     crate::theme::install_fonts(ui.ctx());
                     return;
                 }
-                if let Some(action) =
-                    state
-                        .ui
-                        .show(ui, &Palette::light(), &state.host, state.ticket)
+                let action = if state.checks {
+                    state.ui.checks(ui, &Palette::light(), Some(&state.host), ".", None, false)
+                } else {
+                    state.ui.show(ui, &Palette::light(), &state.host, state.ticket)
+                };
+                if let Some(action) = action
                 {
                     state.actions.push(action);
                 }
@@ -67,6 +70,7 @@ fn harness(data: &Path) -> Harness<'static, State> {
                 ticket: 1,
                 actions: vec![],
                 fonts: false,
+                checks: false,
             },
         )
 }
@@ -185,6 +189,7 @@ fn observer_collaboration_panel_never_exposes_workflow_writes() {
     let data = tempfile::tempdir().unwrap();
     seed(data.path());
     let owner = Host::start_with(data.path().to_path_buf(), fakes, || {}).unwrap();
+    owner.engine().set_project_checks(".", vec![vec!["git".into(), "diff".into(), "--check".into()]]).unwrap();
     let before = owner
         .engine()
         .db()
@@ -228,7 +233,19 @@ fn observer_collaboration_panel_never_exposes_workflow_writes() {
         h.state().host_error.as_deref(),
         Some(sa_engine::owner::BUSY)
     );
+    h.get_by_label("完成检查").click();
+    h.run_steps(3);
+    let end = Instant::now() + Duration::from_secs(5);
+    while h.query_by_label(r#"["git","diff","--check"]"#).is_none() {
+        assert!(Instant::now() < end, "observer checks did not load");
+        h.step();
+        std::thread::sleep(Duration::from_millis(10));
+    }
     for label in [
+        "完成检查命令",
+        "添加检查",
+        "保存完成检查",
+        "移除检查 1",
         "隔离工作区与合入",
         "从历史检查点分支",
         "验证 #1",
@@ -252,4 +269,97 @@ fn observer_collaboration_panel_never_exposes_workflow_writes() {
             .unwrap(),
         before
     );
+}
+
+#[test]
+fn completion_checks_add_remove_save_and_limit() {
+    let data = tempfile::tempdir().unwrap();
+    seed(data.path());
+    let mut h = harness(data.path());
+    h.state_mut().checks = true;
+    h.run_steps(3);
+    h.get_by_label("完成检查").click();
+    h.run_steps(3);
+    let end = Instant::now() + Duration::from_secs(5);
+    while h.get_by_label("添加检查").accesskit_node().is_disabled() {
+        assert!(Instant::now() < end, "completion checks did not load");
+        h.step();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    for index in 1..=4 {
+        let input = h.get_by_role_and_label(Role::TextInput, "完成检查命令");
+        input.focus();
+        input.type_text(&format!(r#"["git","check-{index}"]"#));
+        h.run_steps(2);
+        h.get_by_label("添加检查").click();
+        h.run_steps(2);
+        assert!(h.query_by_label(&format!("移除检查 {index}")).is_some());
+    }
+    assert!(h.get_by_label("添加检查").accesskit_node().is_disabled());
+    assert!(h.query_by_label("移除检查 5").is_none());
+    h.get_by_label("移除检查 2").click();
+    h.run_steps(2);
+    assert!(!h.get_by_label("添加检查").accesskit_node().is_disabled());
+    assert!(h.query_by_label("移除检查 4").is_none());
+    h.get_by_label("保存完成检查").click();
+    h.run_steps(2);
+    let action = h.state_mut().actions.pop().expect("save action");
+    let (request, expected) = match &action {
+        Action::SaveProjectChecks { cwd, checks, request } => {
+            assert_eq!(cwd, ".");
+            assert_eq!(checks, &vec![vec!["git".to_owned(), "check-1".to_owned()], vec!["git".to_owned(), "check-3".to_owned()], vec!["git".to_owned(), "check-4".to_owned()]]);
+            (*request, checks.clone())
+        }
+        other => panic!("unexpected action: {other:?}"),
+    };
+    assert!(h.state().host.submit(action));
+    let result = h.state().host.rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert!(result.result.is_ok(), "{:?}", result.result);
+    h.state_mut().ui.checks_result(request, result.result.map(|_| ()));
+    assert_eq!(h.state().host.engine().project_checks(".").unwrap(), expected);
+    // A fresh editor must load the persisted project commands.
+    h.state_mut().ui = WorkflowState::default();
+    h.run_steps(3);
+    let end = Instant::now() + Duration::from_secs(5);
+    while h.query_by_label("移除检查 3").is_none() {
+        assert!(Instant::now() < end, "saved checks did not reload");
+        h.step();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(h.query_by_label(r#"["git","check-3"]"#).is_some());
+}
+
+#[test]
+fn completion_check_engine_validation_returns_inline_and_unlocks_editor() {
+    let data = tempfile::tempdir().unwrap();
+    seed(data.path());
+    let mut h = harness(data.path());
+    h.state_mut().checks = true;
+    h.run_steps(3);
+    h.get_by_label("完成检查").click();
+    h.run_steps(3);
+    let end = Instant::now() + Duration::from_secs(5);
+    while h.get_by_label("添加检查").accesskit_node().is_disabled() {
+        assert!(Instant::now() < end, "completion checks did not load");
+        h.step();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let input = h.get_by_role_and_label(Role::TextInput, "完成检查命令");
+    input.focus();
+    input.type_text(r#"[""]"#);
+    h.run_steps(2);
+    h.get_by_label("添加检查").click();
+    h.run_steps(2);
+    h.get_by_label("保存完成检查").click();
+    h.run_steps(2);
+    let action = h.state_mut().actions.pop().unwrap();
+    let request = match &action { Action::SaveProjectChecks { request, .. } => *request, other => panic!("unexpected action: {other:?}") };
+    h.state().host.submit(action);
+    let outcome = h.state().host.rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert!(outcome.result.is_err());
+    h.state_mut().ui.checks_result(request, outcome.result.map(|_| ()));
+    h.run_steps(3);
+    assert!(h.query_by_label("验证命令需要 JSON 参数数组，最多 64 项").is_some());
+    assert!(!h.get_by_label("保存完成检查").accesskit_node().is_disabled());
+    assert!(h.state().host.engine().project_checks(".").unwrap().is_empty());
 }

@@ -28,6 +28,17 @@ fn project_key(cwd: &str) -> String {
     }
 }
 
+fn attention_reason(row: &TicketSummary) -> Option<&'static str> {
+    if row.archived {
+        return None;
+    }
+    match row.attention.as_deref() {
+        Some("approval") => Some("待审批"),
+        Some("question") => Some("等你回答"),
+        _ => None,
+    }
+}
+
 fn groups(rows: &[TicketSummary]) -> Vec<Group> {
     let mut out: Vec<Group> = Vec::new();
     for r in rows {
@@ -210,11 +221,28 @@ impl App {
                             .filter(|r| self.show_archived || !r.archived)
                             .cloned()
                             .collect();
+                        let (attention, remaining): (Vec<TicketSummary>, Vec<TicketSummary>) =
+                            shown.into_iter().partition(|r| attention_reason(r).is_some());
                         let (pinned, rest): (Vec<TicketSummary>, Vec<TicketSummary>) =
-                            shown.into_iter().partition(|r| r.pinned && !r.archived);
+                            remaining.into_iter().partition(|r| r.pinned && !r.archived);
                         let all = groups(&rest);
                         let mut clicked = None;
                         let mut action = None;
+                        if !attention.is_empty() {
+                            ui.add_space(4.0);
+                            ui.horizontal(|ui| {
+                                ui.add_space(TEXT_X);
+                                ui.label(RichText::new("待你处理").font(theme::strong(theme::SMALL)).color(pal.mute));
+                            });
+                            for r in &attention {
+                                let (c, a) = self.ticket_row(ui, r);
+                                if c {
+                                    clicked = Some(r.id);
+                                }
+                                action = action.or(a);
+                            }
+                            ui.add_space(10.0);
+                        }
                         if !pinned.is_empty() {
                             let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 28.0), Sense::hover());
                             let p = ui.painter();
@@ -467,6 +495,12 @@ impl App {
         let selected = self.view.as_ref().is_some_and(|v| v.id == r.id);
         let w = ui.available_width();
         let (rect, resp) = ui.allocate_exact_size(vec2(w, ROW), Sense::click());
+        let name = r.title.as_deref().filter(|title| !title.is_empty()).unwrap_or(&r.goal);
+        let row_label = match attention_reason(r) {
+            Some(reason) => format!("{name} · {reason}"),
+            None => name.to_string(),
+        };
+        resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &row_label));
         if ui.is_rect_visible(rect) {
             let p = ui.painter();
             let radius = CornerRadius::same(theme::CONTROL_RADIUS);
@@ -482,7 +516,7 @@ impl App {
             } else {
                 state_mark(ui, mark, &r.state, pal);
             }
-            let time = labels::relative(r.created);
+            let time = attention_reason(r).map(str::to_owned).unwrap_or_else(|| labels::relative(r.created));
             let rg = widgets::line_galley(ui, &time, theme::body(theme::TINY), pal.faint, 100.0);
             let rx = rect.right() - 8.0 - rg.size().x;
             p.galley(pos2(rx, y - rg.size().y / 2.0), rg, pal.faint);
