@@ -22,6 +22,9 @@ pub(crate) struct AutoRequest {
     pub turn: i64,
     /// The job's effective work directory (its isolated worktree if any).
     pub cwd: String,
+    /// The turn left the work tree unchanged. Evidence that is already
+    /// current for the same inputs, contract and gate policy is not redone.
+    pub unchanged: bool,
 }
 
 pub(crate) struct AutoOutcome {
@@ -39,6 +42,20 @@ struct Plan {
     pinned: Vec<String>,
     behavior: Vec<i64>,
     gate: (bool, i64),
+}
+
+/// Whether the ticket has operator-adopted criteria the automatic flow can
+/// check, and whether its delivery gate is enabled.
+pub(crate) fn criteria(q: &Q, ticket: i64) -> Result<(bool, bool)> {
+    let requirements = delivery::requirements(q.conn(), ticket)?;
+    let any = requirements
+        .iter()
+        .any(|item| !item.withdrawn && (item.behavior.is_some() || item.path.is_some()));
+    if !any {
+        return Ok((false, false));
+    }
+    let gate = delivery::gate_metadata(q.conn(), ticket)?;
+    Ok((true, gate.enabled && gate.policy_revision > 0))
 }
 
 fn plan(q: &Q, request: &AutoRequest) -> Result<Option<Plan>> {
@@ -268,6 +285,28 @@ impl Engine {
                 }
             }
         };
+        if request.unchanged && reuse.is_some() {
+            let current = self.db().with(|q| {
+                let assessed = q.conn().query_row(
+                    "SELECT EXISTS(SELECT 1 FROM delivery_assessments WHERE ticket=? AND snapshot_id=?
+                     AND contract_revision=? AND policy_revision=?)",
+                    rusqlite::params![request.ticket, snapshot, plan.contract, plan.gate.1],
+                    |row| row.get::<_, bool>(0),
+                )?;
+                if !assessed || !plan.gate.0 {
+                    return Ok(false);
+                }
+                for requirement in &plan.behavior {
+                    if !last_terminal(q, request.ticket, snapshot, *requirement)? {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            })?;
+            if current {
+                return Ok(None);
+            }
+        }
         payload["snapshot_id"] = json!(snapshot);
         payload["reused"] = json!(reuse.is_some());
         let mut errors = vec![];
@@ -418,7 +457,7 @@ mod tests {
             .map(String::from)
             .into();
         engine.set_project_checks(&cwd, vec![argv.clone()]).unwrap();
-        let request = AutoRequest { ticket: 1, job: 7, turn: 1, cwd: cwd.clone() };
+        let request = AutoRequest { ticket: 1, job: 7, turn: 1, cwd: cwd.clone(), unchanged: false };
         assert!(engine.auto_delivery(&request, &|| false).unwrap().is_none());
         let id = engine
             .save_requirement(1, 0, None, "Result is 42".into(), None, None, None)

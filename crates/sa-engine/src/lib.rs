@@ -35,6 +35,7 @@ pub mod runner;
 pub mod services;
 pub mod scm;
 pub mod workspaces;
+mod verification;
 pub mod stuck;
 
 pub use activity::{ActivityPhase, BadgeTone, JobActivity, RetryInfo};

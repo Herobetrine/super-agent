@@ -261,9 +261,17 @@ pub struct Turn {
     /// In-memory heartbeat for [`Engine::activity`].
     activity: Mutex<Tracker>,
     workspace_dependencies: Vec<(crate::workspaces::Workspace, i64)>,
+    /// Prerequisite workspaces are leased only while this turn builds its own
+    /// snapshot from them (§10.1); afterwards it never reads them again.
+    preparing: AtomicBool,
 }
 
 impl Turn {
+    fn prerequisite_lease(&self) -> impl Iterator<Item = &crate::workspaces::Workspace> {
+        let held = self.preparing.load(Ordering::SeqCst);
+        self.workspace_dependencies.iter().filter(move |_| held).map(|(w, _)| w)
+    }
+
     /// The engine outlives every turn it runs (`close` awaits them).
     pub(crate) fn inner(&self) -> Arc<Inner> {
         self.inner.upgrade().expect("engine dropped while a turn runs")
@@ -1485,7 +1493,7 @@ impl Inner {
         sched.active.values().any(|slot| {
             keys.iter().any(|key| {
                 crate::workspaces::overlaps(key, &crate::workspaces::scope(&slot.turn.job.cwd))
-                    || slot.turn.workspace_dependencies.iter().any(|(w, _)| {
+                    || slot.turn.prerequisite_lease().any(|w| {
                         crate::workspaces::overlaps(key, &crate::workspaces::scope(&w.path))
                     })
             })
@@ -1713,7 +1721,7 @@ impl Inner {
             let mut slots = vec![];
             let mut occupied: Vec<String> = sched.active.values().filter(|s| s.turn.job.writing)
                 .flat_map(|s| std::iter::once(crate::workspaces::scope(&s.turn.job.cwd))
-                    .chain(s.turn.workspace_dependencies.iter().map(|(w,_)|crate::workspaces::scope(&w.path))))
+                    .chain(s.turn.prerequisite_lease().map(|w|crate::workspaces::scope(&w.path))))
                 .chain(sched.maintenance.iter().cloned()).collect();
             for row in candidates {
                 let mut job = JobCtx::from_row(&row);
@@ -1730,7 +1738,10 @@ impl Inner {
                 if sched.maintenance.iter().any(|s| crate::workspaces::overlaps(s,&key))
                     || (job.writing && occupied.iter().any(|s| crate::workspaces::overlaps(s,&key))) { continue; }
                 let mut workspace_dependencies=vec![];
-                if crate::workspaces::get(q,job.id)?.is_some() {
+                // A dependent that already built its snapshot keeps that
+                // version; it neither reads nor leases its prerequisites again.
+                if crate::workspaces::get(q,job.id)?.is_some_and(|w| w.state=="planned"
+                    || w.validation.get("prerequisite_heads").is_none()) {
                     for row in q.all(&format!("{} SELECT n.id,n.turn FROM effective_deps d JOIN jobs n ON n.id=d.needs WHERE d.job=? ORDER BY n.id",crate::job::EFFECTIVE_DEPS_SQL),&[&job.id])? {
                         if let Some(w)=crate::workspaces::get(q,int_of(&row,"id"))? { workspace_dependencies.push((w,int_of(&row,"turn"))); }
                     }
@@ -1831,6 +1842,7 @@ impl Inner {
                     memos: AtomicUsize::new(0),
                     route: Mutex::new(None),
                     activity: Mutex::new(Tracker::new(time)),
+                    preparing: AtomicBool::new(!workspace_dependencies.is_empty()),
                     workspace_dependencies,
                 });
             }
@@ -2039,11 +2051,13 @@ impl Inner {
                 }
                 crate::workspaces::save(q,&ready)
             })?;
+            turn.preparing.store(false, Ordering::SeqCst);
             turn.packet().insert("workspace".into(),json!(ready));
         }
         let project = project_key(turn.packet().get("project").and_then(Value::as_str).unwrap_or(&job.cwd));
-        let commands = self.db.with(|q| checks::configured(q, &project))?;
-        let start_fingerprint = if checks::writer(job) && !commands.is_empty() {
+        let (commands, criteria) = self.db.with(|q| Ok((checks::configured(q, &project)?,
+            crate::delivery::auto_criteria(q, job.ticket)?.0)))?;
+        let start_fingerprint = if checks::writer(job) && (!commands.is_empty() || criteria) {
             self.check_fingerprint(turn).await?
         } else { None };
         let (route, fresh) = self.execution_route(turn).await?;
@@ -2339,15 +2353,23 @@ impl Inner {
         let job = &turn.job;
         let plan = self.db.tx(|q| checks::plan(q, job, project, text,
             turn.tool_follow.load(Ordering::SeqCst), corrections))?;
-        let Some(plan) = plan else { return Ok(None); };
+        let Some(mut plan) = plan else { return Ok(None); };
         let fingerprint = self.check_fingerprint(turn).await?;
         // A bounced check can fail for reasons outside Git or recover without
         // a tree change. Keep checking that claim until its bounce is resolved.
-        if !plan.has_bounce && fingerprint.is_some() && fingerprint == start { return Ok(None); }
+        // With the delivery gate on, required items still need evidence for an
+        // unchanged tree; only the project commands are skipped then (§10.2).
+        let unchanged = !plan.has_bounce && fingerprint.is_some() && fingerprint == start;
+        if unchanged && !(plan.criteria && plan.gate) { return Ok(None); }
+        let commands = plan.commands.clone();
+        let cwd = PathBuf::from(&job.cwd);
+        let environment = tokio::task::spawn_blocking(move || crate::verification::environment(&cwd, &commands))
+            .await.map_err(|_| anyhow!("检查环境识别异常"))?;
+        plan.bind_environment(&environment);
         let cached = plan.cached(fingerprint.as_deref());
         let mut runs = vec![];
         let mut failure = None;
-        if !cached {
+        if !cached && !unchanged {
             for argv in &plan.commands {
                 turn.ensure_current()?;
                 self.db.tx(|q| {
@@ -2388,8 +2410,12 @@ impl Inner {
         }
         // Operator-adopted delivery criteria run only after the project checks
         // pass, on a snapshot of this job's own work directory.
-        let delivery = if failure.is_none() { self.auto_delivery(turn).await? } else { None };
-        let mut payload = json!({"ok":true,"cached":cached,"attempt":plan.attempt,"runs":runs});
+        let delivery = if failure.is_none() { self.auto_delivery(turn, unchanged).await? } else { None };
+        // Unchanged tree with evidence already current: nothing new to record.
+        if unchanged && delivery.is_none() { return Ok(None); }
+        let mut payload = json!({"ok":true,"cached":cached,"attempt":plan.attempt,"runs":runs,
+            "verification_key":plan.checks_sha});
+        if unchanged { payload["unchanged"] = json!(true); }
         if let Some(delivery) = delivery {
             payload["delivery"] = delivery.payload;
             failure = delivery.failure;
@@ -2399,13 +2425,13 @@ impl Inner {
     }
 
     async fn auto_delivery(
-        self: &Arc<Self>, turn: &Arc<Turn>,
+        self: &Arc<Self>, turn: &Arc<Turn>, unchanged: bool,
     ) -> Result<Option<crate::delivery::AutoOutcome>, TurnError> {
         let job = &turn.job;
         let engine = Engine { inner: self.clone() };
         let running = turn.clone();
         let request = crate::delivery::AutoRequest {
-            ticket: job.ticket, job: job.id, turn: job.turn, cwd: job.cwd.clone(),
+            ticket: job.ticket, job: job.id, turn: job.turn, cwd: job.cwd.clone(), unchanged,
         };
         let result = tokio::task::spawn_blocking(move || {
             engine.auto_delivery(&request, &|| running.aborted())

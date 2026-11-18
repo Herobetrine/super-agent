@@ -20,9 +20,16 @@ pub(crate) struct Plan {
     pub project: String,
     pub directory: String,
     pub commands: Vec<Vec<String>>,
+    /// Verification key: commands only until `bind_environment` adds the
+    /// platform, program identities and build-relevant variables.
     pub checks_sha: String,
     pub attempt: i64,
     pub has_bounce: bool,
+    /// Operator-adopted delivery criteria exist for this ticket.
+    pub criteria: bool,
+    /// The delivery gate is enabled: required items need current evidence
+    /// even when this turn left the work tree unchanged.
+    pub gate: bool,
     previous: Option<(String, String)>,
 }
 
@@ -33,7 +40,8 @@ pub(crate) fn plan(
 ) -> Result<Option<Plan>> {
     if !writer(job) || !q.live(job.who())? { return Ok(None); }
     let commands = configured(q, project)?;
-    if commands.is_empty() || tool_follow || q.pending_children(job.id)?
+    let (criteria, gate) = crate::delivery::auto_criteria(q, job.ticket)?;
+    if (commands.is_empty() && !criteria) || tool_follow || q.pending_children(job.id)?
         || q.followed_after(job.ticket, job.admission)?
         || p::last_final_control(text, "SA_ASK").is_some()
         || p::last_final_control(text, "SA_REPORT").is_some_and(|report|
@@ -56,10 +64,15 @@ pub(crate) fn plan(
     let bounce = q.one("SELECT attempt FROM check_bounces WHERE job=?", &[&job.id])?;
     let has_bounce = bounce.is_some();
     let attempt = bounce.map(|row| int_of(&row, "attempt")).unwrap_or(0) + 1;
-    Ok(Some(Plan { project: project.into(), directory, commands, checks_sha, attempt, has_bounce, previous }))
+    Ok(Some(Plan { project: project.into(), directory, commands, checks_sha, attempt, has_bounce, criteria, gate, previous }))
 }
 
 impl Plan {
+    /// Bind the cache key to the environment the commands will run in.
+    pub fn bind_environment(&mut self, environment: &Value) {
+        self.checks_sha = crate::verification::key(&self.commands, environment);
+    }
+
     pub fn cached(&self, fingerprint: Option<&str>) -> bool {
         fingerprint.is_some_and(|fingerprint| self.previous.as_ref()
             .is_some_and(|(previous, sha)| previous == fingerprint && sha == &self.checks_sha))

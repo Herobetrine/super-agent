@@ -2,7 +2,7 @@
 mod acceptance;
 mod auto;
 mod behavior;
-pub(crate) use auto::{AutoOutcome, AutoRequest};
+pub(crate) use auto::{AutoOutcome, AutoRequest, criteria as auto_criteria};
 use crate::{
     Engine,
     db::{Q, now},

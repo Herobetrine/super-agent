@@ -212,7 +212,7 @@ async fn candidate_waits_for_confirmation_survives_restart_and_rejects_stale_inp
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn continued_prerequisite_supplies_latest_tree_and_shared_preparation_is_serialized() {
+async fn continued_prerequisite_supplies_latest_tree_and_dependents_run_together_after_preparation() {
     let first_dependent = Gate::new();
     let fx = Fx::new(
         script({
@@ -259,11 +259,13 @@ async fn continued_prerequisite_supplies_latest_tree_and_shared_preparation_is_s
         fx.shared.count(|call| call.packet["assignment"] == "b") == 1
     })
     .await;
-    for _ in 0..16 {
-        fx.engine.step();
-        tokio::task::yield_now().await;
-    }
-    assert_eq!(fx.shared.count(|call| call.packet["assignment"] == "c"), 0);
+    // The prerequisite is leased only while a dependent builds its own
+    // snapshot (§10.1): the second dependent runs while the first still works.
+    wait(&fx, || {
+        fx.shared.count(|call| call.packet["assignment"] == "c") == 1
+    })
+    .await;
+    assert!(!first_dependent.is_open());
     first_dependent.open();
     wait(&fx, || {
         fx.engine.integration_queue(ticket).unwrap().len() == 3
@@ -403,5 +405,39 @@ async fn isolated_writer_starts_from_all_completed_prerequisite_branches_without
     fx.finish(ticket, "done").await;
     assert!(fx.engine.integration_queue(ticket).unwrap().is_empty());
     assert!(!fx.project.join("a.txt").exists());
+    fx.engine.close().await;
+}
+
+/// The candidate carries exactly the task's tree when the source has not
+/// moved, so the project checks run once, in the clean candidate (§10.2).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn identical_candidate_tree_runs_the_checks_once_and_records_the_reuse() {
+    let fx = Fx::new(writer(), t1_catalog());
+    let marker = fx.dir.path().join("integration-runs.txt");
+    let check = if cfg!(windows) {
+        vec![
+            "powershell.exe".into(), "-NoProfile".into(), "-NonInteractive".into(), "-Command".into(),
+            format!("Add-Content -LiteralPath '{}' -Value $PWD.Path; exit 0",
+                marker.to_string_lossy().replace('\'', "''")),
+        ]
+    } else {
+        vec!["sh".into(), "-c".into(), format!("pwd >> '{}'", marker.to_string_lossy())]
+    };
+    let ticket = setup(&fx, vec![check]).await;
+    wait(&fx, || {
+        fx.engine
+            .integration_queue(ticket)
+            .unwrap()
+            .iter()
+            .any(|i| i.state == "awaiting_confirmation")
+    })
+    .await;
+    let ready = item(&fx, ticket);
+    assert_eq!(ready.validation["workspace_checks"]["reused_from"], "candidate_checks", "{}", ready.validation);
+    assert_eq!(ready.validation["candidate_checks"][0]["ok"], true);
+    let runs = std::fs::read_to_string(&marker).unwrap();
+    // The completion check ran in the task worktree; integration ran once.
+    let integration_runs = runs.lines().filter(|line| line.contains("integrations")).count();
+    assert_eq!(integration_runs, 1, "{runs}");
     fx.engine.close().await;
 }

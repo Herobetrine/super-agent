@@ -209,7 +209,19 @@ pub(crate) fn prepare(
     let source = Path::new(&w.source);
     workspaces::clean(source)?;
     let baseline = workspaces::head(source)?;
-    let (passed, output) = run_checks(Path::new(&w.path), commands, cancel)?;
+    // When the source has not moved past the task's own ancestry, the merge
+    // candidate has exactly the task's tree. The checks then run once, in the
+    // clean candidate, instead of twice (§10.2); see `shared_tree` below.
+    let shared_tree = workspaces::git(
+        Path::new(&w.path),
+        &["merge-base", "--is-ancestor", &baseline, &ready.head],
+    )
+    .is_ok();
+    let (passed, output) = if shared_tree {
+        (true, json!({"deferred":"candidate_has_task_tree"}))
+    } else {
+        run_checks(Path::new(&w.path), commands, cancel)?
+    };
     ready.validation = json!({"identity":w.validation["identity"],"version":VERSION,"head":ready.head,
         "commands":commands,"baseline":baseline,"workspace_checks":output,"passed":false});
     if let Some(heads) = w.validation.get("prerequisite_heads") {
@@ -250,7 +262,23 @@ pub(crate) fn prepare(
         return Ok(ready);
     }
     let candidate_head = workspaces::head(&candidate)?;
+    let tree = |path: &Path| workspaces::git(path, &["rev-parse", "HEAD^{tree}"]);
+    let reused = shared_tree && tree(&candidate)? == tree(Path::new(&w.path))?;
+    if shared_tree && !reused {
+        // Unexpected: fall back to checking the task's own tree as before.
+        let (passed, output) = run_checks(Path::new(&w.path), commands, cancel)?;
+        ready.validation["workspace_checks"] = output;
+        if !passed {
+            ready.state = "failed".into();
+            ready.detail = "隔离任务验证未通过".into();
+            return Ok(ready);
+        }
+    }
     let (passed, output) = run_checks(&candidate, commands, cancel)?;
+    if reused {
+        ready.validation["workspace_checks"] = json!({"reused_from":"candidate_checks",
+            "tree":tree(&candidate)?});
+    }
     ready.validation["candidate_head"] = json!(candidate_head);
     ready.validation["candidate_checks"] = output;
     ready.validation["passed"] = json!(passed);
