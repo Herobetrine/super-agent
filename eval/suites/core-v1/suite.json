@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "id": "superagent-core",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "tasks": [
     {
       "id": "small-bugfix",
@@ -211,7 +211,7 @@
       "script": [
         {
           "when": {
-            "after_seconds": 45
+            "after_seconds": 20
           },
           "action": {
             "type": "restart"

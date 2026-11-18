@@ -347,7 +347,14 @@ pub struct Interactions {
     pub scripted_follows: u64,
     pub scripted_revisions: u64,
     pub restarts: u64,
+    /// Interrupted tasks the runner retried after checking, as the operator
+    /// would with the "重试" control. Records written before this field read 0.
+    #[serde(default)]
+    pub interrupted_retries: u64,
 }
+
+/// Retries per interrupted task before the runner stops intervening.
+const MAX_INTERRUPTED_RETRIES: u32 = 3;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Rework {
@@ -491,6 +498,7 @@ pub async fn run(
     let mut notes = vec![];
     let mut pending: Vec<Step> = task.script.clone();
     let mut timed_out = false;
+    let mut retries: std::collections::BTreeMap<i64, u32> = Default::default();
     loop {
         tokio::time::sleep(harness.poll).await;
         if let Some(fault) = engine.fault() {
@@ -571,6 +579,31 @@ pub async fn run(
                     }
                 }
             }
+        }
+        // A restart leaves a running turn interrupted; the engine waits for the
+        // operator to check the state and retry. The runner does that for them.
+        let interrupted: Vec<i64> = engine.db().with(|q| {
+            let mut stmt = q.conn().prepare("SELECT id FROM jobs WHERE ticket=? AND state='interrupted' ORDER BY id")?;
+            let ids = stmt.query_map([ticket], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+            Ok(ids)
+        })?;
+        let mut retried = false;
+        for id in interrupted {
+            let count = retries.entry(id).or_insert(0u32);
+            if *count >= MAX_INTERRUPTED_RETRIES {
+                continue;
+            }
+            *count += 1;
+            match engine.retry(id) {
+                Ok(()) => {
+                    interactions.interrupted_retries += 1;
+                    retried = true;
+                }
+                Err(e) => notes.push(format!("中断任务 #{id} 重试失败：{e}")),
+            }
+        }
+        if retried {
+            continue;
         }
         let awaiting = task.integration_queue
             && engine
@@ -715,7 +748,8 @@ pub fn aggregate(records: &[RunRecord]) -> Result<TrialReport> {
         group.reported_tokens = group.reported_tokens.zip(tokens).and_then(|(a, b)| a.checked_add(b));
         group.tokens_partial |= record.ledger["partial"] != false || tokens.is_none();
         let i = &record.interactions;
-        group.human_interactions += i.questions_answered + i.approvals + i.integration_confirmations;
+        group.human_interactions +=
+            i.questions_answered + i.approvals + i.integration_confirmations + i.interrupted_retries;
         group.rework += record.rework.check_bounces + record.rework.integration_bounces;
     }
     let mut out = vec![];

@@ -4,7 +4,7 @@
 
 ## 任务集 core-v1
 
-[eval/suites/core-v1/suite.json](../../eval/suites/core-v1/suite.json) 是带版本的任务集（`superagent-core` 1.0.0）。六个任务对应 §13.2 的六类风险：
+[eval/suites/core-v1/suite.json](../../eval/suites/core-v1/suite.json) 是带版本的任务集（`superagent-core` 1.1.0；1.1.0 把 recovery-restart 的重启从第 45 秒提前到第 20 秒，确保重启落在主控执行中）。六个任务对应 §13.2 的六类风险：
 
 | 任务 | 类别 | 主要风险 |
 | --- | --- | --- |
@@ -42,7 +42,7 @@ scripts\cargo.cmd run -p sa-adapters --example trial -- --suite eval/suites/core
 scripts\cargo.cmd run -p sa-adapters --example trial -- --suite eval/suites/core-v1/suite.json --run --variants eval/suites/core-v1/variants.example.json --repeat 3 --out <新目录> --billable
 ```
 
-不加 `--billable` 会拒绝运行。每次运行使用新的临时项目和工单库，不读写真实工单库。过程如下：
+不加 `--billable` 会拒绝运行。`--agents claude` 只加载列出的执行端，其余执行端对主控和派工都不可用，用于把整次试验限定在指定模型上（配合变体里的 `lead` 和 `selections` 固定路由）。执行端集合写在输出目录的 `harness.json` 中，同一目录续跑时必须一致。每次运行使用新的临时项目和工单库，不读写真实工单库。过程如下：
 
 1. 复制项目并建立初始提交，配置项目检查。
 2. 写入需求，采用行为检查。按任务设置开启交付门、隔离写入或合入队列。
@@ -50,7 +50,7 @@ scripts\cargo.cmd run -p sa-adapters --example trial -- --suite eval/suites/core
    - `follow`：追加要求。
    - `revise`：修订需求并采用新检查。
    - `restart`：关闭并重开调度器。
-4. 运行中，执行器代替操作员处理待办：问题按默认答案或第一个选项回答，审批全部允许，合入候选全部确认。这些都计为人工交互。
+4. 运行中，执行器代替操作员处理待办：问题按默认答案或第一个选项回答，审批全部允许，合入候选全部确认。重启打断的任务会进入中断状态，平台不会自行重跑；执行器像操作员点“重试”一样重试它，每个任务最多 3 次。这些都计为人工交互。
 5. 根任务进入终态、没有排队或运行中的任务、脚本执行完毕后，结束本次运行；超过时间上限会停止工单。
 6. 在项目副本上叠加隐藏验收并运行。
 
@@ -61,7 +61,7 @@ scripts\cargo.cmd run -p sa-adapters --example trial -- --suite eval/suites/core
 - 隐藏验收逐项结果。
 - 交付门状态。
 - 用量账目摘要（总量、覆盖、分组、缺口数）。
-- 人工交互：问题、审批、合入确认、脚本追加、脚本修订、重启。
+- 人工交互：问题、审批、合入确认、中断重试、脚本追加、脚本修订、重启。汇总里的人工交互数只计问题、审批、合入确认和中断重试。
 - 返工：检查退回、合入退回、平台重试。
 
 判定规则：

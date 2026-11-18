@@ -360,7 +360,7 @@ fn historical_files_stay_frozen_and_journal_assertions_are_explicitly_current() 
     )
     .unwrap();
     assert_eq!(historical.schema_version, 2);
-    assert_eq!(historical.usage_rules_version, 2);
+    assert_eq!(historical.usage_rules_version, sa_store::ledger::USAGE_RULES_VERSION);
     assert_eq!(
         historical.snapshot_manifest_sha256,
         Some(
@@ -537,7 +537,7 @@ fn different_usage_rules_leave_token_deltas_unknown() {
     old.usage.totals.output_tokens = Some(2);
     let compared = evaluation::compare(&old, &current).unwrap();
     assert_eq!(compared.left_usage_rules_version, 1);
-    assert_eq!(compared.right_usage_rules_version, 2);
+    assert_eq!(compared.right_usage_rules_version, sa_store::ledger::USAGE_RULES_VERSION);
     assert_eq!(compared.input_tokens_delta, None);
     assert_eq!(compared.output_tokens_delta, None);
     assert_eq!(

@@ -388,6 +388,13 @@ struct JobState {
     claude_message_owners: HashMap<String, i64>,
     agy: HashMap<String, AgySession>,
     session: String,
+    /// Job attempts are keyed by physical execution ("slot"), not by logical
+    /// turn: an operator retry reuses the turn number but starts a new native
+    /// run, whose usage and outcome must not merge with the earlier run.
+    /// slot -> (logical turn, execution index within the turn).
+    slots: BTreeMap<i64, (i64, u32)>,
+    /// Logical turn -> (current slot, admissions seen).
+    current: HashMap<i64, (i64, u32)>,
 }
 
 fn number(v: &Value, key: &str) -> Option<u64> {
@@ -466,6 +473,27 @@ fn agy(v: &Value) -> TokenCounts {
 }
 
 impl JobState {
+    /// Slot of the execution an event of `turn` belongs to. Each
+    /// `turn.admitted` after the first starts a new execution; events before
+    /// any admission (older journals) belong to execution 0. `ledger.rs`
+    /// applies the same rule through [`execution_index`].
+    fn slot(&mut self, turn: i64, admitted: bool) -> i64 {
+        let current = self.current.get(&turn).copied();
+        let (exec, reuse) = match current {
+            None => (0, None),
+            Some((_, admissions)) if admitted && admissions > 0 => (admissions, None),
+            Some((slot, _)) => (0, Some(slot)),
+        };
+        let slot = reuse.unwrap_or_else(|| {
+            let id = self.slots.len() as i64;
+            self.slots.insert(id, (turn, exec));
+            id
+        });
+        let admissions = current.map_or(0, |(_, n)| n) + u32::from(admitted);
+        self.current.insert(turn, (slot, admissions));
+        slot
+    }
+
     fn native(&mut self, turn: i64, v: &Value, at: Option<u64>) {
         match self.agent.as_str() {
             "codex" => self.codex(turn, v, at),
@@ -779,6 +807,9 @@ pub(crate) struct RawAttempt {
     pub job: i64,
     /// `None` for usage that cannot be assigned to one attempt.
     pub turn: Option<i64>,
+    /// Physical execution of `turn`: 0 for the first, then one per retry
+    /// that reused the turn number.
+    pub execution: u32,
     pub advisor: Option<String>,
     pub agent: String,
     pub tokens: TokenCounts,
@@ -901,6 +932,8 @@ impl Entry {
                 agent,
                 ..Default::default()
             });
+            // From here on, `turn` names the physical execution slot.
+            let turn = state.slot(turn, kind == "turn.admitted");
             let attempt = state.attempts.entry(turn).or_default();
             match kind.as_str() {
                 "turn.admitted" => {
@@ -1131,13 +1164,15 @@ impl Entry {
         let mut out = vec![];
         for (id, state) in &self.jobs {
             let (turns, unallocated) = state.allocation();
-            for (turn, attempt) in &state.attempts {
+            for (slot, attempt) in &state.attempts {
+                let (turn, execution) = state.slots.get(slot).copied().unwrap_or((*slot, 0));
                 out.push(RawAttempt {
                     job: *id,
-                    turn: Some(*turn),
+                    turn: Some(turn),
+                    execution,
                     advisor: None,
                     agent: state.agent.clone(),
-                    tokens: turns.get(turn).cloned().unwrap_or_default(),
+                    tokens: turns.get(slot).cloned().unwrap_or_default(),
                     reported: attempt.reported,
                     ended: attempt.ended,
                     failed: attempt.failed,
@@ -1148,6 +1183,7 @@ impl Entry {
                 out.push(RawAttempt {
                     job: *id,
                     turn: None,
+                    execution: 0,
                     advisor: None,
                     agent: state.agent.clone(),
                     tokens: unallocated,
@@ -1164,6 +1200,7 @@ impl Entry {
             out.push(RawAttempt {
                 job: call.job,
                 turn: Some(call.turn),
+                execution: 0,
                 advisor: Some(attempt_id.clone()),
                 agent: call.state.agent.clone(),
                 tokens: if call.identity_conflict { TokenCounts::default() } else { view.tokens },

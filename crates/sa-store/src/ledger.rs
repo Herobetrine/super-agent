@@ -18,10 +18,12 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 
 /// Classification rules of this ledger. Bump when a category changes.
-pub const LEDGER_RULES_VERSION: u32 = 1;
+pub const LEDGER_RULES_VERSION: u32 = 2;
 /// Normalization rules of the underlying usage projection (v2 includes
-/// advisor calls), the same value evaluation reports carry.
-pub const USAGE_RULES_VERSION: u32 = 2;
+/// advisor calls; v3 keeps each physical execution of a retried turn apart,
+/// so an interrupted run's usage is no longer replaced by the retry's), the
+/// same value evaluation reports carry.
+pub const USAGE_RULES_VERSION: u32 = 3;
 const MAX_JOBS: usize = 20_000;
 
 /// Native harnesses whose usage frames the projection understands.
@@ -33,6 +35,10 @@ pub struct LedgerAttempt {
     pub job: i64,
     /// `None` when conversation-cumulative usage cannot be split by attempt.
     pub turn: Option<i64>,
+    /// Physical execution of `turn`: 0 for the first run, then one per retry
+    /// that reused the turn number (operator retry of an interrupted or
+    /// failed task).
+    pub execution: u32,
     /// Advisor consultations carry their durable `advice:<seq>` identity.
     pub attempt_id: Option<String>,
     /// `lead`, `collaborator` or `advisor`.
@@ -165,17 +171,27 @@ pub fn ticket_ledger(conn: &Connection, ticket: i64) -> Result<Ledger> {
         .query_map([ticket], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
         .collect::<rusqlite::Result<_>>()?;
     ensure!(jobs.len() <= MAX_JOBS, "工单任务数超限");
-    let mut marks: HashMap<(i64, i64), Marks> = HashMap::new();
+    // Marks per physical execution, counted like the usage projection: each
+    // `turn.admitted` after the first of a turn starts a new execution.
+    let mut marks: HashMap<(i64, i64, u32), Marks> = HashMap::new();
+    let mut admissions: HashMap<(i64, i64), u32> = HashMap::new();
     let mut stmt = conn.prepare(
         "SELECT job,turn,kind FROM events WHERE ticket=? AND seq<=? AND job IS NOT NULL AND turn IS NOT NULL
-         AND kind IN ('reply','failed','cancelled','interrupted','turn.retry_scheduled','turn.gave_up',
-                      'route.rotated','turn.route_wait','auto.retry','check.bounced','integration.bounced')",
+         AND kind IN ('turn.admitted','reply','failed','cancelled','interrupted','turn.retry_scheduled','turn.gave_up',
+                      'route.rotated','turn.route_wait','auto.retry','check.bounced','integration.bounced')
+         ORDER BY seq",
     )?;
     let mut rows = stmt.query([ticket, end])?;
     while let Some(row) = rows.next()? {
         let key = (row.get::<_, i64>(0)?, row.get::<_, i64>(1)?);
         let kind: String = row.get(2)?;
-        let mark = marks.entry(key).or_default();
+        let seen = admissions.entry(key).or_default();
+        if kind == "turn.admitted" {
+            *seen += 1;
+            continue;
+        }
+        let execution = seen.saturating_sub(1);
+        let mark = marks.entry((key.0, key.1, execution)).or_default();
         match kind.as_str() {
             "reply" => mark.reply = true,
             "failed" => mark.failed = true,
@@ -206,7 +222,7 @@ pub fn ticket_ledger(conn: &Connection, ticket: i64) -> Result<Ledger> {
     };
     let raw = projection.attempts();
     for attempt in &raw {
-        ledger.attempts.push(classify(attempt, &parents, &marks));
+        ledger.attempts.push(classify(attempt, &parents, &marks, &admissions));
     }
     // Jobs that never produced a usage-relevant event still ran (or were
     // admitted); list them so the denominator is complete.
@@ -287,8 +303,10 @@ pub fn ticket_ledger(conn: &Connection, ticket: i64) -> Result<Ledger> {
 fn classify(
     attempt: &RawAttempt,
     parents: &HashMap<i64, Option<i64>>,
-    marks: &HashMap<(i64, i64), Marks>,
+    marks: &HashMap<(i64, i64, u32), Marks>,
+    admissions: &HashMap<(i64, i64), u32>,
 ) -> LedgerAttempt {
+    let last = |job: i64, turn: i64| admissions.get(&(job, turn)).copied().unwrap_or(0).saturating_sub(1);
     let role = if attempt.advisor.is_some() {
         "advisor"
     } else if parents.get(&attempt.job).copied().flatten().is_none() {
@@ -299,8 +317,9 @@ fn classify(
     let kind = match (attempt.turn, &attempt.advisor) {
         (_, Some(_)) => "consult",
         (None, None) => "unallocated",
+        (Some(_), None) if attempt.execution > 0 => "retry",
         (Some(turn), None) if turn <= 1 => "initial",
-        (Some(turn), None) => match marks.get(&(attempt.job, turn - 1)) {
+        (Some(turn), None) => match marks.get(&(attempt.job, turn - 1, last(attempt.job, turn - 1))) {
             Some(previous) if previous.retry => "retry",
             Some(previous) if previous.bounced => "repair",
             _ => "continuation",
@@ -309,7 +328,7 @@ fn classify(
     let outcome = if attempt.advisor.is_some() {
         if !attempt.ended { "running" } else if attempt.failed { "failed" } else { "replied" }
     } else if let Some(turn) = attempt.turn {
-        match marks.get(&(attempt.job, turn)) {
+        match marks.get(&(attempt.job, turn, attempt.execution)) {
             Some(m) if m.cancelled => "abandoned",
             Some(m) if m.interrupted => "interrupted",
             Some(m) if m.retry => "retried",
@@ -324,6 +343,7 @@ fn classify(
     LedgerAttempt {
         job: attempt.job,
         turn: attempt.turn,
+        execution: attempt.execution,
         attempt_id: attempt.advisor.clone(),
         role: role.into(),
         kind: kind.into(),

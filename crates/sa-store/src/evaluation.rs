@@ -678,7 +678,7 @@ pub fn evaluate_with_source(
         file_source,
         journal_scope: JournalScope::CurrentJournalThroughEvent,
         snapshot_manifest_sha256,
-        usage_rules_version: 2,
+        usage_rules_version: crate::ledger::USAGE_RULES_VERSION,
         dataset: identity,
         score,
         jobs,
@@ -720,7 +720,7 @@ pub fn compare(left: &Report, right: &Report) -> Result<Comparison> {
         "不同数据集、版本、case 或断言内容不能直接比较"
     );
     let known_usage = left.usage_rules_version == right.usage_rules_version
-        && matches!(left.usage_rules_version, 1 | 2)
+        && (1..=crate::ledger::USAGE_RULES_VERSION).contains(&left.usage_rules_version)
         && !left.usage.partial
         && !right.usage.partial
         && !left.usage.pending

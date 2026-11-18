@@ -86,7 +86,7 @@ fn retries_repairs_and_advisors_are_separate_and_sum_to_the_ticket_total() {
     log(&conn, retry, "advice.result", &json!({"attempt_id":id,"state":"done","usage_complete":true}));
 
     let ledger = ledger_of(&conn, lead.ticket);
-    assert_eq!((ledger.rules_version, ledger.usage_rules_version), (1, 2));
+    assert_eq!((ledger.rules_version, ledger.usage_rules_version), (2, 3));
     let first = find(&ledger, lead.id, 1);
     assert_eq!((first.role.as_str(), first.kind.as_str(), first.outcome.as_str()), ("lead", "initial", "retried"));
     assert_eq!(first.tokens.total_tokens, Some(100));
@@ -185,5 +185,40 @@ fn missing_corrected_unmetered_and_cumulative_usage_are_named_gaps() {
     assert!(ledger.attempts.iter().any(|a| a.job == never.id && a.outcome == "unknown"));
     assert_eq!(ledger.totals.total_tokens, Some(109));
     assert!(ledger.coverage.attempts > ledger.coverage.reported_attempts);
+    assert!(ledger.partial);
+}
+
+/// An operator retry of an interrupted task reuses the turn number but is a
+/// second native run. Both runs are listed, and the interrupted run's usage
+/// is not replaced by the retry's terminal result.
+#[test]
+fn an_operator_retry_of_the_same_turn_is_a_separate_execution() {
+    let (_dir, conn) = open();
+    let lead = create_ticket(&conn, "C:/fixture", "ledger", "claude");
+    let message = |id: &str, input: u64, output: u64| {
+        json!({"type":"assistant","parent_tool_use_id":null,"message":{"id":id,"usage":{
+            "input_tokens":input,"output_tokens":output,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}})
+    };
+    log(&conn, lead, "turn.admitted", &json!({}));
+    log(&conn, lead, "native", &message("m1", 30, 3));
+    log(&conn, lead, "interrupted", &json!("上次执行中断"));
+    log(&conn, lead, "retry", &json!("重试同一逻辑轮次"));
+    log(&conn, lead, "turn.admitted", &json!({}));
+    log(&conn, lead, "native", &message("m2", 40, 4));
+    log(&conn, lead, "native", &cl_result(40, 4));
+    log(&conn, lead, "reply", &json!({"text":"done"}));
+
+    let ledger = ledger_of(&conn, lead.ticket);
+    let runs: Vec<_> = ledger.attempts.iter().filter(|a| a.job == lead.id && a.turn == Some(1)).collect();
+    assert_eq!(runs.len(), 2, "{:#?}", ledger.attempts);
+    let (first, second) = (runs[0], runs[1]);
+    assert_eq!((first.execution, first.kind.as_str(), first.outcome.as_str()), (0, "initial", "interrupted"));
+    // An unfinished assistant message has no trustworthy output count, so
+    // only its input is known; the total says unknown instead of undercounting.
+    assert_eq!((first.tokens.input_tokens, first.tokens.total_tokens), (Some(30), None));
+    assert_eq!((second.execution, second.kind.as_str(), second.outcome.as_str()), (1, "retry", "replied"));
+    assert_eq!(second.tokens.total_tokens, Some(44));
+    assert_eq!((ledger.totals.input_tokens, ledger.totals.total_tokens), (Some(70), None));
+    assert_eq!(ledger.coverage.attempts, 2);
     assert!(ledger.partial);
 }

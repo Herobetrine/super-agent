@@ -9,8 +9,9 @@
 | 字段 | 取值 | 判定依据 |
 | --- | --- | --- |
 | `role` | `lead`、`collaborator`、`advisor` | 主任务（无父任务）、协作者、顾问调用（`advice:<seq>`） |
-| `kind` | `initial`、`continuation`、`retry`、`repair`、`consult`、`unallocated` | 第 1 轮为 initial；上一轮有 `turn.retry_scheduled`、`route.rotated`、`turn.route_wait` 或 `auto.retry` 为 retry；上一轮有 `check.bounced` 或 `integration.bounced` 为 repair；其他后续轮为 continuation |
-| `outcome` | `replied`、`retried`、`failed`、`abandoned`、`interrupted`、`running`、`unknown` | 本轮的 `reply`、重试、`failed` 或 `turn.gave_up`、`cancelled`、`interrupted` 事件 |
+| `execution` | 0、1、2… | 同一逻辑轮次的第几次实际执行。操作员重试中断或失败的任务时沿用轮次号，但会重新接单（`turn.admitted`），每次接单都是一次新的执行 |
+| `kind` | `initial`、`continuation`、`retry`、`repair`、`consult`、`unallocated` | `execution` 大于 0 为 retry；否则第 1 轮为 initial；上一轮有 `turn.retry_scheduled`、`route.rotated`、`turn.route_wait` 或 `auto.retry` 为 retry；上一轮有 `check.bounced` 或 `integration.bounced` 为 repair；其他后续轮为 continuation |
+| `outcome` | `replied`、`retried`、`failed`、`abandoned`、`interrupted`、`running`、`unknown` | 本次执行的 `reply`、重试、`failed` 或 `turn.gave_up`、`cancelled`、`interrupted` 事件 |
 
 每条执行带自身用量。数值来自与工单总量相同的归一化，所以账目不会统计总量没有统计的样本：
 
@@ -42,7 +43,9 @@
 | `advisor_records_incomplete` | 顾问调用记录缺失或无法对应到调用者 |
 | `no_usage_events` | 任务在日志中没有任何用量相关事件 |
 
-金额 `cost` 始终为 null，因为还没有带版本、日期、币种和计费项的价格表。账目规则版本为 `rules_version`=1，用量归一化规则为 `usage_rules_version`=2（含顾问调用）。
+金额 `cost` 始终为 null，因为还没有带版本、日期、币种和计费项的价格表。账目规则版本为 `rules_version`=2，用量归一化规则为 `usage_rules_version`=3。版本 2 加入顾问调用。版本 3 把同一轮次的多次执行分开计量。
+
+此前，被中断的那次执行与随后的重试会合并成一条记录，Claude 的终态用量会覆盖中断执行已经报告的消息用量，导致少计。2026-11-18 的 Opus 5.5 受控试验中，一次中断执行有约 11.7 万输入 Token 被这样漏掉。修正后，未完成的消息只记入输入，输出未知，因此总量显示为未知，不再少计。
 
 ## 使用
 

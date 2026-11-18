@@ -15,7 +15,8 @@ use std::{
 
 const HELP: &str = "受控试验（任务集 eval/suites/core-v1/suite.json）\n\
   校验任务集（不调用模型）：trial --suite SUITE --validate --output new.json\n\
-  运行试验（计费）：trial --suite SUITE --run --variants variants.json [--tasks a,b] [--repeat 3] --out DIR --billable\n\
+  运行试验（计费）：trial --suite SUITE --run --variants variants.json [--tasks a,b] [--agents claude,codex] [--repeat 3] --out DIR --billable\n\
+  --agents 只加载列出的执行端，其余执行端对主控不可用；同一输出目录必须始终使用相同的执行端集合。\n\
   汇总记录：trial --suite SUITE --aggregate DIR --output new.json\n\
 每次运行使用新的临时项目和工单库，不读写真实工单库。输出文件必须尚不存在。";
 
@@ -48,7 +49,7 @@ async fn main() -> Result<()> {
     while let Some(arg) = iter.next() {
         match arg.as_str() {
             "--validate" | "--run" | "--billable" => flags.push(arg),
-            "--suite" | "--output" | "--variants" | "--tasks" | "--repeat" | "--out" | "--aggregate" => {
+            "--suite" | "--output" | "--variants" | "--tasks" | "--agents" | "--repeat" | "--out" | "--aggregate" => {
                 let value = iter.next().context("选项缺少值")?;
                 ensure!(options.insert(arg, value).is_none(), "选项不能重复");
             }
@@ -83,8 +84,30 @@ async fn main() -> Result<()> {
     let wanted: Option<Vec<&str>> = options.get("--tasks").map(|t| t.split(',').collect());
     let out = PathBuf::from(options.get("--out").context("缺少 --out")?);
     std::fs::create_dir_all(out.join("runs"))?;
+    let agents: Option<Vec<String>> =
+        options.get("--agents").map(|a| a.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect());
+    if let Some(agents) = &agents {
+        ensure!(!agents.is_empty(), "--agents 不能为空");
+        for agent in agents {
+            ensure!(sa_engine::adapter::AGENTS.contains(&agent.as_str()), "未知的执行端 {agent}");
+        }
+    }
+    // Runs in one directory must share one executor set, or their records are not comparable.
+    let harness_path = out.join("harness.json");
+    let harness_record = serde_json::json!({ "agents": agents });
+    if harness_path.exists() {
+        let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(&harness_path)?)?;
+        ensure!(saved == harness_record, "输出目录已使用不同的执行端集合：{saved}");
+    } else {
+        write_new(&harness_path, &harness_record)?;
+    }
     let sys = Sys::from_process();
-    let adapters = move || sa_adapters::all(sys.clone());
+    let adapters = move || {
+        sa_adapters::all(sys.clone())
+            .into_iter()
+            .filter(|a| agents.as_ref().is_none_or(|w| w.iter().any(|x| x == a.agent())))
+            .collect::<Vec<_>>()
+    };
     let engine_options = |efficiency| EngineOptions {
         efficiency: sa_store::efficiency::shared(efficiency),
         ..Default::default()
