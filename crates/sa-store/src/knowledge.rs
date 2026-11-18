@@ -24,7 +24,16 @@ pub const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS project_knowledge(
   ticket INTEGER, job INTEGER, agent TEXT, created REAL NOT NULL, sha256 TEXT NOT NULL,
   archived INTEGER NOT NULL DEFAULT 0);
 CREATE INDEX IF NOT EXISTS project_knowledge_cwd ON project_knowledge(cwd,archived,id);
-CREATE UNIQUE INDEX IF NOT EXISTS project_knowledge_active ON project_knowledge(cwd,sha256) WHERE archived=0;";
+CREATE UNIQUE INDEX IF NOT EXISTS project_knowledge_active ON project_knowledge(cwd,sha256) WHERE archived=0;
+CREATE TABLE IF NOT EXISTS knowledge_basis(
+  entry INTEGER PRIMARY KEY REFERENCES project_knowledge(id), type TEXT,
+  paths TEXT NOT NULL DEFAULT '[]', basis TEXT, verified REAL,
+  state TEXT NOT NULL DEFAULT 'current', superseded_by INTEGER);";
+
+/// Values of `knowledge_basis.state`.
+pub const STATE_CURRENT: &str = "current";
+pub const STATE_STALE: &str = "stale";
+pub const STATE_SUPERSEDED: &str = "superseded";
 
 /// Valid `kind` values.
 pub const KINDS: [&str; 3] = ["memory", "lesson", "progress"];
@@ -51,6 +60,93 @@ pub struct KnowledgeEntry {
     /// Unix seconds.
     pub created: f64,
     pub archived: bool,
+    /// `current`, `stale` or `superseded` once the entry carries a typed basis
+    /// (`knowledge_basis`); `None` for entries without one.
+    #[serde(default)]
+    pub state: Option<String>,
+    /// Project-relative files the entry depends on.
+    #[serde(default)]
+    pub paths: Vec<String>,
+    /// Entry that replaced this one.
+    #[serde(default)]
+    pub superseded_by: Option<i64>,
+    /// When the basis was last verified (Unix seconds); creation never counts.
+    #[serde(default)]
+    pub verified: Option<f64>,
+}
+
+/// One file digest recorded with an entry: lowercase SHA-256 hex, `missing`
+/// (absent when recorded) or `unverifiable` (not a plain file within limits).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PathDigest {
+    pub path: String,
+    pub sha256: String,
+}
+
+/// Typed basis row of one entry.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Basis {
+    pub kind: Option<String>,
+    pub paths: Vec<PathDigest>,
+    pub basis: Option<String>,
+    pub verified: Option<f64>,
+    pub state: String,
+    pub superseded_by: Option<i64>,
+}
+
+/// Whether the journal has the basis table (older journals do not).
+pub fn basis_exists(conn: &Connection) -> Result<bool> {
+    Ok(conn
+        .prepare_cached("SELECT 1 FROM sqlite_master WHERE type='table' AND name='knowledge_basis'")?
+        .exists([])?)
+}
+
+/// Basis rows of the given entries. A missing table or row reads as absent.
+pub fn bases(conn: &Connection, ids: &[i64]) -> Result<BTreeMap<i64, Basis>> {
+    let mut out = BTreeMap::new();
+    if ids.is_empty() || !basis_exists(conn)? {
+        return Ok(out);
+    }
+    let mut stmt = conn.prepare_cached(
+        "SELECT type,paths,basis,verified,state,superseded_by FROM knowledge_basis WHERE entry=?",
+    )?;
+    for id in ids {
+        let row = stmt
+            .query_row([id], |r| {
+                Ok(Basis {
+                    kind: r.get(0)?,
+                    paths: serde_json::from_str(&r.get::<_, String>(1)?).unwrap_or_default(),
+                    basis: r.get(2)?,
+                    verified: r.get(3)?,
+                    state: r.get(4)?,
+                    superseded_by: r.get(5)?,
+                })
+            })
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                e => Err(e),
+            })?;
+        if let Some(row) = row {
+            out.insert(*id, row);
+        }
+    }
+    Ok(out)
+}
+
+/// Fill the optional basis fields of freshly read entries.
+fn attach_basis(conn: &Connection, entries: &mut [KnowledgeEntry]) -> Result<()> {
+    let ids: Vec<i64> = entries.iter().map(|e| e.id).collect();
+    let map = bases(conn, &ids)?;
+    for entry in entries {
+        if let Some(b) = map.get(&entry.id) {
+            entry.state = Some(b.state.clone());
+            entry.paths = b.paths.iter().map(|p| p.path.clone()).collect();
+            entry.superseded_by = b.superseded_by;
+            entry.verified = b.verified;
+        }
+    }
+    Ok(())
 }
 
 /// Whether the journal has the table (older journals do not).
@@ -67,9 +163,10 @@ fn rows(conn: &Connection, sql: &str, cwd: &str, limit: i64) -> Result<Vec<Knowl
         return Ok(vec![]);
     }
     let mut stmt = conn.prepare_cached(sql)?;
-    let out = stmt
+    let mut out: Vec<KnowledgeEntry> = stmt
         .query_map(params![cwd, limit], entry_from_row)?
         .collect::<rusqlite::Result<_>>()?;
+    attach_basis(conn, &mut out)?;
     Ok(out)
 }
 
@@ -84,6 +181,10 @@ fn entry_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<KnowledgeEntry> {
         agent: r.get(6)?,
         created: r.get(7)?,
         archived: r.get::<_, i64>(8)? != 0,
+        state: None,
+        paths: vec![],
+        superseded_by: None,
+        verified: None,
     })
 }
 

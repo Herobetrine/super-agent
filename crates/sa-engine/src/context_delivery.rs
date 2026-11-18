@@ -17,6 +17,7 @@ const CURRENT: &[&str] = &[
     "can_assign_write", "this_turn_can_write", "execution_directory",
     "selected_execution", "claude_route", "isolated_writers", "workspace",
     "harness_health", "recovery", "next_step", "scm_notice", "collaboration_preferences", "usage_budget",
+    "requirements", "requirements_omitted",
 ];
 const APPEND: &[&str] = &["notes", "user_updates", "mcp_results"];
 const DELTA_GUIDE: &str = "继续同一原生会话。context_delivery.mode=delta 时将本包合并到已确认上下文。未列字段沿用旧值，removed_fields 删除旧字段。array_modes 指定 append 追加、upsert 按 id（roster 按 job）更新。object_modes 指定逐字段合并并按其 removed_fields 删除子字段。其余字段整项替换。reports 只含变化项，不能据此认定其他任务消失。若旧上下文已被压缩或缺失，先按 full_context 读取完整快照；读取失败应明确报告缺失并请求恢复完整上下文。";
