@@ -25,7 +25,7 @@ impl OwnedProcess {
             use std::os::unix::process::CommandExt;
             command.process_group(0);
         }
-        let child = command.spawn().context("无法启动验证命令或 Git")?;
+        let child = command.spawn().context(crate::operations::NotStarted)?;
         let process = Self {
             child,
             #[cfg(windows)]

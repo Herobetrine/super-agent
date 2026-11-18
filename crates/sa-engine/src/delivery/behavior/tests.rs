@@ -11,6 +11,10 @@ struct Fixture {
 
 impl Fixture {
     fn new(argv: &[&str]) -> Self {
+        Self::with(argv, EngineOptions::default())
+    }
+
+    fn with(argv: &[&str], options: EngineOptions) -> Self {
         let directory = tempfile::tempdir().unwrap();
         let project = directory.path().join("project");
         fs::create_dir(&project).unwrap();
@@ -18,7 +22,7 @@ impl Fixture {
         let engine = Engine::open(
             directory.path().join("ledger"),
             vec![],
-            EngineOptions::default(),
+            options,
         )
         .unwrap();
         engine.db().with(|q| q.run("INSERT INTO tickets(id,goal,cwd,writes,lead,created) VALUES(1,'fixture',?,0,'codex',1)", &[&project.to_string_lossy().as_ref()])).unwrap();
@@ -302,4 +306,88 @@ fn windows_denies_temporary_input_replacement_and_allows_scratch_outputs() {
     ]);
     let receipt = f.run(&|| false).unwrap();
     assert_eq!(receipt.status, "pass", "{}", receipt.detail);
+}
+
+fn operations(f: &Fixture) -> Vec<crate::operations::Operation> {
+    f.engine
+        .db()
+        .with(|q| crate::operations::list(q, 1))
+        .unwrap()
+}
+
+#[cfg(windows)]
+const SLOW: &[&str] = &[
+    "powershell.exe",
+    "-NoProfile",
+    "-NonInteractive",
+    "-Command",
+    "Start-Sleep -Seconds 10",
+];
+#[cfg(not(windows))]
+const SLOW: &[&str] = &["/bin/sh", "-c", "sleep 10"];
+
+/// A timed-out run ended with a confirmed process-tree kill; a cancelled
+/// run records the request before the confirmed termination. Neither passes.
+#[test]
+fn behavior_receipts_distinguish_timeout_from_confirmed_cancellation() {
+    let f = Fixture::new(SLOW);
+    let timed_out = f
+        .engine
+        .run_check_inner(1, 2, f.snapshot, f.requirement, &|| false, Duration::from_millis(30))
+        .unwrap();
+    assert_eq!(timed_out.status, "invalid");
+    let started = std::time::Instant::now();
+    let cancelled = f
+        .run(&|| started.elapsed() > Duration::from_millis(1500))
+        .unwrap();
+    assert_eq!(cancelled.status, "invalid");
+    assert!(started.elapsed() < Duration::from_secs(9), "the process tree was not stopped");
+    let ops = operations(&f);
+    assert_eq!(ops.len(), 2);
+    assert!(ops.iter().all(|op| op.kind == crate::operations::kind::BEHAVIOR));
+    assert_eq!(ops[0].state, "confirmed");
+    assert_eq!(ops[0].detail["status"], "invalid");
+    assert_eq!(ops[0].intent["attempt"], timed_out.id);
+    assert_eq!(ops[1].state, "cancelled", "{:?}", ops[1].detail);
+    assert_ne!(
+        f.engine.prepare_delivery(1, 2, f.snapshot, 1).unwrap().status,
+        "ready"
+    );
+}
+
+/// The process dies after the check ran but before its result was saved.
+/// The attempt keeps no result, supersedes the earlier pass, and the restart
+/// classifies the receipt as an unknown effect without re-running the check.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn crashed_behavior_attempt_never_inherits_a_pass_and_is_unknown_after_restart() {
+    use crate::operations::{Failpoints, Fault, SimulatedCrash};
+    let points = Failpoints::new();
+    let mut f = Fixture::with(PASS, EngineOptions { failpoints: Some(points.clone()), ..Default::default() });
+    assert_eq!(f.run(&|| false).unwrap().status, "pass");
+    points.set("delivery.behavior_check.after_effect", Fault::Crash);
+    assert!(f.run(&|| false).unwrap_err().is::<SimulatedCrash>());
+    let latest = |f: &Fixture| {
+        f.engine.delivery_summary(1).unwrap().latest_snapshot.unwrap().requirements[0]
+            .behavior.clone().unwrap().receipt.unwrap()
+    };
+    assert_eq!(latest(&f).status, "running");
+    assert_ne!(f.engine.prepare_delivery(1, 2, f.snapshot, 1).unwrap().status, "ready");
+    assert_eq!(operations(&f)[1].state, "started");
+    let results = |f: &Fixture| f.engine.db()
+        .with(|q| q.int("SELECT count(*) FROM delivery_behavior_results", &[])).unwrap();
+    assert_eq!(results(&f), 1);
+    // Restart on the same journal without failpoints.
+    f.engine.db().close();
+    f.engine = Engine::open(f._directory.path().join("ledger"), vec![], EngineOptions::default()).unwrap();
+    f.engine.start().unwrap();
+    let ops = operations(&f);
+    assert_eq!(ops[1].state, "unknown_effect");
+    assert_eq!(ops[1].detail["reconciled"], true);
+    assert_eq!(results(&f), 1, "no late result is written and nothing is re-run");
+    assert_eq!(latest(&f).status, "running");
+    assert_ne!(f.engine.prepare_delivery(1, 2, f.snapshot, 1).unwrap().status, "ready");
+    // A fresh attempt is an explicit new run, not a replay of the unknown one.
+    assert_eq!(f.run(&|| false).unwrap().status, "pass");
+    assert_eq!(operations(&f)[1].state, "unknown_effect");
+    f.engine.close().await;
 }

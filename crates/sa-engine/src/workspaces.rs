@@ -2,7 +2,8 @@
 //! Git commands use argv, never a shell. No push, force reset or forced cleanup.
 use crate::db::{Q, int_of, str_of};
 use crate::protocol::digest;
-use anyhow::{Result, ensure};
+use crate::operations::{self, Scope, kind};
+use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{
@@ -189,14 +190,14 @@ fn wait_command(cmd: &mut Command, timeout: Duration, cancel: Option<&dyn Fn() -
             cancelled = true;
             break None;
         }
-        if let Some(status) = child.try_wait()? { break Some(status); }
+        if let Some(status) = child.try_wait().context(crate::operations::ProcessUnconfirmed)? { break Some(status); }
         if start.elapsed() >= timeout {
             timed_out = true;
             break None;
         }
         std::thread::sleep(Duration::from_millis(20));
     };
-    child.shutdown()?;
+    child.shutdown().context(crate::operations::ProcessUnconfirmed)?;
     Ok(CommandOutput {
         ok: status.is_some_and(|status| status.success()),
         exit: status.and_then(|status| status.code()),
@@ -370,7 +371,36 @@ pub(crate) fn verify(w: &Workspace) -> Result<()> {
     Ok(())
 }
 
+/// An existing directory is the recorded worktree of `source` on `branch`.
+/// Returns its HEAD.
+pub(crate) fn existing_worktree(source: &Path, dest: &Path, branch: &str, recorded: &str) -> Result<String> {
+    ensure!(
+        scope(&root(dest)?.to_string_lossy()) == scope(recorded),
+        "工作区路径与记录不一致"
+    );
+    ensure!(
+        git(dest, &["symbolic-ref", "--short", "HEAD"])? == branch,
+        "工作区分支与记录不一致"
+    );
+    ensure!(
+        git(
+            dest,
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"]
+        )? == git(
+            source,
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"]
+        )?,
+        "工作区不属于原仓库"
+    );
+    head(dest)
+}
+
 pub fn provision(w: &Workspace, data: &Path) -> Result<Workspace> {
+    provision_with(w, data, &Scope::detached())
+}
+
+/// `git worktree add` runs under a `workspace.worktree_add` receipt.
+pub(crate) fn provision_with(w: &Workspace, data: &Path, ops: &Scope) -> Result<Workspace> {
     let mut w = identity(w)?;
     let source = Path::new(&w.source);
     let dest = PathBuf::from(&w.path);
@@ -381,27 +411,10 @@ pub fn provision(w: &Workspace, data: &Path) -> Result<Workspace> {
         "工作区位置无效"
     );
     if dest.exists() {
-        ensure!(
-            scope(&root(&dest)?.to_string_lossy()) == scope(&w.path),
-            "工作区路径与记录不一致"
-        );
-        ensure!(
-            git(&dest, &["symbolic-ref", "--short", "HEAD"])? == w.branch,
-            "工作区分支与记录不一致"
-        );
-        ensure!(
-            git(
-                &dest,
-                &["rev-parse", "--path-format=absolute", "--git-common-dir"]
-            )? == git(
-                source,
-                &["rev-parse", "--path-format=absolute", "--git-common-dir"]
-            )?,
-            "工作区不属于原仓库"
-        );
+        let existing = existing_worktree(source, &dest, &w.branch, &w.path)?;
         // A crash between git worktree add and receipt persistence is recoverable.
         if w.base.is_empty() {
-            w.base = head(&dest)?;
+            w.base = existing;
         }
     } else {
         ensure!(
@@ -410,10 +423,12 @@ pub fn provision(w: &Workspace, data: &Path) -> Result<Workspace> {
         );
         clean(source)?;
         w.base = head(source)?;
+        ops.begin(kind::WORKTREE_ADD, json!({"job":w.job,"source":w.source,"path":w.path,"branch":w.branch,"base":w.base}))?;
         git(
             source,
             &["worktree", "add", "-b", &w.branch, &w.path, &w.base],
         )?;
+        ops.effect(kind::WORKTREE_ADD)?;
     }
     w.head = head(&dest)?;
     verify(&w)?;
@@ -452,6 +467,12 @@ pub(crate) fn validate_command(argv: &[String]) -> Result<()> {
 /// Operator-triggered checkpoint commit and test. Validation refers to the
 /// exact resulting Git tree; commands that modify it invalidate their receipt.
 pub fn validate(w: &Workspace, argv: &[String]) -> Result<Workspace> {
+    validate_with(w, argv, &|| false, &Scope::detached())
+}
+
+/// The checkpoint commit and the validation process run under receipts. A
+/// cancelled run whose process tree is confirmed terminated is `cancelled`.
+pub(crate) fn validate_with(w: &Workspace, argv: &[String], cancel: &dyn Fn() -> bool, ops: &Scope) -> Result<Workspace> {
     validate_command(argv)?;
     ensure!(
         !matches!(w.state.as_str(), "planned" | "merged"),
@@ -466,15 +487,33 @@ pub fn validate(w: &Workspace, argv: &[String]) -> Result<Workspace> {
     );
     git(path, &["add", "--all", "--", "."])?;
     if !git(path, &["diff", "--cached", "--name-only"])?.is_empty() {
+        ops.begin(kind::CHECKPOINT, json!({"job":w.job,"path":w.path,"branch":w.branch,"pre_head":head(path)?}))?;
         git(
             path,
             &["commit", "-m", "Checkpoint isolated Super Agent task"],
         )?;
+        ops.effect(kind::CHECKPOINT)?;
     }
     clean(path)?;
     let before = head(path)?;
     let started = Instant::now();
-    let (ok, out) = command(path, argv, Duration::from_secs(600))?;
+    let id = ops.begin(kind::LEGACY_VALIDATE, json!({"job":w.job,"path":w.path,"pre_head":before,
+        "argv_sha256":digest(&serde_json::to_string(argv)?)}))?;
+    let flag = ops.cancellable(id);
+    let stop = || cancel() || flag.load(std::sync::atomic::Ordering::SeqCst);
+    let run = run_command(path, argv, Duration::from_secs(600), Some(&stop), false, Some(1024 * 1024));
+    match &run {
+        Ok(result) if result.cancelled => ops.decide(id, operations::CANCELLED,
+            json!({"reason":"验证已取消，进程树已确认终止"})),
+        Ok(result) => ops.decide(id, operations::CONFIRMED, json!({"exit":result.exit,"timed_out":result.timed_out})),
+        Err(error) => ops.decide(id, operations::process_failure(error, operations::UNKNOWN_EFFECT),
+            json!({"reason":format!("{error:#}")})),
+    }
+    ops.effect(kind::LEGACY_VALIDATE)?;
+    let result = run?;
+    ensure!(!result.cancelled, "验证已取消；进程树已终止，变更未合入");
+    ensure!(!result.timed_out, "命令超时，已终止本次验证；变更未合入");
+    let (ok, out) = (result.ok, result.output);
     let unchanged = head(path)? == before && clean(path).is_ok();
     w.head = before;
     w.state = if ok && unchanged {
@@ -500,6 +539,11 @@ pub fn validate(w: &Workspace, argv: &[String]) -> Result<Workspace> {
 /// Build a merge candidate in a separate worktree, validate it, then publish
 /// via fast-forward. Failed candidates are retained for inspection.
 pub fn integrate(w: &Workspace, data: &Path) -> Result<Workspace> {
+    integrate_with(w, data, &Scope::detached())
+}
+
+/// The fast-forward into the source runs under a `workspace.integrate` receipt.
+pub(crate) fn integrate_with(w: &Workspace, data: &Path, ops: &Scope) -> Result<Workspace> {
     ensure!(
         w.state == "validated" && w.validation["passed"] == true,
         "先验证该任务的当前版本"
@@ -548,11 +592,14 @@ pub fn integrate(w: &Workspace, data: &Path) -> Result<Workspace> {
         head(source)? == baseline,
         "验证期间原项目有新提交，请重新验证后合入"
     );
+    ops.begin(kind::LEGACY_INTEGRATE, json!({"job":w.job,"source":w.source,
+        "source_ref":w.validation["identity"]["source_ref"],"baseline":baseline,"target":merged}))?;
     // Git itself refuses overwriting conflicting local changes; no hard reset.
     git(
         source,
         &["merge", "--no-overwrite-ignore", "--ff-only", &merged],
     )?;
+    ops.effect(kind::LEGACY_INTEGRATE)?;
     result.state = "merged".into();
     result.detail = "合并候选验证通过，已本地合入".into();
     result.validation["integrated_head"] = json!(merged);

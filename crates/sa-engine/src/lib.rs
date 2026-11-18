@@ -29,6 +29,7 @@ pub mod knowledge;
 pub mod owner;
 pub mod pause;
 pub mod protocol;
+pub mod operations;
 pub mod project_git;
 pub mod resilience;
 pub mod runner;
