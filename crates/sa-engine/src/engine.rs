@@ -116,6 +116,8 @@ pub struct EngineOptions {
     pub efficiency: sa_store::efficiency::Shared,
     /// Admission interval (80 ms in the JS engine).
     pub tick: Duration,
+    /// Test-only fault injection around operation receipts; `None` in production.
+    pub failpoints: Option<Arc<crate::operations::Failpoints>>,
 }
 
 impl Default for EngineOptions {
@@ -128,6 +130,7 @@ impl Default for EngineOptions {
             snapshotter: Arc::new(FsSnapshotter),
             efficiency: sa_store::efficiency::shared(Default::default()),
             tick: Duration::from_millis(80),
+            failpoints: None,
         }
     }
 }
@@ -231,6 +234,8 @@ pub(crate) struct Inner {
     pending_aborts: Mutex<Vec<i64>>,
     /// Claude prompt-cache clock per job for keep-alive (in memory only).
     cache_clocks: Mutex<HashMap<i64, CacheClock>>,
+    /// Operations this process executes, and failpoints.
+    pub(crate) operations: crate::operations::Hub,
 }
 
 struct IntegrationLease(Arc<Inner>, Vec<String>);
@@ -369,12 +374,14 @@ impl Engine {
         let db = Db::open(&data_dir)?;
         let adapters = adapters.into_iter().map(|a| (a.agent().to_string(), a)).collect();
         let limits = opts.runner.stall_limits();
+        let operations = crate::operations::Hub::new(opts.failpoints.clone());
         Ok(Self {
             inner: Arc::new(Inner {
                 db,
                 data_dir,
                 adapters,
                 limits,
+                operations,
                 pending_aborts: Mutex::new(vec![]),
                 cache_clocks: Mutex::default(),
                 opts,
@@ -459,6 +466,9 @@ impl Engine {
             ensure!(inner.scheduler_state.load(Ordering::SeqCst) != SCHEDULER_FAILED, "调度循环已异常退出，请核对现场后重新打开工作台。");
             return Ok(());
         }
+        // Classify receipts of operations a previous process left open before
+        // anything is requeued or admitted. Never re-runs an effect.
+        crate::operations::reconcile(&inner.db, &inner.operations)?;
         inner.db.tx(crate::integration_queue::recover)?;
         ensure!(!inner.opts.tick.is_zero(), "调度间隔必须大于零");
         inner.db.tx(|q| q.recover())?;
@@ -558,13 +568,18 @@ impl Engine {
     }
 
     /// `cancel({ticket})` (E:63-73).
+    /// Operation receipts never block a stop: owned processes are signalled
+    /// and finish `cancelled` only once their termination is confirmed.
     pub fn cancel(&self, ticket: i64) -> Result<()> {
+        let processes = self.inner.operations.cancellable_for(ticket);
         self.inner.db.tx(|q| {
             cancel_ticket(q, ticket)?;
             q.run("UPDATE integration_policy SET enabled=0 WHERE ticket=?",&[&ticket])?;
             q.run("UPDATE integration_queue SET state='cancelled',detail='操作者已停止工单和合入队列' WHERE ticket=? AND state!='merged'",&[&ticket])?;
+            crate::operations::request_cancel(q, &processes)?;
             Ok(())
         })?;
+        self.inner.operations.signal(&processes);
         for slot in lock(&self.inner.sched).active.values() {
             if slot.ticket == ticket {
                 slot.cancel.cancel();
@@ -617,6 +632,23 @@ impl Engine {
     /// retain their route and native session.
     pub fn set_lead_routing(&self, ticket: i64, enabled: bool) -> Result<()> {
         self.inner.db.tx(|q| q.set_lead_routing(ticket, enabled))
+    }
+
+    /// Platform operation receipts of a ticket, oldest first.
+    pub fn operations(&self, ticket: i64) -> Result<Vec<crate::operations::Operation>> {
+        self.inner.db.with(|q| {
+            q.root(ticket)?;
+            crate::operations::list(q, ticket)
+        })
+    }
+
+    /// The operator checked an operation whose effect is unknown.
+    pub fn resolve_operation(&self, id: i64, note: &str) -> Result<()> {
+        self.inner.db.tx(|q| crate::operations::resolve(q, id, note))
+    }
+
+    pub(crate) fn operation_scope(&self, owner: crate::operations::Owner) -> crate::operations::Scope<'_> {
+        self.inner.scope(owner)
     }
 
     pub fn isolated_writers(&self, ticket: i64) -> Result<bool> {
@@ -754,30 +786,7 @@ impl Engine {
             let owner = inner.clone();
             let task = tokio::task::spawn_blocking(move || {
                 let _lease = IntegrationLease(owner.clone(), keys);
-                // Freeze operator checks and task state through publication.
-                // Cancellation here reads the atomic shutdown flag, avoiding
-                // recursively taking the journal lock from a Git subprocess.
-                let result=owner.db.tx(|q| {
-                    crate::integration_queue::current(q,&item)?;
-                    let merged=crate::integration_queue::publish(&w,&item.validation,&||owner.stopping.load(Ordering::SeqCst))?;
-                    crate::workspaces::save(q,&merged)?;
-                    q.run("UPDATE integration_queue SET state='merged',detail=?,validation=? WHERE job=?",&[&merged.detail,&merged.validation.to_string(),&job])?;
-                    q.run("UPDATE integration_queue SET state='queued',validation='{}',detail='原项目已合入其他候选，重新验证当前候选' WHERE job!=? AND state='awaiting_confirmation'
-                      AND job IN (SELECT job FROM job_workspaces WHERE source=?)",&[&job,&merged.source])?;
-                    let root=q.root(item.ticket)?;
-                    q.log(who_of(&root),"integration.confirmed",&json!({"job":job,"ok":true}))?;
-                    Ok(())
-                });
-                if let Err(error) = &result {
-                    let _ = owner.db.tx(|q| {
-                        q.run(
-                            "UPDATE integration_queue SET state='stale',detail=? WHERE job=?",
-                            &[&error.to_string(), &job],
-                        )?;
-                        Ok(())
-                    });
-                }
-                let _ = send.send(result);
+                let _ = send.send(owner.publish_confirmed(&item, &w));
             });
             sched.integration_tasks.push(task);
         }
@@ -807,24 +816,47 @@ impl Engine {
                 pending.detail="操作进行中；中断后需重新验证".into();
                 crate::workspaces::save(q,&pending)
             })?;
+            use crate::operations::{self as ops, kind};
+            let scope = inner.scope(ops::Owner::job(workspace.ticket, job));
             let result = match &command {
-                Some(argv) => crate::workspaces::validate(&workspace, argv),
-                None => crate::workspaces::integrate(&workspace, &inner.data_dir),
+                // Shutdown drains operator maintenance; only stopping the
+                // ticket (`Engine::cancel`) cancels the validation process.
+                Some(argv) => crate::workspaces::validate_with(&workspace, argv, &|| false, &scope),
+                None => crate::workspaces::integrate_with(&workspace, &inner.data_dir, &scope),
             };
+            if scope.crashed() {
+                return result.map(drop);
+            }
+            let verdicts = scope.settle(result.is_ok());
+            // An integration that failed after its fast-forward is still a merge.
+            let published = result.is_err().then(|| verdicts.iter()
+                .find(|v| v.kind == kind::LEGACY_INTEGRATE && v.state == ops::CONFIRMED)
+                .map(|v| v.intent["target"].clone())).flatten();
             inner.db.tx(|q| {
                 let root = q.root(workspace.ticket)?;
-                match &result {
-                    Ok(w) => {
+                match (&result, &published) {
+                    (Ok(w), _) => {
                         crate::workspaces::save(q,w)?;
                         q.log(who_of(&root), "workspace.result", &json!({"job":job,"state":w.state,"detail":w.detail,"validation":w.validation}))?;
                     }
-                    Err(e) => {
+                    (Err(_), Some(target)) => {
+                        let mut w = workspace.clone();
+                        w.state = "merged".into();
+                        w.detail = "核对原项目确认已本地合入".into();
+                        w.validation["integrated_head"] = target.clone();
+                        crate::workspaces::save(q,&w)?;
+                        q.log(who_of(&root), "workspace.result", &json!({"job":job,"state":w.state,"detail":w.detail,"validation":w.validation}))?;
+                    }
+                    (Err(e), None) => {
                         q.run("UPDATE job_workspaces SET state='failed',detail=? WHERE job=?",&[&e.to_string(),&job])?;
                         q.log(who_of(&root), "workspace.error", &json!({"job":job,"reason":e.to_string()}))?;
                     }
                 }
-                Ok(())
+                scope.record(q, &verdicts, result.is_ok())
             })?;
+            if published.is_some() {
+                return Ok(());
+            }
             result.map(|_| ())
         }).await.map_err(|_| anyhow!("工作区操作异常"))?
     }
@@ -867,7 +899,8 @@ impl Engine {
         })?;
         // Platform preparation is independent of the model's write permission.
         // Run Git outside the journal transaction and async executor.
-        let repository = inner.prepare_project(dir.clone(), true, CancellationToken::new()).await?;
+        let (repository, operations) = inner
+            .prepare_project(dir.clone(), true, CancellationToken::new(), Default::default()).await?;
         inner.db.tx(|q| {
             let checkpoint=params.checkpoint.map(|(ticket,seq)|crate::checkpoints::capture(q,ticket,seq)).transpose()?;
             let defaults = q.one("SELECT routes FROM route_defaults WHERE singleton=1", &[])?;
@@ -921,6 +954,7 @@ impl Engine {
             if repository.initialized || repository.initial_commit.is_some() {
                 q.log(who, "project.git", &json!(repository))?;
             }
+            crate::operations::attach(q, &operations, who)?;
             if !manifest.is_empty() {
                 q.log(who, "files", &Value::Array(manifest.clone()))?;
             }
@@ -1350,8 +1384,56 @@ fn scheduled_retries(q: &Q, ticket: i64, at: f64) -> Result<Vec<ScheduledRetry>>
 impl Inner {
     /// Coalesce preparation for peers sharing a project. Roots and new tickets
     /// recheck Git; peers reuse readiness, never a clean-tree/validation receipt.
-    async fn prepare_project(self: &Arc<Self>, directory: PathBuf, force: bool, cancel: CancellationToken)
-        -> Result<crate::project_git::Bootstrap>
+    pub(crate) fn scope(&self, owner: crate::operations::Owner) -> crate::operations::Scope<'_> {
+        crate::operations::Scope::new(&self.db, &self.operations, owner)
+    }
+
+    /// Publication runs Git without holding the journal: the receipt is
+    /// persisted first and the result recorded afterwards. A failure whose
+    /// effect is uncertain is classified from the source repository and never
+    /// merged again. The scheduler lease on both paths keeps writers out.
+    fn publish_confirmed(&self, item: &crate::integration_queue::IntegrationItem, w: &crate::workspaces::Workspace) -> Result<()> {
+        use crate::operations::{self as ops, kind};
+        let job = item.job;
+        let scope = self.scope(ops::Owner::job(item.ticket, job));
+        // Cancellation reads the atomic shutdown flag, never the journal.
+        let published = self.db.with(|q| crate::integration_queue::current(q, item)).and_then(|()|
+            crate::integration_queue::publish(w, &item.validation, &|| self.stopping.load(Ordering::SeqCst), &scope));
+        if scope.crashed() {
+            return published.map(drop);
+        }
+        let succeeded = published.is_ok();
+        let verdicts = scope.settle(succeeded);
+        let saved = published.and_then(|merged| self.db.tx(|q| {
+            ops::record_publication(q, job, item.ticket, &merged, false)?;
+            scope.record(q, &verdicts, true)
+        }));
+        let Err(error) = saved else { return Ok(()) };
+        if scope.crashed() {
+            return Err(error);
+        }
+        // The fast-forward may have happened although the call or its receipt failed.
+        let verdicts = if succeeded { ops::reinspect(&verdicts) } else { verdicts };
+        let state = verdicts.iter().find(|v| v.kind == kind::PUBLISH).map(|v| v.state);
+        let recorded = self.db.tx(|q| {
+            match state {
+                Some(ops::CONFIRMED) => ops::record_publication(q, job, item.ticket,
+                    &ops::merged_workspace(w, &item.validation, "操作者已确认；核对原项目确认已本地合入"), false)?,
+                Some(ops::UNKNOWN_EFFECT) => {
+                    q.run("UPDATE integration_queue SET state='blocked',detail=? WHERE job=?",
+                        &[&format!("合入结果未知，请人工核对原项目后重新验证：{error}"), &job])?;
+                }
+                _ => {
+                    q.run("UPDATE integration_queue SET state='stale',detail=? WHERE job=?", &[&error.to_string(), &job])?;
+                }
+            }
+            scope.record(q, &verdicts, false)
+        });
+        if state == Some(ops::CONFIRMED) && recorded.is_ok() { Ok(()) } else { Err(error) }
+    }
+
+    async fn prepare_project(self: &Arc<Self>, directory: PathBuf, force: bool, cancel: CancellationToken, owner: crate::operations::Owner)
+        -> Result<(crate::project_git::Bootstrap, Vec<i64>)>
     {
         let key = project_key(&directory.to_string_lossy());
         let entry = lock(&self.project_preparations).entry(key)
@@ -1365,16 +1447,30 @@ impl Inner {
         if !force && directory.is_dir() && let Some(root) = ready.as_ref()
             && Path::new(root).join(".git").exists()
         {
-            return Ok(crate::project_git::Bootstrap { root: root.clone(), initialized: false, initial_commit: None });
+            return Ok((crate::project_git::Bootstrap { root: root.clone(), initialized: false, initial_commit: None }, vec![]));
         }
         *ready = None;
-        let owner = self.clone();
-        let repository = tokio::task::spawn_blocking(move || {
-            crate::project_git::ensure_with_cancel(&directory, &||
-                cancel.is_cancelled() || owner.stopping.load(Ordering::SeqCst))
-        }).await.map_err(|_| anyhow!("工作目录 Git 准备异常"))??;
+        let inner = self.clone();
+        // `git init` and the initial commit run under operation receipts.
+        let (repository, ids) = tokio::task::spawn_blocking(move || {
+            let scope = inner.scope(owner);
+            let result = crate::project_git::ensure_observed(&directory, &||
+                cancel.is_cancelled() || inner.stopping.load(Ordering::SeqCst), &scope);
+            if scope.crashed() {
+                return (result, vec![]);
+            }
+            let ids = scope.ids();
+            let verdicts = scope.settle(result.is_ok());
+            if !verdicts.is_empty()
+                && let Err(error) = inner.db.tx(|q| scope.record(q, &verdicts, result.is_ok()))
+            {
+                return (Err(error), ids);
+            }
+            (result, ids)
+        }).await.map_err(|_| anyhow!("工作目录 Git 准备异常"))?;
+        let repository = repository?;
         *ready = Some(repository.root.clone());
-        Ok(repository)
+        Ok((repository, ids))
     }
 
     pub(crate) fn extensions(&self) -> Option<Arc<dyn Extensions>> {
@@ -1584,11 +1680,27 @@ impl Inner {
             let owner = self.clone();
             let task = tokio::task::spawn_blocking(move || {
                 let _lease = IntegrationLease(owner.clone(), keys);
-                let result =
-                    crate::integration_queue::prepare(&w, &owner.data_dir, &item.commands, &|| {
+                // Candidate preparation never changes the source branch. Its
+                // receipt lets a restart list candidates left behind.
+                use crate::operations::{self as ops, kind};
+                let scope = owner.scope(ops::Owner::job(item.ticket, item.job));
+                let intent = json!({"job":item.job,"source":w.source,
+                    "baseline":crate::workspaces::head(Path::new(&w.source)).ok(),
+                    "home":owner.data_dir.join("integrations"),"prefix":format!("queue-{}-",item.job)});
+                let result = scope.begin(kind::CANDIDATE, intent).and_then(|id| {
+                    let ready = crate::integration_queue::prepare(&w, &owner.data_dir, &item.commands, &|| {
                         owner.integration_cancelled(item.ticket)
-                    });
+                    })?;
+                    scope.effect(kind::CANDIDATE)?;
+                    scope.decide(id, ops::CONFIRMED, json!({"state":ready.state,"candidate":ready.validation["candidate"]}));
+                    Ok(ready)
+                });
+                if scope.crashed() {
+                    return;
+                }
+                let verdicts = scope.settle(result.is_ok());
                 let saved=owner.db.tx(|q| {
+                    scope.record(q, &verdicts, false)?;
                     if !crate::integration_queue::enabled(q,item.ticket)? {
                         q.run("UPDATE integration_queue SET state='cancelled',detail='操作者已停用队列或停止工单' WHERE job=?",&[&item.job])?;
                         return Ok(());
@@ -2037,7 +2149,8 @@ impl Inner {
         // Also covers pre-upgrade queued/retried jobs. Never initialize the
         // not-yet-provisioned isolated path or sweep inactive historical projects.
         let project_dir = PathBuf::from(turn.packet().get("project").and_then(Value::as_str).unwrap_or(&job.cwd));
-        let repository = self.prepare_project(project_dir, job.is_root(), turn.cancel.clone()).await?;
+        let (repository, _) = self.prepare_project(project_dir, job.is_root(), turn.cancel.clone(),
+            crate::operations::Owner::job(job.ticket, job.id)).await?;
         turn.ensure_current()?;
         if repository.initialized || repository.initial_commit.is_some() {
             self.db.tx(|q| {
@@ -2057,9 +2170,25 @@ impl Inner {
                 Ok(true)
             })?;
             if !valid { return Err(TurnError::Wait(now()+1.0)); }
-            let ready = tokio::task::spawn_blocking(move || crate::integration_queue::provision_dependencies(&w,&data,&prerequisites)).await
-                .map_err(|_| anyhow!("工作区准备异常"))??;
-            self.db.tx(|q| {
+            // Worktree creation, prerequisite checkpoints and merges run under
+            // receipts settled with the workspace row below.
+            let inner = self.clone();
+            let owner = crate::operations::Owner::job(job.ticket, job.id);
+            let (ready, verdicts, crashed) = tokio::task::spawn_blocking(move || {
+                let scope = inner.scope(owner);
+                let ready = crate::integration_queue::provision_dependencies(&w,&data,&prerequisites,&scope);
+                let verdicts = scope.settle(ready.is_ok());
+                (ready, verdicts, scope.crashed())
+            }).await.map_err(|_| anyhow!("工作区准备异常"))?;
+            let record = |q: &Q, receipt: bool| self.operations.record(q, &verdicts, receipt);
+            let ready = match ready {
+                Ok(ready) => ready,
+                Err(error) => {
+                    if !crashed { self.db.tx(|q| record(q, false))?; }
+                    return Err(error.into());
+                }
+            };
+            let saved = self.db.tx(|q| {
                 for (w,version) in &turn.workspace_dependencies {
                     ensure!(q.exists("SELECT 1 FROM jobs WHERE id=? AND turn=? AND state='done'",&[&w.job,version])?,"前置任务在工作区准备期间已续派，请重新派发当前依赖任务");
                     if let Some(mut prior)=crate::workspaces::get(q,w.job)? {
@@ -2067,8 +2196,16 @@ impl Inner {
                         crate::workspaces::save(q,&prior)?;
                     }
                 }
-                crate::workspaces::save(q,&ready)
-            })?;
+                crate::workspaces::save(q,&ready)?;
+                record(q, true)
+            });
+            if let Err(error) = &saved
+                && !error.is::<crate::operations::SimulatedCrash>()
+            {
+                // The Git effects happened; keep their receipts even if the row did not save.
+                let _ = self.db.tx(|q| record(q, false));
+            }
+            saved?;
             turn.preparing.store(false, Ordering::SeqCst);
             turn.packet().insert("workspace".into(),json!(ready));
         }

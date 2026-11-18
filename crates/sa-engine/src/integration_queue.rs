@@ -1,6 +1,7 @@
 //! Operator-enabled candidate preparation. Publishing always needs a separate
 //! operator confirmation against the exact validated trees and check commands.
 use crate::db::{Q, int_of, str_of};
+use crate::operations::{Scope, kind};
 use crate::protocol::digest;
 use crate::workspaces::{self, Workspace};
 use anyhow::{Result, ensure};
@@ -155,15 +156,23 @@ pub(crate) fn current(q: &Q, item: &IntegrationItem) -> Result<()> {
 }
 
 pub(crate) fn checkpoint(w: &Workspace, cancel: &dyn Fn() -> bool) -> Result<Workspace> {
+    checkpoint_with(w, cancel, &Scope::detached())
+}
+
+/// The checkpoint commit runs under a `git.checkpoint` receipt.
+fn checkpoint_with(w: &Workspace, cancel: &dyn Fn() -> bool, ops: &Scope) -> Result<Workspace> {
     ensure!(!cancel(), "合入验证已取消");
     workspaces::verify(w)?;
     let path = Path::new(&w.path);
     workspaces::git(path, &["add", "--all", "--", "."])?;
     if !workspaces::git(path, &["diff", "--cached", "--name-only"])?.is_empty() {
+        ops.begin(kind::CHECKPOINT, json!({"job":w.job,"path":w.path,"branch":w.branch,
+            "pre_head":workspaces::head(path)?}))?;
         workspaces::git(
             path,
             &["commit", "-m", "Checkpoint isolated Super Agent task"],
         )?;
+        ops.effect(kind::CHECKPOINT)?;
     }
     workspaces::clean(path)?;
     let mut ready = w.clone();
@@ -311,6 +320,7 @@ pub(crate) fn publish(
     w: &Workspace,
     validation: &Value,
     cancel: &dyn Fn() -> bool,
+    ops: &Scope,
 ) -> Result<Workspace> {
     ensure!(!cancel(), "合入操作已取消");
     ensure!(
@@ -343,6 +353,8 @@ pub(crate) fn publish(
             "原项目有新提交，请重新验证"
         );
         ensure!(!cancel(), "合入操作已取消");
+        ops.begin(kind::PUBLISH, json!({"job":w.job,"source":w.source,
+            "source_ref":w.validation["identity"]["source_ref"],"baseline":source_head,"target":candidate_head}))?;
         workspaces::git(
             source,
             &[
@@ -352,6 +364,7 @@ pub(crate) fn publish(
                 candidate_head,
             ],
         )?;
+        ops.effect(kind::PUBLISH)?;
     }
     let mut merged = w.clone();
     merged.state = "merged".into();
@@ -368,13 +381,14 @@ pub(crate) fn provision_dependencies(
     w: &Workspace,
     data: &Path,
     prerequisites: &[(Workspace, i64)],
+    ops: &Scope,
 ) -> Result<Workspace> {
     if prerequisites.is_empty() {
-        return workspaces::provision(w, data);
+        return workspaces::provision_with(w, data, ops);
     }
     let prerequisites = prerequisites
         .iter()
-        .map(|(p, turn)| Ok((checkpoint(p, &|| false)?, *turn)))
+        .map(|(p, turn)| Ok((checkpoint_with(p, &|| false, ops)?, *turn)))
         .collect::<Result<Vec<_>>>()?;
     let heads: Vec<Value> = prerequisites
         .iter()
@@ -385,13 +399,13 @@ pub(crate) fn provision_dependencies(
             w.validation["prerequisite_heads"] == json!(heads),
             "前置分支已续派或变化，请人工核对当前写任务"
         );
-        return workspaces::provision(w, data);
+        return workspaces::provision_with(w, data, ops);
     }
     ensure!(
         w.state == "planned",
         "已有工作区缺少前置分支快照，不能自动改变基线"
     );
-    let mut ready = workspaces::provision(w, data)?;
+    let mut ready = workspaces::provision_with(w, data, ops)?;
     for (prerequisite, _) in &prerequisites {
         workspaces::verify(prerequisite)?;
         workspaces::clean(Path::new(&prerequisite.path))?;
@@ -399,10 +413,13 @@ pub(crate) fn provision_dependencies(
             workspaces::head(Path::new(&prerequisite.path))? == prerequisite.head,
             "前置工作区发生变化"
         );
+        ops.begin(kind::DEPENDENCY_MERGE, json!({"job":w.job,"path":ready.path,"branch":ready.branch,
+            "pre_head":workspaces::head(Path::new(&ready.path))?,"merge_head":prerequisite.head,"prerequisite":prerequisite.job}))?;
         workspaces::git(
             Path::new(&ready.path),
             &["merge", "--no-ff", "--no-edit", &prerequisite.head],
         )?;
+        ops.effect(kind::DEPENDENCY_MERGE)?;
     }
     ready.base = workspaces::head(Path::new(&ready.path))?;
     ready.head = ready.base.clone();

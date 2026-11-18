@@ -24,6 +24,36 @@ pub fn ensure(cwd: &Path) -> Result<Bootstrap> {
 /// Initialization may leave an unborn repository if a later operation fails.
 /// A retry completes its initial commit without reinitializing the repository.
 pub fn ensure_with_cancel(cwd: &Path, cancel: &dyn Fn() -> bool) -> Result<Bootstrap> {
+    ensure_observed(cwd, cancel, &NoObserver)
+}
+
+/// Platform side effects of the bootstrap, reported around each one so the
+/// engine can hold an operation receipt for it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Effect {
+    Init,
+    InitialCommit,
+}
+
+pub(crate) trait Observer {
+    /// Called with the affected directory before the effect starts. An error
+    /// prevents the effect.
+    fn before(&self, effect: Effect, path: &Path) -> Result<()>;
+    /// Called after the effect's Git command succeeded.
+    fn after(&self, effect: Effect) -> Result<()>;
+}
+
+struct NoObserver;
+impl Observer for NoObserver {
+    fn before(&self, _: Effect, _: &Path) -> Result<()> {
+        Ok(())
+    }
+    fn after(&self, _: Effect) -> Result<()> {
+        Ok(())
+    }
+}
+
+pub(crate) fn ensure_observed(cwd: &Path, cancel: &dyn Fn() -> bool, observer: &dyn Observer) -> Result<Bootstrap> {
     ensure!(!cancel(), "Git 项目准备已取消");
     let cwd = fs::canonicalize(cwd).context("无法解析项目目录")?;
     ensure!(cwd.is_dir(), "工作目录必须是已存在的目录");
@@ -52,7 +82,9 @@ pub fn ensure_with_cancel(cwd: &Path, cancel: &dyn Fn() -> bool) -> Result<Boots
             config.ok || config.exit == Some(1),
             "Git 配置不可读取，项目未初始化"
         );
+        observer.before(Effect::Init, &cwd)?;
         checked(&cwd, &["init"], cancel)?;
+        observer.after(Effect::Init)?;
         initialized = true;
     } else {
         ensure!(
@@ -108,6 +140,7 @@ pub fn ensure_with_cancel(cwd: &Path, cancel: &dyn Fn() -> bool) -> Result<Boots
         checked(&cwd, &["rev-list", "--all", "--reflog", "--count"], cancel)? == "0",
         "Git HEAD 尚无提交，但仓库已有 reflog 历史；不能自动创建初始提交"
     );
+    observer.before(Effect::InitialCommit, &cwd)?;
     checked(&cwd, &["add", "--all", "--", "."], cancel)?;
     checked(
         &cwd,
@@ -119,6 +152,7 @@ pub fn ensure_with_cancel(cwd: &Path, cancel: &dyn Fn() -> bool) -> Result<Boots
         ],
         cancel,
     )?;
+    observer.after(Effect::InitialCommit)?;
     let initial_commit = checked(&cwd, &["rev-parse", "--verify", "HEAD^{commit}"], cancel)?;
     Ok(Bootstrap {
         root: root.to_string_lossy().into_owned(),

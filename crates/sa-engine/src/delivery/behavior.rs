@@ -140,7 +140,10 @@ impl Engine {
     ) -> Result<BehaviorReceipt> {
         // Reserve a new attempt before touching the filesystem or resolving
         // the command. A crash or slow new attempt immediately supersedes any pass.
-        let (basis, attempt, mut environment) = self.db().tx(|q| {
+        // Its operation receipt is written in the same transaction.
+        use crate::operations::{self as ops, kind};
+        let scope = self.operation_scope(ops::Owner::ticket(ticket));
+        let (basis, attempt, mut environment, operation) = self.db().tx(|q| {
             let project = ticket_project(q, ticket)?;
             let manifest = current_manifest(q, ticket, contract, snapshot_id)?;
             let item = requirement(q, ticket, requirement_id)?;
@@ -154,14 +157,24 @@ impl Engine {
             let id = q.insert("INSERT INTO delivery_behavior_attempts(ticket,requirement,requirement_revision,binding_id,snapshot_id,contract_revision,manifest_sha256,started,environment) VALUES(?,?,?,?,?,?,?,?,?)",
                 &[&ticket,&requirement_id,&item.revision,&check.id,&snapshot_id,&contract,&manifest,&now(),&environment.to_string()])?;
             event(q, ticket, "delivery.check_started", json!({"attempt_id":id,"binding_id":check.id,"snapshot_id":snapshot_id,"contract_revision":contract}))?;
-            Ok((Basis {ticket, contract, snapshot_id, item, project, manifest}, id, environment))
+            let operation = scope.begin_in(q, kind::BEHAVIOR, json!({"attempt":id,"requirement":requirement_id,
+                "snapshot":snapshot_id,"binding":check.id,"argv_sha256":environment["argv_sha256"]}))?;
+            Ok((Basis {ticket, contract, snapshot_id, item, project, manifest}, id, environment, operation))
         })?;
-        let cancelled = || self.is_stopping() || cancel();
-        let outcome = basis
-            .execute(self.data_dir(), &mut environment, &cancelled, timeout)
-            .unwrap_or_else(|error| Outcome::invalid(format!("{error:#}")));
+        scope.point(kind::BEHAVIOR, "after_begin")?;
+        let stop = scope.cancellable(operation);
+        let cancelled = || self.is_stopping() || cancel() || stop.load(std::sync::atomic::Ordering::SeqCst);
+        let executed = basis.execute(self.data_dir(), &mut environment, &cancelled, timeout);
+        let failure = executed.as_ref().err().map(|error| ops::process_failure(error, ops::FAILED_BEFORE_EFFECT));
+        let outcome = executed.unwrap_or_else(|error| Outcome::invalid(format!("{error:#}")));
+        scope.effect(kind::BEHAVIOR)?;
         let cancelled_before_commit = cancelled();
+        // The owned process tree is always reaped before `execute` returns Ok.
+        let state = failure.unwrap_or(if cancelled_before_commit { ops::CANCELLED } else { ops::CONFIRMED });
+        scope.decide(operation, state, json!({"attempt":attempt,"status":outcome.status}));
+        let verdicts = scope.settle(true);
         let (receipt, stale) = self.db().tx(|q| {
+            scope.record(q, &verdicts, true)?;
             let stale = basis.confirm(q, attempt).err().map(|error| error.to_string());
             let outcome = if let Some(reason) = &stale { outcome.invalidate(reason) }
                 else if cancelled_before_commit || self.is_stopping() { outcome.invalidate("提交行为检查回执前已取消") } else { outcome };
@@ -320,8 +333,13 @@ impl Basis {
         #[cfg(windows)]
         let _input_handles = lock_inputs(temp.path(), &workspace, &snapshot.files)?;
         verify_files(&workspace, &snapshot.files)?;
-        let result =
-            workspaces::delivery_command(&workspace, &host.argv, &host.env, timeout, cancel)?;
+        // Any failure after a successful spawn leaves the run's effect unknown.
+        let result = workspaces::delivery_command(&workspace, &host.argv, &host.env, timeout, cancel)
+            .map_err(|error| if error.is::<crate::operations::NotStarted>() || error.is::<crate::operations::ProcessUnconfirmed>() {
+                error
+            } else {
+                error.context(crate::operations::ProcessUnconfirmed)
+            })?;
         let tail = String::from_utf8_lossy(&result.output);
         let observed = Outcome {
             status: match (result.ok, result.exit) {
