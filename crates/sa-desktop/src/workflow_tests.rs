@@ -980,3 +980,21 @@ fn execution_policy_toggle_and_ledger_report_are_reachable() {
     }
     assert!(h.query_by_label_contains("金额未知").is_some());
 }
+
+#[test]
+fn unknown_platform_operations_ask_for_a_check() {
+    let data = tempfile::tempdir().unwrap();
+    seed(data.path());
+    let db = Db::open(data.path()).unwrap();
+    db.tx(|q| q.run("INSERT INTO operations(ticket,job,kind,intent,intent_sha256,state,attempts,detail,created,updated)
+        VALUES(1,1,'integration.publish','{}','x','unknown_effect',1,'{\"reason\":\"原项目 HEAD 既不是基线也不是候选\"}',1,1)", &[])).unwrap();
+    db.close();
+    let mut h = harness(data.path());
+    h.get_by_label("平台操作 · 1 项待核对").click();
+    h.run_steps(3);
+    assert!(h.query_by_label_contains("合入原项目 · 任务 #1 · 结果未知").is_some());
+    assert!(h.query_by_label("原项目 HEAD 既不是基线也不是候选").is_some());
+    h.get_by_label("已核对现场 #1").click();
+    h.run_steps(2);
+    assert!(matches!(h.state_mut().actions.pop(), Some(Action::ResolveOperation { id: 1, .. })));
+}

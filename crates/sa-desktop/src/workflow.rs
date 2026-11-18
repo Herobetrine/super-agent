@@ -5,6 +5,7 @@ use crate::{
     widgets,
 };
 use egui::{Label, RichText, Ui};
+use serde_json::Value;
 
 #[derive(Default)]
 pub struct WorkflowState {
@@ -279,6 +280,34 @@ impl WorkflowState {
         action
     }
 
+    /// Platform operations whose effect needs the operator's check (P4).
+    fn operations(&mut self, ui: &mut Ui, pal: &Palette, host: &Host, ticket: i64, action: &mut Option<Action>) {
+        let Ok(rows) = host.operations(ticket) else { return };
+        let open: Vec<_> = rows.iter()
+            .filter(|op| matches!(op.state.as_str(), "unknown_effect" | "started" | "cancel_requested"))
+            .collect();
+        egui::CollapsingHeader::new(heading(&if open.is_empty() { "平台操作".to_string() } else { format!("平台操作 · {} 项待核对", open.len()) }, pal))
+            .id_salt(("operations", ticket))
+            .show(ui, |ui| {
+                help(ui, format!("平台自己执行的 Git、合入、检查和工具调用共 {} 条记录。重启时只核对实际结果，不会重做；结果未知的操作需要你确认现场。", rows.len()), pal);
+                for op in &open {
+                    let job = op.job.map(|j| format!(" · 任务 #{j}")).unwrap_or_default();
+                    item_name(ui, &format!("{}{} · {}", crate::labels::operation_kind(&op.kind), job,
+                        crate::labels::operation_state(&op.state)), pal);
+                    let detail = op.detail.get("reason").and_then(Value::as_str)
+                        .or_else(|| op.detail.as_str())
+                        .map(str::to_string)
+                        .unwrap_or_else(|| op.detail.to_string());
+                    if !detail.is_empty() && detail != "null" { help(ui, detail, pal); }
+                    if op.state == "unknown_effect"
+                        && widgets::outline_button(ui, "", &format!("已核对现场 #{}", op.id), pal).clicked()
+                    {
+                        *action = Some(Action::ResolveOperation { id: op.id, note: "操作者已在桌面端核对现场".into() });
+                    }
+                }
+            });
+    }
+
     /// Spending ledger of this ticket (P0A): who spent what, and the gaps.
     fn ledger(&mut self, ui: &mut Ui, pal: &Palette, host: &Host, ticket: i64) {
         if let Some((id, pending)) = &self.ledger_loading
@@ -506,6 +535,8 @@ impl WorkflowState {
         self.policy(ui, pal, host, ticket, action);
         ui.add_space(8.0);
         self.ledger(ui, pal, host, ticket);
+        ui.add_space(8.0);
+        self.operations(ui, pal, host, ticket, action);
         ui.add_space(8.0);
         egui::CollapsingHeader::new(heading("从历史检查点分支", pal))
             .id_salt(("fork", ticket))

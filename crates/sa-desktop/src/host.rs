@@ -171,6 +171,11 @@ pub enum Action {
         ticket: i64,
         enabled: bool,
     },
+    /// The operator checked a platform operation whose effect was unknown.
+    ResolveOperation {
+        id: i64,
+        note: String,
+    },
     /// Execution policy of the ticket's project: record only, or apply.
     SetExecutionPolicy {
         ticket: i64,
@@ -270,6 +275,7 @@ impl Action {
             | Action::SetFailover { .. }
             | Action::SetIsolatedWriters { .. }
             | Action::SetExecutionPolicy { .. }
+            | Action::ResolveOperation { .. }
             | Action::ValidateWorkspace { .. }
             | Action::IntegrateWorkspace { .. }
             | Action::SetIntegrationQueue { .. }
@@ -752,6 +758,10 @@ impl Host {
                 .map(|r| sa_engine::workspaces::get(q, sa_engine::db::int_of(r,"job"))?.ok_or_else(|| anyhow!("工作区不存在"))).collect()
         })
     }
+    /// Platform operation receipts of a ticket (P4), oldest first.
+    pub fn operations(&self, ticket: i64) -> Result<Vec<sa_engine::operations::Operation>> {
+        self.read(|q| sa_engine::operations::list(q, ticket))
+    }
     /// Execution policy mode of the ticket's project and its latest decisions.
     pub fn execution_policy(&self, ticket: i64) -> Result<(String, Vec<Value>)> {
         self.read(|q| {
@@ -1131,6 +1141,10 @@ async fn execute(engine: &Engine, shared: &Shared, action: Action) -> Result<Opt
         }
         Action::SetIsolatedWriters { ticket, enabled } => {
             engine.set_isolated_writers(ticket, enabled)?;
+            Ok(None)
+        }
+        Action::ResolveOperation { id, note } => {
+            engine.resolve_operation(id, &note)?;
             Ok(None)
         }
         Action::SetExecutionPolicy { ticket, apply } => {

@@ -161,6 +161,8 @@ pub fn event_label(kind: &str) -> Option<&'static str> {
         "delivery.auto" => "已自动核对需求交付证据",
         "auto.stalled" => "连续给出相同的下一步，已暂停等待你决定",
         "policy.decision" => "执行策略已给出建议",
+        "operation.unknown_effect" => "平台操作结果未知，需要核对现场",
+        "operation.resolved" => "平台操作已人工核对",
         "knowledge.superseded" => "项目知识已被新条目取代",
         _ => return None,
     })
@@ -212,6 +214,38 @@ pub fn check_lines(payload: &serde_json::Value) -> Vec<(String, bool)> {
 
 /// Automatic snapshot evidence for operator-adopted requirements. Isolated
 /// work is described as not yet in the project, never as delivered.
+/// Platform operation kind (P4).
+pub fn operation_kind(kind: &str) -> &'static str {
+    match kind {
+        "project.git_init" => "初始化项目 Git",
+        "project.initial_commit" => "项目初始提交",
+        "workspace.worktree_add" => "创建隔离工作区",
+        "git.dependency_merge" => "合并前置分支",
+        "git.checkpoint" => "工作区检查点提交",
+        "integration.candidate" => "准备合入候选",
+        "integration.publish" => "合入原项目",
+        "workspace.integrate" => "手动合入原项目",
+        "process.validate" => "手动验证命令",
+        "delivery.behavior_check" => "需求行为检查",
+        "mcp.tool_call" => "MCP 工具调用",
+        _ => "平台操作",
+    }
+}
+
+/// Platform operation state (P4).
+pub fn operation_state(state: &str) -> &'static str {
+    match state {
+        "planned" | "started" => "进行中",
+        "confirmed" => "已确认完成",
+        "failed_before_effect" => "未产生效果",
+        "unknown_effect" => "结果未知，需要核对",
+        "cancel_requested" => "正在取消",
+        "cancelled" => "已取消",
+        "resolved" => "已人工核对",
+        _ => "状态未知",
+    }
+}
+
 /// Spending ledger role (P0A).
 pub fn ledger_role(role: &str) -> &'static str {
     match role {
