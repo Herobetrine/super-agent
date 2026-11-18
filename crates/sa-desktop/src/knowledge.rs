@@ -211,6 +211,13 @@ impl App {
                         if e.archived {
                             meta.push_str(" · 已归档");
                         }
+                        match e.state.as_deref() {
+                            Some("stale") => meta.push_str(" · 依赖文件已变化，仅供参考"),
+                            Some("superseded") => meta.push_str(&e.superseded_by
+                                .map(|id| format!(" · 已被 #{id} 取代"))
+                                .unwrap_or_else(|| " · 已被取代".into())),
+                            _ => {}
+                        }
                         ui.label(RichText::new(meta).font(theme::body(theme::TINY)).color(pal.faint));
                         if self.writable() {
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {

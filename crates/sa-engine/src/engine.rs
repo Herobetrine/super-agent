@@ -345,7 +345,7 @@ fn route_json(r: &Route) -> Value {
 
 /// Project key: the canonical directory like `tickets.cwd`, or the text as
 /// given when it does not resolve.
-fn project_key(cwd: &str) -> String {
+pub fn project_key(cwd: &str) -> String {
     realpath(Path::new(cwd))
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|_| cwd.to_string())

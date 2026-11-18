@@ -160,6 +160,8 @@ pub fn event_label(kind: &str) -> Option<&'static str> {
         "check.bounced" => "检查未通过，已退回修复",
         "delivery.auto" => "已自动核对需求交付证据",
         "auto.stalled" => "连续给出相同的下一步，已暂停等待你决定",
+        "policy.decision" => "执行策略已给出建议",
+        "knowledge.superseded" => "项目知识已被新条目取代",
         _ => return None,
     })
 }
@@ -210,6 +212,84 @@ pub fn check_lines(payload: &serde_json::Value) -> Vec<(String, bool)> {
 
 /// Automatic snapshot evidence for operator-adopted requirements. Isolated
 /// work is described as not yet in the project, never as delivered.
+/// Spending ledger role (P0A).
+pub fn ledger_role(role: &str) -> &'static str {
+    match role {
+        "lead" => "主控",
+        "collaborator" => "协作者",
+        "advisor" => "顾问",
+        _ => "其他",
+    }
+}
+
+/// Why an attempt ran (P0A).
+pub fn ledger_kind(kind: &str) -> &'static str {
+    match kind {
+        "initial" => "首次执行",
+        "continuation" => "后续轮次",
+        "retry" => "平台重试",
+        "repair" => "退回修复",
+        "consult" => "咨询",
+        "unallocated" => "未分到轮次",
+        _ => "其他",
+    }
+}
+
+/// How an attempt ended (P0A).
+pub fn ledger_outcome(outcome: &str) -> &'static str {
+    match outcome {
+        "replied" => "已回复",
+        "retried" => "转为重试",
+        "failed" => "失败",
+        "abandoned" => "已放弃",
+        "interrupted" => "中断",
+        "running" => "进行中",
+        _ => "未知",
+    }
+}
+
+/// Coverage gap reason codes (docs/dev/usage-ledger.md).
+pub fn ledger_gap(reason: &str) -> &'static str {
+    match reason {
+        "unreported_attempt" => "执行没有报告用量",
+        "no_usage_protocol" => "执行端不提供用量",
+        "native_subagents_excluded" => "Claude 原生子代理未计入",
+        "partial_samples" => "样本缺失或被更正",
+        "cumulative_unallocated" => "会话累计值无法分到轮次",
+        "shared_native_session" => "多个任务共用原生会话",
+        "advisor_unreported" => "顾问调用没有用量",
+        "advisor_partial" => "顾问调用用量不完整",
+        "advisor_records_incomplete" => "顾问调用记录不完整",
+        "no_usage_events" => "任务没有用量事件",
+        _ => "其他缺口",
+    }
+}
+
+/// Execution policy decision point (P2).
+pub fn policy_point(point: &str) -> &'static str {
+    match point {
+        "dispatch" => "派工",
+        "retry" => "自动重试",
+        "repair" => "退回修复",
+        _ => "策略",
+    }
+}
+
+/// Execution policy recommendation (P2).
+pub fn policy_choice(selected: &str) -> &'static str {
+    match selected {
+        "single" => "单人执行",
+        "limited_parallel" => "有限并行",
+        "serialize" => "排队执行",
+        "add_review" => "建议独立审查",
+        "retry" => "继续重试",
+        "repair" => "继续修复",
+        "stop" => "停止并交给你",
+        "rediagnose" => "重新诊断",
+        _ => "其他",
+    }
+}
+
 pub fn delivery_result(payload: &serde_json::Value) -> String {
     let status = match payload.get("status").and_then(serde_json::Value::as_str) {
         Some("ready") => "全部必需项通过",

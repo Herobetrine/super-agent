@@ -171,6 +171,11 @@ pub enum Action {
         ticket: i64,
         enabled: bool,
     },
+    /// Execution policy of the ticket's project: record only, or apply.
+    SetExecutionPolicy {
+        ticket: i64,
+        apply: bool,
+    },
     ValidateWorkspace {
         job: i64,
         command: Vec<String>,
@@ -264,6 +269,7 @@ impl Action {
             | Action::TicketMeta { .. }
             | Action::SetFailover { .. }
             | Action::SetIsolatedWriters { .. }
+            | Action::SetExecutionPolicy { .. }
             | Action::ValidateWorkspace { .. }
             | Action::IntegrateWorkspace { .. }
             | Action::SetIntegrationQueue { .. }
@@ -726,6 +732,12 @@ impl Host {
             q.exists("SELECT 1 FROM ticket_failover WHERE ticket=?", &[&ticket])
         })
     }
+    /// Spending ledger of one ticket (P0A), read from a separate read-only
+    /// connection off the UI thread. Never writes the journal.
+    pub fn ledger(&self, ctx: &egui::Context, ticket: i64) -> crate::ops::Pending<sa_store::ledger::StatusReport> {
+        let data = self.engine.data_dir().to_path_buf();
+        crate::ops::Pending::spawn(ctx, move || sa_store::ledger::status_report(&data, Some(ticket)))
+    }
     pub fn project_checks(&self, ctx: &egui::Context, cwd: &str) -> crate::ops::Pending<Vec<Vec<String>>> {
         let engine = self.engine.clone();
         let cwd = cwd.to_owned();
@@ -738,6 +750,16 @@ impl Host {
         self.read(|q| {
             q.all("SELECT job FROM job_workspaces WHERE ticket=? ORDER BY job", &[&ticket])?.iter()
                 .map(|r| sa_engine::workspaces::get(q, sa_engine::db::int_of(r,"job"))?.ok_or_else(|| anyhow!("工作区不存在"))).collect()
+        })
+    }
+    /// Execution policy mode of the ticket's project and its latest decisions.
+    pub fn execution_policy(&self, ticket: i64) -> Result<(String, Vec<Value>)> {
+        self.read(|q| {
+            let row = q.one("SELECT cwd FROM tickets WHERE id=?", &[&ticket])?
+                .ok_or_else(|| anyhow!("工单不存在"))?;
+            let project = sa_engine::engine::project_key(sa_engine::db::str_of(&row, "cwd"));
+            let mode = sa_engine::execution_policy::project_mode(q, &project)?;
+            Ok((mode.as_str().to_string(), sa_engine::execution_policy::decisions(q, ticket, 6)?))
         })
     }
     pub fn integration_queue_enabled(&self, ticket: i64) -> Result<bool> {
@@ -1109,6 +1131,15 @@ async fn execute(engine: &Engine, shared: &Shared, action: Action) -> Result<Opt
         }
         Action::SetIsolatedWriters { ticket, enabled } => {
             engine.set_isolated_writers(ticket, enabled)?;
+            Ok(None)
+        }
+        Action::SetExecutionPolicy { ticket, apply } => {
+            let cwd = engine.db().with(|q| {
+                let row = q.one("SELECT cwd FROM tickets WHERE id=?", &[&ticket])?
+                    .ok_or_else(|| anyhow::anyhow!("工单不存在"))?;
+                Ok(sa_engine::db::str_of(&row, "cwd").to_string())
+            })?;
+            engine.set_execution_policy(&cwd, if apply { "apply" } else { "record" })?;
             Ok(None)
         }
         Action::ValidateWorkspace { job, command } => {

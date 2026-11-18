@@ -30,6 +30,8 @@ pub struct WorkflowState {
     fork_confirm: bool,
     pr_url: String,
     pr_job: String,
+    ledger_loading: Option<(i64, crate::ops::Pending<sa_store::ledger::StatusReport>)>,
+    ledger: Option<(i64, Result<sa_store::ledger::StatusReport, String>)>,
 }
 
 /// Secondary help text.
@@ -277,6 +279,78 @@ impl WorkflowState {
         action
     }
 
+    /// Spending ledger of this ticket (P0A): who spent what, and the gaps.
+    fn ledger(&mut self, ui: &mut Ui, pal: &Palette, host: &Host, ticket: i64) {
+        if let Some((id, pending)) = &self.ledger_loading
+            && let Some(result) = pending.poll()
+        {
+            self.ledger = Some((*id, result));
+            self.ledger_loading = None;
+        }
+        egui::CollapsingHeader::new(heading("用量账目", pal))
+            .id_salt(("ledger", ticket))
+            .show(ui, |ui| {
+                help(ui, "按主控、协作者、顾问和执行原因列出已报告的用量；没有报告的部分单列为缺口，不按零计。", pal);
+                let loading = self.ledger_loading.as_ref().is_some_and(|(id, _)| *id == ticket);
+                if widgets::outline_button(ui, "", if loading { "正在汇总…" } else { "生成用量账目" }, pal).clicked() && !loading {
+                    self.ledger_loading = Some((ticket, host.ledger(ui.ctx(), ticket)));
+                }
+                match self.ledger.as_ref().filter(|(id, _)| *id == ticket).map(|(_, r)| r) {
+                    None => {}
+                    Some(Err(error)) => problem(ui, error, pal),
+                    Some(Ok(report)) => {
+                        let c = &report.coverage;
+                        help(ui, format!("共 {} 次执行，{} 次报告了用量；金额未知（没有价格表）。", c.attempts, c.reported_attempts), pal);
+                        for bucket in &report.buckets {
+                            let tokens = bucket.tokens.total_tokens.map(|t| format!("{t} Token")).unwrap_or_else(|| "用量未知".into());
+                            help(ui, format!("{} · {} · {}：{} 次（{} 次有用量）· {}{}",
+                                crate::labels::ledger_role(&bucket.role), crate::labels::ledger_kind(&bucket.kind),
+                                crate::labels::ledger_outcome(&bucket.outcome), bucket.attempts, bucket.reported_attempts,
+                                tokens, if bucket.partial { "（不完整）" } else { "" }), pal);
+                        }
+                        for (reason, count) in &report.gaps {
+                            help(ui, format!("缺口 · {}：{count}", crate::labels::ledger_gap(reason)), pal);
+                        }
+                    }
+                }
+            });
+    }
+
+    /// Rule-based execution policy of the project (P2): record or apply.
+    fn policy(&mut self, ui: &mut Ui, pal: &Palette, host: &Host, ticket: i64, action: &mut Option<Action>) {
+        egui::CollapsingHeader::new(heading("执行策略", pal))
+            .id_salt(("policy", ticket))
+            .show(ui, |ui| {
+                let Ok((mode, decisions)) = host.execution_policy(ticket) else {
+                    help(ui, "工单状态正在更新，稍后重试。", pal);
+                    return;
+                };
+                let mut apply = mode == "apply";
+                if ui
+                    .add(widgets::Check::new(
+                        &mut apply,
+                        RichText::new("按规则自动调整（本项目）").font(theme::body(theme::UI)),
+                    ))
+                    .changed()
+                {
+                    *action = Some(Action::SetExecutionPolicy { ticket, apply });
+                }
+                help(ui, "默认只记录建议，不改变调度。开启后仅做三件事：写入范围重叠的隔离写任务排队执行；自动重试与修复达到工单上限或同类失败连续 3 次时停止并交给你；不改变模型、权限或已停止的工单。", pal);
+                if decisions.is_empty() {
+                    help(ui, "本工单还没有策略记录。", pal);
+                    return;
+                }
+                for decision in &decisions {
+                    let applied = if decision["applied"] == true { "已执行" } else { "仅记录" };
+                    let job = decision["job"].as_i64().map(|j| format!(" · 任务 #{j}")).unwrap_or_default();
+                    help(ui, format!("{} · {}{} · {} · {}",
+                        crate::labels::policy_point(decision["point"].as_str().unwrap_or_default()),
+                        crate::labels::policy_choice(decision["selected"].as_str().unwrap_or_default()),
+                        job, applied, decision["reason"].as_str().unwrap_or_default()), pal);
+                }
+            });
+    }
+
     fn groups(
         &mut self,
         ui: &mut Ui,
@@ -428,6 +502,10 @@ impl WorkflowState {
                     }
                 }
             });
+        ui.add_space(8.0);
+        self.policy(ui, pal, host, ticket, action);
+        ui.add_space(8.0);
+        self.ledger(ui, pal, host, ticket);
         ui.add_space(8.0);
         egui::CollapsingHeader::new(heading("从历史检查点分支", pal))
             .id_salt(("fork", ticket))
@@ -609,6 +687,9 @@ impl WorkflowState {
             help(ui, format!("{} · 已自动退回 {} / 2 次", item.detail, item.attempts), pal);
             if let Some(candidate) = item.validation["candidate"].as_str() { help(ui, format!("候选工作区：{candidate}"), pal); }
             if let Some(head) = item.validation["candidate_head"].as_str() { help(ui, format!("已验证提交：{head}"), pal); }
+            if item.validation["workspace_checks"]["reused_from"] == "candidate_checks" {
+                help(ui, "候选与任务内容相同，项目检查只在干净的候选目录执行了一次。", pal);
+            }
             egui::CollapsingHeader::new(heading(&format!("验证详情 #{}", item.job), pal)).id_salt(("queue-details",item.job)).show(ui, |ui| {
                 for key in ["workspace_checks", "candidate_checks"] {
                     if let Some(checks) = item.validation[key].as_array() {

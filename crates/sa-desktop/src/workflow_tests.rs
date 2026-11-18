@@ -954,3 +954,29 @@ fn delivery_ui_accepts_only_the_confirmed_partial_assessment() {
     assert!(observer.query_by_label("接受此部分交付").is_none());
     assert!(observer.query_by_label("确认接受部分交付").is_none());
 }
+
+#[test]
+fn execution_policy_toggle_and_ledger_report_are_reachable() {
+    let data = tempfile::tempdir().unwrap();
+    seed(data.path());
+    let mut h = harness(data.path());
+    h.get_by_label("执行策略").click();
+    h.run_steps(3);
+    h.get_by_label("按规则自动调整（本项目）").click();
+    h.run_steps(2);
+    assert!(matches!(
+        h.state_mut().actions.pop(),
+        Some(Action::SetExecutionPolicy { ticket: 1, apply: true })
+    ));
+    assert!(h.query_by_label("本工单还没有策略记录。").is_some());
+    h.get_by_label("用量账目").click();
+    h.run_steps(3);
+    h.get_by_label("生成用量账目").click();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while h.query_by_label_contains("次报告了用量").is_none() {
+        assert!(Instant::now() < deadline, "ledger report did not arrive");
+        std::thread::sleep(Duration::from_millis(50));
+        h.run_steps(1);
+    }
+    assert!(h.query_by_label_contains("金额未知").is_some());
+}
