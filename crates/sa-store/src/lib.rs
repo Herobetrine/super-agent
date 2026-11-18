@@ -6,6 +6,7 @@ pub mod delivery;
 mod harness_activity;
 pub mod journal;
 pub mod knowledge;
+pub mod ledger;
 pub mod model;
 mod native_activity;
 mod progress;

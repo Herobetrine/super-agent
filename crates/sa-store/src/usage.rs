@@ -201,6 +201,9 @@ pub struct TicketUsage {
     pub advisor_calls: Vec<AdvisorUsage>,
     pub reported_advisor_calls: u64,
     pub unreported_advisor_calls: u64,
+    /// Native sessions reported by more than one job. Their cumulative
+    /// counters cannot be split between the jobs, so totals stay partial.
+    pub shared_native_sessions: u64,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -380,6 +383,8 @@ struct JobState {
     units: HashMap<String, (i64, TokenCounts)>,
     codex_baselines: HashMap<String, TokenCounts>,
     codex_total: Sum,
+    /// The same Codex deltas, keyed by the attempt that observed them.
+    codex_turns: BTreeMap<i64, Sum>,
     claude_message_owners: HashMap<String, i64>,
     agy: HashMap<String, AgySession>,
     session: String,
@@ -515,6 +520,7 @@ impl JobState {
         };
         self.codex_baselines.insert(thread, next);
         self.codex_total.add(&delta);
+        self.codex_turns.entry(turn).or_default().add(&delta);
         let attempt = self.attempts.entry(turn).or_default();
         attempt.reported = true;
         attempt.output_change(Some(0), delta.output_tokens, at);
@@ -729,6 +735,59 @@ impl JobState {
             performance,
         }
     }
+
+    /// Reported tokens per attempt (turn). Conversation-cumulative usage that
+    /// cannot be assigned to one attempt is returned separately.
+    fn allocation(&self) -> (BTreeMap<i64, TokenCounts>, TokenCounts) {
+        let mut turns: BTreeMap<i64, Sum> = BTreeMap::new();
+        for (turn, sum) in &self.codex_turns {
+            if let Some(tokens) = &sum.0 {
+                turns.entry(*turn).or_default().add(tokens);
+            }
+        }
+        for (owner, unit) in self.units.values() {
+            turns.entry(*owner).or_default().add(unit);
+        }
+        for (turn, attempt) in &self.attempts {
+            let entry = turns.entry(*turn).or_default();
+            if let Some(result) = &attempt.claude_result {
+                entry.add(result);
+            } else {
+                for message in attempt.claude_messages.values() {
+                    entry.add(message);
+                }
+            }
+        }
+        let mut unallocated = Sum::default();
+        for session in self.agy.values() {
+            if let Some(total) = &session.total {
+                unallocated.add(total);
+            }
+            for (_, step) in session.pending.values() {
+                unallocated.add(step);
+            }
+        }
+        (
+            turns.into_iter().map(|(turn, sum)| (turn, sum.finish())).collect(),
+            unallocated.finish(),
+        )
+    }
+}
+
+/// One attempt's reported usage, before the ledger classifies it.
+pub(crate) struct RawAttempt {
+    pub job: i64,
+    /// `None` for usage that cannot be assigned to one attempt.
+    pub turn: Option<i64>,
+    pub advisor: Option<String>,
+    pub agent: String,
+    pub tokens: TokenCounts,
+    pub reported: bool,
+    pub ended: bool,
+    pub failed: bool,
+    /// The job's or call's counters are incomplete (replays, regressions,
+    /// missing fields, identity conflicts).
+    pub partial: bool,
 }
 
 /// Retains compact counters and deduplication identities, never raw payloads.
@@ -739,6 +798,7 @@ pub(crate) struct Entry {
     advisors: BTreeMap<String, AdvisorState>,
     advisor_partial: bool,
     native_owners: HashMap<(String, String), HashSet<UsageOwner>>,
+    shared_sessions: HashSet<(String, String)>,
 }
 
 struct AdvisorState {
@@ -885,11 +945,17 @@ impl Entry {
         let Some(session) = native_session(agent, value) else {
             return;
         };
-        let owners = self
-            .native_owners
-            .entry((agent.to_string(), session))
-            .or_default();
+        let key = (agent.to_string(), session);
+        let owners = self.native_owners.entry(key.clone()).or_default();
         owners.insert(owner);
+        if owners
+            .iter()
+            .filter(|owner| matches!(owner, UsageOwner::Job(_)))
+            .count()
+            > 1
+        {
+            self.shared_sessions.insert(key);
+        }
         if owners.len() > 1 {
             for owner in owners.iter() {
                 if let UsageOwner::Advisor(id) = owner
@@ -987,7 +1053,8 @@ impl Entry {
     pub(crate) fn view(&self, end: i64, visible: &[(i64, String)], total_jobs: i64) -> TicketUsage {
         let mut totals = Sum::default();
         let mut performance = UsagePerformance::default();
-        let mut partial = self.seq < end || self.advisor_partial;
+        let mut partial =
+            self.seq < end || self.advisor_partial || !self.shared_sessions.is_empty();
         let mut reported_jobs = 0;
         let mut jobs = Vec::new();
         for (id, state) in &self.jobs {
@@ -1055,6 +1122,72 @@ impl Entry {
             advisor_calls,
             reported_advisor_calls,
             unreported_advisor_calls,
+            shared_native_sessions: self.shared_sessions.len() as u64,
         }
+    }
+
+    /// Every scanned attempt with its own reported usage, for the ledger.
+    pub(crate) fn attempts(&self) -> Vec<RawAttempt> {
+        let mut out = vec![];
+        for (id, state) in &self.jobs {
+            let (turns, unallocated) = state.allocation();
+            for (turn, attempt) in &state.attempts {
+                out.push(RawAttempt {
+                    job: *id,
+                    turn: Some(*turn),
+                    advisor: None,
+                    agent: state.agent.clone(),
+                    tokens: turns.get(turn).cloned().unwrap_or_default(),
+                    reported: attempt.reported,
+                    ended: attempt.ended,
+                    failed: attempt.failed,
+                    partial: state.partial,
+                });
+            }
+            if unallocated.any() {
+                out.push(RawAttempt {
+                    job: *id,
+                    turn: None,
+                    advisor: None,
+                    agent: state.agent.clone(),
+                    tokens: unallocated,
+                    reported: true,
+                    ended: true,
+                    failed: false,
+                    partial: state.partial,
+                });
+            }
+        }
+        for (attempt_id, call) in &self.advisors {
+            let view = call.state.view(call.job);
+            let attempt = call.state.attempts.get(&1);
+            out.push(RawAttempt {
+                job: call.job,
+                turn: Some(call.turn),
+                advisor: Some(attempt_id.clone()),
+                agent: call.state.agent.clone(),
+                tokens: if call.identity_conflict { TokenCounts::default() } else { view.tokens },
+                reported: !call.identity_conflict && view.reported_attempts > 0,
+                ended: attempt.is_some_and(|a| a.ended),
+                failed: attempt.is_some_and(|a| a.failed),
+                partial: call.state.partial || call.identity_conflict,
+            });
+        }
+        out
+    }
+
+    /// Native sessions reported by more than one job, as (agent, session).
+    pub(crate) fn shared_sessions(&self) -> Vec<(String, String)> {
+        let mut shared: Vec<_> = self.shared_sessions.iter().cloned().collect();
+        shared.sort();
+        shared
+    }
+
+    pub(crate) fn advisor_partial(&self) -> bool {
+        self.advisor_partial
+    }
+
+    pub(crate) fn position(&self) -> i64 {
+        self.seq
     }
 }
