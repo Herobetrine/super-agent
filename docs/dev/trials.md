@@ -78,6 +78,7 @@ scripts\cargo.cmd run -p sa-adapters --example trial -- --suite eval/suites/core
 - `selections`：路由。
 - `efficiency`：效率设置，例如 `max_collaborators`、`incremental_context`、`quota_guard`。
 - `isolated_writers`：是否隔离写入。
+- `policy`：执行策略模式（`record` 或 `apply`），用于 §8.3 的匹配对照：同一任务在只记录与按规则调整两种模式下比较。
 
 执行顺序是每轮依次运行所有任务和所有变体，让时间漂移对各变体的影响相同。已存在的记录会跳过，中断后可以续跑。
 

@@ -135,6 +135,9 @@ pub struct Variant {
     pub efficiency: Option<Value>,
     #[serde(default)]
     pub isolated_writers: Option<bool>,
+    /// Execution policy mode of the trial project: `record` or `apply` (P2).
+    #[serde(default)]
+    pub policy: Option<String>,
 }
 
 pub struct LoadedSuite {
@@ -477,6 +480,9 @@ pub async fn run(
     }
     if task.integration_queue {
         engine.set_integration_queue(ticket, true)?;
+    }
+    if let Some(mode) = &variant.policy {
+        engine.set_execution_policy(&project.to_string_lossy(), mode)?;
     }
     engine.start()?;
     let started = Instant::now();

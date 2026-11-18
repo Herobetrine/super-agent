@@ -3,6 +3,10 @@
     "id": "baseline"
   },
   {
+    "id": "policy-apply",
+    "policy": "apply"
+  },
+  {
     "id": "single-collaborator",
     "efficiency": {
       "max_collaborators": 1
