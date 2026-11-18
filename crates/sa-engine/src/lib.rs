@@ -17,6 +17,7 @@ mod checks;
 pub mod adapter;
 pub mod autonomy;
 pub mod context;
+pub mod context_selection;
 pub mod db;
 pub mod delivery;
 pub mod dispatch;

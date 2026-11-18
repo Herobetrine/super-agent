@@ -46,6 +46,9 @@ const CONTROL: &[&str] = &[
     "checks",
     "completion_checks",
     "prerequisites",
+    // Required acceptance items are never compacted away (bounded to 16 KiB).
+    "requirements",
+    "requirements_omitted",
 ];
 const HISTORY: &[&str] = &["user_updates", "reports", "notes", "roster", "mcp_results", "plan"];
 

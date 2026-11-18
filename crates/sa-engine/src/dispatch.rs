@@ -616,7 +616,7 @@ fn progress(turn: &Turn, text: &str) -> Result<()> {
     })
 }
 
-/// `SA_MEMO {"kind","text"}` (final reply only, spec §4.4). Like
+/// `SA_MEMO {"kind","text"[,"paths","supersedes"]}` (final reply only, spec §4.4). Like
 /// SA_PROGRESS, a malformed or excess entry is logged as
 /// `knowledge.rejected {reason}` without quoting it or failing the job.
 /// Duplicates (and replays of a retried turn) are silent no-ops.
@@ -624,6 +624,14 @@ fn memo(turn: &Turn, text: &str) -> Result<()> {
     let job = &turn.job;
     let who = job.who();
     let seen = turn.memos.fetch_add(1, Ordering::SeqCst) + 1;
+    // File digests are read before the journal transaction opens.
+    let parsed = serde_json::from_str::<Value>(text).ok();
+    let digests = match parsed.as_ref().and_then(knowledge::parse_memo_ext) {
+        Some(memo) if seen <= knowledge::MAX_PER_TURN && !memo.paths.is_empty() => {
+            knowledge::digest_paths(std::path::Path::new(&job.cwd), &memo.paths)
+        }
+        _ => vec![],
+    };
     turn.inner().db.tx(|q| {
         if turn.aborted() || !q.live(who)? {
             return Ok(());
@@ -632,21 +640,32 @@ fn memo(turn: &Turn, text: &str) -> Result<()> {
         if seen > knowledge::MAX_PER_TURN {
             return reject("too_many");
         }
-        let Ok(cmd) = serde_json::from_str::<Value>(text) else {
+        let Some(cmd) = &parsed else {
             return reject("invalid_json");
         };
-        let Some((kind, body)) = knowledge::parse_memo(&cmd) else {
+        let Some(memo) = knowledge::parse_memo_ext(cmd) else {
             return reject("invalid_fields");
         };
         let entry = knowledge::NewEntry {
             cwd: &job.cwd,
-            kind,
-            body,
+            kind: memo.kind,
+            body: memo.text,
             ticket: Some(job.ticket),
             job: Some(job.id),
             agent: &job.agent,
         };
-        knowledge::insert(q, &entry, Some(who))?;
+        if let Some(id) = knowledge::insert(q, &entry, Some(who))? {
+            if !digests.is_empty() {
+                knowledge::record_basis(q, id, memo.kind, &digests)?;
+            }
+            if let Some(old) = memo.supersedes {
+                if knowledge::supersede(q, id, old)? {
+                    q.log(who, "knowledge.superseded", &json!({"id": old, "by": id}))?;
+                } else {
+                    return reject("supersedes_unavailable");
+                }
+            }
+        }
         Ok(())
     })
 }

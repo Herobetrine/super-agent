@@ -2127,6 +2127,9 @@ impl Inner {
         if failing_report || unhealthy {
             guide.push_str(guides::REROUTE);
         }
+        // Role pack: runs on the enriched envelope, before the snapshot and
+        // before any delivery view is derived from it.
+        let selection = crate::context_selection::select(&mut packet, job);
         *turn.packet() = packet.clone();
         let manifest = packet.get("files").cloned().unwrap_or(Value::Null);
         let objects = self.data_dir.join("objects");
@@ -2204,6 +2207,9 @@ impl Inner {
                 "saved_bytes": full_prompt_bytes.saturating_sub(prompt.len()),
                 "lazy_mcp_schemas": deferred_schemas,
             }))?;
+            let mode = if compacted { "compacted" } else if recovery_delivery { "recovery" } else if incremental { "delta" } else { "full" };
+            q.log(job.who(), "context.selection", &crate::context_selection::manifest(
+                crate::context_selection::role_of(job), &snapshot, &selection, mode))?;
             Ok(snapshot_seq)
         })?;
         if prompt.len() > MAX_PROMPT_BYTES {
@@ -3874,10 +3880,10 @@ impl Engine {
         let cancel = cancel.child_token();
         ensure!(!brief.trim().is_empty() && brief.len() <= crate::advice::MAX_BRIEF, "简报为空或超过 {} 字节", crate::advice::MAX_BRIEF);
         let who = Who { ticket, id: job, turn };
-        let (advisor, cwd) = inner.db.tx(|q| {
+        let (advisor, cwd, requirements) = inner.db.tx(|q| {
             ensure!(q.live(who)?, "本轮已结束");
             let cwd = q.one("SELECT cwd FROM tickets WHERE id=?", &[&ticket])?.ok_or_else(|| anyhow!("工单不存在"))?;
-            Ok((crate::advice::choose(q, ticket)?, str_of(&cwd, "cwd").to_string()))
+            Ok((crate::advice::choose(q, ticket)?, str_of(&cwd, "cwd").to_string(), crate::context_selection::advisor_section(q, ticket)?))
         })?;
         let adapter = inner.adapters.get(&advisor.agent).cloned().ok_or_else(|| anyhow!("顾问执行端不可用：{}", advisor.agent))?;
         if inner.opts.efficiency.read().unwrap_or_else(|e| e.into_inner()).quota_guard
@@ -3889,14 +3895,26 @@ impl Engine {
         let label = json!({"agent": advisor.agent, "provider": advisor.route.provider, "model": advisor.route.model,
             "reasoning_effort": advisor.route.reasoning_effort, "source": advisor.source});
         // Journal sequence is durable and unique across concurrent callers and restarts.
-        let started_seq = inner.db.with(|q| q.log(who, "advice.started", &json!({"schema_version":1, "advisor": label, "brief_bytes": brief.len(), "brief_sha256": digest(brief)})))?;
+        let (section, sources, omitted) = match requirements {
+            Some((text, sources, omitted)) => (Some(text), sources, omitted),
+            None => (None, vec![], 0),
+        };
+        let started_seq = inner.db.with(|q| {
+            let seq = q.log(who, "advice.started", &json!({"schema_version":1, "advisor": label, "brief_bytes": brief.len(), "brief_sha256": digest(brief)}))?;
+            q.log(who, "context.selection", &crate::context_selection::advisor_manifest(sources, omitted, brief.len()))?;
+            Ok(seq)
+        })?;
         let attempt_id = format!("advice:{started_seq}");
+        let prompt = match &section {
+            Some(section) => format!("{}\n\n{section}\n\n{brief}", crate::advice::GUIDE),
+            None => format!("{}\n\n{brief}", crate::advice::GUIDE),
+        };
         let request = RunRequest {
             ticket,
             job,
             turn,
             agent: advisor.agent.clone(),
-            prompt: format!("{}\n\n{brief}", crate::advice::GUIDE),
+            prompt,
             images: vec![],
             cwd: PathBuf::from(cwd),
             route: advisor.route.clone(),

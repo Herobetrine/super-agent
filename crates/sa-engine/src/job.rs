@@ -367,6 +367,12 @@ pub fn envelope(q: &Q, j: &JobCtx, harness_health: Value) -> Result<Map<String, 
     );
     m.insert("notes".into(), Value::Array(q.notes(j.id, false)?));
     m.insert("user_updates".into(), Value::Array(user_updates));
+    if let Some((requirements, omitted)) = crate::context_selection::requirements(q, j)? {
+        m.insert("requirements".into(), requirements);
+        if let Some(omitted) = omitted {
+            m.insert("requirements_omitted".into(), omitted);
+        }
+    }
     m.insert("roster".into(), Value::Array(roster));
     m.insert(
         "next_step".into(),
