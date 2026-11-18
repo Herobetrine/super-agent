@@ -257,3 +257,41 @@ Fable 审查后修复了需求提交后再读失败导致的误报、损坏最�
 | 模块测试 | 输入不变时沿用快照，不重跑已有回执的检查；项目超过 128 个文件时退回到「上次快照 + 改动」；门关闭不退回，门开启时退回内容带需求标题和退出码。 |
 
 日志位于 `tmpstate/delivery-auto-20261118/`：`build.log`、`clippy.log`、`clippy-final.log`、`test.log`、`test-engine-final.log`。未执行的部分：没有用真实模型跑端到端工单，没有重新编译或替换 `target/release` 发布程序，也没有人工体验验收。真实模型是否会利用回报中的 `delivery` 字段，仍待实际运行确认。
+
+## 架构演进 P0A–P5 实现（2026-11-18）
+
+本轮实现了[长期设计](architecture-evolution.md)剩余各阶段，状态汇总见 §14.2：
+
+- P0A：[用量账目与现状报告](dev/usage-ledger.md)。
+- P1B：[角色上下文与知识过期](dev/context-selection.md)。
+- P2：[执行策略](dev/execution-policy.md)。
+- P3：[验证复用与短租约](dev/verification-reuse.md)。
+- P4：[操作回执与重启对账](dev/operation-recovery.md)。
+- P5：[固定任务集与受控试验](dev/trials.md)。
+
+P1B、P2、P4 由三个隔离工作树并行实现。合入前逐个审阅了它们对共享文件的改动；合入后修正了一处：P2 的工单恢复预算原先按日志事件计数，一次重试会计两次，现改为按不同的任务轮次计数。
+
+| 验证 | 结果 |
+| --- | --- |
+| 构建与静态检查 | 最终提交 `298cdfc` 上，`build --workspace` 和 `clippy --workspace --all-targets -- -D warnings` 均退出 0（`CARGO_TARGET_DIR=target/audit`）。 |
+| 全量测试 | `test --workspace --no-fail-fast -- --test-threads=2` 退出 0：833 通过、0 失败、7 忽略。合入 P4 前的同一命令为 818 通过、0 失败、7 忽略。 |
+| 新增回归 | 账目夹具 4 项；验证复用 3 项与候选单次检查 1 项；上下文选择 8 项；执行策略 18 项；操作恢复 9 项及行为检查 2 项；试验执行器 1 项集成测试与 2 项单元测试；桌面端执行策略与用量账目、平台操作核对各 1 项。 |
+| 现状报告 | 对真实工单库的 SQLite 备份副本只读运行 `ledger`：7 张工单、759 次执行、556 次报告了用量。缺口：未报告 203、样本不完整 68、Claude 子代理 40、累计值未分配 16。 |
+| 任务集 | `trial --validate`：core-v1 六个任务均有效，即初始项目未通过隐藏验收、参考解全部通过。 |
+| 旧库续跑 | 在工单库的另一份副本上运行 `legacy_journal_copy_opens_and_resumes`，通过并续跑 3 张工单。启动时的对账在三张历史工单的平台检查目录（`.local/share/superagent/checks/…`）上记录了 Git 初始化与初始提交回执，状态均为 confirmed。 |
+| 本地发布 | 当前没有运行中的 Super Agent。原发布程序（`64ecca91…`）备份为 `tmpstate/evolution-full/super-agent.before.exe`，然后执行 `build --release -p sa-desktop`，退出 0，新程序 SHA-256 为 `566316d86946b6a5959723cf3ce24febf965228293928c8d25f4e0b7774fbb71`。发布版以只读观察模式打开续跑后的副本并截图（`release-panel.png`），界面正常渲染。 |
+
+日志和报告都在 `tmpstate/evolution-full/`：
+
+- `final-build.log`、`final-clippy.log`、`final-tests.log`、`pre-p4-workspace-tests.log`
+- `status-report.json`、`suite-validation-final.json`、`legacy-resume.log`、`release.log`
+
+**未执行：**
+
+- 没有运行计费的真实模型试验，也没有用真实模型跑工单。
+- 没有人工体验验收。
+- 新增的项目面板分区（执行策略、用量账目、平台操作）只有界面自动测试，没有在发布版窗口里逐项查看。
+
+因此 §14 的阶段出口都尚未满足，六项目标也没有对照结论。
+
+各隔离工作树的报告都提到同一项界面测试：`extensions_dialog_grants_skills_and_probed_mcp_servers` 在它们的工作树里因 MCP 探测超时失败，在基线提交上也同样失败。本次主工作区的两轮全量测试中它都通过了。
