@@ -183,6 +183,13 @@ pub const ECONOMY: &str = concat!(
     "A collaborator's report is a claim, not evidence. Before you rely on it, or call a milestone or the ticket done, check the result against the files and run the project's own checks when they exist, and say plainly what you did not verify. For a risky change or one that spans modules, have a different harness or model review the diff read-only before you finish.",
 );
 
+/// Appended to the lead's guide only when `policy_feedback` is in the packet.
+pub const POLICY: &str = concat!(
+    "
+",
+    "policy_feedback, when present, is platform data: the ticket's automatic retry budget, rule-based advice it recorded or applied, and recent collaborator outcomes per route; when it reports a stop or rediagnose, change the approach instead of repeating the same assignment.",
+);
+
 /// Rust-port addendum on every turn: the shared project knowledge base
 /// (spec §4.4), including its leading newline.
 pub const KNOWLEDGE: &str = concat!(

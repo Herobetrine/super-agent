@@ -88,6 +88,7 @@ impl Db {
         conn.execute_batch(crate::workspaces::SCHEMA)?;
         conn.execute_batch(crate::scm::SCHEMA)?;
         conn.execute_batch(crate::checkpoints::SCHEMA)?;
+        conn.execute_batch(crate::execution_policy::SCHEMA)?;
         conn.execute_batch(sa_store::delivery::SCHEMA)?;
         conn.set_prepared_statement_cache_capacity(256);
         Ok(Self {

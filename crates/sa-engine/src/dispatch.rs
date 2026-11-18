@@ -567,6 +567,11 @@ async fn dispatch(turn: &Arc<Turn>, cmd: &Value) -> Result<()> {
                 "permission_profile": c.effective,
             }),
         )?;
+        // P2: rule-based advice for the new child (record mode logs only).
+        crate::execution_policy::on_dispatch(q, job, &crate::execution_policy::NewChild {
+            id: child, to: &c.to, write: c.write, role: &c.role, body: &c.body, files: &c.files,
+            needs: &c.needs, explicit_model: c.selection.is_some(),
+        })?;
         Ok(())
     })
 }

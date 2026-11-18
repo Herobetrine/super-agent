@@ -1133,6 +1133,23 @@ impl Engine {
         })
     }
 
+    /// Execution policy mode of a project: `record` (default) or `apply`.
+    pub fn execution_policy(&self, cwd: &str) -> Result<String> {
+        let project = project_key(cwd);
+        self.inner.db.with(|q| crate::execution_policy::project_mode(q, &project)).map(|m| m.as_str().to_string())
+    }
+
+    /// Set the project's execution policy mode. Affects later decisions only.
+    pub fn set_execution_policy(&self, cwd: &str, mode: &str) -> Result<()> {
+        let project = project_key(cwd);
+        self.inner.db.tx(|q| crate::execution_policy::set_mode(q, &project, mode, now()))
+    }
+
+    /// Stored policy decisions of a ticket, newest first.
+    pub fn policy_decisions(&self, ticket: i64, limit: usize) -> Result<Vec<Value>> {
+        self.inner.db.with(|q| crate::execution_policy::decisions(q, ticket, limit))
+    }
+
     /// Project knowledge entries of `cwd` (canonicalized when it exists),
     /// newest first, including archived ones.
     pub fn knowledge(&self, cwd: &str) -> Result<Vec<sa_store::knowledge::KnowledgeEntry>> {
@@ -1601,6 +1618,7 @@ impl Inner {
                         state="blocked";
                         if attempts<2 && !q.exists("SELECT 1 FROM job_failovers WHERE original=?",&[&item.job])?
                             && !q.exists("SELECT 1 FROM continuous_runs WHERE ticket=? AND boundary_job>=?",&[&item.ticket,&item.job])?
+                            && !crate::execution_policy::gate_repair(q,item.ticket,item.job,"integration")?
                         {
                             let row=q.one("SELECT * FROM jobs WHERE id=?",&[&item.job])?.ok_or_else(||anyhow!("任务不存在"))?;
                             let job=JobCtx::from_row(&row);
@@ -2079,6 +2097,10 @@ impl Inner {
         }));
         if let Some(budget) = self.db.with(|q| usage_budget(q, &efficiency, now()))? {
             packet.insert("usage_budget".into(), budget);
+        }
+        if job.is_root() && let Some(feedback) = self.db.with(|q| crate::execution_policy::feedback(q, job))? {
+            packet.insert("policy_feedback".into(), feedback);
+            guide.push_str(guides::POLICY);
         }
         if primary && packet.get("autonomy").and_then(|a| a.get("phase")).and_then(Value::as_str) == Some("discover") {
             guide.push_str(guides::DISCOVERY);
@@ -2751,7 +2773,10 @@ impl Inner {
             return Ok(());
         }
         let check_failed = checked.is_some_and(checks::Outcome::failed);
-        let bounce = checked.is_some_and(checks::Outcome::bounced);
+        // P2 repair gate: in apply mode an exhausted ticket budget ends the
+        // repair loop through the existing limit-reached branch below.
+        let bounce = checked.is_some_and(checks::Outcome::bounced)
+            && !crate::execution_policy::gate_repair(q, job.ticket, job.id, "check")?;
         if let Some(checked) = checked { checked.save(q, job)?; }
         else { q.run("DELETE FROM job_checks WHERE job=?", &[&job.id])?; }
         // A bounced completion claim has no accepted agent outcome yet.
@@ -3021,6 +3046,11 @@ impl Inner {
         coalesce((SELECT max(seq) FROM events WHERE job=? AND kind IN ('reply','user.follow')),0)",
                 &[&job.id, &job.id],
             )?;
+            if ((job.continuous && pause::status(q, job.ticket)? == PauseStatus::Running) || attempts < 2)
+                && let Some(reason) = crate::execution_policy::gate_retry(q, job, None)?
+            {
+                return self.give_up(q, job, &reason);
+            }
             if (job.continuous && pause::status(q, job.ticket)? == PauseStatus::Running) || attempts < 2 {
                 let delay = 2f64.powi((attempts + 1).min(9) as i32).min(300.0);
                 q.interrupt(who, &job.ticket_profile)?;
@@ -3205,6 +3235,12 @@ impl Inner {
             }
             Ok(())
         };
+        // P2 retry gate: a retry or rotation is one automatic recovery.
+        if matches!(&decision, Recovery::Retry { .. } | Recovery::Rotate { .. })
+            && let Some(reason) = crate::execution_policy::gate_retry(q, job, class_name(err.class).as_str())?
+        {
+            return self.give_up(q, job, &reason);
+        }
         match decision {
             Recovery::Retry { delay, attempt, max, resume_session } => {
                 let session = if err.class == ErrorClass::SessionMismatch {
@@ -3282,6 +3318,9 @@ impl Inner {
                         &[&job.id, &(at - 3600.0)],
                     )?;
                     if recent < CONTINUOUS_RETRIES_PER_HOUR {
+                        if let Some(reason) = crate::execution_policy::gate_retry(q, job, class_name(class).as_str())? {
+                            return self.give_up(q, job, &reason);
+                        }
                         let cfg = crate::resilience::ResilienceConfig::default();
                         let delay = cfg.retry_cap;
                         self.requeue(q, job, at + delay.as_secs_f64(), None, "turn.retry_scheduled", json!({

@@ -21,6 +21,7 @@ pub mod db;
 pub mod delivery;
 pub mod dispatch;
 pub mod engine;
+pub mod execution_policy;
 pub mod guides;
 pub mod images;
 pub mod integration_queue;
