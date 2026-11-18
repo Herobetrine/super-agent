@@ -219,6 +219,14 @@ impl App {
     }
     fn collab_tab(&mut self, ui: &mut Ui, snap: &Snapshot) {
         let pal = self.pal.clone();
+        let data = self.opts.data.clone().unwrap_or_else(sa_store::default_data_dir);
+        let delivery_context = crate::delivery_ui::DeliveryContext {
+            data, ticket: snap.ticket.id, project: &snap.ticket.cwd, execution: &snap.ticket.state,
+            host: self.host.as_ref(), demo: self.opts.demo, expanded: self.opts.expand_all,
+        };
+        if let Some(action) = self.workflow.delivery.show(ui, &pal, delivery_context) {
+            self.submit(action);
+        }
         if let Some(settings) = self.saved_efficiency()
             && let Some(text) = collaborator_slots(
                 snap.running_peers, snap.queued_peers, settings.max_collaborators,

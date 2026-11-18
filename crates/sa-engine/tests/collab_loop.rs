@@ -468,6 +468,60 @@ async fn continue_rejects_forbidden_targets_fields_and_conflicting_replays() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn continuation_key_dependency_waits_for_new_result_and_replays_once() {
+    let implementation = Gate::new();
+    let fx = Fx::new(script({
+        let implementation = implementation.clone();
+        move |c| {
+            let implementation = implementation.clone();
+            async move {
+                let packet = c.full_packet();
+                if c.depth() == 0 {
+                    return match c.turn() {
+                        1 => Ok(send(json!({"id":"impl","body":"implement"}))),
+                        2 => {
+                            let target = packet["reports"][0]["id"].clone();
+                            let commands = [
+                                wire("SA_SEND",json!({"id":"resume-impl","continue":target,"body":"fix"})),
+                                wire("SA_NOTE",json!({"id":"plain-note","job":target,"body":"note"})),
+                                send(json!({"id":"bad-review","body":"bad-review","after":["plain-note"]})),
+                                send(json!({"id":"review","body":"review","after":["resume-impl"]})),
+                            ].join("\n");
+                            c.emit("delta",json!(format!("{commands}\n")));
+                            Ok(commands)
+                        }
+                        _ => Ok("reviewed".into()),
+                    };
+                }
+                if packet["assignment"] == "implement" {
+                    if c.turn() == 1 { return Ok("original".into()); }
+                    assert_eq!(c.req.session_id.as_deref(),Some(format!("session-{}",c.job()).as_str()));
+                    assert!(has_note(&packet,"fix"));
+                    implementation.wait().await;
+                    return Ok("updated".into());
+                }
+                assert_eq!(packet["assignment"],"review");
+                assert_eq!(packet["prerequisites"][0]["result"],"updated");
+                Ok("reviewed updated result".into())
+            }
+        }
+    }),t1_catalog());
+    let ticket = fx.begin(fx.params()).await;
+    fx.until(|| event_count(&fx,"continued") == 1
+        && fx.shared.count(|call| call.packet["assignment"] == "implement" && call.packet["turn"] == 2) == 1
+        && fx.int("SELECT count(*) FROM job_deps") == 1).await;
+    assert_eq!(fx.shared.count(|call| call.packet["assignment"] == "review"),0);
+    assert_eq!(state(&fx,child(&fx,"review")),"queued");
+    implementation.open();
+    fx.finish(ticket,"done").await;
+    assert_eq!(event_count(&fx,"continued"),1);
+    assert_eq!(fx.shared.count(|call| call.packet["assignment"] == "review"),1);
+    assert_eq!(fx.int("SELECT count(*) FROM jobs WHERE msgkey='bad-review'"),0);
+    assert_eq!(fx.int("SELECT count(*) FROM jobs"),3);
+    fx.engine.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn dependent_dispatch_waits_and_delivers_full_prerequisite_with_one_parent_wake() {
     let implementer = Gate::new();
     let result = format!("实现结果\n{}\n最后一行", "完整内容".repeat(12_000));

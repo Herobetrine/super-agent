@@ -47,6 +47,11 @@ impl TurnRunner for PanicRunner {
 
 fn fixture(runner: Arc<dyn TurnRunner>) -> (tempfile::TempDir, Engine, Arc<WaitingAdapter>) {
     let dir = tempfile::tempdir().unwrap();
+    // Scheduler timing excludes first-time project bootstrap. Keep the active
+    // journal outside the project tree, as it is in ordinary desktop use.
+    let project = dir.path().join("project");
+    std::fs::create_dir(&project).unwrap();
+    crate::project_git::ensure(&project).unwrap();
     let adapter = Arc::new(WaitingAdapter::default());
     let engine = Engine::open(dir.path(), vec![adapter.clone()], EngineOptions {
         runner,
@@ -55,7 +60,7 @@ fn fixture(runner: Arc<dyn TurnRunner>) -> (tempfile::TempDir, Engine, Arc<Waiti
     }).unwrap();
     engine.db().with(|q| {
         q.run("INSERT INTO tickets(id,goal,cwd,writes,lead,created,permission_profile) VALUES(1,'fixture',?,0,'codex',0,'readonly')",
-            &[&dir.path().to_string_lossy().as_ref()])?;
+            &[&project.to_string_lossy().as_ref()])?;
         q.conn().execute_batch(
             "INSERT INTO jobs(id,ticket,parent,agent,body,writing,depth,turn,state) VALUES
              (1,1,NULL,'codex','root',0,0,1,'waiting'),

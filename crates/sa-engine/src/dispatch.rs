@@ -375,11 +375,28 @@ fn dependencies(q: &Q, job: &crate::job::JobCtx, after: Option<&Value>, replay: 
     let mut needs = Vec::new();
     for entry in entries {
         let child = if let Some(key) = entry.as_str() {
-            q.one(
-                "SELECT id FROM jobs WHERE parent=? AND ticket=? AND id>? AND msgkey=? AND id!=?
-      ORDER BY CASE WHEN source_turn=? THEN 0 ELSE 1 END,id DESC LIMIT 1",
-                &[&job.id, &job.ticket, &job.floor, &key, &replay, &job.logical()],
-            )?
+            // A continuation is also an earlier SA_SEND. Its alias needs both
+            // the delivered note and the successful continuation receipt.
+            let candidates = q.all(
+                "SELECT j.id,c.source_turn FROM jobs j JOIN (
+        SELECT id,source_turn FROM jobs WHERE msgkey=?
+        UNION
+        SELECT m.target,m.source_turn FROM mailbox m JOIN events n ON n.seq=m.seq
+        WHERE m.source=? AND m.msgkey=? AND n.kind='note' AND n.job=? AND n.ticket=?
+          AND EXISTS(SELECT 1 FROM events e WHERE e.ticket=n.ticket AND e.job=n.job
+            AND e.turn=n.turn AND e.seq>n.seq AND e.kind='continued'
+            AND json_extract(e.payload,'$.job')=m.target AND json_extract(e.payload,'$.key')=m.msgkey)
+      ) c ON c.id=j.id WHERE j.parent=? AND j.ticket=? AND j.id>? AND j.id!=?
+      ORDER BY CASE WHEN c.source_turn=? THEN 0 ELSE 1 END,j.id DESC",
+                &[&key, &job.id, &key, &job.id, &job.ticket,
+                    &job.id, &job.ticket, &job.floor, &replay, &job.logical()],
+            )?;
+            if let Some(first) = candidates.first()
+                && candidates.iter().any(|row| row["source_turn"] == first["source_turn"] && row["id"] != first["id"])
+            {
+                return Err(rejected("after 消息 ID 在同一逻辑轮次指向不同的任务，请使用任务编号"));
+            }
+            candidates.into_iter().next()
         } else if let Some(id) = p::safe_int(Some(entry)) {
             q.one("SELECT id FROM jobs WHERE id=? AND parent=? AND ticket=? AND id>?", &[&id, &job.id, &job.ticket, &job.floor])?
         } else {
@@ -715,6 +732,8 @@ mod tests {
     fn dependencies_prefer_logical_turn_and_compare_normalized_sets() {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         conn.execute_batch("CREATE TABLE jobs(id INTEGER PRIMARY KEY,parent INTEGER,ticket INTEGER,msgkey TEXT,source_turn INTEGER);
+          CREATE TABLE events(seq INTEGER PRIMARY KEY,ticket INTEGER,job INTEGER,turn INTEGER,kind TEXT,payload TEXT);
+          CREATE TABLE mailbox(seq INTEGER,target INTEGER,source INTEGER,source_turn INTEGER,msgkey TEXT);
           INSERT INTO jobs VALUES(11,1,2,'impl',3),(12,1,2,'impl',4),(13,1,2,'review',4),(14,9,2,'foreign',4);").unwrap();
         let q = Q(&conn);
         let job = crate::job::JobCtx::from_row(json!({"id":1,"ticket":2,"floor":10,"turn":3}).as_object().unwrap());
@@ -723,5 +742,43 @@ mod tests {
         assert!(dependencies(&q, &job, Some(&json!(["missing"])), 0).is_err());
         assert!(dependencies(&q, &job, Some(&json!([14])), 0).is_err());
         assert!(dependencies(&q, &job, Some(&json!([])), 0).is_err());
+    }
+
+    #[test]
+    fn continuation_alias_requires_paired_receipt_and_scoped_child() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE jobs(id INTEGER PRIMARY KEY,parent INTEGER,ticket INTEGER,msgkey TEXT,source_turn INTEGER);
+          CREATE TABLE events(seq INTEGER PRIMARY KEY,ticket INTEGER,job INTEGER,turn INTEGER,kind TEXT,payload TEXT);
+          CREATE TABLE mailbox(seq INTEGER,target INTEGER,source INTEGER,source_turn INTEGER,msgkey TEXT);
+          INSERT INTO jobs VALUES(11,1,2,'impl',1),(12,1,2,'other',2),
+            (13,9,2,'nonchild',2),(14,1,9,'foreign',2),(9,1,2,'old',1);").unwrap();
+        // Physical turn 7 can replay logical turn 3. Only paired receipts
+        // confer aliases, regardless of the child's original dispatch turn.
+        for (seq, target, key, logical, paired) in [
+            (1,11,"resume",3,true), (3,12,"resume",2,true),
+            (5,11,"note-only",3,false), (7,13,"not-child",3,true),
+            (9,14,"wrong-ticket",3,true), (11,9,"before-floor",3,true),
+            (13,11,"collision",3,true),
+        ] {
+            conn.execute("INSERT INTO events VALUES(?,2,1,7,'note',?)",
+                rusqlite::params![seq, stringify(&json!({"job":target,"id":key,"body":"continue"}))]).unwrap();
+            conn.execute("INSERT INTO mailbox VALUES(?,?,1,?,?)", rusqlite::params![seq,target,logical,key]).unwrap();
+            if paired {
+                conn.execute("INSERT INTO events VALUES(?,2,1,7,'continued',?)",
+                    rusqlite::params![seq+1,stringify(&json!({"job":target,"key":key}))]).unwrap();
+            }
+        }
+        conn.execute_batch("INSERT INTO jobs VALUES(15,1,2,'collision',3);
+          INSERT INTO events VALUES(20,2,1,7,'continued','{\"job\":11,\"key\":\"orphan\"}');
+          INSERT INTO events VALUES(21,9,1,7,'note','{}'),
+            (22,9,1,7,'continued','{\"job\":11,\"key\":\"foreign-receipt\"}');
+          INSERT INTO mailbox VALUES(21,11,1,3,'foreign-receipt');").unwrap();
+        let q = Q(&conn);
+        let job = crate::job::JobCtx::from_row(json!({"id":1,"ticket":2,"floor":10,"turn":3}).as_object().unwrap());
+        assert_eq!(dependencies(&q,&job,Some(&json!(["resume"])),0).unwrap(),vec![11]);
+        assert_eq!(dependencies(&q,&job,Some(&json!(["resume"])),11).unwrap(),vec![12]);
+        for key in ["note-only","not-child","wrong-ticket","before-floor","collision","orphan","foreign-receipt"] {
+            assert!(dependencies(&q,&job,Some(&json!([key])),0).is_err(),"{key}");
+        }
     }
 }

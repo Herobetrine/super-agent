@@ -287,6 +287,7 @@ impl App {
         }
         self.composer.attachments.clear();
         self.composer.target = None;
+        self.workflow.delivery = Default::default();
         self.epoch += 1;
         self.view = ticket.map(|id| TicketView {
             id,

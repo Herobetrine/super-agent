@@ -92,8 +92,11 @@ fn coverage(ui: &mut Ui, usage: &TicketUsage, pal: &Palette) {
             .wrap(),
         );
     }
-    if usage.jobs.iter().any(|job| job.agent == "claude") {
+    if usage.jobs.iter().any(|job| job.agent == "claude") || usage.advisor_calls.iter().any(|call| call.agent == "claude") {
         help(ui, "Claude 仅统计主循环，内部子任务未计入。", pal);
+    }
+    if !usage.advisor_calls.is_empty() {
+        help(ui, format!("顾问调用已计入总量：已报告 {} 次，未报告 {} 次。", usage.reported_advisor_calls, usage.unreported_advisor_calls), pal);
     }
 }
 
@@ -235,6 +238,16 @@ pub fn footer(ui: &mut Ui, usage: &TicketUsage, quota: &[Observed], pal: &Palett
                             if job.partial {
                                 ui.label(dim("此任务的计数存在缺口").color(pal.warn.fg));
                             }
+                        });
+                    });
+                }
+                for call in &usage.advisor_calls {
+                    let title = format!("顾问 {} · 任务 #{} · {}", labels::agent_name(&call.agent), call.job, number(call.tokens.total_tokens));
+                    ui.push_id(&call.attempt_id, |ui| {
+                        ui.collapsing(RichText::new(title).font(theme::body(theme::UI)), |ui| {
+                            counts(ui, &call.tokens, pal);
+                            help(ui, format!("第 {} 轮 · {}", call.turn, if call.reported { "有用量记录" } else { "未报告，不能视为零" }), pal);
+                            if call.partial { help(ui, "此顾问调用的计数存在缺口。", pal); }
                         });
                     });
                 }

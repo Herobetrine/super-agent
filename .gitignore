@@ -30,6 +30,7 @@ credentials.json
 *.lnk
 /control-room/
 /checks/
+/tmpstate/
 /objects/
 /context-objects/
 /workspaces/

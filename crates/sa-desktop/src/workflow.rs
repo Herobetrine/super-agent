@@ -8,15 +8,21 @@ use egui::{Label, RichText, Ui};
 
 #[derive(Default)]
 pub struct WorkflowState {
+    pub delivery: crate::delivery_ui::DeliveryState,
     checks_project: Option<String>,
     checks_rows: Vec<Vec<String>>,
     checks_input: String,
     checks_loading: Option<crate::ops::Pending<Vec<Vec<String>>>>,
     checks_error: Option<String>,
     checks_saving: Option<u64>,
+    checks_pending_save: Option<(String, Vec<Vec<String>>)>,
     checks_loaded: bool,
+    suggestions: Option<sa_engine::check_suggestions::SuggestionReport>,
+    suggestions_loading: Option<crate::ops::Pending<sa_engine::check_suggestions::SuggestionReport>>,
+    suggestions_error: Option<String>,
     command: String,
     confirm: Option<i64>,
+    queue_confirm: Option<(i64, i64, String)>,
     error: Option<String>,
     ticket: Option<i64>,
     fork_goal: String,
@@ -63,13 +69,50 @@ fn workspace_tone(state: &str, pal: &Palette) -> Tone {
     }
 }
 
+pub fn queue_state_label(state: &str) -> &'static str {
+    match state {
+        "queued" => "等待自动验证",
+        "validating" => "正在验证候选",
+        "repairing" => "已退回原任务修复",
+        "awaiting_confirmation" => "验证通过，待你确认",
+        "publishing" => "合入中或等待恢复确认",
+        "merged" => "已本地合入",
+        "blocked" => "需要处理",
+        "stale" => "版本已变化，需重新验证",
+        "cancelled" => "已停止",
+        _ => "状态待确认",
+    }
+}
+
 impl WorkflowState {
+    fn save_checks(&mut self, cwd: &str) -> Action {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let request = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.checks_saving = Some(request);
+        self.checks_pending_save = Some((cwd.to_owned(), self.checks_rows.clone()));
+        self.checks_error = None;
+        Action::SaveProjectChecks { cwd: cwd.to_owned(), checks: self.checks_rows.clone(), request }
+    }
+
     pub fn checks_result(&mut self, request: u64, result: Result<(), String>) {
         if self.checks_saving != Some(request) {
             return;
         }
         self.checks_saving = None;
-        self.checks_error = result.err();
+        if let Some((project, rows)) = self.checks_pending_save.take() {
+            match result {
+                Ok(()) if self.checks_project.as_deref() == Some(project.as_str()) => {
+                    // A read launched after switching away and back may have
+                    // preceded the save. Its late result must not win.
+                    self.checks_loading = None;
+                    self.checks_rows = rows;
+                    self.checks_loaded = true;
+                    self.checks_error = None;
+                }
+                Ok(()) => {}
+                Err(error) => self.checks_error = Some(format!("保存 {project} 的完成检查失败：{error}")),
+            }
+        } else { self.checks_error = result.err(); }
     }
 
     /// Project checks are available in observer windows through a read-only connection.
@@ -88,8 +131,13 @@ impl WorkflowState {
             self.checks_rows.clear();
             self.checks_input.clear();
             self.checks_error = None;
-            self.checks_saving = None;
             self.checks_loaded = demo;
+            self.suggestions = None;
+            self.suggestions_error = None;
+            self.suggestions_loading = if host.is_some() && !demo {
+                let project = std::path::PathBuf::from(cwd);
+                Some(crate::ops::Pending::spawn(ui.ctx(), move || sa_engine::check_suggestions::inspect(&project)))
+            } else { None };
             self.checks_loading = if demo {
                 self.checks_rows = vec![vec!["cargo".into(), "test".into(), "--workspace".into()]];
                 None
@@ -118,11 +166,49 @@ impl WorkflowState {
             }
         }
         let writable = host.is_some() && !demo;
+        if let Some(result) = self.suggestions_loading.as_ref().and_then(crate::ops::Pending::poll) {
+            self.suggestions_loading = None;
+            match result {
+                Ok(report) => self.suggestions = Some(report),
+                Err(error) => self.suggestions_error = Some(error),
+            }
+        }
         let mut action = None;
         egui::CollapsingHeader::new(heading("完成检查", pal))
             .id_salt(("completion-checks", cwd))
             .show(ui, |ui| {
                 help(ui, "写入任务或主控报告完成时由平台运行；未通过会退回原任务修复，最多两次。命令由你指定，agent 不能修改。", pal);
+                if writable {
+                    let mut adopt = false;
+                    if let Some(report) = &self.suggestions {
+                        egui::CollapsingHeader::new(heading("推荐检查", pal))
+                            .id_salt(("suggested-checks", cwd))
+                            .default_open(self.checks_rows.is_empty())
+                            .show(ui, |ui| {
+                                help(ui, "根据项目文件识别；点击采用后才会保存并启用。项目脚本会在完成检查时运行，请先核对命令。", pal);
+                                for suggestion in &report.suggestions {
+                                    item_name(ui, &suggestion.label, pal);
+                                    help(ui, &suggestion.reason, pal);
+                                    ui.add(Label::new(RichText::new(serde_json::to_string(&suggestion.command).unwrap_or_default()).font(theme::mono(12.0)).color(pal.ink)).wrap());
+                                }
+                                for issue in &report.issues { help(ui, issue, pal); }
+                                let additions = report.suggestions.iter().filter(|s| !self.checks_rows.contains(&s.command)).count();
+                                let room = self.checks_rows.len() + additions <= 4;
+                                let ready = self.checks_loaded && self.checks_saving.is_none() && additions > 0 && room;
+                                if !room { help(ui, "最多保留 4 条检查；请先移除不需要的命令，再采用推荐。", pal); }
+                                adopt = ui.add_enabled_ui(ready, |ui| widgets::outline_button(ui, "", "采用推荐检查", pal)).inner.clicked();
+                            });
+                    }
+                    if adopt {
+                        if let Some(report) = &self.suggestions {
+                            for suggestion in &report.suggestions {
+                                if !self.checks_rows.contains(&suggestion.command) { self.checks_rows.push(suggestion.command.clone()); }
+                            }
+                        }
+                        action = Some(self.save_checks(cwd));
+                    }
+                    if let Some(error) = &self.suggestions_error { problem(ui, &format!("无法读取推荐检查：{error}"), pal); }
+                }
                 let mut remove = None;
                 for (index, argv) in self.checks_rows.iter().enumerate() {
                     ui.horizontal_top(|ui| {
@@ -156,11 +242,7 @@ impl WorkflowState {
                             }
                             let can_save = ui.is_enabled();
                             if widgets::primary_button(ui, "", "保存完成检查", pal, can_save).clicked() {
-                                static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-                                let request = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                self.checks_saving = Some(request);
-                                self.checks_error = None;
-                                action = Some(Action::SaveProjectChecks { cwd: cwd.to_owned(), checks: self.checks_rows.clone(), request });
+                                action = Some(self.save_checks(cwd));
                             }
                         });
                     });
@@ -180,6 +262,7 @@ impl WorkflowState {
         if self.ticket != Some(ticket) {
             self.ticket = Some(ticket);
             self.confirm = None;
+            self.queue_confirm = None;
             self.error = None;
             self.fork_seq = None;
             self.fork_confirm = false;
@@ -219,6 +302,22 @@ impl WorkflowState {
                     *action = Some(Action::SetIsolatedWriters { ticket, enabled });
                 }
                 help(ui, "从已提交的干净仓库创建。完成后先验证，再本地合入。已有任务不迁移。", pal);
+                let queue_enabled = host.integration_queue_enabled(ticket);
+                if let Ok(mut queue_enabled) = queue_enabled {
+                    if ui.add(widgets::Check::new(
+                        &mut queue_enabled,
+                        RichText::new("自动验证合入队列，合入前由我确认").font(theme::body(theme::UI)),
+                    )).changed() {
+                        self.queue_confirm = None;
+                        *action = Some(Action::SetIntegrationQueue { ticket, enabled: queue_enabled });
+                    }
+                    help(ui, "需先启用隔离工作区并保存完成检查。验证失败或合并冲突会退回原任务修复，最多两次；不会自动更新原项目。", pal);
+                }
+                let queue = match host.integration_queue(ticket) {
+                    Ok(rows) => rows,
+                    Err(error) => { problem(ui, &error.to_string(), pal); return; }
+                };
+                self.queue_rows(ui, pal, &queue, action);
                 let rows = match host.workspaces(ticket) {
                     Ok(r) => r,
                     Err(e) => {
@@ -226,7 +325,7 @@ impl WorkflowState {
                         return;
                     }
                 };
-                if rows.is_empty() {
+                if rows.iter().all(|workspace| queue.iter().any(|item| item.job == workspace.job)) {
                     return;
                 }
                 ui.add_space(4.0);
@@ -247,6 +346,9 @@ impl WorkflowState {
                     problem(ui, error, pal);
                 }
                 for w in rows {
+                    // Queue-owned workspaces use exact-candidate confirmation,
+                    // never the older validate-and-integrate shortcut.
+                    if queue.iter().any(|item| item.job == w.job) { continue; }
                     ui.add_space(4.0);
                     widgets::rule(ui, pal.line_soft);
                     ui.add_space(4.0);
@@ -487,5 +589,55 @@ impl WorkflowState {
                     Err(e) => problem(ui, &e.to_string(), pal),
                 }
             });
+    }
+
+    fn queue_rows(&mut self, ui: &mut Ui, pal: &Palette, rows: &[sa_engine::integration_queue::IntegrationItem], action: &mut Option<Action>) {
+        if self.queue_confirm.as_ref().is_some_and(|(job, turn, head)| !rows.iter().any(|item|
+            item.job == *job && item.turn == *turn && matches!(item.state.as_str(), "awaiting_confirmation" | "publishing")
+                && item.validation["confirmation_token"].as_str() == Some(head.as_str()))) {
+            self.queue_confirm = None;
+        }
+        for item in rows {
+            ui.add_space(4.0);
+            widgets::rule(ui, pal.line_soft);
+            let state = queue_state_label(&item.state);
+            ui.horizontal_wrapped(|ui| {
+                item_name(ui, &format!("队列任务 #{}", item.job), pal);
+                let color = if item.state == "awaiting_confirmation" || item.state == "merged" { pal.ok.fg } else { pal.wait.fg };
+                widgets::status(ui, state, color, false);
+            });
+            help(ui, format!("{} · 已自动退回 {} / 2 次", item.detail, item.attempts), pal);
+            if let Some(candidate) = item.validation["candidate"].as_str() { help(ui, format!("候选工作区：{candidate}"), pal); }
+            if let Some(head) = item.validation["candidate_head"].as_str() { help(ui, format!("已验证提交：{head}"), pal); }
+            egui::CollapsingHeader::new(heading(&format!("验证详情 #{}", item.job), pal)).id_salt(("queue-details",item.job)).show(ui, |ui| {
+                for key in ["workspace_checks", "candidate_checks"] {
+                    if let Some(checks) = item.validation[key].as_array() {
+                        for check in checks {
+                            help(ui, format!("{} · {}", check["argv"], if check["ok"] == true {"通过"} else {"未通过"}), pal);
+                            if let Some(output) = check["output_tail"].as_str().filter(|s| !s.is_empty()) { help(ui, output, pal); }
+                        }
+                    }
+                }
+                if let Some(conflicts) = item.validation["conflicts"].as_str().filter(|s| !s.is_empty()) { problem(ui, &format!("冲突文件：{conflicts}"), pal); }
+            });
+            if matches!(item.state.as_str(), "blocked" | "stale" | "cancelled")
+                && widgets::outline_button(ui, "", &format!("重新排队验证 #{}", item.job), pal).clicked() {
+                *action = Some(Action::RevalidateIntegration { job: item.job });
+            }
+            if matches!(item.state.as_str(), "awaiting_confirmation" | "publishing")
+                && widgets::outline_button(ui, "", &format!("确认候选 #{}…", item.job), pal).clicked() {
+                self.queue_confirm = Some((item.job, item.turn, item.validation["confirmation_token"].as_str().unwrap_or_default().to_owned()));
+            }
+            if self.queue_confirm.as_ref().is_some_and(|(job,_,_)| *job == item.job) {
+                help(ui, "将把已验证的候选合入原项目本地分支，不会推送。若代码或检查已改变，平台会拒绝并要求重新验证。", pal);
+                ui.horizontal_wrapped(|ui| {
+                    if widgets::primary_button(ui, "", &format!("确认合入候选 #{}", item.job), pal, true).clicked() {
+                        *action = Some(Action::ConfirmIntegration { job: item.job, confirmation_token: item.validation["confirmation_token"].as_str().unwrap_or_default().to_owned() });
+                        self.queue_confirm = None;
+                    }
+                    if widgets::quiet_button(ui, "", &format!("暂不合入候选 #{}", item.job), pal, false).clicked() { self.queue_confirm = None; }
+                });
+            }
+        }
     }
 }

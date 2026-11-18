@@ -197,6 +197,9 @@ async fn failed_checks_return_to_the_same_native_session_then_pass() {
                 assert_eq!(packet["reports"][0]["checks"]["attempt"], 2);
                 return Ok(report("partial"));
             }
+            if c.turn() == 1 {
+                std::fs::write(c.req.cwd.join("implementation.txt"), "needs repair\n").unwrap();
+            }
             if c.turn() == 2 {
                 assert_eq!(
                     c.req.session_id.as_deref(),
@@ -235,7 +238,12 @@ async fn failed_checks_return_to_the_same_native_session_then_pass() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn commands_run_in_order_and_stop_at_the_first_failure() {
-    let fx = Fx::new(script(|_| async { Ok(report("done")) }), t1_catalog());
+    let fx = Fx::new(script(|c| async move {
+        if c.turn() == 1 {
+            std::fs::write(c.req.cwd.join("implementation.txt"), "check this change\n").unwrap();
+        }
+        Ok(report("done"))
+    }), t1_catalog());
     let first_marker = fx.dir.path().join("first-check");
     let skipped_marker = fx.dir.path().join("skipped-check");
     let first = marker_check(&first_marker);
@@ -277,6 +285,9 @@ async fn third_failure_is_partial_and_lead_receives_failed_checks() {
     let fx = Fx::new(
         script(|c| async move {
             if c.depth() > 0 {
+                if c.turn() == 1 {
+                    std::fs::write(c.req.cwd.join("implementation.txt"), "needs repair\n").unwrap();
+                }
                 if c.turn() > 1 {
                     assert_eq!(
                         c.req.session_id.as_deref(),
@@ -390,6 +401,9 @@ async fn an_outstanding_bounce_can_use_a_recorded_pass_for_the_same_tree() {
 async fn an_intermediate_partial_report_clears_receipt_without_resetting_bounce_budget() {
     let fx = Fx::new(
         script(|c| async move {
+            if c.turn() == 1 {
+                std::fs::write(c.req.cwd.join("implementation.txt"), "needs repair\n").unwrap();
+            }
             if c.turn() == 2 {
                 return Ok(report("partial"));
             }
@@ -537,6 +551,9 @@ async fn auto_root_only_gates_done_finish_and_never_emits_a_failed_milestone() {
             if c.turn() == 1 {
                 return Ok(wire("SA_NEXT", json!({"body": "continue fixture"})));
             }
+            if c.turn() == 2 {
+                std::fs::write(c.req.cwd.join("implementation.txt"), "check before milestone\n").unwrap();
+            }
             Ok(finish())
         }),
         t1_catalog(),
@@ -573,7 +590,10 @@ async fn auto_root_only_gates_done_finish_and_never_emits_a_failed_milestone() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cancellation_kills_the_running_checks_process_tree() {
-    let fx = Fx::new(script(|_| async { Ok(report("done")) }), t1_catalog());
+    let fx = Fx::new(script(|c| async move {
+        std::fs::write(c.req.cwd.join("implementation.txt"), "check this change\n").unwrap();
+        Ok(report("done"))
+    }), t1_catalog());
     let started = fx.dir.path().join("started");
     let survived = fx.dir.path().join("survived");
     let child = fx.dir.path().join(if cfg!(windows) {

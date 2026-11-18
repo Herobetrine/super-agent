@@ -412,6 +412,149 @@ mod native {
         use super::*;
         use anyhow::bail;
 
+        struct QuestionToastIdentity {
+            id: String,
+            shortcut: PathBuf,
+            _apartment: Apartment,
+        }
+
+        impl QuestionToastIdentity {
+            fn cleanup(&self) -> Result<()> {
+                ToastNotificationManager::History()?.ClearWithId(&HSTRING::from(&self.id))?;
+                if self.shortcut.exists() {
+                    std::fs::remove_file(&self.shortcut)?;
+                }
+                unsafe {
+                    windows::Win32::System::Registry::RegDeleteTreeW(
+                        HKEY_CURRENT_USER,
+                        &HSTRING::from(format!(
+                            "Software\\Classes\\AppUserModelId\\{}",
+                            self.id
+                        )),
+                    )
+                    .ok()?;
+                }
+                Ok(())
+            }
+        }
+
+        impl Drop for QuestionToastIdentity {
+            fn drop(&mut self) {
+                // Preserve the original assertion error while attempting every cleanup.
+                if let Ok(history) = ToastNotificationManager::History() {
+                    let _ = history.ClearWithId(&HSTRING::from(&self.id));
+                }
+                let _ = std::fs::remove_file(&self.shortcut);
+                unsafe {
+                    let _ = windows::Win32::System::Registry::RegDeleteTreeW(
+                        HKEY_CURRENT_USER,
+                        &HSTRING::from(format!(
+                            "Software\\Classes\\AppUserModelId\\{}",
+                            self.id
+                        )),
+                    );
+                }
+            }
+        }
+
+        #[test]
+        #[ignore = "displays a real question toast using a disposable journal and app identity"]
+        fn windows_question_toast_reaches_notification_history() -> Result<()> {
+            let data = tempfile::tempdir()?;
+            let suffix = data
+                .path()
+                .file_name()
+                .context("临时目录缺少名称")?
+                .to_string_lossy();
+            let name = format!(
+                "Super Agent question verification {} {suffix}",
+                std::process::id()
+            );
+            let identity = QuestionToastIdentity {
+                id: format!(
+                    "Herobetrine.SuperAgent.QuestionCheck.{}.{suffix}",
+                    std::process::id()
+                ),
+                shortcut: programs()?
+                    .join("Herobetrine Super Agent")
+                    .join(format!("{name}.lnk")),
+                _apartment: Apartment::new()?,
+            };
+            register(&identity.id, &name)?;
+            let connection = rusqlite::Connection::open(data.path().join(sa_store::DB_FILE))?;
+            connection.execute_batch(
+                "CREATE TABLE questions(id INTEGER PRIMARY KEY, ticket INTEGER, state TEXT, question TEXT);",
+            )?;
+            let context = egui::Context::default();
+            let mut watch = crate::notifications::QuestionWatch::default();
+            let drain = |watch: &mut crate::notifications::QuestionWatch| -> Result<Vec<Notice>> {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+                watch.0.last = None;
+                let mut notices = watch.poll(&context, data.path());
+                while watch.0.pending.is_some() {
+                    if std::time::Instant::now() >= deadline {
+                        bail!("问题轮询超时");
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    notices.extend(watch.poll(&context, data.path()));
+                }
+                Ok(notices)
+            };
+            assert!(
+                drain(&mut watch)?.is_empty(),
+                "startup establishes a baseline"
+            );
+            let private_question = "PRIVATE QUESTION CONTENT MUST STAY IN THE JOURNAL";
+            connection.execute(
+                "INSERT INTO questions VALUES(1,731,'pending',?)",
+                [private_question],
+            )?;
+            let mut notices = drain(&mut watch)?;
+            assert_eq!(
+                notices,
+                vec![Notice {
+                    ticket: 731,
+                    kind: crate::notifications::NoticeKind::Question,
+                    status: String::new(),
+                }]
+            );
+            assert!(
+                drain(&mut watch)?.is_empty(),
+                "pending question is not repeated"
+            );
+            let mut backend = Backend::with_id(&identity.id, data.path(), Apartment::new()?)?;
+            let (tx, rx) = mpsc::channel();
+            backend.show(notices.remove(0), tx, context)?;
+            let history = ToastNotificationManager::History()?;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                if let Ok(Feedback::Failed(error)) = rx.try_recv() {
+                    bail!(error);
+                }
+                let notifications = history.GetHistoryWithId(&HSTRING::from(&identity.id))?;
+                if notifications.Size()? > 0 {
+                    assert_eq!(notifications.Size()?, 1);
+                    let document = notifications.GetAt(0)?.Content()?;
+                    let text = document.GetElementsByTagName(&HSTRING::from("text"))?;
+                    assert_eq!(text.Length()?, 2);
+                    assert_eq!(text.Item(0)?.InnerText()?.to_string(), "需要你的回答");
+                    assert_eq!(
+                        text.Item(1)?.InnerText()?.to_string(),
+                        "工单 #731 · 点击返回工作台查看"
+                    );
+                    assert!(!document.GetXml()?.to_string().contains(private_question));
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    bail!("问题通知未进入 Windows 通知历史");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            drop(backend);
+            identity.cleanup()?;
+            Ok(())
+        }
+
         #[test]
         #[ignore = "displays a real Windows toast using a disposable app identity"]
         fn windows_toast_reaches_notification_history() {

@@ -202,7 +202,10 @@ struct Sched {
     /// Maintenance leases also prevent admission while validating/integrating.
     maintenance: Vec<String>,
     timer: Option<JoinHandle<()>>,
+    integration_tasks: Vec<JoinHandle<()>>,
 }
+
+type ProjectPreparation = Arc<tokio::sync::Mutex<Option<String>>>;
 
 pub(crate) struct Inner {
     pub(crate) db: Db,
@@ -211,6 +214,7 @@ pub(crate) struct Inner {
     opts: EngineOptions,
     sched: Mutex<Sched>,
     catalogs: Mutex<HashMap<CatalogKey, CatalogFuture>>,
+    project_preparations: Mutex<HashMap<String, ProjectPreparation>>,
     started: AtomicBool,
     stopping: AtomicBool,
     fault: Mutex<Option<String>>,
@@ -227,6 +231,13 @@ pub(crate) struct Inner {
     pending_aborts: Mutex<Vec<i64>>,
     /// Claude prompt-cache clock per job for keep-alive (in memory only).
     cache_clocks: Mutex<HashMap<i64, CacheClock>>,
+}
+
+struct IntegrationLease(Arc<Inner>, Vec<String>);
+impl Drop for IntegrationLease {
+    fn drop(&mut self) {
+        lock(&self.0.sched).maintenance.retain(|key| !self.1.contains(key));
+    }
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -249,6 +260,7 @@ pub struct Turn {
     route: Mutex<Option<Route>>,
     /// In-memory heartbeat for [`Engine::activity`].
     activity: Mutex<Tracker>,
+    workspace_dependencies: Vec<(crate::workspaces::Workspace, i64)>,
 }
 
 impl Turn {
@@ -360,6 +372,7 @@ impl Engine {
                 opts,
                 sched: Mutex::new(Sched::default()),
                 catalogs: Mutex::new(HashMap::new()),
+                project_preparations: Mutex::default(),
                 started: AtomicBool::new(false),
                 stopping: AtomicBool::new(false),
                 fault: Mutex::new(None),
@@ -378,6 +391,10 @@ impl Engine {
 
     pub fn data_dir(&self) -> &Path {
         &self.inner.data_dir
+    }
+
+    pub(crate) fn is_stopping(&self) -> bool {
+        self.inner.stopping.load(Ordering::SeqCst)
     }
 
     /// Set when the scheduler halted on an unrecoverable journal error.
@@ -434,6 +451,7 @@ impl Engine {
             ensure!(inner.scheduler_state.load(Ordering::SeqCst) != SCHEDULER_FAILED, "调度循环已异常退出，请核对现场后重新打开工作台。");
             return Ok(());
         }
+        inner.db.tx(crate::integration_queue::recover)?;
         ensure!(!inner.opts.tick.is_zero(), "调度间隔必须大于零");
         inner.db.tx(|q| q.recover())?;
         inner.started.store(true, Ordering::SeqCst);
@@ -516,13 +534,15 @@ impl Engine {
             if let Some(t) = s.timer.take() {
                 t.abort();
             }
-            s.active
+            let mut tasks: Vec<_> = s.active
                 .values_mut()
                 .filter_map(|slot| {
                     slot.cancel.cancel();
                     slot.task.take()
                 })
-                .collect()
+                .collect();
+            tasks.append(&mut s.integration_tasks);
+            tasks
         };
         for t in tasks {
             let _ = t.await;
@@ -532,7 +552,10 @@ impl Engine {
     /// `cancel({ticket})` (E:63-73).
     pub fn cancel(&self, ticket: i64) -> Result<()> {
         self.inner.db.tx(|q| {
-            cancel_ticket(q, ticket)
+            cancel_ticket(q, ticket)?;
+            q.run("UPDATE integration_policy SET enabled=0 WHERE ticket=?",&[&ticket])?;
+            q.run("UPDATE integration_queue SET state='cancelled',detail='操作者已停止工单和合入队列' WHERE ticket=? AND state!='merged'",&[&ticket])?;
+            Ok(())
         })?;
         for slot in lock(&self.inner.sched).active.values() {
             if slot.ticket == ticket {
@@ -643,6 +666,115 @@ impl Engine {
     pub async fn integrate_workspace(&self, job: i64) -> Result<()> {
         self.workspace_operation(job, None).await
     }
+
+    pub fn set_integration_queue(&self, ticket: i64, enabled: bool) -> Result<()> {
+        self.inner.db.tx(|q| {
+            let root=q.root(ticket)?;
+            if enabled {
+                ensure!(q.int("SELECT writes FROM tickets WHERE id=?",&[&ticket])?!=0,"只读工单不能启用自动合入队列");
+                ensure!(q.exists("SELECT 1 FROM workspace_policy WHERE ticket=? AND isolated=1",&[&ticket])?,"请先启用隔离写工作区");
+                ensure!(!crate::integration_queue::commands(q,ticket)?.is_empty(),"请先配置项目完成检查");
+            }
+            q.run("INSERT INTO integration_policy(ticket,enabled) VALUES(?,?) ON CONFLICT(ticket) DO UPDATE SET enabled=excluded.enabled",&[&ticket,&i64::from(enabled)])?;
+            q.log(who_of(&root),"integration.policy",&json!({"enabled":enabled}))?;
+            Ok(())
+        })
+    }
+
+    pub fn integration_queue(
+        &self,
+        ticket: i64,
+    ) -> Result<Vec<crate::integration_queue::IntegrationItem>> {
+        self.inner.db.with(|q| {
+            q.root(ticket)?;
+            crate::integration_queue::list(q, ticket)
+        })
+    }
+
+    pub fn revalidate_integration(&self, job: i64) -> Result<()> {
+        self.inner.db.tx(|q| {
+            let item=crate::integration_queue::get(q,job)?;
+            ensure!(crate::integration_queue::enabled(q,item.ticket)?,"该工单未启用自动合入队列");
+            ensure!(!matches!(item.state.as_str(),"validating"|"publishing"|"merged"),"当前状态不能重新验证");
+            let row=q.one("SELECT state,turn FROM jobs WHERE id=?",&[&job])?.ok_or_else(||anyhow!("任务不存在"))?;
+            ensure!(str_of(&row,"state")=="done" || (str_of(&row,"state")=="partial" && int_of(&row,"turn")==item.turn && item.state=="blocked"),"请等待任务完成");
+            let commands=crate::integration_queue::commands(q,item.ticket)?;
+            ensure!(!commands.is_empty(),"请先配置项目完成检查");
+            q.run("UPDATE jobs SET state='done' WHERE id=? AND state='partial'",&[&job])?;
+            q.run("UPDATE integration_queue SET state='queued',turn=?,version=?,commands=?,validation='{}',detail='操作者请求重新验证' WHERE job=?",
+                &[&int_of(&row,"turn"),&crate::integration_queue::VERSION,&json!(commands).to_string(),&job])?;
+            Ok(())
+        })
+    }
+
+    /// This is the sole queue publication entry point and must be invoked by
+    /// an explicit operator action. It never runs from the automatic scheduler.
+    pub async fn confirm_integration(&self, job: i64, expected_candidate: &str) -> Result<()> {
+        let inner = self.inner.clone();
+        let (send, receive) = tokio::sync::oneshot::channel();
+        {
+            let mut sched = lock(&inner.sched);
+            ensure!(!inner.stopping.load(Ordering::SeqCst), "引擎正在关闭");
+            let (item, w) = inner.db.with(|q| {
+                Ok((
+                    crate::integration_queue::get(q, job)?,
+                    crate::workspaces::get(q, job)?.ok_or_else(|| anyhow!("工作区不存在"))?,
+                ))
+            })?;
+            ensure!(
+                matches!(item.state.as_str(), "awaiting_confirmation" | "publishing"),
+                "候选尚未通过验证或需要重新验证"
+            );
+            ensure!(
+                item.validation["confirmation_token"].as_str() == Some(expected_candidate),
+                "候选已变化，请重新查看后确认"
+            );
+            let keys = vec![
+                crate::workspaces::scope(&w.path),
+                crate::workspaces::scope(&w.source),
+            ];
+            ensure!(
+                !inner.workspace_busy(&sched, &keys),
+                "相关工作区仍有任务运行"
+            );
+            inner.db.tx(|q| {
+                crate::integration_queue::current(q,&item)?;
+                q.run("UPDATE integration_queue SET state='publishing',detail='操作者已确认，正在核对并合入' WHERE job=?",&[&job])?;
+                Ok(())
+            })?;
+            sched.maintenance.extend(keys.clone());
+            let owner = inner.clone();
+            let task = tokio::task::spawn_blocking(move || {
+                let _lease = IntegrationLease(owner.clone(), keys);
+                // Freeze operator checks and task state through publication.
+                // Cancellation here reads the atomic shutdown flag, avoiding
+                // recursively taking the journal lock from a Git subprocess.
+                let result=owner.db.tx(|q| {
+                    crate::integration_queue::current(q,&item)?;
+                    let merged=crate::integration_queue::publish(&w,&item.validation,&||owner.stopping.load(Ordering::SeqCst))?;
+                    crate::workspaces::save(q,&merged)?;
+                    q.run("UPDATE integration_queue SET state='merged',detail=?,validation=? WHERE job=?",&[&merged.detail,&merged.validation.to_string(),&job])?;
+                    q.run("UPDATE integration_queue SET state='queued',validation='{}',detail='原项目已合入其他候选，重新验证当前候选' WHERE job!=? AND state='awaiting_confirmation'
+                      AND job IN (SELECT job FROM job_workspaces WHERE source=?)",&[&job,&merged.source])?;
+                    let root=q.root(item.ticket)?;
+                    q.log(who_of(&root),"integration.confirmed",&json!({"job":job,"ok":true}))?;
+                    Ok(())
+                });
+                if let Err(error) = &result {
+                    let _ = owner.db.tx(|q| {
+                        q.run(
+                            "UPDATE integration_queue SET state='stale',detail=? WHERE job=?",
+                            &[&error.to_string(), &job],
+                        )?;
+                        Ok(())
+                    });
+                }
+                let _ = send.send(result);
+            });
+            sched.integration_tasks.push(task);
+        }
+        receive.await.map_err(|_| anyhow!("合入操作异常"))?
+    }
     async fn workspace_operation(&self, job: i64, command: Option<Vec<String>>) -> Result<()> {
         let inner = self.inner.clone();
         tokio::task::spawn_blocking(move || {
@@ -650,8 +782,7 @@ impl Engine {
                 let mut sched = lock(&inner.sched);
                 let w = inner.db.with(|q| crate::workspaces::get(q, job))?.ok_or_else(|| anyhow!("工作区不存在"))?;
                 let keys = vec![crate::workspaces::scope(&w.path), crate::workspaces::scope(&w.source)];
-                let busy = sched.active.values().any(|s| keys.iter().any(|k| crate::workspaces::overlaps(k, &crate::workspaces::scope(&s.turn.job.cwd))))
-                    || sched.maintenance.iter().any(|s| keys.iter().any(|k| crate::workspaces::overlaps(k,s)));
+                let busy = inner.workspace_busy(&sched,&keys);
                 if busy { bail!("相关工作区仍有任务运行，请停止或等待后再验证/合入"); }
                 sched.maintenance.extend(keys.clone());
                 (w,keys)
@@ -716,6 +847,19 @@ impl Engine {
             None => None,
         };
         let manifest = inner.snapshot(&dir_text, &params.files).await?;
+        // Reject invalid requests before changing a previously non-Git directory.
+        // The transaction repeats these checks against the final journal state.
+        inner.db.with(|q| {
+            let defaults = q.one("SELECT routes FROM route_defaults WHERE singleton=1", &[])?;
+            let raw = params.selections.clone().unwrap_or_else(||
+                parse(Some(defaults.as_ref().map_or("{}", |d| str_of(d, "routes")))));
+            p::routes(&raw).map_err(|e| anyhow!(e))?;
+            if let Some((ticket, seq)) = params.checkpoint { crate::checkpoints::capture(q, ticket, seq)?; }
+            Ok(())
+        })?;
+        // Platform preparation is independent of the model's write permission.
+        // Run Git outside the journal transaction and async executor.
+        let repository = inner.prepare_project(dir.clone(), true, CancellationToken::new()).await?;
         inner.db.tx(|q| {
             let checkpoint=params.checkpoint.map(|(ticket,seq)|crate::checkpoints::capture(q,ticket,seq)).transpose()?;
             let defaults = q.one("SELECT routes FROM route_defaults WHERE singleton=1", &[])?;
@@ -766,6 +910,9 @@ impl Engine {
             }
             let who = Who { ticket, id, turn: 1 };
             q.log(who, "user", &json!(params.goal))?;
+            if repository.initialized || repository.initial_commit.is_some() {
+                q.log(who, "project.git", &json!(repository))?;
+            }
             if !manifest.is_empty() {
                 q.log(who, "files", &Value::Array(manifest.clone()))?;
             }
@@ -1176,6 +1323,35 @@ fn scheduled_retries(q: &Q, ticket: i64, at: f64) -> Result<Vec<ScheduledRetry>>
 }
 
 impl Inner {
+    /// Coalesce preparation for peers sharing a project. Roots and new tickets
+    /// recheck Git; peers reuse readiness, never a clean-tree/validation receipt.
+    async fn prepare_project(self: &Arc<Self>, directory: PathBuf, force: bool, cancel: CancellationToken)
+        -> Result<crate::project_git::Bootstrap>
+    {
+        let key = project_key(&directory.to_string_lossy());
+        let entry = lock(&self.project_preparations).entry(key)
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(None))).clone();
+        let mut ready = tokio::select! {
+            biased;
+            () = cancel.cancelled() => bail!("Git 项目准备已取消"),
+            ready = entry.lock() => ready,
+        };
+        ensure!(!self.stopping.load(Ordering::SeqCst) && !cancel.is_cancelled(), "Git 项目准备已取消");
+        if !force && directory.is_dir() && let Some(root) = ready.as_ref()
+            && Path::new(root).join(".git").exists()
+        {
+            return Ok(crate::project_git::Bootstrap { root: root.clone(), initialized: false, initial_commit: None });
+        }
+        *ready = None;
+        let owner = self.clone();
+        let repository = tokio::task::spawn_blocking(move || {
+            crate::project_git::ensure_with_cancel(&directory, &||
+                cancel.is_cancelled() || owner.stopping.load(Ordering::SeqCst))
+        }).await.map_err(|_| anyhow!("工作目录 Git 准备异常"))??;
+        *ready = Some(repository.root.clone());
+        Ok(repository)
+    }
+
     pub(crate) fn extensions(&self) -> Option<Arc<dyn Extensions>> {
         self.opts.extensions.clone()
     }
@@ -1268,7 +1444,9 @@ impl Inner {
         {
             return 0;
         }
-        match self.admit() {
+        // Queue bookkeeping is part of admission and shares its recoverable
+        // BEGIN-busy path. A contended journal must never stop the scheduler.
+        match self.drive_integrations().and_then(|()| self.admit()) {
             Ok(n) => {
                 self.scheduler_database_busy.store(false, Ordering::SeqCst);
                 self.mark_scheduler_progress();
@@ -1303,6 +1481,159 @@ impl Inner {
         }
     }
 
+    fn workspace_busy(&self, sched: &Sched, keys: &[String]) -> bool {
+        sched.active.values().any(|slot| {
+            keys.iter().any(|key| {
+                crate::workspaces::overlaps(key, &crate::workspaces::scope(&slot.turn.job.cwd))
+                    || slot.turn.workspace_dependencies.iter().any(|(w, _)| {
+                        crate::workspaces::overlaps(key, &crate::workspaces::scope(&w.path))
+                    })
+            })
+        }) || sched.maintenance.iter().any(|leased| {
+            keys.iter()
+                .any(|key| crate::workspaces::overlaps(key, leased))
+        })
+    }
+
+    fn integration_cancelled(&self, ticket: i64) -> bool {
+        self.stopping.load(Ordering::SeqCst) || self.db.with(|q| {
+            Ok(!crate::integration_queue::enabled(q,ticket)? || q.exists(
+                "SELECT 1 FROM jobs WHERE ticket=? AND parent IS NULL AND state IN ('cancelled','interrupted','failed')",&[&ticket])?)
+        }).unwrap_or(true)
+    }
+
+    fn drive_integrations(self: &Arc<Self>) -> Result<()> {
+        // Preserve admission's scheduler -> journal lock order, including
+        // its read-only disabled-policy check and shutdown observation.
+        let mut sched = lock(&self.sched);
+        if self.stopping.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        // Disabled queues do not acquire an extra SQLite writer transaction
+        // or reconcile unrelated task state on every normal scheduler tick.
+        if !self.db.with(|q| q.exists("SELECT 1 FROM integration_policy WHERE enabled=1", &[]))? {
+            return Ok(());
+        }
+        if self.stopping.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        sched.integration_tasks.retain(|task| !task.is_finished());
+        let items=self.db.admission_tx(|q| {
+            crate::integration_queue::reconcile(q)?;
+            let mut items=vec![];
+            for row in q.all("SELECT DISTINCT i.ticket FROM integration_queue i JOIN integration_policy p ON p.ticket=i.ticket AND p.enabled=1 WHERE i.state='queued'",&[])? {
+                items.extend(crate::integration_queue::list(q,int_of(&row,"ticket"))?.into_iter().filter(|item|item.state=="queued"));
+            }
+            Ok(items)
+        })?;
+        for item in items {
+            if self.integration_cancelled(item.ticket) {
+                continue;
+            }
+            if self.db.with(|q| pause::status(q, item.ticket))? != PauseStatus::Running {
+                continue;
+            }
+            let w = self
+                .db
+                .with(|q| crate::workspaces::get(q, item.job))?
+                .ok_or_else(|| anyhow!("工作区不存在"))?;
+            let keys = vec![
+                crate::workspaces::scope(&w.path),
+                crate::workspaces::scope(&w.source),
+            ];
+            if self.workspace_busy(&sched, &keys) {
+                continue;
+            }
+            let accepted=self.db.admission_tx(|q| {
+                if let Err(error)=crate::integration_queue::current(q,&item) {
+                    q.run("UPDATE integration_queue SET state='stale',detail=? WHERE job=?",&[&error.to_string(),&item.job])?;
+                    return Ok(false);
+                }
+                q.run("UPDATE integration_queue SET state='validating',detail='正在验证隔离任务和合并候选',validation='{}' WHERE job=?",&[&item.job])?;
+                Ok(true)
+            })?;
+            if !accepted {
+                continue;
+            }
+            sched.maintenance.extend(keys.clone());
+            let owner = self.clone();
+            let task = tokio::task::spawn_blocking(move || {
+                let _lease = IntegrationLease(owner.clone(), keys);
+                let result =
+                    crate::integration_queue::prepare(&w, &owner.data_dir, &item.commands, &|| {
+                        owner.integration_cancelled(item.ticket)
+                    });
+                let saved=owner.db.tx(|q| {
+                    if !crate::integration_queue::enabled(q,item.ticket)? {
+                        q.run("UPDATE integration_queue SET state='cancelled',detail='操作者已停用队列或停止工单' WHERE job=?",&[&item.job])?;
+                        return Ok(());
+                    }
+                    if owner.stopping.load(Ordering::SeqCst) {
+                        q.run("UPDATE integration_queue SET state='queued',detail='关闭时取消验证，重开后重新验证' WHERE job=?",&[&item.job])?;
+                        return Ok(());
+                    }
+                    if let Err(error)=crate::integration_queue::current(q,&item) {
+                        q.run("UPDATE integration_queue SET state='stale',detail=? WHERE job=?",&[&error.to_string(),&item.job])?;
+                        return Ok(());
+                    }
+                    let ready=match result {
+                        Ok(ready)=>ready,
+                        Err(error)=>{
+                            q.run("UPDATE integration_queue SET state='blocked',detail=? WHERE job=?",&[&error.to_string(),&item.job])?;
+                            q.run("UPDATE jobs SET state='partial' WHERE id=? AND state='done'",&[&item.job])?;
+                            let row=q.one("SELECT * FROM jobs WHERE id=?",&[&item.job])?.ok_or_else(||anyhow!("任务不存在"))?;
+                            let job=JobCtx::from_row(&row);
+                            if let Some(parent)=job.parent {
+                                platform_note(q,&job,parent,&format!("隔离任务 #{} 的自动合入验证受阻：{}。原项目未改变，请处理后重新验证。",job.id,error))?;
+                                q.run("UPDATE jobs SET state='waiting' WHERE id=? AND state='done'",&[&parent])?;
+                            }
+                            return Ok(());
+                        }
+                    };
+                    crate::workspaces::save(q,&ready)?;
+                    let mut state=ready.state.as_str();
+                    let mut attempts=item.attempts;
+                    if matches!(state,"failed"|"conflict") && pause::status(q,item.ticket)? != PauseStatus::Running {
+                        q.run("UPDATE integration_queue SET state='queued',detail='工单已暂停，恢复后重新验证；未发送修复任务',validation=? WHERE job=?",&[&ready.validation.to_string(),&item.job])?;
+                        return Ok(());
+                    }
+                    if matches!(state,"failed"|"conflict") {
+                        state="blocked";
+                        if attempts<2 && !q.exists("SELECT 1 FROM job_failovers WHERE original=?",&[&item.job])?
+                            && !q.exists("SELECT 1 FROM continuous_runs WHERE ticket=? AND boundary_job>=?",&[&item.ticket,&item.job])?
+                        {
+                            let row=q.one("SELECT * FROM jobs WHERE id=?",&[&item.job])?.ok_or_else(||anyhow!("任务不存在"))?;
+                            let job=JobCtx::from_row(&row);
+                            let body=format!("平台自动合入验证未通过，请在原任务工作区修复，完成后平台会重新验证。第 {} 次修复（最多2次）。\n{}\n真实验证回执（含输出末尾、冲突路径和候选目录）：\n{}",attempts+1,ready.detail,ready.validation);
+                            platform_note(q,&job,job.id,&body)?;
+                            q.run("UPDATE jobs SET state='queued',turn=turn+1,dispatch_turn=NULL,ready_after=0 WHERE id=?",&[&job.id])?;
+                            if let Some(parent)=job.parent { q.run("UPDATE jobs SET state='waiting' WHERE id=? AND state='done'",&[&parent])?; }
+                            attempts+=1; state="repairing";
+                            q.log(job.who(),"integration.bounced",&json!({"attempt":attempts,"validation":ready.validation}))?;
+                        }
+                        if state=="blocked" {
+                            q.run("UPDATE jobs SET state='partial' WHERE id=? AND state='done'",&[&item.job])?;
+                            let row=q.one("SELECT * FROM jobs WHERE id=?",&[&item.job])?.ok_or_else(||anyhow!("任务不存在"))?;
+                            let job=JobCtx::from_row(&row);
+                            if let Some(parent)=job.parent {
+                                platform_note(q,&job,parent,&format!("隔离任务 #{} 自动修复已达到上限或不能安全续派。请处理后重新验证。\n{}",job.id,ready.validation))?;
+                                q.run("UPDATE jobs SET state='waiting' WHERE id=? AND state='done'",&[&parent])?;
+                            }
+                        }
+                    }
+                    q.run("UPDATE integration_queue SET state=?,attempts=?,detail=?,validation=? WHERE job=?",&[&state,&attempts,&ready.detail,&ready.validation.to_string(),&item.job])?;
+                    let root=q.root(item.ticket)?;
+                    q.log(who_of(&root),"integration.result",&json!({"job":item.job,"state":state,"validation":ready.validation}))?;
+                    Ok(())
+                });
+                if let Err(error) = saved {
+                    owner.scheduler_failed("integration_result", error.to_string());
+                }
+            });
+            sched.integration_tasks.push(task);
+        }
+        Ok(())
+    }
     /// `harness_health` envelope field: unhealthy routes per agent.
     fn health_value(&self) -> Value {
         let mut out = Map::new();
@@ -1367,6 +1698,10 @@ impl Inner {
         LEFT JOIN continuous_runs c ON c.ticket=j.ticket
         WHERE j.state='queued' AND j.ready_after<=? AND j.writing=?
         AND NOT EXISTS(SELECT 1 FROM effective_deps d JOIN jobs n ON n.id=d.needs WHERE d.job=j.id AND n.state!='done')
+        AND NOT EXISTS(SELECT 1 FROM effective_deps d JOIN jobs n ON n.id=d.needs
+          JOIN job_workspaces w ON w.job=n.id JOIN integration_policy p ON p.ticket=n.ticket AND p.enabled=1
+          LEFT JOIN integration_queue i ON i.job=n.id WHERE d.job=j.id
+          AND (i.job IS NULL OR i.turn!=n.turn OR i.state NOT IN ('awaiting_confirmation','merged')))
         AND NOT EXISTS(SELECT 1 FROM ticket_pause p WHERE p.ticket=j.ticket
           AND (j.parent IS NOT NULL OR p.state='paused' OR p.state='draining'))
         {exclusion} ORDER BY j.id LIMIT ?", crate::job::EFFECTIVE_DEPS_SQL);
@@ -1377,7 +1712,9 @@ impl Inner {
             let plan = q.exists("SELECT 1 FROM sqlite_master WHERE type='table' AND name='studio_plan'", &[])?;
             let mut slots = vec![];
             let mut occupied: Vec<String> = sched.active.values().filter(|s| s.turn.job.writing)
-                .map(|s| crate::workspaces::scope(&s.turn.job.cwd)).chain(sched.maintenance.iter().cloned()).collect();
+                .flat_map(|s| std::iter::once(crate::workspaces::scope(&s.turn.job.cwd))
+                    .chain(s.turn.workspace_dependencies.iter().map(|(w,_)|crate::workspaces::scope(&w.path))))
+                .chain(sched.maintenance.iter().cloned()).collect();
             for row in candidates {
                 let mut job = JobCtx::from_row(&row);
                 if let Some(w) = crate::workspaces::get(q,job.id)? {
@@ -1392,6 +1729,15 @@ impl Inner {
                 let key = crate::workspaces::scope(&job.cwd);
                 if sched.maintenance.iter().any(|s| crate::workspaces::overlaps(s,&key))
                     || (job.writing && occupied.iter().any(|s| crate::workspaces::overlaps(s,&key))) { continue; }
+                let mut workspace_dependencies=vec![];
+                if crate::workspaces::get(q,job.id)?.is_some() {
+                    for row in q.all(&format!("{} SELECT n.id,n.turn FROM effective_deps d JOIN jobs n ON n.id=d.needs WHERE d.job=? ORDER BY n.id",crate::job::EFFECTIVE_DEPS_SQL),&[&job.id])? {
+                        if let Some(w)=crate::workspaces::get(q,int_of(&row,"id"))? { workspace_dependencies.push((w,int_of(&row,"turn"))); }
+                    }
+                }
+                if workspace_dependencies.iter().any(|(w,_)|occupied.iter().any(|key|crate::workspaces::overlaps(key,&crate::workspaces::scope(&w.path)))) {
+                    continue;
+                }
                 if !job.is_root() && efficiency.max_collaborators > 0
                     && collaborators.get(&job.ticket).copied().unwrap_or(0) >= i64::from(efficiency.max_collaborators) {
                     continue;
@@ -1437,6 +1783,9 @@ impl Inner {
                 }
                 q.run("UPDATE questions SET parked=0 WHERE job=? AND state='pending'", &[&job.id])?;
                 let mut packet = envelope(q, &job, health.clone())?;
+                if crate::integration_queue::enabled(q,job.ticket)? {
+                    packet.insert("integration_queue".into(),json!({"enabled":true,"publication":"operator_confirmation"}));
+                }
                 if job.is_root() && let Some(control) = pause::resumed_control(q, job.ticket)? {
                     packet.insert("pause_control".into(), control);
                 }
@@ -1465,6 +1814,7 @@ impl Inner {
                     .cloned()
                     .unwrap_or_default();
                 if job.writing { occupied.push(key); }
+                occupied.extend(workspace_dependencies.iter().map(|(w,_)|crate::workspaces::scope(&w.path)));
                 if !job.is_root() && efficiency.max_collaborators > 0 {
                     *collaborators.entry(job.ticket).or_insert(0) += 1;
                 }
@@ -1481,6 +1831,7 @@ impl Inner {
                     memos: AtomicUsize::new(0),
                     route: Mutex::new(None),
                     activity: Mutex::new(Tracker::new(time)),
+                    workspace_dependencies,
                 });
             }
             ensure!(self.admission_open(), "调度准入已停止，本批事务已回滚");
@@ -1653,13 +2004,41 @@ impl Inner {
         }
         let primary = job.primary();
         turn.ensure_current()?;
+        // Also covers pre-upgrade queued/retried jobs. Never initialize the
+        // not-yet-provisioned isolated path or sweep inactive historical projects.
+        let project_dir = PathBuf::from(turn.packet().get("project").and_then(Value::as_str).unwrap_or(&job.cwd));
+        let repository = self.prepare_project(project_dir, job.is_root(), turn.cancel.clone()).await?;
+        turn.ensure_current()?;
+        if repository.initialized || repository.initial_commit.is_some() {
+            self.db.tx(|q| {
+                if q.live(job.who())? { q.log(job.who(), "project.git", &json!(repository))?; }
+                Ok(())
+            })?;
+        }
         if let Some(w) = self.db.with(|q| crate::workspaces::get(q,job.id))? {
             let w=crate::workspaces::identity(&w)?;
             self.db.tx(|q|crate::workspaces::save(q,&w))?;
             let data = self.data_dir.clone();
-            let ready = tokio::task::spawn_blocking(move || crate::workspaces::provision(&w,&data)).await
+            let prerequisites=turn.workspace_dependencies.clone();
+            let valid=self.db.with(|q| {
+                for (w,version) in &prerequisites {
+                    if !q.exists("SELECT 1 FROM jobs WHERE id=? AND turn=? AND state='done'",&[&w.job,version])? { return Ok(false); }
+                }
+                Ok(true)
+            })?;
+            if !valid { return Err(TurnError::Wait(now()+1.0)); }
+            let ready = tokio::task::spawn_blocking(move || crate::integration_queue::provision_dependencies(&w,&data,&prerequisites)).await
                 .map_err(|_| anyhow!("工作区准备异常"))??;
-            self.db.tx(|q| crate::workspaces::save(q,&ready))?;
+            self.db.tx(|q| {
+                for (w,version) in &turn.workspace_dependencies {
+                    ensure!(q.exists("SELECT 1 FROM jobs WHERE id=? AND turn=? AND state='done'",&[&w.job,version])?,"前置任务在工作区准备期间已续派，请重新派发当前依赖任务");
+                    if let Some(mut prior)=crate::workspaces::get(q,w.job)? {
+                        prior.head=crate::workspaces::head(Path::new(&prior.path))?;
+                        crate::workspaces::save(q,&prior)?;
+                    }
+                }
+                crate::workspaces::save(q,&ready)
+            })?;
             turn.packet().insert("workspace".into(),json!(ready));
         }
         let project = project_key(turn.packet().get("project").and_then(Value::as_str).unwrap_or(&job.cwd));
@@ -1679,6 +2058,9 @@ impl Inner {
             }
         }
         let mut guide = guides::base(efficiency.concise_handoffs);
+        if turn.packet().get("integration_queue").is_some() {
+            guide.push_str("\n本工单启用隔离任务自动验证合入队列。写任务完成后平台自动创建检查点、验证合并候选，失败可退回原会话修复。通过后等待操作者确认才更新原项目。请在结论中区分隔离工作区完成、候选通过与已确认合入；没有 merged 回执时明确尚未合入。\n");
+        }
         if primary {
             guide.push('\n');
             guide.push_str(guides::CONTINUOUS);
@@ -3391,6 +3773,10 @@ impl TurnHost for AdviceHost {
 /// Upper bound of one advisor turn; bus clients wait at most this long.
 const ADVICE_LIMIT: Duration = Duration::from_secs(14 * 60);
 
+#[cfg(test)]
+#[path = "engine/advice_usage_tests.rs"]
+mod advice_usage_tests;
+
 impl Engine {
     /// The advisor a ticket would consult now (override, default or lead).
     pub fn advisor_for(&self, ticket: i64) -> Result<crate::advice::Advisor> {
@@ -3413,7 +3799,21 @@ impl Engine {
     /// One read-only advisor turn for a running task. Logged on the caller's
     /// job as `advice.started` / `advice.result`.
     pub async fn consult(&self, ticket: i64, job: i64, turn: i64, brief: &str, cancel: CancellationToken) -> Result<Value> {
+        self.consult_limited(ticket, job, turn, brief, cancel, ADVICE_LIMIT)
+            .await
+    }
+
+    async fn consult_limited(
+        &self,
+        ticket: i64,
+        job: i64,
+        turn: i64,
+        brief: &str,
+        cancel: CancellationToken,
+        limit: Duration,
+    ) -> Result<Value> {
         let inner = &self.inner;
+        let cancel = cancel.child_token();
         ensure!(!brief.trim().is_empty() && brief.len() <= crate::advice::MAX_BRIEF, "简报为空或超过 {} 字节", crate::advice::MAX_BRIEF);
         let who = Who { ticket, id: job, turn };
         let (advisor, cwd) = inner.db.tx(|q| {
@@ -3430,7 +3830,9 @@ impl Engine {
         }
         let label = json!({"agent": advisor.agent, "provider": advisor.route.provider, "model": advisor.route.model,
             "reasoning_effort": advisor.route.reasoning_effort, "source": advisor.source});
-        inner.db.with(|q| q.log(who, "advice.started", &json!({"advisor": label, "brief_bytes": brief.len(), "brief_sha256": digest(brief)})))?;
+        // Journal sequence is durable and unique across concurrent callers and restarts.
+        let started_seq = inner.db.with(|q| q.log(who, "advice.started", &json!({"schema_version":1, "advisor": label, "brief_bytes": brief.len(), "brief_sha256": digest(brief)})))?;
+        let attempt_id = format!("advice:{started_seq}");
         let request = RunRequest {
             ticket,
             job,
@@ -3446,22 +3848,64 @@ impl Engine {
             bus: None,
         };
         let (tx, mut rx) = mpsc::unbounded_channel();
-        // Native advisor events are not journaled; drain them as they come.
-        let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
-        let started = std::time::Instant::now();
-        let outcome = tokio::select! {
-            r = adapter.run(request, Arc::new(AdviceHost), tx, cancel.clone()) => r.map_err(|e| anyhow!(e.message)),
-            () = tokio::time::sleep(ADVICE_LIMIT) => { cancel.cancel(); Err(anyhow!("顾问超过 {} 分钟未完成", ADVICE_LIMIT.as_secs() / 60)) }
+        let record_usage = |event| -> Result<()> {
+            if let AdapterEvent::Journal { kind, data } = event
+                && kind == "native"
+                && let Some(sample) = sa_store::usage::advisor_usage_sample(&advisor.agent, &data)
+            {
+                inner.db.with(|q| q.log(who, "usage.observed", &json!({
+                    "schema_version":1, "role":"advisor", "attempt_id":attempt_id,
+                    "agent":advisor.agent, "sample":sample
+                })))?;
+            }
+            Ok(())
         };
-        drain.abort();
+        let mut usage_lost = false;
+        let started = std::time::Instant::now();
+        let outcome = {
+            let run = adapter.run(request, Arc::new(AdviceHost), tx, cancel.clone());
+            let timeout = tokio::time::sleep(limit);
+            tokio::pin!(run, timeout);
+            loop {
+                tokio::select! {
+                    r = &mut run => break r.map_err(|e| anyhow!(e.message)),
+                    event = rx.recv(), if !rx.is_closed() || !rx.is_empty() => {
+                        if let Some(event) = event {
+                            usage_lost |= record_usage(event).is_err();
+                        }
+                    }
+                    () = &mut timeout => {
+                        cancel.cancel();
+                        break Err(anyhow!("顾问超过 {} 分钟未完成", ADVICE_LIMIT.as_secs() / 60));
+                    }
+                    () = cancel.cancelled() => break Err(anyhow!("顾问已取消")),
+                }
+            }
+        };
+        // Completion can win select while a final usage frame is already queued.
+        // Preserve those samples on success, failure, cancellation and timeout.
+        rx.close();
+        while let Ok(event) = rx.try_recv() {
+            usage_lost |= record_usage(event).is_err();
+        }
+        if outcome.is_err() {
+            cancel.cancel();
+        }
         let seconds = (started.elapsed().as_secs_f64() * 10.0).round() / 10.0;
         let logged = match &outcome {
-            Ok(o) => json!({"state": "done", "seconds": seconds, "advisor": label, "advice": o.text}),
-            Err(e) => json!({"state": "error", "seconds": seconds, "advisor": label, "error": e.to_string()}),
+            Ok(o) => json!({"schema_version":1, "attempt_id":attempt_id, "usage_complete":!usage_lost, "state": "done", "seconds": seconds, "advisor": label, "advice": o.text}),
+            Err(e) => json!({"schema_version":1, "attempt_id":attempt_id, "usage_complete":!usage_lost, "state": "error", "seconds": seconds, "advisor": label, "error": e.to_string()}),
         };
-        inner.db.with(|q| q.log(who, "advice.result", &logged))?;
+        // Unlike optional metering, durable delivery of the advice is required.
+        // Do not report success when its final receipt cannot be persisted;
+        // the existing SQLite busy timeout applies, and we never re-run the
+        // model merely to retry a failed journal write.
+        if let Err(error) = inner.db.with(|q| q.log(who, "advice.result", &logged)) {
+            cancel.cancel();
+            return Err(error);
+        }
         let o = outcome?;
-        Ok(json!({"advisor": label, "seconds": seconds, "advice": o.text}))
+        Ok(json!({"attempt_id":attempt_id, "usage_complete":!usage_lost, "advisor": label, "seconds": seconds, "advice": o.text}))
     }
 }
 

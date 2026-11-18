@@ -259,6 +259,7 @@ T1 asserts recovery runs only on `start()`, not in the constructor.
   - Validates goal, cwd, lead, profile and the routing boolean, then `realpath`s the cwd and checks it is a directory.
   - Runs `extensions.prepare`. If `params.extensions` is set but no extension service is configured, it throws.
   - Runs `snapshot(files)`: at most 16 relative paths, no `..` and no absolute or rooted paths (S:144-174, native `snapshot`). The manifest per file is `{name, bytes, sha256, object_path}`.
+  - Prevalidates routes and any historical checkpoint, then prepares the directory's Git repository outside the database transaction. Non-Git and unborn root directories get an initial commit respecting Git ignore rules, including an empty commit for empty projects. Existing committed repositories retain their index, branch and dirty files. This platform operation does not widen the model's permission profile. Actual initialization is logged as `project.git`; old queued/retried jobs receive the same preparation at execution, without sweeping inactive history. See [project Git](project-git.md).
   - In the transaction: `routes()` validates each route, which must have exactly the keys `{provider, model, mode∈cli|desktop}` (PR:16-31). Then it inserts the ticket, calls `extensions.bind`, inserts `continuous_runs` if the profile is auto, inserts the root job and logs `user` and `files`.
 
 ---

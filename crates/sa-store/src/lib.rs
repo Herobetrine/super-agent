@@ -2,6 +2,7 @@
 
 mod activity;
 pub mod efficiency;
+pub mod delivery;
 mod harness_activity;
 pub mod journal;
 pub mod knowledge;

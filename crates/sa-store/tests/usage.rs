@@ -66,6 +66,238 @@ fn ag_result(usage: Value) -> Value {
     json!({"event":"result","result":{"conversation_id":"ag-session","usage":usage,"status":"SUCCESS"}})
 }
 
+fn advice_start(conn: &Connection, job: Job, agent: &str) -> String {
+    let seq = log(
+        conn,
+        job,
+        "advice.started",
+        &json!({"advisor":{"agent":agent}}),
+    );
+    format!("advice:{seq}")
+}
+
+fn advice_sample(conn: &Connection, job: Job, id: &str, agent: &str, event: Value) {
+    let sample = sa_store::usage::advisor_usage_sample(agent, &event).unwrap();
+    log(
+        conn,
+        job,
+        "usage.observed",
+        &json!({"schema_version":1,"role":"advisor",
+        "attempt_id":id,"agent":agent,"sample":sample}),
+    );
+}
+
+fn advice_done(conn: &Connection, job: Job, id: &str, state: &str) {
+    log(
+        conn,
+        job,
+        "advice.result",
+        &json!({"attempt_id":id,"state":state}),
+    );
+}
+
+#[test]
+fn advisor_calls_are_independent_of_caller_cumulative_usage_and_each_other() {
+    let (_dir, mut store, writer, job) = fixture("codex");
+    let first = cx(
+        "same-thread",
+        cx_counts(100, 20, 50),
+        cx_counts(100, 20, 50),
+    );
+    native(&writer, job, first);
+    for index in 0..2 {
+        let id = advice_start(&writer, job, "codex");
+        let sample = cx(
+            &format!("advisor-{index}"),
+            cx_counts(10, 2, 5),
+            cx_counts(10, 2, 5),
+        );
+        advice_sample(&writer, job, &id, "codex", sample.clone());
+        advice_sample(&writer, job, &id, "codex", sample);
+        advice_done(&writer, job, &id, "done");
+    }
+    native(
+        &writer,
+        job,
+        cx(
+            "same-thread",
+            cx_counts(180, 50, 100),
+            cx_counts(80, 30, 50),
+        ),
+    );
+    done(&writer, job);
+    let usage = snapshot(&mut store, job).usage;
+    assert_eq!(usage.totals.total_tokens, Some(254));
+    assert_eq!(usage.jobs[0].tokens.total_tokens, Some(230));
+    assert_eq!(usage.reported_advisor_calls, 2);
+    assert_eq!(usage.unreported_advisor_calls, 0);
+    assert!(!usage.partial);
+    assert_eq!(usage.advisor_calls.len(), 2);
+    assert_ne!(
+        usage.advisor_calls[0].attempt_id,
+        usage.advisor_calls[1].attempt_id
+    );
+    assert_eq!(snapshot(&mut store, job).usage, usage);
+}
+
+#[test]
+fn advisor_cumulative_identity_collisions_are_unknown_and_never_double_counted() {
+    for advisor_first in [false, true] {
+        let (_dir, mut store, writer, job) = fixture("codex");
+        if !advisor_first {
+            native(
+                &writer,
+                job,
+                cx("shared", cx_counts(100, 20, 0), cx_counts(100, 20, 0)),
+            );
+        }
+        let id = advice_start(&writer, job, "codex");
+        advice_sample(
+            &writer,
+            job,
+            &id,
+            "codex",
+            cx("shared", cx_counts(110, 22, 0), cx_counts(10, 2, 0)),
+        );
+        advice_done(&writer, job, &id, "done");
+        if advisor_first {
+            native(
+                &writer,
+                job,
+                cx("shared", cx_counts(100, 20, 0), cx_counts(100, 20, 0)),
+            );
+        }
+        done(&writer, job);
+        let usage = snapshot(&mut store, job).usage;
+        assert_eq!(usage.totals.total_tokens, Some(120));
+        assert_eq!(usage.advisor_calls[0].tokens.total_tokens, None);
+        assert_eq!(usage.unreported_advisor_calls, 1);
+        assert!(usage.partial);
+    }
+    let (_dir, mut store, writer, job) = fixture("codex");
+    for _ in 0..2 {
+        let id = advice_start(&writer, job, "codex");
+        advice_sample(
+            &writer,
+            job,
+            &id,
+            "codex",
+            cx("shared", cx_counts(10, 2, 0), cx_counts(10, 2, 0)),
+        );
+        advice_done(&writer, job, &id, "done");
+    }
+    let usage = snapshot(&mut store, job).usage;
+    assert_eq!(usage.totals.total_tokens, None);
+    assert_eq!(usage.reported_advisor_calls, 0);
+    assert_eq!(usage.unreported_advisor_calls, 2);
+    assert!(usage.partial);
+
+    for (agent, frames) in [
+        (
+            "deepseek",
+            vec![
+                json!({"type":"session","sessionId":"shared"}),
+                ds(
+                    1,
+                    1,
+                    json!({"totalTokens":12,"outputTokens":2,"cacheReadTokens":0,"cacheWriteTokens":0}),
+                ),
+            ],
+        ),
+        ("antigravity", vec![ag_step(1, ag_counts(10, 2, 0))]),
+    ] {
+        let (_dir, mut store, writer, job) = fixture(agent);
+        for frame in &frames {
+            native(&writer, job, frame.clone());
+        }
+        let id = advice_start(&writer, job, agent);
+        for frame in frames {
+            advice_sample(&writer, job, &id, agent, frame);
+        }
+        advice_done(&writer, job, &id, "done");
+        done(&writer, job);
+        let usage = snapshot(&mut store, job).usage;
+        assert_eq!(usage.totals.total_tokens, Some(12), "{agent}");
+        assert_eq!(usage.advisor_calls[0].tokens.total_tokens, None, "{agent}");
+        assert!(usage.partial, "{agent}");
+    }
+}
+
+#[test]
+fn advisor_missing_partial_and_failed_usage_preserves_known_expense_and_legacy_coverage() {
+    let (_dir, mut store, writer, job) = fixture("codex");
+    native(
+        &writer,
+        job,
+        cx("caller", cx_counts(20, 5, 0), cx_counts(20, 5, 0)),
+    );
+    done(&writer, job);
+    let id = advice_start(&writer, job, "deepseek");
+    advice_sample(
+        &writer,
+        job,
+        &id,
+        "deepseek",
+        ds(1, 1, json!({"outputTokens":4})),
+    );
+    advice_done(&writer, job, &id, "error");
+    let legacy = advice_start(&writer, job, "codex");
+    log(
+        &writer,
+        job,
+        "advice.result",
+        &json!({"state":"done","advice":"legacy text"}),
+    );
+    let usage = snapshot(&mut store, job).usage;
+    assert_eq!(usage.reported_advisor_calls, 1);
+    assert_eq!(usage.unreported_advisor_calls, 1);
+    assert_eq!(usage.totals.total_tokens, None);
+    assert_eq!(usage.totals.output_tokens, Some(9));
+    assert_eq!(usage.jobs[0].tokens.total_tokens, Some(25));
+    assert!(usage.partial);
+    let legacy = usage
+        .advisor_calls
+        .iter()
+        .find(|call| call.attempt_id == legacy)
+        .unwrap();
+    assert!(!legacy.reported && legacy.partial);
+    assert_eq!(legacy.tokens.total_tokens, None);
+    assert_eq!(usage.advisor_calls[0].performance.samples, 0);
+}
+
+#[test]
+fn advisor_metering_samples_retain_only_protocol_usage_and_deduplication_fields() {
+    for (agent, event) in [
+        ("codex", cx("c", cx_counts(10, 2, 0), cx_counts(10, 2, 0))),
+        (
+            "claude",
+            json!({"type":"assistant","message":{"id":"m","content":"secret","usage":cl_counts(10, 2)}}),
+        ),
+        (
+            "claude",
+            json!({"type":"result","usage":cl_counts(10, 2),"result":"secret"}),
+        ),
+        (
+            "deepseek",
+            ds(
+                1,
+                2,
+                json!({"totalTokens":12,"outputTokens":2,"private":"secret"}),
+            ),
+        ),
+        ("antigravity", ag_result(ag_counts(10, 2, 0))),
+    ] {
+        let mut event = event;
+        event["private"] = json!({"prompt":"secret","tool_arguments":"secret"});
+        let sample = sa_store::usage::advisor_usage_sample(agent, &event).unwrap();
+        assert!(!sample.to_string().contains("secret"), "{agent}");
+        assert!(!sample.to_string().contains("private"), "{agent}");
+    }
+    let old: sa_store::TicketUsage = serde_json::from_value(json!({"totals":{}})).unwrap();
+    assert!(old.advisor_calls.is_empty());
+    assert_eq!(old.reported_advisor_calls, 0);
+}
+
 #[test]
 fn codex_cumulative_frames_resume_and_new_sessions_are_counted_once() {
     let (_dir, mut store, writer, job) = fixture("codex");

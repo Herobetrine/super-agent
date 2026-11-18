@@ -166,7 +166,8 @@ impl Adapter for Fake {
         let packet: Value = if req.prompt.starts_with(sa_engine::advice::GUIDE) {
             Value::Null
         } else {
-            serde_json::from_str(req.prompt.rsplit('\n').next().unwrap_or("null")).expect("packet JSON")
+            serde_json::from_str(req.prompt.rsplit('\n').next().unwrap_or("null"))
+                .expect("packet JSON")
         };
         let job = packet["job"].clone();
         self.shared.calls.lock().unwrap().push(Call {

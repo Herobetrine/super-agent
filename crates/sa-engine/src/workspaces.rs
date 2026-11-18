@@ -16,7 +16,11 @@ mod process;
 
 pub const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS job_directories(job INTEGER PRIMARY KEY,cwd TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS workspace_policy(ticket INTEGER PRIMARY KEY,isolated INTEGER NOT NULL DEFAULT 0);
-CREATE TABLE IF NOT EXISTS job_workspaces(job INTEGER PRIMARY KEY,ticket INTEGER NOT NULL,source TEXT NOT NULL,path TEXT NOT NULL,branch TEXT NOT NULL,base TEXT NOT NULL DEFAULT '',head TEXT NOT NULL DEFAULT '',state TEXT NOT NULL DEFAULT 'planned',validation TEXT NOT NULL DEFAULT '{}',detail TEXT NOT NULL DEFAULT '');";
+CREATE TABLE IF NOT EXISTS job_workspaces(job INTEGER PRIMARY KEY,ticket INTEGER NOT NULL,source TEXT NOT NULL,path TEXT NOT NULL,branch TEXT NOT NULL,base TEXT NOT NULL DEFAULT '',head TEXT NOT NULL DEFAULT '',state TEXT NOT NULL DEFAULT 'planned',validation TEXT NOT NULL DEFAULT '{}',detail TEXT NOT NULL DEFAULT '');
+CREATE TABLE IF NOT EXISTS integration_policy(ticket INTEGER PRIMARY KEY,enabled INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS integration_queue(job INTEGER PRIMARY KEY,ticket INTEGER NOT NULL,turn INTEGER NOT NULL,
+ state TEXT NOT NULL,attempts INTEGER NOT NULL DEFAULT 0,version TEXT NOT NULL,commands TEXT NOT NULL,
+ detail TEXT NOT NULL DEFAULT '',validation TEXT NOT NULL DEFAULT '{}');";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Workspace {
@@ -109,29 +113,74 @@ pub(crate) fn command_with_cancel(
     run_command(cwd, argv, timeout, cancel, true, Some(4000))
 }
 
+/// Delivery checks can emit arbitrary amounts of output. Drain one combined
+/// pipe continuously and retain only its tail, including on timeout.
+pub(crate) fn delivery_command(
+    cwd: &Path, argv: &[String], env: &[(std::ffi::OsString, std::ffi::OsString)],
+    timeout: Duration, cancel: &dyn Fn() -> bool,
+) -> Result<CommandOutput> {
+    use std::{collections::VecDeque, io::Read, sync::mpsc};
+    const TAIL: usize = 4000;
+    let (mut reader, writer) = std::io::pipe()?;
+    let mut command = check_command(cwd, argv)?;
+    command.env_clear().envs(env.iter().map(|(key, value)| (key, value)))
+        .stdout(writer.try_clone()?).stderr(writer);
+    let (send, receive) = mpsc::sync_channel(1);
+    std::thread::Builder::new().name("delivery-check-output".into()).spawn(move || {
+        let result = (|| -> std::io::Result<Vec<u8>> {
+            let mut tail = VecDeque::with_capacity(TAIL);
+            let mut chunk = [0; 8192];
+            loop {
+                let n = reader.read(&mut chunk)?;
+                if n == 0 { return Ok(tail.into()); }
+                let keep = &chunk[n.saturating_sub(TAIL)..n];
+                tail.drain(..(tail.len() + keep.len()).saturating_sub(TAIL));
+                tail.extend(keep);
+            }
+        })();
+        let _ = send.send(result);
+    })?;
+    let mut result = wait_command(&mut command, timeout, Some(cancel))?;
+    drop(command);
+    result.output = receive.recv_timeout(Duration::from_secs(5))??;
+    Ok(result)
+}
+
+fn check_command(cwd: &Path, argv: &[String]) -> Result<Command> {
+    ensure!(!argv.is_empty() && !argv[0].trim().is_empty(), "验证命令不能为空");
+    let mut cmd = Command::new(&argv[0]);
+    cmd.args(&argv[1..]).current_dir(cwd).stdin(Stdio::null())
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env_remove("GIT_DIR").env_remove("GIT_WORK_TREE").env_remove("GIT_INDEX_FILE");
+    Ok(cmd)
+}
+
 fn run_command(
     cwd: &Path, argv: &[String], timeout: Duration, cancel: Option<&dyn Fn() -> bool>, combined: bool, limit: Option<u64>,
 ) -> Result<CommandOutput> {
-    ensure!(!argv.is_empty() && !argv[0].trim().is_empty(), "验证命令不能为空");
     let output = tempfile::NamedTempFile::new()?;
     let errors = tempfile::NamedTempFile::new()?;
     let stdout = output.reopen()?;
     // A cloned handle shares the file offset, preserving stdout/stderr order.
     let stderr = if combined { stdout.try_clone()? } else { errors.reopen()? };
-    let mut cmd = Command::new(&argv[0]);
-    cmd.args(&argv[1..])
-        .current_dir(cwd)
-        .stdin(Stdio::null())
-        .stdout(stdout)
-        .stderr(stderr)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_INDEX_FILE");
+    let mut cmd = check_command(cwd, argv)?;
+    cmd.stdout(stdout).stderr(stderr);
+    let mut result = wait_command(&mut cmd, timeout, cancel)?;
+    use std::io::{Read, Seek, SeekFrom};
+    let mut reader = output.reopen()?;
+    if combined {
+        let len = reader.metadata()?.len();
+        reader.seek(SeekFrom::Start(len.saturating_sub(4000)))?;
+    }
+    reader.take(limit.unwrap_or(u64::MAX)).read_to_end(&mut result.output)?;
+    Ok(result)
+}
+
+fn wait_command(cmd: &mut Command, timeout: Duration, cancel: Option<&dyn Fn() -> bool>) -> Result<CommandOutput> {
     if cancel.is_some_and(|check| check()) {
         return Ok(CommandOutput { ok: false, exit: None, output: vec![], cancelled: true, timed_out: false });
     }
-    let mut child = process::OwnedProcess::spawn(&mut cmd)?;
+    let mut child = process::OwnedProcess::spawn(cmd)?;
     let start = Instant::now();
     let mut cancelled = false;
     let mut timed_out = false;
@@ -148,18 +197,10 @@ fn run_command(
         std::thread::sleep(Duration::from_millis(20));
     };
     child.shutdown()?;
-    use std::io::{Read, Seek, SeekFrom};
-    let mut reader = output.reopen()?;
-    if combined {
-        let len = reader.metadata()?.len();
-        reader.seek(SeekFrom::Start(len.saturating_sub(4000)))?;
-    }
-    let mut bytes = vec![];
-    reader.take(limit.unwrap_or(u64::MAX)).read_to_end(&mut bytes)?;
     Ok(CommandOutput {
         ok: status.is_some_and(|status| status.success()),
         exit: status.and_then(|status| status.code()),
-        output: bytes, cancelled, timed_out,
+        output: vec![], cancelled, timed_out,
     })
 }
 
@@ -220,7 +261,7 @@ pub(crate) fn fingerprint(cwd: &Path, cancel: &dyn Fn() -> bool) -> Result<Optio
     Ok(Some(format!("{:x}", hash.finalize())))
 }
 
-fn git_argv(args: &[&str]) -> Vec<String> {
+pub(crate) fn git_argv(args: &[&str]) -> Vec<String> {
     [
         "git",
         "-c",
@@ -242,21 +283,21 @@ fn git_argv(args: &[&str]) -> Vec<String> {
     .collect()
 }
 
-fn git(cwd: &Path, args: &[&str]) -> Result<String> {
+pub(crate) fn git(cwd: &Path, args: &[&str]) -> Result<String> {
     let argv = git_argv(args);
     let (ok, out) = command(cwd, &argv, Duration::from_secs(60))?;
     ensure!(ok, "Git 操作失败；工作区保留，未强制重置或删除");
     Ok(String::from_utf8(out)?.trim().to_string())
 }
 
-fn clean(root: &Path) -> Result<()> {
+pub(crate) fn clean(root: &Path) -> Result<()> {
     ensure!(
         git(root, &["status", "--porcelain=v1", "--untracked-files=all"])?.is_empty(),
         "工作区有未提交修改；请先保存或提交再执行"
     );
     Ok(())
 }
-fn head(root: &Path) -> Result<String> {
+pub(crate) fn head(root: &Path) -> Result<String> {
     git(root, &["rev-parse", "--verify", "HEAD"])
 }
 fn root(root: &Path) -> Result<PathBuf> {
@@ -282,7 +323,7 @@ pub fn identity(w: &Workspace) -> Result<Workspace> {
     Ok(w)
 }
 
-fn verify(w: &Workspace) -> Result<()> {
+pub(crate) fn verify(w: &Workspace) -> Result<()> {
     ensure!(
         w.validation.get("identity").is_some(),
         "工作区缺少身份记录，请先重新准备"
@@ -435,7 +476,9 @@ pub fn validate(w: &Workspace, argv: &[String]) -> Result<Workspace> {
         "验证通过，尚未合入"
     }
     .into();
+    let prerequisite_heads = w.validation.get("prerequisite_heads").cloned();
     w.validation = json!({"identity":w.validation["identity"],"command":argv,"head":w.head,"passed":ok && unchanged,"elapsed_ms":started.elapsed().as_millis() as u64,"output_sha256":digest(&String::from_utf8_lossy(&out))});
+    if let Some(heads) = prerequisite_heads { w.validation["prerequisite_heads"] = heads; }
     Ok(w)
 }
 

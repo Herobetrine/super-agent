@@ -17,7 +17,7 @@
 use anyhow::Result;
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 /// Maximum journal rows and native payload bytes examined per refresh.
@@ -197,6 +197,95 @@ pub struct TicketUsage {
     pub pending: bool,
     pub cursor: i64,
     pub performance: UsagePerformance,
+    /// Independent read-only consultations, attributed to their calling job.
+    pub advisor_calls: Vec<AdvisorUsage>,
+    pub reported_advisor_calls: u64,
+    pub unreported_advisor_calls: u64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct AdvisorUsage {
+    pub attempt_id: String,
+    pub job: i64,
+    pub turn: i64,
+    pub agent: String,
+    pub tokens: TokenCounts,
+    pub reported: bool,
+    pub partial: bool,
+    pub scope: UsageScope,
+    pub performance: UsagePerformance,
+}
+
+/// Retain only protocol fields required by the existing native projector.
+/// Text, tool arguments, prompts and unrelated metadata never leave memory.
+pub fn advisor_usage_sample(agent: &str, value: &Value) -> Option<Value> {
+    fn counts(value: &Value, keys: &[&str]) -> Value {
+        keys.iter()
+            .map(|key| ((*key).to_string(), json!(number(value, key))))
+            .collect()
+    }
+    let camel = [
+        "totalTokens",
+        "inputTokens",
+        "outputTokens",
+        "cachedInputTokens",
+        "cacheWriteInputTokens",
+        "reasoningOutputTokens",
+    ];
+    let snake = [
+        "input_tokens",
+        "output_tokens",
+        "cache_read_input_tokens",
+        "cache_creation_input_tokens",
+    ];
+    match agent {
+        "codex" if value["method"] == "thread/tokenUsage/updated" => {
+            let p = &value["params"];
+            Some(json!({"method":"thread/tokenUsage/updated", "params":{
+                "threadId":identity(&p["threadId"]), "tokenUsage":{
+                    "total":counts(&p["tokenUsage"]["total"], &camel),
+                    "last":counts(&p["tokenUsage"]["last"], &camel)}}}))
+        }
+        "claude" if value["type"] == "assistant" || value["type"] == "result" => {
+            if !value["parent_tool_use_id"].is_null() {
+                return None;
+            }
+            if value["type"] == "assistant" {
+                Some(json!({"type":"assistant", "message":{
+                    "id":identity(&value["message"]["id"]),
+                    "usage":counts(&value["message"]["usage"], &snake)}}))
+            } else {
+                Some(
+                    json!({"type":"result", "is_error":value["is_error"] == true,
+                    "subtype":if value["subtype"] == "error_during_execution" { "error_during_execution" } else { "result" },
+                    "usage":counts(&value["usage"], &snake)}),
+                )
+            }
+        }
+        "deepseek" if value["type"] == "session" => {
+            Some(json!({"type":"session", "sessionId":identity(&value["sessionId"])}))
+        }
+        "deepseek" if value["type"] == "status" && value["phase"] == "step_end" => Some(
+            json!({"type":"status", "phase":"step_end", "turn":identity(&value["turn"]),
+                "step":identity(&value["step"]), "usage":counts(&value["usage"],
+                    &["totalTokens", "inputTokens", "outputTokens", "cacheReadTokens", "cacheWriteTokens", "reasoningTokens"])}),
+        ),
+        "antigravity" => {
+            let kind = match value["event"].as_str()? {
+                "step_update" => "step_update",
+                "result" => "result",
+                _ => return None,
+            };
+            let sample = &value[kind];
+            Some(
+                json!({"event":kind, (kind):{"conversation_id":identity(&sample["conversation_id"]),
+                "step_index":identity(&sample["step_index"]), "usage":counts(&sample["usage"],
+                    &["total_tokens", "output_tokens", "cache_read_tokens", "thinking_tokens"])}}),
+            )
+        }
+        _ => None,
+    }
 }
 
 #[derive(Default)]
@@ -647,6 +736,37 @@ impl JobState {
 pub(crate) struct Entry {
     seq: i64,
     jobs: BTreeMap<i64, JobState>,
+    advisors: BTreeMap<String, AdvisorState>,
+    advisor_partial: bool,
+    native_owners: HashMap<(String, String), HashSet<UsageOwner>>,
+}
+
+struct AdvisorState {
+    job: i64,
+    turn: i64,
+    started_seq: i64,
+    state: JobState,
+    identity_conflict: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum UsageOwner {
+    Job(i64),
+    Advisor(String),
+}
+
+fn native_session(agent: &str, value: &Value) -> Option<String> {
+    match agent {
+        "codex" if value["method"] == "thread/tokenUsage/updated" => {
+            identity(&value["params"]["threadId"])
+        }
+        "deepseek" if value["type"] == "session" => identity(&value["sessionId"]),
+        "antigravity" => value["event"]
+            .as_str()
+            .filter(|kind| matches!(*kind, "step_update" | "result"))
+            .and_then(|kind| identity(&value[kind]["conversation_id"])),
+        _ => None,
+    }
 }
 
 impl Entry {
@@ -655,10 +775,15 @@ impl Entry {
         // guard runs in SQLite before Rust allocates or parses a payload.
         let mut stmt = conn.prepare_cached(
             "SELECT e.seq,e.job,e.turn,j.agent,e.kind,
-             CASE WHEN e.kind='native' AND length(CAST(e.payload AS BLOB))<=?4 THEN e.payload END,e.ts
+             CASE WHEN e.kind IN ('advice.started','advice.result') AND json_valid(e.payload)
+                  THEN json_object('attempt_id',json_extract(e.payload,'$.attempt_id'),
+                                   'agent',json_extract(e.payload,'$.advisor.agent'),
+                                   'state',json_extract(e.payload,'$.state'),
+                                   'usage_complete',json_extract(e.payload,'$.usage_complete'))
+                  WHEN e.kind IN ('native','usage.observed') AND length(CAST(e.payload AS BLOB))<=?4 THEN e.payload END,e.ts
              FROM events e LEFT JOIN jobs j ON j.id=e.job
              WHERE e.ticket=?1 AND e.seq>?2 AND e.seq<=?3
-             AND e.kind IN ('native','turn.admitted','reply','failed','cancelled','interrupted','turn.retry_scheduled','turn.gave_up','route.rotated','turn.route_wait','auto.retry')
+             AND e.kind IN ('native','turn.admitted','reply','failed','cancelled','interrupted','turn.retry_scheduled','turn.gave_up','route.rotated','turn.route_wait','auto.retry','advice.started','advice.result','usage.observed')
              ORDER BY e.seq LIMIT ?5",
         )?;
         let mut rows = stmt.query(params![
@@ -686,6 +811,32 @@ impl Entry {
                 .map(|seconds| seconds * 1000.0)
                 .filter(|ms| ms.is_finite() && *ms >= 0.0 && *ms < u64::MAX as f64)
                 .map(|ms| ms.round() as u64);
+            if matches!(
+                kind.as_str(),
+                "advice.started" | "advice.result" | "usage.observed"
+            ) {
+                let payload = row
+                    .get::<_, Option<String>>(5)?
+                    .and_then(|text| serde_json::from_str::<Value>(&text).ok());
+                match payload {
+                    Some(value) => self.advisor(job, turn, &kind, &value, at),
+                    None if kind == "advice.started" => {
+                        self.advisor_partial = true;
+                        self.advisor(job, turn, &kind, &Value::Null, at);
+                    }
+                    None => self.advisor_partial = true,
+                }
+                continue;
+            }
+            let native = if kind == "native" {
+                row.get::<_, Option<String>>(5)?
+                    .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+            } else {
+                None
+            };
+            if let Some(value) = &native {
+                self.register_identity(&agent, value, UsageOwner::Job(job));
+            }
             let state = self.jobs.entry(job).or_insert_with(|| JobState {
                 agent,
                 ..Default::default()
@@ -714,14 +865,8 @@ impl Entry {
                     attempt.failed = true;
                     attempt.finish(at);
                 }
-                "native" => match row.get::<_, Option<String>>(5)? {
-                    Some(text) => match serde_json::from_str(&text) {
-                        Ok(value) => state.native(turn, &value, at),
-                        Err(_) => {
-                            state.partial = true;
-                            state.attempts.entry(turn).or_default().timing_invalid = true;
-                        }
-                    },
+                "native" => match native {
+                    Some(value) => state.native(turn, &value, at),
                     None => {
                         state.partial = true;
                         state.attempts.entry(turn).or_default().timing_invalid = true;
@@ -736,10 +881,113 @@ impl Entry {
         Ok(())
     }
 
+    fn register_identity(&mut self, agent: &str, value: &Value, owner: UsageOwner) {
+        let Some(session) = native_session(agent, value) else {
+            return;
+        };
+        let owners = self
+            .native_owners
+            .entry((agent.to_string(), session))
+            .or_default();
+        owners.insert(owner);
+        if owners.len() > 1 {
+            for owner in owners.iter() {
+                if let UsageOwner::Advisor(id) = owner
+                    && let Some(call) = self.advisors.get_mut(id)
+                {
+                    // Shared cumulative history cannot be allocated to a call.
+                    call.identity_conflict = true;
+                }
+            }
+        }
+    }
+
+    fn advisor(&mut self, job: i64, turn: i64, kind: &str, value: &Value, at: Option<u64>) {
+        if kind == "advice.started" {
+            let id =
+                identity(&value["attempt_id"]).unwrap_or_else(|| format!("advice:{}", self.seq));
+            self.advisors.entry(id).or_insert_with(|| {
+                let mut state = JobState {
+                    agent: value["agent"].as_str().unwrap_or_default().to_string(),
+                    ..Default::default()
+                };
+                state.attempts.insert(
+                    1,
+                    Attempt {
+                        started_ms: at,
+                        timing_invalid: at.is_none(),
+                        ..Default::default()
+                    },
+                );
+                AdvisorState {
+                    job,
+                    turn,
+                    started_seq: self.seq,
+                    state,
+                    identity_conflict: false,
+                }
+            });
+            return;
+        }
+        let id = identity(&value["attempt_id"]).or_else(|| {
+            // Legacy consultations were sequential and had no explicit ID.
+            (kind == "advice.result")
+                .then(|| {
+                    self.advisors
+                        .iter()
+                        .filter(|(_, call)| {
+                            call.job == job
+                                && call.turn == turn
+                                && !call
+                                    .state
+                                    .attempts
+                                    .get(&1)
+                                    .is_some_and(|attempt| attempt.ended)
+                        })
+                        .max_by_key(|(_, call)| call.started_seq)
+                        .map(|(id, _)| id.clone())
+                })
+                .flatten()
+        });
+        let Some(id) = id else {
+            self.advisor_partial = true;
+            return;
+        };
+        if kind == "usage.observed"
+            && let Some(agent) = self.advisors.get(&id).map(|call| call.state.agent.clone())
+        {
+            self.register_identity(&agent, &value["sample"], UsageOwner::Advisor(id.clone()));
+        }
+        let Some(call) = self.advisors.get_mut(&id) else {
+            self.advisor_partial = true;
+            return;
+        };
+        if call.job != job || call.turn != turn {
+            self.advisor_partial = true;
+            return;
+        }
+        if kind == "usage.observed" {
+            if value["schema_version"] != 1
+                || value["role"] != "advisor"
+                || value["agent"].as_str() != Some(call.state.agent.as_str())
+            {
+                call.state.partial = true;
+                return;
+            }
+            call.state.native(1, &value["sample"], at);
+        } else {
+            call.state.partial |= value["usage_complete"] == false || value["usage_complete"] == 0;
+            let attempt = call.state.attempts.entry(1).or_default();
+            attempt.ended = true;
+            attempt.failed |= value["state"] != "done";
+            attempt.finish(at);
+        }
+    }
+
     pub(crate) fn view(&self, end: i64, visible: &[(i64, String)], total_jobs: i64) -> TicketUsage {
         let mut totals = Sum::default();
         let mut performance = UsagePerformance::default();
-        let mut partial = self.seq < end;
+        let mut partial = self.seq < end || self.advisor_partial;
         let mut reported_jobs = 0;
         let mut jobs = Vec::new();
         for (id, state) in &self.jobs {
@@ -764,7 +1012,38 @@ impl Entry {
         }
         jobs.sort_by_key(|j| j.job);
         let unreported_jobs = (total_jobs.max(0) as u64).saturating_sub(reported_jobs);
-        performance.partial |= self.seq < end || unreported_jobs > 0;
+        let mut advisor_calls = Vec::new();
+        let mut reported_advisor_calls = 0;
+        for (attempt_id, call) in &self.advisors {
+            let mut view = call.state.view(call.job);
+            if call.identity_conflict {
+                view.tokens = TokenCounts::default();
+                view.reported_attempts = 0;
+                view.partial = true;
+                view.performance = UsagePerformance {
+                    partial: true,
+                    ..Default::default()
+                };
+            }
+            totals.add(&view.tokens);
+            performance.add(&view.performance);
+            partial |= view.partial;
+            let reported = view.reported_attempts > 0;
+            reported_advisor_calls += u64::from(reported);
+            advisor_calls.push(AdvisorUsage {
+                attempt_id: attempt_id.clone(),
+                job: call.job,
+                turn: call.turn,
+                agent: view.agent,
+                tokens: view.tokens,
+                reported,
+                partial: view.partial,
+                scope: view.scope,
+                performance: view.performance,
+            });
+        }
+        let unreported_advisor_calls = advisor_calls.len() as u64 - reported_advisor_calls;
+        performance.partial |= self.seq < end || unreported_jobs > 0 || self.advisor_partial;
         TicketUsage {
             totals: totals.finish(),
             jobs,
@@ -773,6 +1052,9 @@ impl Entry {
             pending: self.seq < end,
             cursor: self.seq,
             performance,
+            advisor_calls,
+            reported_advisor_calls,
+            unreported_advisor_calls,
         }
     }
 }

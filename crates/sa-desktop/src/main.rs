@@ -9,6 +9,7 @@ mod control;
 mod conversation;
 mod data;
 mod demo;
+mod delivery_ui;
 mod efficiency;
 #[cfg(test)]
 mod efficiency_tests;

@@ -305,6 +305,9 @@ impl App {
             if let ActionKind::ProjectChecks { request } = kind {
                 self.workflow.checks_result(request, Err("调度线程已退出，请重新打开窗口".into()));
             }
+            if let ActionKind::Delivery { ticket, request } = kind {
+                self.workflow.delivery.result(ticket, request, Err("调度线程已退出，请重新打开窗口".into()));
+            }
             self.composer.message = Some(("调度线程已退出，请重新打开窗口".into(), true));
         }
     }
@@ -410,6 +413,9 @@ impl App {
                     if let Err(error) = result {
                         self.composer.message = Some((error, true));
                     }
+                }
+                (ActionKind::Delivery { ticket, request }, result) => {
+                    self.workflow.delivery.result(ticket, request, result.map(|_| ()));
                 }
                 (ActionKind::ProjectChecks { request }, result) => {
                     self.workflow.checks_result(request, result.map(|_| ()));
@@ -982,6 +988,7 @@ impl App {
                             .as_ref()
                             .map(|p| p.display().to_string())
                             .unwrap_or_else(|| "未选择时使用新的临时目录".into());
+                        let tip = format!("{tip}\n发送时自动准备 Git；无提交时按现有忽略规则建立本地初始提交");
                         if widgets::quiet_button(ui, icon::FOLDER_SIMPLE, &folder, &pal, false)
                             .on_hover_text(tip)
                             .clicked()

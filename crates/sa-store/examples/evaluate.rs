@@ -1,6 +1,6 @@
 //! Local journal evaluation and report comparison. No model or network calls.
 use anyhow::{Context, Result, bail, ensure};
-use sa_store::evaluation::{self, Dataset, Report};
+use sa_store::evaluation::{self, Dataset, EvidenceSource, Report};
 use std::{
     collections::BTreeMap,
     fs::File,
@@ -22,9 +22,9 @@ fn main() -> Result<()> {
     if args.is_empty() || args.iter().any(|a| a == "--help" || a == "-h") {
         println!(
             "本地只读评测（不运行模型，不上传数据）\n\
-scripts\\cargo.cmd run -p sa-store --example evaluate -- --data DATA_DIR --ticket ID [--dataset dataset.json --case CASE_ID] --output new-report.json\n\
+scripts\\cargo.cmd run -p sa-store --example evaluate -- --data DATA_DIR --ticket ID [--dataset dataset.json --case CASE_ID [--snapshot ID]] --output new-report.json\n\
 scripts\\cargo.cmd run -p sa-store --example evaluate -- --left report-a.json --right report-b.json --output new-comparison.json\n\
-不传 --data 时使用 SUPERAGENT_DATA 或默认工单库。输出文件必须尚不存在。文件断言检查当前工作区，非历史快照。"
+不传 --data 时使用 SUPERAGENT_DATA 或默认工单库。输出文件必须尚不存在。文件断言默认检查当前工作区；--snapshot 显式选择历史文件清单，未列出的路径为 unknown。状态、结果、用量和计时始终来自当前日志，through_event 标记读取截止事件。"
         );
         return Ok(());
     }
@@ -37,7 +37,14 @@ scripts\\cargo.cmd run -p sa-store --example evaluate -- --left report-a.json --
         ensure!(
             matches!(
                 pair[0].as_str(),
-                "--data" | "--ticket" | "--dataset" | "--case" | "--output" | "--left" | "--right"
+                "--data"
+                    | "--ticket"
+                    | "--dataset"
+                    | "--case"
+                    | "--snapshot"
+                    | "--output"
+                    | "--left"
+                    | "--right"
             ),
             "未知选项"
         );
@@ -49,7 +56,7 @@ scripts\\cargo.cmd run -p sa-store --example evaluate -- --left report-a.json --
     let output = Path::new(options.get("--output").context("缺少 --output")?);
     if options.contains_key("--left") || options.contains_key("--right") {
         ensure!(
-            !["--data", "--ticket", "--dataset", "--case"]
+            !["--data", "--ticket", "--dataset", "--case", "--snapshot"]
                 .iter()
                 .any(|key| options.contains_key(key)),
             "比较模式不能混用工单选项"
@@ -77,7 +84,17 @@ scripts\\cargo.cmd run -p sa-store --example evaluate -- --left report-a.json --
             (None, None) => None,
             _ => bail!("--dataset 和 --case 必须同时提供"),
         };
-        let report = evaluation::evaluate(&data, ticket, selection)?;
+        let source = options
+            .get("--snapshot")
+            .map(|value| {
+                value
+                    .parse::<i64>()
+                    .map(|snapshot_id| EvidenceSource::DeliverySnapshot { snapshot_id })
+                    .context("快照编号必须是正整数")
+            })
+            .transpose()?
+            .unwrap_or_default();
+        let report = evaluation::evaluate_with_source(&data, ticket, selection, source)?;
         evaluation::write_new(output, &report)?;
         println!(
             "已生成本地评测报告：{} 个任务，{} 次恢复；金额未知。",

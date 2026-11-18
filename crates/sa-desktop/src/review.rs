@@ -1620,10 +1620,18 @@ mod tests {
                 .is_some_and(|v| v.checkpoint.is_some())
                 && s.saving.is_none()
         });
+        wait(&mut h, |s| {
+            s.pending.is_none() && s.detail_pending.is_none() && matches!(s.detail, Some(Ok(_)))
+        });
         h.run_steps(3);
         h.get_by_label("与检查点比较").click();
         h.run_steps(3);
         assert!(h.state().diff.compare);
+        // Git can memory-map the working file during the background comparison
+        // on Windows. Wait for that read to finish before truncating the fixture.
+        wait(&mut h, |s| {
+            s.pending.is_none() && s.detail_pending.is_none() && matches!(s.result, Some(Ok(_)))
+        });
         fs::write(root.join("tracked.txt"), "after checkpoint\n").unwrap();
         let ctx = h.state().ctx.clone();
         // Reopening the panel uses only the persisted manifest and objects.

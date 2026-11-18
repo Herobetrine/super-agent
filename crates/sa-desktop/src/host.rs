@@ -59,6 +59,66 @@ pub enum Action {
         checks: Vec<Vec<String>>,
         request: u64,
     },
+    SaveRequirement {
+        ticket: i64,
+        expected_revision: i64,
+        requirement_id: Option<i64>,
+        text: String,
+        path: Option<String>,
+        expected_sha256: Option<String>,
+        job: Option<i64>,
+        request: u64,
+    },
+    CaptureDelivery {
+        ticket: i64,
+        expected_revision: i64,
+        paths: Vec<String>,
+        request: u64,
+    },
+    SetDeliveryGate {
+        ticket: i64,
+        expected_policy_revision: i64,
+        enabled: bool,
+        request: u64,
+    },
+    SetRequirementDisposition {
+        ticket: i64,
+        expected_contract_revision: i64,
+        requirement_id: i64,
+        required: bool,
+        withdrawn: bool,
+        reason: String,
+        request: u64,
+    },
+    AdoptDeliveryCheck {
+        ticket: i64,
+        expected_contract_revision: i64,
+        requirement_id: i64,
+        argv: Vec<String>,
+        verifier_paths: Vec<String>,
+        request: u64,
+    },
+    RunDeliveryCheck {
+        ticket: i64,
+        expected_contract_revision: i64,
+        snapshot_id: i64,
+        requirement_id: i64,
+        cancel: Arc<AtomicBool>,
+        request: u64,
+    },
+    PrepareDelivery {
+        ticket: i64,
+        expected_contract_revision: i64,
+        expected_snapshot_id: i64,
+        expected_policy_revision: i64,
+        request: u64,
+    },
+    AcceptDelivery {
+        ticket: i64,
+        expected_assessment_id: i64,
+        expected_status: &'static str,
+        request: u64,
+    },
     Cancel {
         ticket: i64,
     },
@@ -118,6 +178,9 @@ pub enum Action {
     IntegrateWorkspace {
         job: i64,
     },
+    SetIntegrationQueue { ticket: i64, enabled: bool },
+    ConfirmIntegration { job: i64, confirmation_token: String },
+    RevalidateIntegration { job: i64 },
     BindScm {
         ticket: i64,
         job: i64,
@@ -175,6 +238,14 @@ impl Action {
             Action::Note { .. } => ActionKind::Note,
             Action::Answer { question, .. } => ActionKind::Answer { question: *question },
             Action::SaveProjectChecks { request, .. } => ActionKind::ProjectChecks { request: *request },
+            Action::SaveRequirement { ticket, request, .. }
+            | Action::CaptureDelivery { ticket, request, .. }
+            | Action::SetDeliveryGate { ticket, request, .. }
+            | Action::SetRequirementDisposition { ticket, request, .. }
+            | Action::AdoptDeliveryCheck { ticket, request, .. }
+            | Action::RunDeliveryCheck { ticket, request, .. }
+            | Action::PrepareDelivery { ticket, request, .. }
+            | Action::AcceptDelivery { ticket, request, .. } => ActionKind::Delivery { ticket: *ticket, request: *request },
             Action::Cancel { .. } => ActionKind::Cancel,
             Action::Retry { .. } => ActionKind::Retry,
             Action::Decide { allow, .. } => ActionKind::Decide { allow: *allow },
@@ -195,6 +266,9 @@ impl Action {
             | Action::SetIsolatedWriters { .. }
             | Action::ValidateWorkspace { .. }
             | Action::IntegrateWorkspace { .. }
+            | Action::SetIntegrationQueue { .. }
+            | Action::ConfirmIntegration { .. }
+            | Action::RevalidateIntegration { .. }
             | Action::BindScm { .. }
             | Action::RefreshScm { .. } => ActionKind::Meta,
         }
@@ -204,7 +278,13 @@ impl Action {
         matches!(
             self,
             Self::ValidateWorkspace { .. }
+                | Self::CaptureDelivery { .. }
+                | Self::AdoptDeliveryCheck { .. }
+                | Self::RunDeliveryCheck { .. }
+                | Self::PrepareDelivery { .. }
+                | Self::AcceptDelivery { .. }
                 | Self::IntegrateWorkspace { .. }
+                | Self::ConfirmIntegration { .. }
                 | Self::RefreshScm { .. }
         )
     }
@@ -218,6 +298,7 @@ pub enum ActionKind {
     Note,
     Answer { question: i64 },
     ProjectChecks { request: u64 },
+    Delivery { ticket: i64, request: u64 },
     Cancel,
     Retry,
     Decide { allow: bool },
@@ -659,6 +740,12 @@ impl Host {
                 .map(|r| sa_engine::workspaces::get(q, sa_engine::db::int_of(r,"job"))?.ok_or_else(|| anyhow!("工作区不存在"))).collect()
         })
     }
+    pub fn integration_queue_enabled(&self, ticket: i64) -> Result<bool> {
+        self.read(|q| sa_engine::integration_queue::enabled(q, ticket))
+    }
+    pub fn integration_queue(&self, ticket: i64) -> Result<Vec<sa_engine::integration_queue::IntegrationItem>> {
+        self.read(|q| sa_engine::integration_queue::list(q, ticket))
+    }
     pub fn checkpoints(&self, ticket: i64) -> Result<Vec<Value>> {
         self.read(|q| sa_engine::checkpoints::list(q, ticket))
     }
@@ -866,6 +953,61 @@ async fn execute(engine: &Engine, shared: &Shared, action: Action) -> Result<Opt
             engine.set_project_checks(&cwd, checks)?;
             Ok(None)
         }
+        Action::SaveRequirement { ticket, expected_revision, requirement_id, text, path, expected_sha256, job, .. } => {
+            engine.save_requirement(ticket, expected_revision, requirement_id, text, path, expected_sha256, job)?;
+            Ok(None)
+        }
+        Action::CaptureDelivery { ticket, expected_revision, paths, .. } => {
+            engine.capture_delivery(ticket, expected_revision, paths)?;
+            Ok(None)
+        }
+        Action::SetDeliveryGate { ticket, expected_policy_revision, enabled, .. } => {
+            engine.set_delivery_gate(ticket, expected_policy_revision, enabled)?;
+            Ok(None)
+        }
+        Action::SetRequirementDisposition { ticket, expected_contract_revision, requirement_id, required, withdrawn, reason, .. } => {
+            engine.set_requirement_disposition(ticket, expected_contract_revision, requirement_id, required, withdrawn, reason)?;
+            Ok(None)
+        }
+        Action::AdoptDeliveryCheck {
+            ticket, expected_contract_revision, requirement_id, argv, verifier_paths, ..
+        } => {
+            let engine = engine.clone();
+            tokio::task::spawn_blocking(move || {
+                engine.adopt_delivery_check_with_files(
+                    ticket, expected_contract_revision, requirement_id, argv, verifier_paths,
+                )
+            }).await??;
+            Ok(None)
+        }
+        Action::RunDeliveryCheck {
+            ticket, expected_contract_revision, snapshot_id, requirement_id, cancel, ..
+        } => {
+            // Engine::quiesce cancels the child process before the action loop
+            // drains its maintenance tasks and closes the journal.
+            let engine = engine.clone();
+            tokio::task::spawn_blocking(move || {
+                engine.run_delivery_check_with_cancel(
+                    ticket, expected_contract_revision, snapshot_id, requirement_id,
+                    &|| cancel.load(Ordering::Relaxed),
+                )
+            }).await??;
+            Ok(None)
+        }
+        Action::PrepareDelivery { ticket, expected_contract_revision, expected_snapshot_id, expected_policy_revision, .. } => {
+            let engine = engine.clone();
+            tokio::task::spawn_blocking(move || {
+                engine.prepare_delivery(ticket, expected_contract_revision, expected_snapshot_id, expected_policy_revision)
+            }).await??;
+            Ok(None)
+        }
+        Action::AcceptDelivery { ticket, expected_assessment_id, expected_status, .. } => {
+            let engine = engine.clone();
+            tokio::task::spawn_blocking(move || {
+                engine.accept_delivery(ticket, expected_assessment_id, expected_status)
+            }).await??;
+            Ok(None)
+        }
         Action::Cancel { ticket } => {
             engine.cancel(ticket)?;
             Ok(None)
@@ -975,6 +1117,18 @@ async fn execute(engine: &Engine, shared: &Shared, action: Action) -> Result<Opt
         }
         Action::IntegrateWorkspace { job } => {
             engine.integrate_workspace(job).await?;
+            Ok(None)
+        }
+        Action::SetIntegrationQueue { ticket, enabled } => {
+            engine.set_integration_queue(ticket, enabled)?;
+            Ok(None)
+        }
+        Action::ConfirmIntegration { job, confirmation_token } => {
+            engine.confirm_integration(job, &confirmation_token).await?;
+            Ok(None)
+        }
+        Action::RevalidateIntegration { job } => {
+            engine.revalidate_integration(job)?;
             Ok(None)
         }
         Action::BindScm { ticket, job, url } => {
@@ -2251,7 +2405,18 @@ exit 0
             until(|| response.exists());
             serde_json::from_slice(&std::fs::read(response).unwrap()).unwrap()
         };
-        let status = request("status", "status", &ready["generation"]);
+        // Status deliberately stays nonblocking; even normal scheduler work
+        // can briefly own the journal. A new request retries the snapshot,
+        // while the explicit held-lock case below verifies the busy response.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut attempt = 0;
+        let status = loop {
+            let response = request(&format!("status-{attempt}"), "status", &ready["generation"]);
+            assert_eq!(response["ok"], true, "{response}");
+            if response["result"]["state_available"] == true { break response; }
+            assert!(std::time::Instant::now() < deadline, "status snapshot remained unavailable: {response}");
+            attempt += 1;
+        };
         assert_eq!(status["ok"], true);
         assert_eq!(status["result"]["jobs"][0]["state"], "done");
         assert_eq!(status["result"]["scheduler"]["state"], "running");
