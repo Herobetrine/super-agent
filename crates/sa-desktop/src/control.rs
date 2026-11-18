@@ -52,13 +52,32 @@ impl Server {
         loop {
             interval.tick().await;
             // The owned engine remains the only scheduler and database writer.
-            let _ = self.poll(|command, ticket| {
+            let _ = self.poll(|command, ticket, args| {
                 match command {
                     "pause_after_handoff" => {
                         engine.request_pause_after_handoff(ticket)?;
                     }
                     "resume" => {
                         engine.resume_paused(ticket)?;
+                    }
+                    "answer" => {
+                        let id = owned(&engine, "questions", args["question"].as_i64(), ticket)?;
+                        engine.answer(id, text(&args["answer"])?)?;
+                    }
+                    "decide" => {
+                        let id = owned(&engine, "approvals", args["approval"].as_i64(), ticket)?;
+                        let allow = args["allow"].as_bool().ok_or_else(|| anyhow::anyhow!("invalid request"))?;
+                        engine.decide(id, allow)?;
+                    }
+                    "retry" => {
+                        let id = owned(&engine, "jobs", args["job"].as_i64(), ticket)?;
+                        engine.retry(id)?;
+                    }
+                    "follow" => {
+                        engine.follow(ticket, text(&args["body"])?, true)?;
+                    }
+                    "stop" => {
+                        engine.cancel(ticket)?;
                     }
                     _ => {}
                 }
@@ -80,7 +99,7 @@ impl Server {
         }
     }
 
-    fn poll(&mut self, mut execute: impl FnMut(&str, i64) -> Result<Value>) -> Result<()> {
+    fn poll(&mut self, mut execute: impl FnMut(&str, i64, &Value) -> Result<Value>) -> Result<()> {
         for entry in fs::read_dir(self.root.join("requests"))?
             .filter(|entry| {
                 entry.as_ref().is_ok_and(|entry| {
@@ -129,7 +148,7 @@ impl Server {
                 Some(response) => response.clone(),
                 None => {
                     let result = read_request(&claimed, id, &self.generation)
-                        .and_then(|(command, ticket)| execute(&command, ticket));
+                        .and_then(|(command, ticket, args)| execute(&command, ticket, &args));
                     let response = match result {
                         Ok(value) => json!({"version":1,"id":id,"ok":true,"result":value}),
                         Err(_) => {
@@ -164,7 +183,22 @@ fn valid_id(id: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
-fn read_request(path: &Path, expected_id: &str, generation: &str) -> Result<(String, i64)> {
+/// Operator actions name a question, approval or job; it must belong to the ticket.
+fn owned(engine: &Engine, table: &str, id: Option<i64>, ticket: i64) -> Result<i64> {
+    let id = id.filter(|id| *id > 0).ok_or_else(|| anyhow::anyhow!("invalid request"))?;
+    let sql = format!("SELECT ticket FROM {table} WHERE id=?");
+    let row = engine.db().with(|q| q.one(&sql, &[&id]))?;
+    if row.is_none_or(|r| sa_engine::db::int_of(&r, "ticket") != ticket) {
+        bail!("invalid request");
+    }
+    Ok(id)
+}
+
+fn text(value: &Value) -> Result<&str> {
+    value.as_str().map(str::trim).filter(|t| !t.is_empty()).ok_or_else(|| anyhow::anyhow!("invalid request"))
+}
+
+fn read_request(path: &Path, expected_id: &str, generation: &str) -> Result<(String, i64, Value)> {
     let file = fs::File::open(path)?;
     if file.metadata()?.len() > MAX_BYTES {
         bail!("invalid request");
@@ -180,16 +214,20 @@ fn read_request(path: &Path, expected_id: &str, generation: &str) -> Result<(Str
         .ok_or_else(|| anyhow::anyhow!("invalid request"))?;
     let command = value["command"].as_str().unwrap_or_default();
     let ticket = value["ticket"].as_i64().unwrap_or_default();
-    if object.len() != 5
+    // Operator actions carry one `args` object; status and pause requests have none.
+    let operator = matches!(command, "answer" | "decide" | "retry" | "follow");
+    let args = value.get("args").cloned().unwrap_or(Value::Null);
+    if object.len() != if operator { 6 } else { 5 }
+        || (operator && !args.is_object())
         || value["generation"] != generation
         || value["version"] != 1
         || value["id"] != expected_id
-        || !matches!(command, "status" | "pause_after_handoff" | "resume")
+        || !matches!(command, "status" | "pause_after_handoff" | "resume" | "answer" | "decide" | "retry" | "follow" | "stop")
         || ticket <= 0
     {
         bail!("invalid request");
     }
-    Ok((command.to_owned(), ticket))
+    Ok((command.to_owned(), ticket, args))
 }
 
 fn publish(path: &Path, value: &Value) -> Result<()> {
@@ -217,7 +255,7 @@ mod tests {
         publish(&requests.join("one.json"), &request).unwrap();
         let mut calls = 0;
         server
-            .poll(|command, ticket| {
+            .poll(|command, ticket, _| {
                 calls += 1;
                 assert_eq!(command, "pause_after_handoff");
                 assert_eq!(ticket, 7);
@@ -226,7 +264,7 @@ mod tests {
             .unwrap();
         publish(&requests.join("one.json"), &request).unwrap();
         server
-            .poll(|_, _| {
+            .poll(|_, _, _| {
                 calls += 1;
                 Ok(Value::Null)
             })
@@ -236,13 +274,13 @@ mod tests {
             json!({"version":1,"id":"bad","command":"exec","ticket":7,"secret":"fixture-private"});
         publish(&requests.join("bad.processing"), &malformed).unwrap();
         server
-            .poll(|_, _| panic!("rejected request executed"))
+            .poll(|_, _, _| panic!("rejected request executed"))
             .unwrap();
         let error = fs::read_to_string(server.root.join("responses/bad.json")).unwrap();
         assert!(error.contains("request_rejected"));
         assert!(!error.contains("fixture-private"));
         publish(&requests.join("recover.processing"), &json!({"generation":server.generation,"version":1,"id":"recover","command":"status","ticket":7})).unwrap();
-        server.poll(|_, _| Ok(json!({"pause":"paused"}))).unwrap();
+        server.poll(|_, _, _| Ok(json!({"pause":"paused"}))).unwrap();
         assert!(server.root.join("responses/recover.json").exists());
         let ready = server.root.join("ready.json");
         drop(server);
@@ -271,13 +309,41 @@ mod tests {
         }
         fs::write(server.root.join("requests/large.json"), vec![b'x'; 4097]).unwrap();
         server
-            .poll(|_, _| panic!("invalid request executed"))
+            .poll(|_, _, _| panic!("invalid request executed"))
             .unwrap();
         assert_eq!(
             fs::read_dir(server.root.join("responses")).unwrap().count(),
             4
         );
     }
+    #[test]
+    fn operator_actions_require_exactly_one_args_object() {
+        let data = tempfile::tempdir().unwrap();
+        let mut server = Server::open(data.path()).unwrap();
+        let g = server.generation.clone();
+        for (id, value) in [
+            ("noargs", json!({"generation":g,"version":1,"id":"noargs","command":"answer","ticket":1})),
+            ("scalar", json!({"generation":g,"version":1,"id":"scalar","command":"retry","ticket":1,"args":5})),
+            ("extra", json!({"generation":g,"version":1,"id":"extra","command":"status","ticket":1,"args":{}})),
+        ] {
+            publish(&server.root.join(format!("requests/{id}.json")), &value).unwrap();
+        }
+        server.poll(|_, _, _| panic!("invalid operator request executed")).unwrap();
+        let request = json!({"generation":g,"version":1,"id":"ok","command":"answer","ticket":3,"args":{"question":9,"answer":"继续"}});
+        publish(&server.root.join("requests/ok.json"), &request).unwrap();
+        let mut seen = None;
+        server
+            .poll(|command, ticket, args| {
+                seen = Some((command.to_owned(), ticket, args.clone()));
+                Ok(Value::Null)
+            })
+            .unwrap();
+        let (command, ticket, args) = seen.unwrap();
+        assert_eq!((command.as_str(), ticket), ("answer", 3));
+        assert_eq!(args["answer"], "继续");
+        assert!(text(&json!("  ")).is_err());
+    }
+
     #[test]
     fn failed_response_publication_does_not_repeat_a_completed_resume() {
         let data = tempfile::tempdir().unwrap();
@@ -289,7 +355,7 @@ mod tests {
         let mut paused = true;
         assert!(
             server
-                .poll(|command, _| {
+                .poll(|command, _, _| {
                     assert_eq!(command, "resume");
                     calls += 1;
                     paused = false;
@@ -305,7 +371,7 @@ mod tests {
         paused = true;
         assert!(
             server
-                .poll(|_, _| {
+                .poll(|_, _, _| {
                     calls += 1;
                     paused = false;
                     Ok(Value::Null)
@@ -317,7 +383,7 @@ mod tests {
         fs::remove_file(&responses).unwrap();
         fs::create_dir(&responses).unwrap();
         server
-            .poll(|_, _| {
+            .poll(|_, _, _| {
                 calls += 1;
                 paused = false;
                 Ok(Value::Null)

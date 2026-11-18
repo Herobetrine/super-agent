@@ -8,13 +8,23 @@
 
 ## 本机控制接口
 
-锁定工单库的工作台提供同用户文件接口，目录为数据目录下的 `control/`，没有网络监听。请求只允许查询状态、交接后暂停和恢复，不接受代码、路径或模型提示。请求通过原工作台的 Engine 执行；测试脚本不直接修改数据库，也不启动第二个调度器。目录访问遵循本机用户文件权限，不是面向不可信用户的服务。
+锁定工单库的工作台提供同用户文件接口，目录为数据目录下的 `control/`，没有网络监听。请求可以查询状态、交接后暂停和恢复，也可以执行操作员动作：回答问题、审批、重试任务、追加要求和停止工单。不接受代码、路径或模型提示。请求通过原工作台的 Engine 执行；测试脚本不直接修改数据库，也不启动第二个调度器。目录访问遵循本机用户文件权限，不是面向不可信用户的服务。
 
 ```powershell
 $data = "$env:USERPROFILE/.local/share/superagent/control-room"
 python scripts/agent-control.py --data $data status --ticket 6
 python scripts/agent-control.py --data $data pause-after-handoff --ticket 6
 python scripts/agent-control.py --data $data resume --ticket 6
+```
+
+操作员动作用 `--args` 传一个 JSON 对象。问题、审批和任务必须属于该工单，否则请求被拒绝；回答和追加要求不能为空。这些动作与界面上的同名按钮等价，适合操作员不在场、由其授权的代理代为处理的情况。
+
+```powershell
+python scripts/agent-control.py --data $data answer --ticket 6 --args '{"question": 12, "answer": "按默认方案继续"}'
+python scripts/agent-control.py --data $data decide --ticket 6 --args '{"approval": 3, "allow": true}'
+python scripts/agent-control.py --data $data retry --ticket 6 --args '{"job": 41}'
+python scripts/agent-control.py --data $data follow --ticket 6 --args '{"body": "时间盒还剩 30 分钟，请收尾并交接"}'
+python scripts/agent-control.py --data $data stop --ticket 6
 ```
 
 返回状态 `draining` / `handoff` 仅表示暂停请求已受理；只有 `paused` 才表示后续调度已经暂停。应继续观察正在运行的任务数与交接回执。接口有版本与当前进程代号，旧进程遗留的请求不会在重启后恢复调度。

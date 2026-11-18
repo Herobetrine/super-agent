@@ -18,7 +18,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data", type=Path, default=Path(os.environ.get("SUPERAGENT_DATA", Path.home() / ".local/share/superagent/control-room")))
     parser.add_argument("--timeout", type=float, default=10.0)
-    parser.add_argument("command", choices=["status", "pause-after-handoff", "resume"])
+    parser.add_argument("command", choices=["status", "pause-after-handoff", "resume", "answer", "decide", "retry", "follow", "stop"])
+    parser.add_argument("--args", help="JSON object for answer/decide/retry/follow, e.g. '{\"question\": 3, \"answer\": \"...\"}'")
     parser.add_argument("--ticket", type=int, required=True)
     args = parser.parse_args()
     if args.ticket <= 0 or not 0 < args.timeout <= 300:
@@ -30,6 +31,11 @@ def main():
             raise ValueError("unsupported local control protocol")
         request_id = uuid.uuid4().hex
         request = {"generation": ready["generation"], "version": 1, "id": request_id, "command": args.command.replace("-", "_"), "ticket": args.ticket}
+        if args.command in ("answer", "decide", "retry", "follow"):
+            operator_args = json.loads(args.args or "null")
+            if not isinstance(operator_args, dict):
+                raise ValueError("--args must be a JSON object")
+            request["args"] = operator_args
         # Temporary files live outside requests so the bounded server scan sees only requests.
         with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=control, suffix=".tmp", delete=False) as temporary:
             temporary_path = Path(temporary.name)
