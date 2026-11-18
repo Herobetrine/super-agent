@@ -314,6 +314,7 @@ fn snapshot(data: &std::path::Path, conn: &rusqlite::Connection, ticket: i64, id
         }],
         requirements: vec![],
         evidence: vec![],
+        origin: None,
     };
     let payload = serde_json::to_string(&frozen).unwrap();
     conn.execute(

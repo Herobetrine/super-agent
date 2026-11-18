@@ -244,3 +244,16 @@ Fable 审查后修复了需求提交后再读失败导致的误报、损坏最�
 | 顾问 | 配对目录确认后，使用 `claude-opus-5-5` 完成一次设计审查及一次冻结核心代码复核。两次原生结果均成功且报告同型号。第二次覆盖 6 个文件，早于最终 Git 边界、预检和人工接受增量。后续由本机回归与原生运行验证。 |
 
 本机回执位于 `tmpstate/delivery-behavior-20261118/verification.json`，对应日志为 `build-verified.log`、`clippy-verified.log` 和 `test-verified.log`。真实示例在 `verified-fixture/receipt.json`，发布窗口在 `release-writable.png` 和 `release-observer.png`。发布前备份为同目录 `super-agent.before.exe`。真实模型端到端工单开关未开启，运行中的模拟接受不代表用户已验收本次产品。长期架构其余阶段及质量、用量对照仍待验证。
+
+## 完成时自动核对交付证据（2026-11-18）
+
+写入型任务的完成检查通过后，平台会在任务工作目录的快照上自动运行操作员已采用的需求标准，并把结论交给主控。交付门默认只记录。门开启时，必需项失败会复用两次退回上限，退回同一任务修复。[操作与边界](dev/delivery-behavior.md#完成时自动核对)
+
+| 验证 | 结果 |
+| --- | --- |
+| 构建与静态检查 | 经 Windows Cargo 包装器（`CARGO_TARGET_DIR=target/audit`）执行工作区构建、全目标严格 Clippy，均退出 0。最后一处修改（保持手动捕获事件格式不变）之后重跑了 Clippy 和 `sa-engine` 全部测试：371 项通过、0 失败、4 项忽略。 |
+| 全量测试 | `test --workspace --no-fail-fast -- --test-threads=2` 退出 0：763 项通过、0 失败、7 项忽略。新增 7 项：`sa-engine --test delivery_auto` 的 4 个集成场景，以及 `delivery::auto` 的 3 个模块测试。另扩充了一个桌面标签测试。 |
+| 集成场景 | 使用脚本化执行端、真实 Git 仓库和真实检查进程。覆盖：记录模式下捕获任务目录并通过，主控回报中带 `delivery`；交付门开启时，依赖被忽略文件的通过在快照上失败、退回同一任务、修复后核验为 ready；隔离 worktree 在合入前捕获，当前视图显示尚未合入；没有需求的工单保持原检查回执。 |
+| 模块测试 | 输入不变时沿用快照，不重跑已有回执的检查；项目超过 128 个文件时退回到「上次快照 + 改动」；门关闭不退回，门开启时退回内容带需求标题和退出码。 |
+
+日志位于 `tmpstate/delivery-auto-20261118/`：`build.log`、`clippy.log`、`clippy-final.log`、`test.log`、`test-engine-final.log`。未执行的部分：没有用真实模型跑端到端工单，没有重新编译或替换 `target/release` 发布程序，也没有人工体验验收。真实模型是否会利用回报中的 `delivery` 字段，仍待实际运行确认。

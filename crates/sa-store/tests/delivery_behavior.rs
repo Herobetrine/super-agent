@@ -59,6 +59,7 @@ impl Fixture {
             files,
             requirements: delivery::requirements(&db, 1).unwrap(),
             evidence: Vec::new(),
+            origin: None,
         };
         let payload = serde_json::to_string(&frozen).unwrap();
         let manifest = delivery::sha256(payload.as_bytes());

@@ -1,7 +1,7 @@
 # Super Agent 长期架构演进设计
 
 状态：设计提案 v0.1；用于后续分阶段开发，不代表以下能力已经实现或验收。  
-实施进度：已接入[第一轮需求证据](dev/delivery-evidence.md)、P1A 的[可选快照交付门](dev/delivery-gate.md)，并在 2026-11-18 增加了[实际行为检查与交付版本的绑定](dev/delivery-behavior.md)。阶段出口和人工验收按 §14 判断，开发验证见[验证记录](verification.md)。
+实施进度：已接入[第一轮需求证据](dev/delivery-evidence.md)、P1A 的[可选快照交付门](dev/delivery-gate.md)，并在 2026-11-18 增加了[实际行为检查与交付版本的绑定](dev/delivery-behavior.md)，以及写入任务完成时的[自动核对](dev/delivery-behavior.md#完成时自动核对)（默认只记录，门开启时失败退回）。阶段出口和人工验收按 §14 判断，开发验证见[验证记录](verification.md)。
 编写日期：2026-11-17。  
 基线：本地 Rust 工作区，Git HEAD `0cc3b8b8d25ac9ed06bafa61a69e0458ebc13bed`，包含当前尚未提交的协作闭环、候选队列及自动 Git 准备改动。HEAD 单独不能复现整个基线；实施各阶段前必须冻结源码及配置版本。  
 范围：Windows 本地桌面工作台及其调度、账本、执行端适配、协作总线、扩展和评测。本文不授权启动任何开发阶段、付费评测、远端发布或变更现有工单策略。

@@ -1,6 +1,8 @@
 //! Operator-owned requirements, explicit snapshots and delivery checks.
 mod acceptance;
+mod auto;
 mod behavior;
+pub(crate) use auto::{AutoOutcome, AutoRequest};
 use crate::{
     Engine,
     db::{Q, now},
@@ -8,7 +10,7 @@ use crate::{
 use anyhow::{Context, Result, ensure};
 use rusqlite::OptionalExtension;
 use sa_store::delivery::{
-    self, DeliveryAssessment, DeliveryFile, DeliverySnapshot, DeliverySummary,
+    self, DeliveryAssessment, DeliveryFile, DeliverySnapshot, DeliverySummary, SnapshotOrigin,
 };
 use serde_json::json;
 use std::{collections::HashSet, fs, io::Write, path::Path};
@@ -358,6 +360,20 @@ impl Engine {
         expected_contract_revision: i64,
         paths: Vec<String>,
     ) -> Result<DeliverySnapshot> {
+        self.capture_inner(ticket, expected_contract_revision, paths, None, None)
+    }
+
+    /// `source` replaces the ticket project as the read root for a platform
+    /// capture of a job's work directory. Paths stay project-relative.
+    fn capture_inner(
+        &self,
+        ticket: i64,
+        expected_contract_revision: i64,
+        paths: Vec<String>,
+        source: Option<&Path>,
+        origin: Option<SnapshotOrigin>,
+    ) -> Result<DeliverySnapshot> {
+        ensure!(source.is_some() == origin.is_some(), "平台捕获必须同时记录来源");
         ensure!(
             !paths.is_empty() && paths.len() <= delivery::MAX_FILES,
             "请明确选择 1 至 128 个交付文件"
@@ -382,7 +398,7 @@ impl Engine {
             );
             Ok((project, delivery::requirements(q.conn(), ticket)?))
         })?;
-        let root = Path::new(&project);
+        let root = source.unwrap_or(Path::new(&project));
         let mut files = Vec::new();
         let mut total = 0;
         for path in &paths {
@@ -440,6 +456,7 @@ impl Engine {
             files,
             requirements,
             evidence,
+            origin,
         };
         for (requirement, evidence) in frozen.requirements.iter_mut().zip(&frozen.evidence) {
             requirement.status = evidence.status.clone();
@@ -453,7 +470,12 @@ impl Engine {
             let payload = serde_json::to_string(&frozen)?;
             ensure!(payload.len() <= delivery::MAX_MANIFEST_BYTES, "交付清单超过 2 MiB");
             q.run("UPDATE delivery_snapshots SET payload=?,sha256=? WHERE id=?", &[&payload, &delivery::sha256(payload.as_bytes()), &id])?;
-            event(q, ticket, "delivery.captured", json!({"schema_version":1,"snapshot_id":id,"contract_revision":expected_contract_revision,"manifest_sha256":delivery::sha256(payload.as_bytes()),"source":"platform_sha256"}))?;
+            let mut captured = json!({"schema_version":1,"snapshot_id":id,"contract_revision":expected_contract_revision,"manifest_sha256":delivery::sha256(payload.as_bytes()),"source":"platform_sha256"});
+            if let Some(origin) = &frozen.origin {
+                captured["source"] = json!("platform_auto");
+                captured["origin"] = json!(origin);
+            }
+            event(q, ticket, "delivery.captured", captured)?;
             Ok(delivery::sha256(payload.as_bytes()))
         })?;
         if frozen.schema_version == 2 {

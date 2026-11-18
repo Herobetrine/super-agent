@@ -158,6 +158,7 @@ pub fn event_label(kind: &str) -> Option<&'static str> {
         "check.started" => "正在运行完成检查",
         "check.result" => "完成检查已结束",
         "check.bounced" => "检查未通过，已退回修复",
+        "delivery.auto" => "已自动核对需求交付证据",
         "auto.stalled" => "连续给出相同的下一步，已暂停等待你决定",
         _ => return None,
     })
@@ -194,12 +195,44 @@ pub fn check_result(payload: &serde_json::Value) -> String {
 }
 
 pub fn check_lines(payload: &serde_json::Value) -> Vec<(String, bool)> {
-    if payload.get("cached").and_then(serde_json::Value::as_bool) == Some(true) {
-        return vec![(check_result(payload), true)];
+    let mut lines = if payload.get("cached").and_then(serde_json::Value::as_bool) == Some(true) {
+        vec![(check_result(payload), true)]
+    } else {
+        payload.get("runs").and_then(serde_json::Value::as_array).into_iter().flatten()
+            .map(|run| (check_result(run), run.get("ok").and_then(serde_json::Value::as_bool) == Some(true)))
+            .collect()
+    };
+    if let Some(delivery) = payload.get("delivery") {
+        lines.push((delivery_result(delivery), delivery.get("status").and_then(serde_json::Value::as_str) == Some("ready")));
     }
-    payload.get("runs").and_then(serde_json::Value::as_array).into_iter().flatten()
-        .map(|run| (check_result(run), run.get("ok").and_then(serde_json::Value::as_bool) == Some(true)))
-        .collect()
+    lines
+}
+
+/// Automatic snapshot evidence for operator-adopted requirements. Isolated
+/// work is described as not yet in the project, never as delivered.
+pub fn delivery_result(payload: &serde_json::Value) -> String {
+    let status = match payload.get("status").and_then(serde_json::Value::as_str) {
+        Some("ready") => "全部必需项通过",
+        Some("partial") => "部分必需项通过",
+        Some("blocked") => "必需项未通过",
+        _ => "结果未知",
+    };
+    let mut text = format!("需求交付证据：{status}");
+    if let Some(snapshot) = payload.get("snapshot_id").and_then(serde_json::Value::as_i64) {
+        text.push_str(&format!(" · 快照 {snapshot}"));
+    }
+    if payload.get("isolated").and_then(serde_json::Value::as_bool) == Some(true) {
+        text.push_str(" · 隔离工作区，尚未合入");
+    }
+    if payload.get("gate").and_then(serde_json::Value::as_bool) != Some(true) {
+        text.push_str(" · 仅记录");
+    }
+    if !matches!(payload.get("status").and_then(serde_json::Value::as_str), Some("ready" | "partial" | "blocked"))
+        && let Some(reason) = payload.get("reason").and_then(serde_json::Value::as_str)
+    {
+        text.push_str(&format!(" · {}", compact(reason, 60)));
+    }
+    text
 }
 
 /// Payload-aware journal labels also supply the running check's activity.
@@ -213,6 +246,7 @@ pub fn collaboration_event(kind: &str, payload: &serde_json::Value) -> Option<St
         "check.started" => format!("正在运行完成检查：{}", argv(payload)),
         "check.result" => check_result(payload),
         "check.bounced" => format!("检查未通过，已退回修复（第 {} 次）", payload.get("attempt")?),
+        "delivery.auto" => delivery_result(payload),
         "auto.stalled" => "连续给出相同的下一步，已暂停等待你决定".into(),
         _ => return None,
     })
@@ -343,6 +377,7 @@ mod tests {
             ("check.started", json!({"argv":["cargo","test"]}), "正在运行完成检查：cargo test"),
             ("check.result", json!({"argv":["cargo","test"],"ok":true,"seconds":1.5}), "平台检查通过 · cargo test · 1.5 秒"),
             ("check.bounced", json!({"attempt":2}), "检查未通过，已退回修复（第 2 次）"),
+            ("delivery.auto", json!({"status":"ready","snapshot_id":4,"gate":true}), "需求交付证据：全部必需项通过 · 快照 4"),
             ("auto.stalled", json!({}), "连续给出相同的下一步，已暂停等待你决定"),
         ];
         for (kind, payload, expected) in cases {
@@ -352,6 +387,11 @@ mod tests {
         assert_eq!(check_result(&json!({"argv":["cargo","test"],"ok":false})), "平台检查未通过 · cargo test");
         assert_eq!(check_lines(&json!({"ok":true,"cached":true,"runs":[]})), vec![("平台检查通过（文件未变，沿用上次结果）".into(), true)]);
         assert_eq!(outcome_status("blocked"), "受阻");
+        let receipt = json!({"ok":false,"runs":[{"argv":["cargo","test"],"ok":true,"seconds":1.0}],
+            "delivery":{"status":"blocked","snapshot_id":9,"isolated":true,"gate":false}});
+        assert_eq!(check_lines(&receipt)[1], ("需求交付证据：必需项未通过 · 快照 9 · 隔离工作区，尚未合入 · 仅记录".into(), false));
+        assert_eq!(delivery_result(&json!({"status":"unknown","reason":"任务目录不在工单项目内"})),
+            "需求交付证据：结果未知 · 仅记录 · 任务目录不在工单项目内");
     }
 
     #[test]

@@ -119,6 +119,34 @@ pub struct DeliverySnapshot {
     pub files: Vec<DeliveryFile>,
     pub requirements: Vec<RequirementView>,
     pub evidence: Vec<DeliveryEvidence>,
+    /// Absent for operator captures. Older manifests keep their byte identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<SnapshotOrigin>,
+}
+
+/// Platform capture after a writing job claimed completion. The job's own
+/// work directory is the input; an isolated one is not yet in the project.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SnapshotOrigin {
+    pub kind: String,
+    pub job: i64,
+    pub turn: i64,
+    pub isolated: bool,
+    pub selection: String,
+}
+
+impl SnapshotOrigin {
+    pub const AUTO: &'static str = "auto_completion";
+
+    fn valid(&self) -> bool {
+        self.kind == Self::AUTO
+            && self.job > 0
+            && self.turn >= 0
+            && matches!(
+                self.selection.as_str(),
+                "project_files" | "previous_and_changed"
+            )
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -720,7 +748,8 @@ fn snapshot_matching(
             && frozen.contract_revision == contract_revision
             && frozen.files.len() <= MAX_FILES
             && frozen.requirements.len() <= MAX_REQUIREMENTS
-            && frozen.evidence.len() <= MAX_REQUIREMENTS,
+            && frozen.evidence.len() <= MAX_REQUIREMENTS
+            && frozen.origin.as_ref().is_none_or(SnapshotOrigin::valid),
         "交付清单身份或数量无效"
     );
     if frozen.schema_version == 2 {
@@ -980,7 +1009,13 @@ pub fn summary(connection: &Connection, data_dir: &Path, ticket: i64) -> Result<
             };
             if drifted {
                 evidence.status = "stale".into();
-                evidence.reason = "当前项目输入文件与已捕获版本不一致或不可读取".into();
+                evidence.reason = match &frozen.origin {
+                    Some(origin) if origin.isolated => format!(
+                        "快照来自任务 #{} 的隔离工作区，当前项目尚未包含这些版本",
+                        origin.job
+                    ),
+                    _ => "当前项目输入文件与已捕获版本不一致或不可读取".into(),
+                };
             }
         }
         requirement.status = evidence.status.clone();

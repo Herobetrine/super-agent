@@ -607,7 +607,7 @@ impl DeliveryState {
                     }
                 }
                 if let Some(snapshot) = &summary.latest_snapshot {
-                    note(ui, format!("最近交付快照 #{} · 需求版本 {} · {} 个文件", snapshot.id, snapshot.contract_revision, snapshot.files.len()), pal);
+                    note(ui, format!("最近交付快照 #{} · 需求版本 {} · {} 个文件{}", snapshot.id, snapshot.contract_revision, snapshot.files.len(), snapshot_origin(snapshot)), pal);
                 }
                 if !writable { note(ui, "只读观察窗口，可查看需求、快照和核验记录。", pal); return; }
                 ui.add_enabled_ui(self.saving.is_none(), |ui| {
@@ -691,6 +691,20 @@ impl DeliveryState {
     }
 }
 
+/// Platform captures name the job turn and whether its isolated work is
+/// already in the project. Operator captures keep the original wording.
+fn snapshot_origin(snapshot: &sa_store::delivery::DeliverySnapshot) -> String {
+    match &snapshot.origin {
+        Some(origin) => format!(
+            " · 任务 #{} 第 {} 轮完成时自动捕获{}",
+            origin.job,
+            origin.turn,
+            if origin.isolated { "（隔离工作区，尚未合入）" } else { "" }
+        ),
+        None => String::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -764,3 +778,4 @@ mod tests {
         assert!(state.error.is_none());
     }
 }
+

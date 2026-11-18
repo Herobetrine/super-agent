@@ -80,7 +80,7 @@ impl Outcome {
 
     pub fn note(&self) -> String {
         let (argv, exit, tail) = self.failure.as_ref().expect("failed check");
-        let exit = exit.map(|code| code.to_string()).unwrap_or_else(|| "timeout".into());
+        let exit = exit.map(|code| code.to_string()).unwrap_or_else(|| "unavailable (timeout or not run)".into());
         format!("Completion check failed (attempt {} of 2): {}\nexit {exit}\n{tail}\nFix the cause if your change produced it. If the failure is unrelated to your work, do not hide it: end with SA_REPORT status \"partial\" and say so with evidence.", self.plan.attempt, argv.join(" "))
     }
 

@@ -2386,8 +2386,40 @@ impl Inner {
                 }
             }
         }
-        let payload = json!({"ok":failure.is_none(),"cached":cached,"attempt":plan.attempt,"runs":runs});
+        // Operator-adopted delivery criteria run only after the project checks
+        // pass, on a snapshot of this job's own work directory.
+        let delivery = if failure.is_none() { self.auto_delivery(turn).await? } else { None };
+        let mut payload = json!({"ok":true,"cached":cached,"attempt":plan.attempt,"runs":runs});
+        if let Some(delivery) = delivery {
+            payload["delivery"] = delivery.payload;
+            failure = delivery.failure;
+        }
+        payload["ok"] = json!(failure.is_none());
         Ok(Some(checks::Outcome { plan, fingerprint, payload, failure }))
+    }
+
+    async fn auto_delivery(
+        self: &Arc<Self>, turn: &Arc<Turn>,
+    ) -> Result<Option<crate::delivery::AutoOutcome>, TurnError> {
+        let job = &turn.job;
+        let engine = Engine { inner: self.clone() };
+        let running = turn.clone();
+        let request = crate::delivery::AutoRequest {
+            ticket: job.ticket, job: job.id, turn: job.turn, cwd: job.cwd.clone(),
+        };
+        let result = tokio::task::spawn_blocking(move || {
+            engine.auto_delivery(&request, &|| running.aborted())
+        }).await.map_err(|_| anyhow!("交付证据采集异常"))?;
+        if turn.aborted() { return Err(anyhow!("任务已中止").into()); }
+        let outcome = result?;
+        if let Some(outcome) = &outcome {
+            self.db.tx(|q| {
+                ensure!(q.live(job.who())?, "任务已中止");
+                q.log(job.who(), "delivery.auto", &outcome.payload)?;
+                Ok(())
+            })?;
+        }
+        Ok(outcome)
     }
 
     /// `executionRoute(ctx)` (E:219-262). Returns the route and whether it was

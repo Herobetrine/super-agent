@@ -283,6 +283,21 @@ pub(crate) fn git_argv(args: &[&str]) -> Vec<String> {
     .collect()
 }
 
+/// NUL-separated Git path output, relative to `cwd` for `ls-files` and
+/// `diff --relative`. `None` outside a usable work tree or above the bound,
+/// so a truncated listing is never mistaken for a complete one.
+pub(crate) fn git_paths(cwd: &Path, args: &[&str], cancel: &dyn Fn() -> bool) -> Result<Option<Vec<String>>> {
+    const LIMIT: u64 = 4 * 1024 * 1024;
+    let argv = git_argv(args);
+    let result = run_command(cwd, &argv, Duration::from_secs(60), Some(cancel), false, Some(LIMIT + 1))?;
+    ensure!(!result.cancelled, "任务已中止");
+    if !result.ok || result.output.len() as u64 > LIMIT {
+        return Ok(None);
+    }
+    Ok(Some(result.output.split(|byte| *byte == 0).filter(|name| !name.is_empty())
+        .map(|name| String::from_utf8_lossy(name).into_owned()).collect()))
+}
+
 pub(crate) fn git(cwd: &Path, args: &[&str]) -> Result<String> {
     let argv = git_argv(args);
     let (ok, out) = command(cwd, &argv, Duration::from_secs(60))?;
