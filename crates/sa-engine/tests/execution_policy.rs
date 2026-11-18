@@ -64,16 +64,18 @@ fn selected(fx: &Fx, ticket: i64, point: &str) -> Vec<String> {
         .collect()
 }
 
-/// Journal rows that stand in for spent automatic recoveries.
+/// Journal rows that stand in for spent automatic recoveries, one per
+/// (historical) job turn: the budget counts distinct recoveries.
 fn spend(fx: &Fx, ticket: i64, job: i64, count: usize) {
     fx.engine
         .db()
         .with(|q| {
             for i in 0..count {
                 let kind = ["auto.retry", "check.bounced", "integration.bounced", "route.rotated"][i % 4];
+                let turn = 1000 + i as i64;
                 q.run(
-                    "INSERT INTO events(ts,ticket,job,turn,kind,payload,sha256) VALUES(0,?,?,1,?,'{}','x')",
-                    &[&ticket, &job, &kind],
+                    "INSERT INTO events(ts,ticket,job,turn,kind,payload,sha256) VALUES(0,?,?,?,?,'{}','x')",
+                    &[&ticket, &job, &turn, &kind],
                 )?;
             }
             Ok(())
@@ -560,5 +562,27 @@ async fn mode_api_validates_and_defaults_to_record() {
     assert_eq!(fx.engine.execution_policy(&cwd).unwrap(), "record");
     // A per-project switch never touches another project.
     assert_eq!(fx.engine.execution_policy("elsewhere").unwrap(), "record");
+    fx.engine.close().await;
+}
+
+/// One recovery of a job turn spends the budget once, however many events
+/// it journaled; retries and repairs of the same turn are separate.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_budget_counts_distinct_recoveries_not_events() {
+    let fx = Fx::new(script(|_| async move { Ok("done".into()) }), t1_catalog());
+    let ticket = fx.create(fx.params().profile("full")).await;
+    let job = root_id(&fx, ticket);
+    let used = |fx: &Fx| fx.engine.db().with(|q| sa_engine::execution_policy::ticket_attempts(q, ticket)).unwrap();
+    fx.engine
+        .db()
+        .with(|q| {
+            for kind in ["turn.retry_scheduled", "auto.retry", "check.bounced"] {
+                q.run("INSERT INTO events(ts,ticket,job,turn,kind,payload,sha256) VALUES(0,?,?,1,?,'{}','x')",
+                    &[&ticket, &job, &kind])?;
+            }
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(used(&fx), 2);
     fx.engine.close().await;
 }

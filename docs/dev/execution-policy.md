@@ -45,7 +45,7 @@
 - 否则本任务（自上次回复、追加、手动重试、放弃以来）同类失败连续 ≥ 3 次：`rediagnose`。连续次数包含当前这次，类别取 `turn.retry_scheduled` 的 `class` 与 `route.rotated` 的 `reason`；类别不同则重新计数，不比较错误码。
 - 否则 `retry`。
 
-自动恢复次数 = 该工单中 `turn.retry_scheduled`、`route.rotated`、`auto.retry`、`check.bounced`、`integration.bounced` 事件的数量。平台重试会同时写 `turn.retry_scheduled` 和配对的 `auto.retry`，所以一次重试计两次，实际可用恢复约 20 次，这是按日志事件计数的结果。
+自动恢复次数 = 该工单中出现 `turn.retry_scheduled`、`route.rotated`、`auto.retry`（重试）或 `check.bounced`、`integration.bounced`（修复）的不同任务轮次数。同一轮的同类恢复只计一次，因此一次重试同时写入 `turn.retry_scheduled` 和 `auto.retry` 时不会重复计数。
 
 `apply` 下 `stop` 以「工单自动重试与修复已达上限（N 次），请人工处理」放弃任务，`rediagnose` 以「同类失败连续 3 次，平台不再原样重试；请重新诊断后再派发」放弃任务。放弃走原有 `give_up` 路径：任务变为 failed（有子任务时先 draining），子任务的终态报告沿用现有渠道回到上级，不新增通知。已被停止或取消的任务不会进入这条路径（先检查任务仍在运行），策略不会让任何东西复活。`record` 下照常重试，决策 `applied=0`。持续项目原有的每小时重试上限仍然生效，策略只会额外提前放弃，不会放宽。
 
@@ -77,7 +77,7 @@
 
 - 规则按关键词判断高风险，会有误报和漏报，所以只给建议。
 - 规则只看已声明的文件，看不到未声明的写入冲突。
-- 预算用日志事件计数，不是 Token 或费用；未知用量不会被当成零。
+- 预算按自动恢复的任务轮次计数，不是 Token 或费用；未知用量不会被当成零。
 - `rediagnose` 的 3 次比平台对瞬时错误的 5 次上限更严；只在 `apply` 下生效。
 - 没有桌面界面入口，模式只能通过 Engine API 设置。
 - 尚未做匹配对照（§8.3 第二阶段）；本阶段只提供记录与有限自动效果。

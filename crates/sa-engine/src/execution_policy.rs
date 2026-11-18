@@ -35,9 +35,10 @@ CREATE TABLE IF NOT EXISTS policy_decisions(id INTEGER PRIMARY KEY,ticket INTEGE
   selected TEXT NOT NULL,reason TEXT NOT NULL,applied INTEGER NOT NULL,created REAL NOT NULL);
 CREATE INDEX IF NOT EXISTS policy_decisions_ticket ON policy_decisions(ticket,id);";
 
-/// Events that spend the ticket's automatic recovery budget. A platform retry
-/// writes `turn.retry_scheduled` and a paired `auto.retry`, so one retry
-/// counts twice; the budget is deliberately counted by journal events.
+/// Events that spend the ticket's automatic recovery budget. One automatic
+/// recovery of a job turn may journal several of them (a retry can log both
+/// `turn.retry_scheduled` and `auto.retry`), so the budget counts distinct
+/// job turns per kind of recovery (retry or repair), not raw events.
 const ATTEMPT_KINDS: &str =
     "'turn.retry_scheduled','route.rotated','auto.retry','check.bounced','integration.bounced'";
 
@@ -340,7 +341,8 @@ pub fn budget_reason(used: i64) -> String {
 
 /// Automatic recoveries already spent by `ticket`.
 pub fn ticket_attempts(q: &Q, ticket: i64) -> Result<i64> {
-    q.int(&format!("SELECT count(*) FROM events WHERE ticket=? AND kind IN ({ATTEMPT_KINDS})"), &[&ticket])
+    q.int(&format!("SELECT count(*) FROM (SELECT DISTINCT job,turn,
+        kind IN ('check.bounced','integration.bounced') FROM events WHERE ticket=? AND kind IN ({ATTEMPT_KINDS}))"), &[&ticket])
 }
 
 /// Retry rule: ticket budget first, then repeated same-class failures.
