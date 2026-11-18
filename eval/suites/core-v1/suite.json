@@ -1,0 +1,259 @@
+{
+  "schema_version": 1,
+  "id": "superagent-core",
+  "version": "1.0.0",
+  "tasks": [
+    {
+      "id": "small-bugfix",
+      "category": "small_change",
+      "fixture": "fixtures/small-bugfix",
+      "goal": "修复 pricing.total：discount_percent 是百分比折扣（README 已说明），当前实现把它当作金额相减。保持函数签名不变，结果保留两位小数。",
+      "requirements": [
+        {
+          "text": "pricing.total 按百分比折扣计算并保留两位小数",
+          "check": {
+            "argv": [
+              "python",
+              "-B",
+              "checks/test_pricing.py"
+            ],
+            "files": [
+              "checks/test_pricing.py"
+            ]
+          }
+        }
+      ],
+      "gate": true,
+      "acceptance": [
+        {
+          "argv": [
+            "python",
+            "-B",
+            "hidden_pricing.py"
+          ],
+          "files": [
+            "hidden_pricing.py"
+          ]
+        }
+      ],
+      "minutes": 20
+    },
+    {
+      "id": "cross-module",
+      "category": "cross_module",
+      "fixture": "fixtures/cross-module",
+      "goal": "为库存增加补货提醒：Store 增加 low_stock(threshold)，返回数量严格小于阈值的物品名并按名称排序；python -m inventory.report 增加可选参数 --threshold N，给出时在原报告后追加“需要补货”一节，列出这些物品；不给参数时输出保持不变。",
+      "requirements": [
+        {
+          "text": "low_stock 与报告的补货一节按目标描述工作",
+          "check": {
+            "argv": [
+              "python",
+              "-B",
+              "checks/test_reorder.py"
+            ],
+            "files": [
+              "checks/test_reorder.py"
+            ]
+          }
+        }
+      ],
+      "gate": true,
+      "acceptance": [
+        {
+          "argv": [
+            "python",
+            "-B",
+            "hidden_reorder.py"
+          ],
+          "files": [
+            "hidden_reorder.py"
+          ]
+        }
+      ],
+      "minutes": 25
+    },
+    {
+      "id": "parallel-modules",
+      "category": "parallel",
+      "fixture": "fixtures/parallel-modules",
+      "goal": "实现 textstats：words.word_count(text) 统计小写单词频次（单词为字母数字和撇号组成的连续片段）；lines.line_stats(text) 返回 lines、blank（只含空白的行）、longest（最长行长度）；cli 从标准输入读取文本，第一行输出 `lines=N blank=N longest=N`，随后每行 `word=count`，按次数降序、次数相同按单词升序。两个模块彼此独立，可以并行完成后再集成 cli。",
+      "requirements": [
+        {
+          "text": "words、lines 和 cli 按目标描述工作",
+          "check": {
+            "argv": [
+              "python",
+              "-B",
+              "checks/test_textstats.py"
+            ],
+            "files": [
+              "checks/test_textstats.py"
+            ]
+          }
+        }
+      ],
+      "gate": true,
+      "acceptance": [
+        {
+          "argv": [
+            "python",
+            "-B",
+            "hidden_textstats.py"
+          ],
+          "files": [
+            "hidden_textstats.py"
+          ]
+        }
+      ],
+      "minutes": 30
+    },
+    {
+      "id": "requirement-change",
+      "category": "requirement_change",
+      "fixture": "fixtures/requirement-change",
+      "goal": "实现 slug.slugify(text)：转为小写，空白替换为连字符。",
+      "requirements": [
+        {
+          "text": "slugify 转小写并把空白替换为连字符",
+          "check": {
+            "argv": [
+              "python",
+              "-B",
+              "checks/test_slug.py"
+            ],
+            "files": [
+              "checks/test_slug.py"
+            ]
+          }
+        }
+      ],
+      "gate": true,
+      "acceptance": [
+        {
+          "argv": [
+            "python",
+            "-B",
+            "hidden_slug.py"
+          ],
+          "files": [
+            "hidden_slug.py"
+          ]
+        }
+      ],
+      "script": [
+        {
+          "when": {
+            "after_root_turn": 1
+          },
+          "action": {
+            "type": "revise",
+            "requirement": 0,
+            "text": "slugify 转小写；连续的空白和连字符合并为一个连字符；去掉首尾空白和连字符；保留非 ASCII 字母",
+            "check": {
+              "argv": [
+                "python",
+                "-B",
+                "checks/test_slug.py",
+                "--strict"
+              ],
+              "files": [
+                "checks/test_slug.py"
+              ]
+            }
+          }
+        },
+        {
+          "when": {
+            "after_root_turn": 1
+          },
+          "action": {
+            "type": "follow",
+            "body": "需求变更：连续的空白和连字符要合并成一个连字符，去掉首尾的空白和连字符，非 ASCII 字母原样保留（例如 Café → café）。"
+          }
+        }
+      ],
+      "minutes": 25
+    },
+    {
+      "id": "recovery-restart",
+      "category": "long_recovery",
+      "fixture": "fixtures/recovery-restart",
+      "goal": "实现 csvsum.summarize(path)：读取带表头的 CSV，返回 {\"rows\": 行数, \"total\": amount 列之和（浮点数）}。amount 列可能不在第一列，字段可能带引号和逗号，只有表头时 rows 为 0、total 为 0.0。",
+      "requirements": [
+        {
+          "text": "summarize 返回行数与 amount 合计",
+          "check": {
+            "argv": [
+              "python",
+              "-B",
+              "checks/test_csvsum.py"
+            ],
+            "files": [
+              "checks/test_csvsum.py"
+            ]
+          }
+        }
+      ],
+      "gate": true,
+      "acceptance": [
+        {
+          "argv": [
+            "python",
+            "-B",
+            "hidden_csvsum.py"
+          ],
+          "files": [
+            "hidden_csvsum.py"
+          ]
+        }
+      ],
+      "script": [
+        {
+          "when": {
+            "after_seconds": 45
+          },
+          "action": {
+            "type": "restart"
+          }
+        }
+      ],
+      "minutes": 25
+    },
+    {
+      "id": "usage-doc",
+      "category": "docs_delivery",
+      "fixture": "fixtures/usage-doc",
+      "goal": "为 greet.py 编写 docs/USAGE.md：包含“## 安装”“## 用法”“## 示例”三节；用法一节说明全部命令行参数；示例一节给出至少一个 console 代码块，第一行是以 `$ python greet.py` 开头的命令，其后是该命令的实际输出。",
+      "requirements": [
+        {
+          "text": "USAGE.md 含三节且示例输出与实际一致",
+          "check": {
+            "argv": [
+              "python",
+              "-B",
+              "checks/test_doc.py"
+            ],
+            "files": [
+              "checks/test_doc.py"
+            ]
+          }
+        }
+      ],
+      "gate": true,
+      "acceptance": [
+        {
+          "argv": [
+            "python",
+            "-B",
+            "hidden_doc.py"
+          ],
+          "files": [
+            "hidden_doc.py"
+          ]
+        }
+      ],
+      "minutes": 20
+    }
+  ]
+}

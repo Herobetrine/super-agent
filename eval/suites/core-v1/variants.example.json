@@ -1,0 +1,11 @@
+[
+  {
+    "id": "baseline"
+  },
+  {
+    "id": "single-collaborator",
+    "efficiency": {
+      "max_collaborators": 1
+    }
+  }
+]

@@ -37,6 +37,7 @@ pub mod scm;
 pub mod workspaces;
 mod verification;
 pub mod stuck;
+pub mod trials;
 
 pub use activity::{ActivityPhase, BadgeTone, JobActivity, RetryInfo};
 pub use engine::{CreateParams, Engine, EngineOptions};
