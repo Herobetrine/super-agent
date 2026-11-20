@@ -133,6 +133,7 @@ pub struct App {
     pub scroll_to_bottom: bool,
     pub auto_selected: bool,
     pub persist: bool,
+    window_size_checked: bool,
     shot: Option<ShotState>,
     applied_dark: Option<bool>,
     /// Scheduler host; `None` in observer mode.
@@ -223,6 +224,7 @@ impl App {
             scroll_to_bottom: false,
             auto_selected: false,
             persist: !screenshot,
+            window_size_checked: false,
             shot,
             applied_dark: None,
             composer: Composer::new(
@@ -445,6 +447,26 @@ impl App {
         let _ = self.worker.tx.send(Cmd::Search(q));
     }
 
+    fn guard_window_size(&mut self, ctx: &egui::Context) {
+        if self.window_size_checked || !self.persist || self.opts.size.is_some() {
+            return;
+        }
+        let (minimized, inner) = ctx.input(|i| (i.viewport().minimized, i.viewport().inner_rect));
+        if minimized == Some(true) {
+            return;
+        }
+        let Some(rect) = inner else {
+            return;
+        };
+        self.window_size_checked = true;
+        if rect.width() < crate::MIN_WINDOW.0 || rect.height() < crate::MIN_WINDOW.1 {
+            ctx.send_viewport_cmd(ViewportCommand::InnerSize(Vec2::new(
+                crate::DEFAULT_WINDOW.0,
+                crate::DEFAULT_WINDOW.1,
+            )));
+        }
+    }
+
     fn screenshot(&mut self, ctx: &egui::Context) {
         let ready = self.history_loaded
             && (self.source.error.is_some()
@@ -554,6 +576,7 @@ impl eframe::App for App {
             self.applied_dark = Some(self.dark);
         }
         theme::measure_fonts(ctx);
+        self.guard_window_size(ctx);
         self.screenshot(ctx);
         if self
             .view
