@@ -146,6 +146,7 @@ fn conflict_and_failed_validation_never_change_source_or_erase_user_edits() {
         state: "planned".into(),
         validation: json!({}),
         detail: String::new(),
+        label: Default::default(),
     };
     let w = workspaces::provision(&make(1), &data).unwrap();
     std::fs::write(Path::new(&w.path).join("base.txt"), "child\n").unwrap();
@@ -220,4 +221,53 @@ async fn distinct_projects_write_concurrently_but_nested_directories_are_seriali
     fx.finish(b, "done").await;
     fx.finish(c, "done").await;
     assert_eq!(count.load(Ordering::SeqCst), 3);
+}
+
+#[test]
+fn platform_commits_name_the_task_and_fall_back_without_task_info() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("repo");
+    let data = dir.path().join("data");
+    std::fs::create_dir(&source).unwrap();
+    init(&source);
+    let make = |id, title: &str| workspaces::Workspace {
+        job: id,
+        ticket: 7,
+        source: source.to_string_lossy().into(),
+        path: data.join("workspaces").join(format!("job-{id}")).to_string_lossy().into(),
+        branch: format!("codex/label-{id}"),
+        base: String::new(),
+        head: String::new(),
+        state: "planned".into(),
+        validation: json!({}),
+        detail: String::new(),
+        label: workspaces::CommitLabel { title: title.into(), round: 2 },
+    };
+    // Multi-byte title longer than the subject limit: cut on a char boundary.
+    let long = "实现登录页面".repeat(20);
+    let mut w = workspaces::provision(&make(3, &long), &data).unwrap();
+    w.label = make(3, &long).label;
+    std::fs::write(Path::new(&w.path).join("a.txt"), "a\n").unwrap();
+    let pass = workspaces::validate(&w, &["git".into(), "diff".into(), "--check".into()]).unwrap();
+    let path = Path::new(&pass.path);
+    let subject = git(path, &["log", "-1", "--format=%s"]);
+    assert!(subject.starts_with("Checkpoint task #3 (ticket 7): 实现登录"), "{subject}");
+    assert!(subject.chars().count() <= 72, "{subject}");
+    let body = git(path, &["log", "-1", "--format=%b"]);
+    for needle in ["ticket: 7", "Job: 3", "Round: 2", "Branch: codex/label-3"] {
+        assert!(body.contains(needle), "{body}");
+    }
+    let mut pass = pass;
+    pass.label.title = workspaces::sanitize_title("Add login page\nsecond line with secrets");
+    let done = workspaces::integrate(&pass, &data).unwrap();
+    assert_eq!(done.state, "merged");
+    let merge = git(&source, &["log", "-1", "--format=%s"]);
+    assert_eq!(merge, "Merge task #3 (ticket 7): Add login page");
+
+    // Without task info (job 0) the old generic checkpoint text remains.
+    let mut bare = workspaces::provision(&make(4, ""), &data).unwrap();
+    bare.job = 0;
+    std::fs::write(Path::new(&bare.path).join("b.txt"), "b\n").unwrap();
+    let bare = workspaces::validate(&bare, &["git".into(), "diff".into(), "--check".into()]).unwrap();
+    assert_eq!(git(Path::new(&bare.path), &["log", "-1", "--format=%s"]), "Checkpoint isolated Super Agent task");
 }

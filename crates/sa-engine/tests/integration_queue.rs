@@ -378,6 +378,20 @@ async fn isolated_writer_starts_from_all_completed_prerequisite_branches_without
     fx.finish(ticket, "done").await;
     assert!(fx.engine.integration_queue(ticket).unwrap().is_empty());
     assert!(!fx.project.join("a.txt").exists());
+    // Platform commits on the task branches name the task, not just "merge".
+    let branches = git(&fx.project, &["for-each-ref", "--format=%(refname:short)", "refs/heads/codex/"]);
+    let subjects: Vec<String> = branches
+        .lines()
+        .flat_map(|b| git(&fx.project, &["log", "--format=%s", b]).lines().map(String::from).collect::<Vec<_>>())
+        .collect();
+    assert!(
+        subjects.iter().any(|s| s.starts_with("Checkpoint task #") && s.contains("(ticket ")),
+        "{subjects:?}"
+    );
+    assert!(
+        subjects.iter().any(|s| s.starts_with("Merge prerequisite task #") && s.contains(" into task #")),
+        "{subjects:?}"
+    );
     fx.engine.close().await;
 }
 
@@ -589,6 +603,8 @@ async fn source_commit_after_confirmation_revalidates_and_merges_the_same_task()
     let merged = item(&fx, ticket);
     assert!(merged.validation["baseline"] != first.validation["baseline"]);
     assert!(fx.project.join("result.txt").exists() && fx.project.join("evidence.txt").exists());
+    let top = git(&fx.project, &["log", "-1", "--format=%s"]);
+    assert!(top.starts_with(&format!("Merge task #{} (ticket {})", merged.job, ticket)), "{top}");
     // Superseded and merged candidates and the merged task workspace are removed.
     let first_candidate = first.validation["candidate"].as_str().unwrap();
     assert!(!std::path::Path::new(first_candidate).exists(), "superseded candidate removed");

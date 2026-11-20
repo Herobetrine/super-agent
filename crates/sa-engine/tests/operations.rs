@@ -270,7 +270,10 @@ async fn worktree_and_checkpoint_receipts_are_classified_from_repository_state()
     // Checkpoint commit in the isolated worktree.
     std::fs::write(made.join("work.txt"), "work\n").unwrap();
     git(&made, &["add", "."]);
-    git(&made, &["commit", "-m", "Checkpoint isolated Super Agent task"]);
+    // Reconciliation compares commit ancestry, never the message: the task-aware
+    // subject and body are accepted exactly like the old generic one.
+    git(&made, &["commit", "-m", "Checkpoint task #901 (ticket 1): add work", "-m", "Job: 901
+Branch: codex/made"]);
     let checkpoint = |pre: &str| json!({"job":0,"path":made,"branch":"codex/made","pre_head":pre});
     let committed = crashed(&fx, ticket, kind::CHECKPOINT, checkpoint(&base));
     let uncommitted = crashed(&fx, ticket, kind::CHECKPOINT, checkpoint(&head(&made)));

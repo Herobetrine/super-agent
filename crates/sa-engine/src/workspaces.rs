@@ -37,12 +37,105 @@ pub struct Workspace {
     pub state: String,
     pub validation: serde_json::Value,
     pub detail: String,
+    /// Task description for commit messages; filled by `get`, never persisted.
+    #[serde(skip)]
+    pub label: CommitLabel,
+}
+
+/// Small task description used to word platform-created commits.
+#[derive(Clone, Debug, Default)]
+pub struct CommitLabel {
+    pub title: String,
+    pub round: i64,
+}
+
+const SUBJECT_MAX: usize = 72;
+const TITLE_MAX: usize = 60;
+const GENERIC_CHECKPOINT: &str = "Checkpoint isolated Super Agent task";
+
+/// First non-empty line, control characters removed, whitespace collapsed and
+/// cut on a char boundary.
+pub fn sanitize_title(text: &str) -> String {
+    let line = text.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("");
+    let clean: String = line.chars().map(|c| if c.is_control() { ' ' } else { c }).collect();
+    let clean = clean.split_whitespace().collect::<Vec<_>>().join(" ");
+    truncate_chars(&clean, TITLE_MAX)
+}
+
+pub(crate) fn truncate_chars(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    let mut out: String = text.chars().take(max.saturating_sub(3)).collect();
+    out.truncate(out.trim_end().len());
+    out.push_str("...");
+    out
+}
+
+fn subject(head: String, title: &str) -> String {
+    let full = if title.is_empty() { head } else { format!("{head}: {title}") };
+    truncate_chars(&full, SUBJECT_MAX)
+}
+
+fn body(w: &Workspace) -> String {
+    let mut text = format!("Super Agent ticket: {}\nJob: {}\n", w.ticket, w.job);
+    if w.label.round > 0 {
+        text.push_str(&format!("Round: {}\n", w.label.round));
+    }
+    text.push_str(&format!("Branch: {}", w.branch));
+    text
+}
+
+/// `(subject, body)` for the checkpoint commit; generic text without task info.
+pub(crate) fn checkpoint_message(w: &Workspace) -> (String, String) {
+    if w.job <= 0 {
+        return (GENERIC_CHECKPOINT.into(), String::new());
+    }
+    (subject(format!("Checkpoint task #{} (ticket {})", w.job, w.ticket), &w.label.title), body(w))
+}
+
+/// `(subject, body)` for merging a task branch into a candidate.
+pub(crate) fn merge_message(w: &Workspace) -> (String, String) {
+    if w.job <= 0 {
+        return ("Merge isolated Super Agent task".into(), String::new());
+    }
+    (subject(format!("Merge task #{} (ticket {})", w.job, w.ticket), &w.label.title), body(w))
+}
+
+/// `(subject, body)` for merging a prerequisite task into a dependent one.
+pub(crate) fn prerequisite_message(prerequisite: &Workspace, dependent: &Workspace) -> (String, String) {
+    let head = format!("Merge prerequisite task #{} into task #{}", prerequisite.job, dependent.job);
+    let mut text = body(dependent);
+    text.push_str(&format!("\nPrerequisite job: {}\nPrerequisite branch: {}", prerequisite.job, prerequisite.branch));
+    (subject(head, ""), text)
+}
+
+pub(crate) fn commit_args<'a>(subject: &'a str, body: &'a str) -> Vec<&'a str> {
+    let mut args = vec!["commit", "-m", subject];
+    if !body.is_empty() {
+        args.extend(["-m", body]);
+    }
+    args
+}
+
+pub(crate) fn merge_args<'a>(subject: &'a str, body: &'a str, head: &'a str) -> Vec<&'a str> {
+    let mut args = vec!["merge", "--no-ff", "-m", subject];
+    if !body.is_empty() {
+        args.extend(["-m", body]);
+    }
+    args.push(head);
+    args
 }
 
 pub fn get(q: &Q, job: i64) -> Result<Option<Workspace>> {
     q.one("SELECT * FROM job_workspaces WHERE job=?", &[&job])?
         .map(|r| {
+            let label = q
+                .one("SELECT body,turn FROM jobs WHERE id=?", &[&job])?
+                .map(|j| CommitLabel { title: sanitize_title(str_of(&j, "body")), round: int_of(&j, "turn") })
+                .unwrap_or_default();
             Ok(Workspace {
+                label,
                 job: int_of(&r, "job"),
                 ticket: int_of(&r, "ticket"),
                 source: str_of(&r, "source").into(),
@@ -508,10 +601,8 @@ pub(crate) fn validate_with(w: &Workspace, argv: &[String], cancel: &dyn Fn() ->
     git(path, &["add", "--all", "--", "."])?;
     if !git(path, &["diff", "--cached", "--name-only"])?.is_empty() {
         ops.begin(kind::CHECKPOINT, json!({"job":w.job,"path":w.path,"branch":w.branch,"pre_head":head(path)?}))?;
-        git(
-            path,
-            &["commit", "-m", "Checkpoint isolated Super Agent task"],
-        )?;
+        let (subject, detail) = checkpoint_message(&w);
+        git(path, &commit_args(&subject, &detail))?;
         ops.effect(kind::CHECKPOINT)?;
     }
     clean(path)?;
@@ -594,7 +685,8 @@ pub(crate) fn integrate_with(w: &Workspace, data: &Path, ops: &Scope, hydration:
     let mut result = w.clone();
     result.validation["candidate"] = json!(candidate_text);
     result.validation["candidate_hydration"] = hydrate::hydrate(source, &candidate, hydration)?;
-    if git(&candidate, &["merge", "--no-ff", "--no-edit", &w.head]).is_err() {
+    let (subject, detail) = merge_message(w);
+    if git(&candidate, &merge_args(&subject, &detail, &w.head)).is_err() {
         result.state = "conflict".into();
         result.detail = "合并冲突；原项目未改变，候选工作区已保留".into();
         return Ok(result);

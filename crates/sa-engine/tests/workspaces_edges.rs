@@ -50,6 +50,7 @@ fn planned(source: &Path, data: &Path) -> Workspace {
         state: "planned".into(),
         validation: json!({}),
         detail: String::new(),
+        label: Default::default(),
     }
 }
 fn valid(w: &Workspace) -> Workspace {

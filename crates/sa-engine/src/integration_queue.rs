@@ -180,10 +180,8 @@ fn checkpoint_with(w: &Workspace, cancel: &dyn Fn() -> bool, ops: &Scope) -> Res
     if !workspaces::git(path, &["diff", "--cached", "--name-only"])?.is_empty() {
         ops.begin(kind::CHECKPOINT, json!({"job":w.job,"path":w.path,"branch":w.branch,
             "pre_head":workspaces::head(path)?}))?;
-        workspaces::git(
-            path,
-            &["commit", "-m", "Checkpoint isolated Super Agent task"],
-        )?;
+        let (subject, detail) = workspaces::checkpoint_message(w);
+        workspaces::git(path, &workspaces::commit_args(&subject, &detail))?;
         ops.effect(kind::CHECKPOINT)?;
     }
     workspaces::clean(path)?;
@@ -274,9 +272,10 @@ pub(crate) fn prepare(
     )?;
     ready.validation["candidate"] = json!(candidate_text);
     ready.validation["candidate_hydration"] = workspaces::hydrate::hydrate(source, &candidate, hydration)?;
+    let (subject, detail) = workspaces::merge_message(w);
     let merge = workspaces::command_with_cancel(
         &candidate,
-        &workspaces::git_argv(&["merge", "--no-ff", "--no-edit", &ready.head]),
+        &workspaces::git_argv(&workspaces::merge_args(&subject, &detail, &ready.head)),
         Duration::from_secs(60),
         Some(cancel),
     )?;
@@ -434,9 +433,10 @@ pub(crate) fn provision_dependencies(
         );
         ops.begin(kind::DEPENDENCY_MERGE, json!({"job":w.job,"path":ready.path,"branch":ready.branch,
             "pre_head":workspaces::head(Path::new(&ready.path))?,"merge_head":prerequisite.head,"prerequisite":prerequisite.job}))?;
+        let (subject, detail) = workspaces::prerequisite_message(prerequisite, w);
         workspaces::git(
             Path::new(&ready.path),
-            &["merge", "--no-ff", "--no-edit", &prerequisite.head],
+            &workspaces::merge_args(&subject, &detail, &prerequisite.head),
         )?;
         ops.effect(kind::DEPENDENCY_MERGE)?;
     }
