@@ -82,10 +82,13 @@ async fn admission_uses_selected_catalog_only_for_complete_collaborator_routes()
         let counted = adapters(&fx.shared)
             .into_iter()
             .map(|inner| {
+                // Only the collaborator's route is rejected; ticket creation
+                // verifies the lead's explicit codex route against its catalog.
+                let reject_selected = reject && inner.agent() == "deepseek";
                 Arc::new(Counted {
                     inner,
                     probes: probes.clone(),
-                    reject_selected: reject,
+                    reject_selected,
                 }) as Arc<dyn Adapter>
             })
             .collect();
@@ -97,8 +100,14 @@ async fn admission_uses_selected_catalog_only_for_complete_collaborator_routes()
         fx.finish(ticket, if reject { "partial" } else { "done" })
             .await;
         let probes = probes.lock().unwrap();
+        let created: Vec<_> = probes
+            .iter()
+            .filter(|(name, route)| name == "codex" && route.is_some())
+            .collect();
+        assert_eq!(created.len(), 1, "creation verifies the explicit route once");
         let selected: Vec<_> = probes
             .iter()
+            .filter(|(name, _)| name != "codex")
             .filter_map(|(name, route)| route.as_ref().map(|r| (name, r)))
             .collect();
         assert_eq!(selected.len(), usize::from(explicit));
@@ -168,4 +177,72 @@ async fn bound_collaborator_route_is_revalidated_on_its_next_turn() {
             .iter()
             .all(|(_, route)| route.as_ref().unwrap().model == "review")
     );
+}
+
+/// A ticket-configured route missing from one live probe (a gateway timing out)
+/// is retried with a fresh probe instead of failing permanently.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn configured_route_missing_from_one_probe_is_retried() {
+    struct Flaky {
+        inner: Arc<dyn Adapter>,
+        misses: Arc<Mutex<u32>>,
+    }
+    impl Adapter for Flaky {
+        fn agent(&self) -> &'static str {
+            self.inner.agent()
+        }
+        fn catalog(&self) -> BoxFuture<'static, anyhow::Result<Catalog>> {
+            self.inner.catalog()
+        }
+        fn catalog_for_route(&self, _route: Route) -> Option<BoxFuture<'static, anyhow::Result<Catalog>>> {
+            let miss = {
+                let mut left = self.misses.lock().unwrap();
+                let miss = self.agent() == "deepseek" && *left > 0;
+                if miss { *left -= 1; }
+                miss
+            };
+            let future = self.inner.catalog();
+            Some(Box::pin(async move {
+                let mut catalog = future.await?;
+                if miss {
+                    catalog.value["providers"][0]["models"] = json!([]);
+                }
+                Ok(catalog)
+            }))
+        }
+        fn run(&self, request: RunRequest, host: Arc<dyn TurnHost>, events: EventSink, cancel: CancellationToken)
+            -> BoxFuture<'static, Result<RunOutcome, AdapterError>> {
+            self.inner.run(request, host, events, cancel)
+        }
+    }
+    let mut fx = Fx::new(
+        script(|c| async move {
+            if c.depth() == 0 && c.turn() == 1 {
+                return Ok(send(json!({})));
+            }
+            Ok("verified".into())
+        }),
+        t1_catalog(),
+    );
+    fx.engine.close().await;
+    let misses = Arc::new(Mutex::new(0));
+    let flaky = adapters(&fx.shared)
+        .into_iter()
+        .map(|inner| Arc::new(Flaky { inner, misses: misses.clone() }) as Arc<dyn Adapter>)
+        .collect();
+    fx.engine = Engine::open(&fx.data, flaky, quiet()).unwrap();
+    let mut params = fx.params();
+    params.selections = Some(json!({"deepseek":{"provider":"test-local", "model":"review", "mode":"cli"}}));
+    // Creation verifies the route; the collaborator's first probe then misses it.
+    let ticket = fx.create(params).await;
+    *misses.lock().unwrap() = 1;
+    fx.engine.start().unwrap();
+    fx.until(|| fx.int("SELECT count(*) FROM events WHERE kind='turn.retry_scheduled'") == 1).await;
+    let _ = ticket;
+    assert_eq!(*misses.lock().unwrap(), 0, "the missing probe happened");
+    let retry = fx.all("SELECT payload FROM events WHERE kind='turn.retry_scheduled'");
+    assert!(retry[0]["payload"].as_str().unwrap().contains("route:probe_failed"), "{retry:?}");
+    assert_eq!(fx.int("SELECT count(*) FROM jobs WHERE state='failed'"), 0);
+    assert_eq!(fx.int("SELECT count(*) FROM events WHERE kind='turn.gave_up'"), 0);
+    fx.engine.close().await;
 }

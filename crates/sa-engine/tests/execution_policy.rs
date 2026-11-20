@@ -130,7 +130,8 @@ async fn run_dispatch(mode: &str, isolated: bool) -> (Fx, i64) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn record_mode_logs_dispatch_decisions_without_changing_anything() {
     let (fx, ticket) = run_dispatch("record", false).await;
-    assert_eq!(selected(&fx, ticket, "dispatch"), ["limited_parallel", "single", "limited_parallel", "serialize"]);
+    // Without isolation the second writer serializes even with disjoint files.
+    assert_eq!(selected(&fx, ticket, "dispatch"), ["limited_parallel", "single", "serialize", "serialize"]);
     assert_eq!(fx.int("SELECT count(*) FROM job_deps"), 0);
     assert!(decisions(&fx, ticket).iter().all(|d| d["applied"] == false && d["mode"] == "record" && d["policy_version"] == "rules-1"));
     // Every decision is mirrored by an event with the same payload.
@@ -143,7 +144,7 @@ async fn record_mode_logs_dispatch_decisions_without_changing_anything() {
         assert_eq!(event["reason"], row["reason"]);
         assert_eq!(event["inputs"], row["inputs"]);
     }
-    let overlap = stored.iter().find(|d| d["selected"] == "serialize").unwrap();
+    let overlap = stored.iter().rev().find(|d| d["selected"] == "serialize").unwrap();
     assert_eq!(overlap["inputs"]["files"], json!(["a.txt"]));
     assert_eq!(overlap["inputs"]["isolated_writers"], false);
     assert!(overlap["alternatives"].as_array().unwrap().iter().any(|a| a == "add_review"));
@@ -155,7 +156,8 @@ async fn record_mode_logs_dispatch_decisions_without_changing_anything() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn apply_mode_without_isolation_serializes_by_advice_only() {
     let (fx, ticket) = run_dispatch("apply", false).await;
-    assert_eq!(selected(&fx, ticket, "dispatch"), ["limited_parallel", "single", "limited_parallel", "serialize"]);
+    // Without isolation the second writer serializes even with disjoint files.
+    assert_eq!(selected(&fx, ticket, "dispatch"), ["limited_parallel", "single", "serialize", "serialize"]);
     assert_eq!(fx.int("SELECT count(*) FROM job_deps"), 0);
     assert!(decisions(&fx, ticket).iter().all(|d| d["applied"] == false && d["mode"] == "apply"));
     fx.engine.close().await;

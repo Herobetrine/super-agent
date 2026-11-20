@@ -4,6 +4,7 @@ mod common;
 
 use common::*;
 use sa_engine::EngineOptions;
+use sa_engine::adapter::{AdapterError, ErrorClass};
 use sa_store::efficiency::{Settings, shared};
 use serde_json::{Value, json};
 use std::sync::{Arc, Mutex};
@@ -579,7 +580,7 @@ async fn failed_prerequisite_skips_dependents_and_unknown_reference_is_rejected(
     let fx = Fx::new(script(|c| async move {
         if c.depth() > 0 {
             assert_eq!(c.full_packet()["assignment"], "implement");
-            return Ok(report("partial", "实现剩余一项未完成"));
+            return Err(AdapterError::new(ErrorClass::Protocol, "实现无法继续"));
         }
         if c.turn() == 1 {
             return Ok([
@@ -587,23 +588,60 @@ async fn failed_prerequisite_skips_dependents_and_unknown_reference_is_rejected(
                 send(json!({"id": "review", "body": "review", "after": ["impl"]})),
                 send(json!({"id": "publish", "body": "publish", "after": ["review"]})),
                 send(json!({"id": "unknown", "after": ["missing"]})),
-            ].join("\n"));
+            ].join("
+"));
         }
         Ok("已汇总未完成项和跳过原因".into())
     }), t1_catalog());
     let ticket = fx.begin(fx.params()).await;
-    fx.finish(ticket, "partial").await;
+    fx.until(|| matches!(root_state(&fx.engine, ticket).as_str(), "done" | "partial" | "failed")).await;
     let implementer = child(&fx, "impl");
     let review = child(&fx, "review");
+    assert_eq!(state(&fx, implementer), "failed");
     assert_eq!(state(&fx, review), "cancelled");
     assert_eq!(state(&fx, child(&fx, "publish")), "cancelled");
     assert_eq!(fx.all(&format!("SELECT result FROM jobs WHERE id={review}"))[0]["result"],
-        format!("前置任务 #{implementer} 以「partial」结束，本任务未执行。"));
+        format!("前置任务 #{implementer} 以「failed」结束，本任务未执行。"));
     assert_eq!(event_count(&fx, "skipped"), 2);
     assert_eq!(event_count(&fx, "protocol.rejected"), 1);
     let rejection = &payloads(&fx, "SELECT payload FROM events WHERE kind='protocol.rejected'")[0];
     assert!(rejection["reason"].as_str().unwrap().contains("after 引用了不存在的任务"));
     assert_eq!(fx.shared.count(|call| call.packet["depth"] == 1), 1);
+    fx.engine.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn partial_prerequisite_runs_dependents_with_its_outcome() {
+    let fx = Fx::new(script(|c| async move {
+        if c.depth() > 0 {
+            let packet = c.full_packet();
+            return Ok(match packet["assignment"].as_str() {
+                Some("implement") => report("partial", "录像已完成，剩余一项未闭合"),
+                Some("review") => {
+                    let prerequisite = &packet["prerequisites"][0];
+                    assert_eq!(prerequisite["state"], "partial");
+                    assert_eq!(prerequisite["outcome"]["summary"], "录像已完成，剩余一项未闭合");
+                    "已审阅现有录像".into()
+                }
+                _ => "已发布".into(),
+            });
+        }
+        if c.turn() == 1 {
+            return Ok([
+                send(json!({"id": "impl", "body": "implement"})),
+                send(json!({"id": "review", "body": "review", "after": ["impl"]})),
+                send(json!({"id": "publish", "body": "publish", "after": ["review"]})),
+            ].join("
+"));
+        }
+        Ok("已汇总".into())
+    }), t1_catalog());
+    let ticket = fx.begin(fx.params()).await;
+    fx.until(|| matches!(root_state(&fx.engine, ticket).as_str(), "done" | "partial")).await;
+    assert_eq!(state(&fx, child(&fx, "impl")), "partial");
+    assert_eq!(state(&fx, child(&fx, "review")), "done");
+    assert_eq!(state(&fx, child(&fx, "publish")), "done");
+    assert_eq!(event_count(&fx, "skipped"), 0);
     fx.engine.close().await;
 }
 
@@ -846,7 +884,7 @@ async fn dependency_follows_the_entire_failover_chain() {
                         release.wait().await;
                         return Ok(report(if complete { "done" } else { "partial" }, "最终替代执行者的结果"));
                     }
-                    assert!(complete, "a partial effective dependency must skip review");
+                    assert_eq!(packet["prerequisites"][0]["state"], if complete { "done" } else { "partial" });
                     assert_eq!(packet["prerequisites"].as_array().unwrap().len(), 1);
                     assert_eq!(packet["prerequisites"][0]["job"], *effective.lock().unwrap());
                     assert_eq!(packet["prerequisites"][0]["outcome"]["summary"], "最终替代执行者的结果");
@@ -873,14 +911,10 @@ async fn dependency_follows_the_entire_failover_chain() {
         assert_eq!(event_count(&fx, "skipped"), 0);
         assert_eq!(fx.int("SELECT needs FROM job_deps"), original);
         release.open();
-        fx.finish(ticket, if complete { "done" } else { "partial" }).await;
-        assert_eq!(state(&fx, child(&fx, "review")), if complete { "done" } else { "cancelled" });
-        assert_eq!(event_count(&fx, "skipped"), i64::from(!complete));
-        if !complete {
-            let skipped = &payloads(&fx, "SELECT payload FROM events WHERE kind='skipped'")[0];
-            assert_eq!(skipped["needs"], replacement);
-            assert_eq!(skipped["state"], "partial");
-        }
+        fx.until(|| matches!(root_state(&fx.engine, ticket).as_str(), "done" | "partial")).await;
+        // A partial replacement without an isolated workspace still satisfies review.
+        assert_eq!(state(&fx, child(&fx, "review")), "done");
+        assert_eq!(event_count(&fx, "skipped"), 0);
         fx.engine.close().await;
     }
 }

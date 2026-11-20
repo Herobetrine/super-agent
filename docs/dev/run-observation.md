@@ -8,7 +8,7 @@
 
 ## 本机控制接口
 
-锁定工单库的工作台提供同用户文件接口，目录为数据目录下的 `control/`，没有网络监听。请求可以查询状态、交接后暂停和恢复，也可以执行操作员动作：回答问题、审批、重试任务、追加要求和停止工单。不接受代码、路径或模型提示。请求通过原工作台的 Engine 执行；测试脚本不直接修改数据库，也不启动第二个调度器。目录访问遵循本机用户文件权限，不是面向不可信用户的服务。
+锁定工单库的工作台提供同用户文件接口，目录为数据目录下的 `control/`，没有网络监听。请求可以查询状态、交接后暂停和恢复，也可以执行操作员动作：回答问题、审批、重试任务、追加要求、停止工单和确认合入。不接受代码、路径或模型提示。请求通过原工作台的 Engine 执行；测试脚本不直接修改数据库，也不启动第二个调度器。目录访问遵循本机用户文件权限，不是面向不可信用户的服务。
 
 ```powershell
 $data = "$env:USERPROFILE/.local/share/superagent/control-room"
@@ -25,7 +25,11 @@ python scripts/agent-control.py --data $data decide --ticket 6 --args '{"approva
 python scripts/agent-control.py --data $data retry --ticket 6 --args '{"job": 41}'
 python scripts/agent-control.py --data $data follow --ticket 6 --args '{"body": "时间盒还剩 30 分钟，请收尾并交接"}'
 python scripts/agent-control.py --data $data stop --ticket 6
+python scripts/agent-control.py --data $data confirm --ticket 6 --args '{"job": 41, "token": "<confirmation_token>"}'
+python scripts/agent-control.py --data $data revalidate --ticket 6 --args '{"job": 41}'
 ```
+
+`confirm` 确认合入队列中已验证的候选，`token` 取队列项 `validation.confirmation_token`。原项目或任务工作区空闲时立即合入；仍有任务在原项目中运行时，候选记为「已确认，等待空闲后合入」（`confirmed`），由调度器在两轮之间合入。候选已过期或令牌不符时请求被拒绝。
 
 返回状态 `draining` / `handoff` 仅表示暂停请求已受理；只有 `paused` 才表示后续调度已经暂停。应继续观察正在运行的任务数与交接回执。接口有版本与当前进程代号，旧进程遗留的请求不会在重启后恢复调度。
 

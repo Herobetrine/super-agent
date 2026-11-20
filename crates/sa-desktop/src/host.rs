@@ -171,6 +171,11 @@ pub enum Action {
         ticket: i64,
         enabled: bool,
     },
+    /// Project-relative paths whose ignored files hydrate isolated worktrees.
+    SetWorkspaceHydration {
+        ticket: i64,
+        paths: Vec<String>,
+    },
     /// The operator checked a platform operation whose effect was unknown.
     ResolveOperation {
         id: i64,
@@ -274,6 +279,7 @@ impl Action {
             | Action::TicketMeta { .. }
             | Action::SetFailover { .. }
             | Action::SetIsolatedWriters { .. }
+            | Action::SetWorkspaceHydration { .. }
             | Action::SetExecutionPolicy { .. }
             | Action::ResolveOperation { .. }
             | Action::ValidateWorkspace { .. }
@@ -772,6 +778,18 @@ impl Host {
             Ok((mode.as_str().to_string(), sa_engine::execution_policy::decisions(q, ticket, 6)?))
         })
     }
+    /// Hydration paths of the ticket's project; empty for journals without the table.
+    pub fn workspace_hydration(&self, ticket: i64) -> Result<Vec<String>> {
+        self.read(|q| {
+            if !q.exists("SELECT 1 FROM sqlite_master WHERE type='table' AND name='workspace_hydration'", &[])? {
+                return Ok(vec![]);
+            }
+            let row = q.one("SELECT cwd FROM tickets WHERE id=?", &[&ticket])?
+                .ok_or_else(|| anyhow!("工单不存在"))?;
+            let project = sa_engine::engine::project_key(sa_engine::db::str_of(&row, "cwd"));
+            sa_engine::workspaces::hydrate::paths(q, &project)
+        })
+    }
     pub fn integration_queue_enabled(&self, ticket: i64) -> Result<bool> {
         self.read(|q| sa_engine::integration_queue::enabled(q, ticket))
     }
@@ -1141,6 +1159,15 @@ async fn execute(engine: &Engine, shared: &Shared, action: Action) -> Result<Opt
         }
         Action::SetIsolatedWriters { ticket, enabled } => {
             engine.set_isolated_writers(ticket, enabled)?;
+            Ok(None)
+        }
+        Action::SetWorkspaceHydration { ticket, paths } => {
+            let cwd = engine.db().with(|q| {
+                let row = q.one("SELECT cwd FROM tickets WHERE id=?", &[&ticket])?
+                    .ok_or_else(|| anyhow::anyhow!("工单不存在"))?;
+                Ok(sa_engine::db::str_of(&row, "cwd").to_string())
+            })?;
+            engine.set_workspace_hydration(&cwd, paths)?;
             Ok(None)
         }
         Action::ResolveOperation { id, note } => {

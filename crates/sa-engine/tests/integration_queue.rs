@@ -136,15 +136,9 @@ async fn candidate_waits_for_confirmation_survives_restart_and_rejects_stale_inp
     std::fs::write(fx.project.join("source-update.txt"), "new source\n").unwrap();
     git(&fx.project, &["add", "."]);
     git(&fx.project, &["commit", "-m", "source updated"]);
-    assert!(
-        fx.engine
-            .confirm_integration(
-                next.job,
-                next.validation["confirmation_token"].as_str().unwrap()
-            )
-            .await
-            .is_err()
-    );
+    // Confirming now would carry over to the revalidated candidate (see
+    // source_commit_after_confirmation_revalidates_and_merges_the_same_task);
+    // here the operator revalidates without confirming.
     assert!(!fx.project.join("result.txt").exists());
     fx.engine.revalidate_integration(next.job).unwrap();
     wait(&fx, || item(&fx, ticket).state == "awaiting_confirmation").await;
@@ -180,34 +174,13 @@ async fn candidate_waits_for_confirmation_survives_restart_and_rejects_stale_inp
         "result\n"
     );
     assert_eq!(git(&fx.project, &["status", "--porcelain"]), "");
-    // Simulate a process dying after Git published but before its journal
-    // receipt. Confirmation reconciles the exact commit without another merge.
-    let published_head = git(&fx.project, &["rev-parse", "HEAD"]);
-    fx.engine
-        .db()
-        .tx(|q| {
-            q.run(
-                "UPDATE integration_queue SET state='publishing' WHERE job=?",
-                &[&next.job],
-            )?;
-            q.run(
-                "UPDATE job_workspaces SET state='awaiting_confirmation' WHERE job=?",
-                &[&next.job],
-            )?;
-            Ok(())
-        })
-        .unwrap();
-    fx.restart(quiet()).await;
-    fx.engine.start().unwrap();
-    fx.engine
-        .confirm_integration(
-            next.job,
-            next.validation["confirmation_token"].as_str().unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(git(&fx.project, &["rev-parse", "HEAD"]), published_head);
-    assert_eq!(item(&fx, ticket).state, "merged");
+    // A crash between the Git publication and its receipt is reconciled in
+    // tests/operations.rs (integration.publish.after_effect). After a recorded
+    // merge the candidate and the task workspace are removed.
+    let workspace = fx.engine.db().with(|q| sa_engine::workspaces::get(q, next.job)).unwrap().unwrap();
+    let candidate = item(&fx, ticket).validation["candidate"].as_str().unwrap().to_string();
+    wait(&fx, || !Path::new(&workspace.path).exists() && !Path::new(&candidate).exists()).await;
+    assert_eq!(fx.int("SELECT count(*) FROM integration_confirmations"), 0);
     fx.engine.close().await;
 }
 
@@ -408,6 +381,41 @@ async fn isolated_writer_starts_from_all_completed_prerequisite_branches_without
     fx.engine.close().await;
 }
 
+/// A partial isolated writer leaves an unfinished branch; dependents that
+/// would merge it are skipped, unlike partial prerequisites in the shared tree.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn partial_isolated_prerequisite_still_skips_its_dependent_writer() {
+    let fx = Fx::new(
+        script(|c| async move {
+            if c.depth() == 0 {
+                if c.turn() == 1 {
+                    return Ok([
+                        send(json!({"id":"a","body":"a","write":true})),
+                        send(json!({"id":"c","body":"c","write":true,"after":["a"]})),
+                    ]
+                    .join("
+"));
+                }
+                return Ok("summary".into());
+            }
+            assert_eq!(c.packet["assignment"], "a", "the dependent must not start");
+            std::fs::write(c.req.cwd.join("a.txt"), "a").unwrap();
+            Ok(wire("SA_REPORT", json!({"status":"partial","summary":"half done"})))
+        }),
+        t1_catalog(),
+    );
+    init(&fx.project);
+    let ticket = fx.create(fx.params().profile("full")).await;
+    fx.engine.set_isolated_writers(ticket, true).unwrap();
+    fx.engine.start().unwrap();
+    wait(&fx, || {
+        fx.int("SELECT count(*) FROM jobs WHERE msgkey='c' AND state='cancelled'") == 1
+    })
+    .await;
+    assert_eq!(fx.int("SELECT count(*) FROM events WHERE kind='skipped'"), 1);
+    fx.engine.close().await;
+}
+
 /// The candidate carries exactly the task's tree when the source has not
 /// moved, so the project checks run once, in the clean candidate (§10.2).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -439,5 +447,155 @@ async fn identical_candidate_tree_runs_the_checks_once_and_records_the_reuse() {
     // The completion check ran in the task worktree; integration ran once.
     let integration_runs = runs.lines().filter(|line| line.contains("integrations")).count();
     assert_eq!(integration_runs, 1, "{runs}");
+    fx.engine.close().await;
+}
+
+/// Ignored generated resources named by the project reach the isolated
+/// writer and the merge candidate; edits to them are never merged back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn isolated_writer_and_candidate_receive_configured_ignored_resources() {
+    let fx = Fx::new(
+        script(|c| async move {
+            if c.depth() == 0 {
+                if c.turn() == 1 {
+                    return Ok(send(json!({"id":"writer","write":true,"body":"write"})));
+                }
+                return Ok("summary".into());
+            }
+            let cwd = &c.req.cwd;
+            assert_eq!(std::fs::read_to_string(cwd.join("gen/model.json")).unwrap(), "native");
+            assert!(!cwd.join("tmp/scratch.bin").exists(), "unconfigured ignored paths stay out");
+            std::fs::write(cwd.join("gen/model.json"), "edited in worktree").unwrap();
+            std::fs::write(cwd.join("result.txt"), "result\n").unwrap();
+            Ok("done".into())
+        }),
+        t1_catalog(),
+    );
+    init(&fx.project);
+    std::fs::write(fx.project.join(".gitignore"), "gen/\ntmp/\n").unwrap();
+    git(&fx.project, &["add", ".gitignore"]);
+    git(&fx.project, &["commit", "-m", "ignore generated"]);
+    std::fs::create_dir_all(fx.project.join("gen")).unwrap();
+    std::fs::create_dir_all(fx.project.join("tmp")).unwrap();
+    std::fs::write(fx.project.join("gen/model.json"), "native").unwrap();
+    std::fs::write(fx.project.join("tmp/scratch.bin"), "scratch").unwrap();
+    let project = fx.project.to_string_lossy().to_string();
+    assert!(fx.engine.set_workspace_hydration(&project, vec!["../outside".into()]).is_err());
+    fx.engine.set_workspace_hydration(&project, vec!["./gen/".into()]).unwrap();
+    assert_eq!(fx.engine.workspace_hydration(&project).unwrap(), ["gen"]);
+    let check: Vec<String> = if cfg!(windows) {
+        ["powershell.exe","-NoProfile","-NonInteractive","-Command",
+            "if ($PWD.Path -like '*integrations*' -and !(Test-Path gen/model.json)) { exit 1 }; exit 0"]
+            .into_iter().map(str::to_string).collect()
+    } else {
+        ["sh","-c","case \"$PWD\" in */integrations/*) test -f gen/model.json;; *) exit 0;; esac"]
+            .into_iter().map(str::to_string).collect()
+    };
+    fx.engine.set_project_checks(&project, vec![check]).unwrap();
+    let ticket = fx.create(fx.params().profile("full")).await;
+    fx.engine.set_isolated_writers(ticket, true).unwrap();
+    fx.engine.set_integration_queue(ticket, true).unwrap();
+    fx.engine.start().unwrap();
+    wait(&fx, || {
+        fx.engine.integration_queue(ticket).unwrap().iter().any(|i| i.state == "awaiting_confirmation")
+    })
+    .await;
+    let ready = item(&fx, ticket);
+    assert_eq!(ready.validation["candidate_hydration"]["files"], 1, "{}", ready.validation);
+    assert_eq!(std::fs::read_to_string(fx.project.join("gen/model.json")).unwrap(), "native");
+    fx.engine.close().await;
+}
+
+/// Confirming while the primary still works in the source records the
+/// confirmation; the scheduler publishes once the source is free.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn confirmation_while_the_source_is_busy_publishes_between_turns() {
+    let entered = Gate::new();
+    let release = Gate::new();
+    let fx = Fx::new(
+        script({
+            let (entered, release) = (entered.clone(), release.clone());
+            move |c| {
+                let (entered, release) = (entered.clone(), release.clone());
+                async move {
+                    if c.depth() == 0 {
+                        if c.turn() == 1 {
+                            return Ok(send(json!({"id":"writer","write":true,"body":"write"})));
+                        }
+                        if c.turn() >= 3 {
+                            // The operator's follow-up keeps the primary busy in the source.
+                            entered.open();
+                            release.wait().await;
+                        }
+                        return Ok("summary".into());
+                    }
+                    std::fs::write(c.req.cwd.join("result.txt"), "result
+").unwrap();
+                    Ok("done".into())
+                }
+            }
+        }),
+        t1_catalog(),
+    );
+    let ticket = setup(&fx, vec![passing()]).await;
+    wait(&fx, || {
+        fx.engine.integration_queue(ticket).unwrap().iter().any(|i| i.state == "awaiting_confirmation")
+            && root_state(&fx.engine, ticket) == "done"
+    })
+    .await;
+    fx.engine.follow(ticket, "继续核对", true).unwrap();
+    wait(&fx, || root_state(&fx.engine, ticket) == "running").await;
+    let busy = tokio::time::timeout(std::time::Duration::from_secs(60), entered.wait()).await;
+    if busy.is_err() {
+        release.open();
+        let jobs = fx.all("SELECT id,state,turn,ready_after FROM jobs");
+        let events = fx.all("SELECT job,kind,substr(payload,1,160) AS p FROM events ORDER BY seq DESC LIMIT 12");
+        panic!("the primary did not start its follow-up turn {jobs:?} {events:?} {:?}", item(&fx, ticket).state);
+    }
+    let ready = item(&fx, ticket);
+    let token = ready.validation["confirmation_token"].as_str().unwrap().to_string();
+    let confirmed = fx.engine.confirm_integration(ready.job, &token).await;
+    let state = item(&fx, ticket).state;
+    let merged_early = fx.project.join("result.txt").exists();
+    release.open();
+    confirmed.unwrap();
+    assert_eq!(state, "confirmed");
+    assert!(!merged_early, "nothing merges while the primary runs");
+    wait(&fx, || item(&fx, ticket).state == "merged").await;
+    assert!(fx.project.join("result.txt").exists());
+    fx.engine.close().await;
+}
+
+/// A source commit after validation (the primary saving evidence) makes the
+/// confirmation fail without merging; the candidate validates again by itself.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn source_commit_after_confirmation_revalidates_and_merges_the_same_task() {
+    let fx = Fx::new(writer(), t1_catalog());
+    let ticket = setup(&fx, vec![passing()]).await;
+    wait(&fx, || {
+        fx.engine.integration_queue(ticket).unwrap().iter().any(|i| i.state == "awaiting_confirmation")
+    })
+    .await;
+    let first = item(&fx, ticket);
+    std::fs::write(fx.project.join("evidence.txt"), "primary evidence\n").unwrap();
+    git(&fx.project, &["add", "evidence.txt"]);
+    git(&fx.project, &["commit", "-m", "evidence"]);
+    let token = first.validation["confirmation_token"].as_str().unwrap().to_string();
+    assert!(fx.engine.confirm_integration(first.job, &token).await.is_err());
+    assert!(!fx.project.join("result.txt").exists());
+    // The task itself did not change, so the confirmation carries over to the
+    // revalidated candidate and it merges without a second confirmation.
+    wait(&fx, || item(&fx, ticket).state == "merged").await;
+    let merged = item(&fx, ticket);
+    assert!(merged.validation["baseline"] != first.validation["baseline"]);
+    assert!(fx.project.join("result.txt").exists() && fx.project.join("evidence.txt").exists());
+    // Superseded and merged candidates and the merged task workspace are removed.
+    let first_candidate = first.validation["candidate"].as_str().unwrap();
+    assert!(!std::path::Path::new(first_candidate).exists(), "superseded candidate removed");
+    // Cleanup runs right after the merge is recorded.
+    let workspace = fx.engine.db().with(|q| sa_engine::workspaces::get(q, merged.job)).unwrap().unwrap();
+    let candidate = merged.validation["candidate"].as_str().unwrap().to_string();
+    wait(&fx, || !std::path::Path::new(&workspace.path).exists() && !std::path::Path::new(&candidate).exists()).await;
+    assert_eq!(fx.int("SELECT count(*) FROM integration_confirmations"), 0);
     fx.engine.close().await;
 }

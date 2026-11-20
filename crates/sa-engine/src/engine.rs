@@ -741,6 +741,8 @@ impl Engine {
             let commands=crate::integration_queue::commands(q,item.ticket)?;
             ensure!(!commands.is_empty(),"请先配置项目完成检查");
             q.run("UPDATE jobs SET state='done' WHERE id=? AND state='partial'",&[&job])?;
+            // An explicit revalidation asks for a fresh review.
+            q.run("DELETE FROM integration_confirmations WHERE job=?",&[&job])?;
             q.run("UPDATE integration_queue SET state='queued',turn=?,version=?,commands=?,validation='{}',detail='操作者请求重新验证' WHERE job=?",
                 &[&int_of(&row,"turn"),&crate::integration_queue::VERSION,&json!(commands).to_string(),&job])?;
             Ok(())
@@ -762,21 +764,36 @@ impl Engine {
                 ))
             })?;
             ensure!(
-                matches!(item.state.as_str(), "awaiting_confirmation" | "publishing"),
+                matches!(item.state.as_str(), "awaiting_confirmation" | "confirmed" | "publishing"),
                 "候选尚未通过验证或需要重新验证"
             );
             ensure!(
                 item.validation["confirmation_token"].as_str() == Some(expected_candidate),
                 "候选已变化，请重新查看后确认"
             );
+            // The operator approves this task version; it carries over when only
+            // the source moves and the new candidate passes the checks again.
+            if let Some(head) = item.validation["head"].as_str() {
+                inner.db.tx(|q| {
+                    q.run("INSERT OR REPLACE INTO integration_confirmations(job,task_head,turn,created) VALUES(?,?,?,?)",
+                        &[&job, &head, &item.turn, &now()])?;
+                    Ok(())
+                })?;
+            }
             let keys = vec![
                 crate::workspaces::scope(&w.path),
                 crate::workspaces::scope(&w.source),
             ];
-            ensure!(
-                !inner.workspace_busy(&sched, &keys),
-                "相关工作区仍有任务运行"
-            );
+            // While a task still runs in the source or task workspace, keep the
+            // confirmation; the scheduler publishes it between turns (§10.3).
+            if inner.workspace_busy(&sched, &keys) {
+                inner.db.tx(|q| {
+                    crate::integration_queue::current(q, &item)?;
+                    q.run("UPDATE integration_queue SET state='confirmed',detail='操作者已确认，等待相关工作区空闲后合入' WHERE job=? AND state='awaiting_confirmation'", &[&job])?;
+                    Ok(())
+                })?;
+                return Ok(());
+            }
             inner.db.tx(|q| {
                 crate::integration_queue::current(q,&item)?;
                 q.run("UPDATE integration_queue SET state='publishing',detail='操作者已确认，正在核对并合入' WHERE job=?",&[&job])?;
@@ -807,6 +824,7 @@ impl Engine {
             struct Lease(Arc<Inner>, Vec<String>);
             impl Drop for Lease { fn drop(&mut self) { lock(&self.0.sched).maintenance.retain(|k| !self.1.contains(k)); } }
             let _lease = Lease(inner.clone(), keys);
+            let hydration = inner.db.with(|q| crate::workspaces::hydrate::paths(q, &project_key(&workspace.source)))?;
             // Invalidate the previous receipt before a new attempt, including
             // spawn failures/timeouts and process crashes during validation.
             inner.db.tx(|q| {
@@ -822,7 +840,7 @@ impl Engine {
                 // Shutdown drains operator maintenance; only stopping the
                 // ticket (`Engine::cancel`) cancels the validation process.
                 Some(argv) => crate::workspaces::validate_with(&workspace, argv, &|| false, &scope),
-                None => crate::workspaces::integrate_with(&workspace, &inner.data_dir, &scope),
+                None => crate::workspaces::integrate_with(&workspace, &inner.data_dir, &scope, &hydration),
             };
             if scope.crashed() {
                 return result.map(drop);
@@ -897,6 +915,9 @@ impl Engine {
             if let Some((ticket, seq)) = params.checkpoint { crate::checkpoints::capture(q, ticket, seq)?; }
             Ok(())
         })?;
+        if let Some(selections) = &params.selections {
+            inner.verify_selected_routes(selections).await?;
+        }
         // Platform preparation is independent of the model's write permission.
         // Run Git outside the journal transaction and async executor.
         let (repository, operations) = inner
@@ -1182,6 +1203,19 @@ impl Engine {
     }
 
     /// Set the project's execution policy mode. Affects later decisions only.
+    /// Project-relative paths whose Git-ignored files are copied into each
+    /// isolated worktree and merge candidate (§10). An empty list turns it off.
+    pub fn set_workspace_hydration(&self, cwd: &str, paths: Vec<String>) -> Result<()> {
+        let paths = crate::workspaces::hydrate::validate(&paths)?;
+        let project = project_key(cwd);
+        self.inner.db.tx(|q| crate::workspaces::hydrate::set(q, &project, &paths))
+    }
+
+    pub fn workspace_hydration(&self, cwd: &str) -> Result<Vec<String>> {
+        let project = project_key(cwd);
+        self.inner.db.with(|q| crate::workspaces::hydrate::paths(q, &project))
+    }
+
     pub fn set_execution_policy(&self, cwd: &str, mode: &str) -> Result<()> {
         let project = project_key(cwd);
         self.inner.db.tx(|q| crate::execution_policy::set_mode(q, &project, mode, now()))
@@ -1408,7 +1442,15 @@ impl Inner {
             ops::record_publication(q, job, item.ticket, &merged, false)?;
             scope.record(q, &verdicts, true)
         }));
-        let Err(error) = saved else { return Ok(()) };
+        let Err(error) = saved else {
+            // The merge is in the source branch; its candidate and task worktrees
+            // are no longer needed (merged workspaces cannot be continued).
+            if let Some(candidate) = item.validation["candidate"].as_str() {
+                crate::workspaces::discard(Path::new(&w.source), Path::new(candidate), &self.data_dir);
+            }
+            crate::workspaces::discard(Path::new(&w.source), Path::new(&w.path), &self.data_dir);
+            return Ok(());
+        };
         if scope.crashed() {
             return Err(error);
         }
@@ -1420,10 +1462,18 @@ impl Inner {
                 Some(ops::CONFIRMED) => ops::record_publication(q, job, item.ticket,
                     &ops::merged_workspace(w, &item.validation, "操作者已确认；核对原项目确认已本地合入"), false)?,
                 Some(ops::UNKNOWN_EFFECT) => {
+                    q.run("DELETE FROM integration_confirmations WHERE job=?", &[&job])?;
                     q.run("UPDATE integration_queue SET state='blocked',detail=? WHERE job=?",
                         &[&format!("合入结果未知，请人工核对原项目后重新验证：{error}"), &job])?;
                 }
+                // The primary committed to the source after validation; requeue
+                // instead of waiting for the operator to notice a stale candidate.
+                _ if error.to_string() == crate::integration_queue::SOURCE_MOVED => {
+                    q.run("UPDATE integration_queue SET state='queued',validation='{}',detail='原项目有新提交，自动重新验证；通过后需重新确认' WHERE job=?", &[&job])?;
+                }
+                // Any other refusal needs a fresh review; the confirmation lapses.
                 _ => {
+                    q.run("DELETE FROM integration_confirmations WHERE job=?", &[&job])?;
                     q.run("UPDATE integration_queue SET state='stale',detail=? WHERE job=?", &[&error.to_string(), &job])?;
                 }
             }
@@ -1647,6 +1697,42 @@ impl Inner {
             }
             Ok(items)
         })?;
+        // Operator-confirmed candidates publish first, as soon as their
+        // workspaces are free; the confirmation already passed its checks.
+        let confirmed = self.db.with(|q| {
+            let mut out = vec![];
+            for row in q.all("SELECT DISTINCT i.ticket FROM integration_queue i JOIN integration_policy p ON p.ticket=i.ticket AND p.enabled=1 WHERE i.state='confirmed'",&[])? {
+                out.extend(crate::integration_queue::list(q,int_of(&row,"ticket"))?.into_iter().filter(|item|item.state=="confirmed"));
+            }
+            Ok(out)
+        })?;
+        for item in confirmed {
+            if self.integration_cancelled(item.ticket) {
+                continue;
+            }
+            let Some(w) = self.db.with(|q| crate::workspaces::get(q, item.job))? else { continue };
+            let keys = vec![crate::workspaces::scope(&w.path), crate::workspaces::scope(&w.source)];
+            if self.workspace_busy(&sched, &keys) {
+                continue;
+            }
+            let accepted = self.db.admission_tx(|q| {
+                if let Err(error) = crate::integration_queue::current(q, &item) {
+                    q.run("UPDATE integration_queue SET state='stale',detail=? WHERE job=?", &[&error.to_string(), &item.job])?;
+                    return Ok(false);
+                }
+                Ok(q.run("UPDATE integration_queue SET state='publishing',detail='操作者已确认，正在核对并合入' WHERE job=? AND state='confirmed'", &[&item.job])? > 0)
+            })?;
+            if !accepted {
+                continue;
+            }
+            sched.maintenance.extend(keys.clone());
+            let owner = self.clone();
+            let task = tokio::task::spawn_blocking(move || {
+                let _lease = IntegrationLease(owner.clone(), keys);
+                let _ = owner.publish_confirmed(&item, &w);
+            });
+            sched.integration_tasks.push(task);
+        }
         for item in items {
             if self.integration_cancelled(item.ticket) {
                 continue;
@@ -1665,6 +1751,7 @@ impl Inner {
             if self.workspace_busy(&sched, &keys) {
                 continue;
             }
+            let hydration = self.db.with(|q| crate::workspaces::hydrate::paths(q, &project_key(&w.source)))?;
             let accepted=self.db.admission_tx(|q| {
                 if let Err(error)=crate::integration_queue::current(q,&item) {
                     q.run("UPDATE integration_queue SET state='stale',detail=? WHERE job=?",&[&error.to_string(),&item.job])?;
@@ -1690,7 +1777,7 @@ impl Inner {
                 let result = scope.begin(kind::CANDIDATE, intent).and_then(|id| {
                     let ready = crate::integration_queue::prepare(&w, &owner.data_dir, &item.commands, &|| {
                         owner.integration_cancelled(item.ticket)
-                    })?;
+                    }, &hydration)?;
                     scope.effect(kind::CANDIDATE)?;
                     scope.decide(id, ops::CONFIRMED, json!({"state":ready.state,"candidate":ready.validation["candidate"]}));
                     Ok(ready)
@@ -1759,7 +1846,17 @@ impl Inner {
                             }
                         }
                     }
-                    q.run("UPDATE integration_queue SET state=?,attempts=?,detail=?,validation=? WHERE job=?",&[&state,&attempts,&ready.detail,&ready.validation.to_string(),&item.job])?;
+                    let mut detail=ready.detail.clone();
+                    if state=="awaiting_confirmation" {
+                        let head=ready.validation["head"].as_str().unwrap_or_default().to_string();
+                        if q.exists("SELECT 1 FROM integration_confirmations WHERE job=? AND task_head=? AND turn=?",&[&item.job,&head,&item.turn])? {
+                            state="confirmed";
+                            detail="操作者已确认该任务版本；基线更新后复验通过，等待空闲后合入".into();
+                        } else {
+                            q.run("DELETE FROM integration_confirmations WHERE job=?",&[&item.job])?;
+                        }
+                    }
+                    q.run("UPDATE integration_queue SET state=?,attempts=?,detail=?,validation=? WHERE job=?",&[&state,&attempts,&detail,&ready.validation.to_string(),&item.job])?;
                     let root=q.root(item.ticket)?;
                     q.log(who_of(&root),"integration.result",&json!({"job":item.job,"state":state,"validation":ready.validation}))?;
                     Ok(())
@@ -1835,14 +1932,14 @@ impl Inner {
         FROM jobs j JOIN tickets t ON t.id=j.ticket LEFT JOIN native_routes r ON r.job=j.id
         LEFT JOIN continuous_runs c ON c.ticket=j.ticket
         WHERE j.state='queued' AND j.ready_after<=? AND j.writing=?
-        AND NOT EXISTS(SELECT 1 FROM effective_deps d JOIN jobs n ON n.id=d.needs WHERE d.job=j.id AND n.state!='done')
+        AND NOT EXISTS(SELECT 1 FROM effective_deps d JOIN jobs n ON n.id=d.needs WHERE d.job=j.id AND NOT {settled})
         AND NOT EXISTS(SELECT 1 FROM effective_deps d JOIN jobs n ON n.id=d.needs
           JOIN job_workspaces w ON w.job=n.id JOIN integration_policy p ON p.ticket=n.ticket AND p.enabled=1
           LEFT JOIN integration_queue i ON i.job=n.id WHERE d.job=j.id
-          AND (i.job IS NULL OR i.turn!=n.turn OR i.state NOT IN ('awaiting_confirmation','merged')))
+          AND (i.job IS NULL OR i.turn!=n.turn OR i.state NOT IN ('awaiting_confirmation','confirmed','merged')))
         AND NOT EXISTS(SELECT 1 FROM ticket_pause p WHERE p.ticket=j.ticket
           AND (j.parent IS NOT NULL OR p.state='paused' OR p.state='draining'))
-        {exclusion} ORDER BY j.id LIMIT ?", crate::job::EFFECTIVE_DEPS_SQL);
+        {exclusion} ORDER BY j.id LIMIT ?", crate::job::EFFECTIVE_DEPS_SQL, settled = crate::job::PREREQUISITE_SETTLED_SQL);
             let time = now();
             let mut candidates = q.all(&queued, &[&time, &0, &(READS_PER_SLICE as i64)])?;
             candidates.extend(q.all(&queued, &[&time, &1, &256])?);
@@ -1873,7 +1970,8 @@ impl Inner {
                 if crate::workspaces::get(q,job.id)?.is_some_and(|w| w.state=="planned"
                     || w.validation.get("prerequisite_heads").is_none()) {
                     for row in q.all(&format!("{} SELECT n.id,n.turn FROM effective_deps d JOIN jobs n ON n.id=d.needs WHERE d.job=? ORDER BY n.id",crate::job::EFFECTIVE_DEPS_SQL),&[&job.id])? {
-                        if let Some(w)=crate::workspaces::get(q,int_of(&row,"id"))? { workspace_dependencies.push((w,int_of(&row,"turn"))); }
+                        // A merged prerequisite is already in the source baseline.
+                        if let Some(w)=crate::workspaces::get(q,int_of(&row,"id"))?.filter(|w| w.state!="merged") { workspace_dependencies.push((w,int_of(&row,"turn"))); }
                     }
                 }
                 if workspace_dependencies.iter().any(|(w,_)|occupied.iter().any(|key|crate::workspaces::overlaps(key,&crate::workspaces::scope(&w.path)))) {
@@ -2024,6 +2122,30 @@ impl Inner {
         self.opts.runner.admission_blocked_until(&job.agent, &route, time)
     }
 
+    /// Reject explicitly selected routes that a loaded executor's catalog does
+    /// not offer. Otherwise the executor would silently disappear from the
+    /// lead's delegation menu for the whole ticket. A catalog that cannot be
+    /// read is not proof of absence and does not block creation.
+    async fn verify_selected_routes(self: &Arc<Self>, selections: &Value) -> Result<()> {
+        let picked = p::routes(selections).map_err(|e| anyhow!(e))?;
+        for (agent, value) in &picked {
+            if !self.adapters.contains_key(agent.as_str()) {
+                continue;
+            }
+            let Ok(route) = p::route(Some(value)) else { continue };
+            let Ok(cat) = self.catalog_request(agent, Some(route.clone())).await else { continue };
+            match p::options(Some(&cat), Some(value)) {
+                Ok(Some(_)) => {}
+                Ok(None) => bail!(
+                    "{agent} 的所选路由不在当前模型目录中（{} / {}），请刷新模型目录或重新选择",
+                    route.provider, route.model
+                ),
+                Err(message) => bail!("{agent} 的所选路由无效：{message}"),
+            }
+        }
+        Ok(())
+    }
+
     /// `catalogRequest(name)` (E:207-215): one in-flight probe per harness.
     fn catalog(self: &Arc<Self>, name: &str) -> CatalogFuture {
         self.catalog_request(name, None)
@@ -2170,13 +2292,14 @@ impl Inner {
                 Ok(true)
             })?;
             if !valid { return Err(TurnError::Wait(now()+1.0)); }
+            let hydration = self.db.with(|q| crate::workspaces::hydrate::paths(q, &project_key(&w.source)))?;
             // Worktree creation, prerequisite checkpoints and merges run under
             // receipts settled with the workspace row below.
             let inner = self.clone();
             let owner = crate::operations::Owner::job(job.ticket, job.id);
             let (ready, verdicts, crashed) = tokio::task::spawn_blocking(move || {
                 let scope = inner.scope(owner);
-                let ready = crate::integration_queue::provision_dependencies(&w,&data,&prerequisites,&scope);
+                let ready = crate::integration_queue::provision_dependencies(&w,&data,&prerequisites,&scope,&hydration);
                 let verdicts = scope.settle(ready.is_ok());
                 (ready, verdicts, scope.crashed())
             }).await.map_err(|_| anyhow!("工作区准备异常"))?;
@@ -2644,7 +2767,13 @@ impl Inner {
                             menus.insert(name.into(), menu);
                         }
                         Ok(None) => {
-                            menus.insert(name.into(), json!({"available": false, "reason": "unavailable"}));
+                            // Name the missing route so the lead can report why it cannot delegate.
+                            let mut entry = json!({"available": false, "reason": "unavailable"});
+                            if let Some(route) = pick(name, Some(cat)).and_then(|v| p::route(Some(&v)).ok()) {
+                                entry["reason"] = json!("route_not_in_catalog");
+                                entry["route"] = json!({"provider": route.provider, "model": route.model, "mode": route.mode});
+                            }
+                            menus.insert(name.into(), entry);
                         }
                         // An unavailable local provider cannot grant delegation rights.
                         Err(_) => {}
@@ -2696,10 +2825,18 @@ impl Inner {
         let selected = p::route(picked.as_ref()).map_err(|e| TurnError::Engine(anyhow!(e)))?;
         // Existing native conversations stay on their bound route. A missing
         // model requires an explicit choice; never substitute an upstream.
+        // A route the ticket configured (or this job already bound) was valid
+        // before. Missing from one live probe (a gateway or CLI timing out
+        // under load) it is retried with a fresh probe; only an explicit model
+        // choice that the catalog does not offer fails permanently.
+        let configured = !fresh || assigned.get(&job.agent)
+            .and_then(|v| p::route(Some(v)).ok())
+            .is_some_and(|r| r == selected);
+        let code = if configured { crate::resilience::CODE_ROUTE_PROBE_FAILED } else { crate::resilience::CODE_ROUTE_NOT_CONFIGURED };
         match p::options(Some(&cat), Some(&route_json(&selected))) {
             Ok(Some(_)) => {}
-            Ok(None) => return Err(route_error(crate::resilience::CODE_ROUTE_NOT_CONFIGURED, UNAVAILABLE.into())),
-            Err(message) => return Err(route_error(crate::resilience::CODE_ROUTE_NOT_CONFIGURED, message)),
+            Ok(None) => return Err(route_error(code, UNAVAILABLE.into())),
+            Err(message) => return Err(route_error(code, message)),
         }
         turn.ensure_current()?;
         self.db.tx(|q| {

@@ -439,7 +439,10 @@ pub async fn scope(
     Ok("workspace-write")
 }
 
-/// `select(catalog, request)` (AC:347-361).
+/// `select(catalog, request)` (AC:347-361). The engine already validated the
+/// route against the catalog before admission, so a provider, model or effort
+/// missing from this run's rediscovery is treated as a transient discovery
+/// failure (retryable); a removed route still fails once retries are spent.
 pub fn select(catalog: &Value, request: &Route) -> Result<Route, AdapterError> {
     let mode_ok = request.mode == "cli"
         && catalog["modes"].as_array().is_some_and(|m| {
@@ -460,14 +463,14 @@ pub fn select(catalog: &Value, request: &Route) -> Result<Route, AdapterError> {
         })
     });
     if !listed {
-        return Err(route_gone("已选供应商或模型失效，请刷新配置"));
+        return Err(probe_failed("已选供应商或模型在本次发现中缺失，请刷新配置"));
     }
     if let Some(effort) = &request.reasoning_effort {
         let model = provider
             .and_then(|p| p["models"].as_array())
             .and_then(|ms| ms.iter().find(|m| m["id"] == request.model));
         if model.is_none_or(|m| !crate::catalog::efforts(m).contains(effort)) {
-            return Err(route_gone("所选模型未声明支持该思考强度，请刷新模型目录"));
+            return Err(probe_failed("所选模型在本次发现中未声明该思考强度，请刷新模型目录"));
         }
     }
     Ok(request.clone())

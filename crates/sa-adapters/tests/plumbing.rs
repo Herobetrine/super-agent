@@ -51,9 +51,11 @@ fn explicit_routes_fail_closed_for_stale_providers_models_and_desktops() {
     });
     let route = |p: &str, m: &str, mode: &str| Route { provider: p.into(), model: m.into(), mode: mode.into(), reasoning_effort: None };
     assert_eq!(select(&cat, &route("p", "m", "cli")).unwrap(), route("p", "m", "cli"));
-    for r in [route("p", "hidden", "cli"), route("other", "m", "cli"), route("p", "m", "desktop")] {
+    for (r, retryable) in [(route("p", "hidden", "cli"), true), (route("other", "m", "cli"), true), (route("p", "m", "desktop"), false)] {
         let e = select(&cat, &r).unwrap_err();
         assert_eq!(e.class, ErrorClass::RouteUnavailable);
+        // A route the engine just admitted but rediscovery misses is retried.
+        assert_eq!(e.code.as_deref() == Some(sa_engine::resilience::CODE_ROUTE_PROBE_FAILED), retryable, "{r:?}");
     }
     let mut effort = route("p", "m", "cli");
     effort.reasoning_effort = Some("high".into());

@@ -769,7 +769,8 @@ pub(crate) fn record_publication(q: &Q, job: i64, ticket: i64, merged: &Workspac
     workspaces::save(q, merged)?;
     q.run("UPDATE integration_queue SET state='merged',detail=?,validation=? WHERE job=?",
         &[&merged.detail, &merged.validation.to_string(), &job])?;
-    q.run("UPDATE integration_queue SET state='queued',validation='{}',detail='原项目已合入其他候选，重新验证当前候选' WHERE job!=? AND state='awaiting_confirmation'
+    q.run("DELETE FROM integration_confirmations WHERE job=?", &[&job])?;
+    q.run("UPDATE integration_queue SET state='queued',validation='{}',detail='原项目已合入其他候选，重新验证当前候选' WHERE job!=? AND state IN ('awaiting_confirmation','confirmed')
       AND job IN (SELECT job FROM job_workspaces WHERE source=?)", &[&job, &merged.source])?;
     let root = q.root(ticket)?;
     let mut payload = json!({"job": job, "ok": true});

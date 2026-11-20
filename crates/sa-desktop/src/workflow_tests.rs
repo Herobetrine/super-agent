@@ -998,3 +998,25 @@ fn unknown_platform_operations_ask_for_a_check() {
     h.run_steps(2);
     assert!(matches!(h.state_mut().actions.pop(), Some(Action::ResolveOperation { id: 1, .. })));
 }
+
+#[test]
+fn hydration_paths_are_saved_one_per_line() {
+    let data = tempfile::tempdir().unwrap();
+    seed(data.path());
+    let mut h = harness(data.path());
+    h.get_by_label("隔离工作区与合入").click();
+    h.run_steps(2);
+    let input = h.get_by_role(Role::MultilineTextInput);
+    input.focus();
+    input.type_text("gen\n\n  assets/x  ");
+    h.run_steps(2);
+    h.get_by_label("保存补齐路径").click();
+    h.run_steps(2);
+    match h.state_mut().actions.pop() {
+        Some(Action::SetWorkspaceHydration { ticket, paths }) => {
+            assert_eq!(ticket, 1);
+            assert_eq!(paths, ["gen", "assets/x"]);
+        }
+        other => panic!("unexpected action {other:?}"),
+    }
+}

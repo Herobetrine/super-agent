@@ -865,7 +865,7 @@ async fn run(
             .iter()
             .find(|r| r.id() == s.provider)
             .cloned()
-            .ok_or_else(|| route_gone("已选供应商或模型失效，请刷新配置"))?,
+            .ok_or_else(|| probe_failed("已选供应商在本次发现中缺失，请刷新配置"))?,
     };
     let exe = d
         .exe

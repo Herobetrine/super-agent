@@ -86,6 +86,7 @@ impl Db {
         conn.execute_batch(crate::pause::SCHEMA)?;
         conn.execute_batch(crate::advice::SCHEMA)?;
         conn.execute_batch(crate::workspaces::SCHEMA)?;
+        conn.execute_batch(crate::workspaces::hydrate::SCHEMA)?;
         conn.execute_batch(crate::scm::SCHEMA)?;
         conn.execute_batch(crate::checkpoints::SCHEMA)?;
         conn.execute_batch(crate::execution_policy::SCHEMA)?;
@@ -593,13 +594,14 @@ impl Q<'_> {
         Ok(())
     }
 
-    /// Failed prerequisites cancel queued work before admission. A later pass
-    /// propagates the cancellation along the dependency chain.
+    /// Failed or cancelled prerequisites, and partial isolated writers, cancel
+    /// queued work before admission. A later pass propagates the cancellation
+    /// along the dependency chain.
     pub fn skip_dependents(&self) -> Result<()> {
         let rows = self.all(&format!("{} SELECT j.*,n.id AS needs,n.state AS needs_state
             FROM jobs j JOIN effective_deps d ON d.job=j.id JOIN jobs n ON n.id=d.needs
-            WHERE j.state='queued' AND n.state IN ('partial','failed','cancelled') ORDER BY j.id,n.id",
-            crate::job::EFFECTIVE_DEPS_SQL), &[])?;
+            WHERE j.state='queued' AND n.state IN ('partial','failed','cancelled') AND NOT {} ORDER BY j.id,n.id",
+            crate::job::EFFECTIVE_DEPS_SQL, crate::job::PREREQUISITE_SETTLED_SQL), &[])?;
         for row in rows {
             let who = who_of(&row);
             let needs = int_of(&row, "needs");

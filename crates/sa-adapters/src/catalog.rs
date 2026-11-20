@@ -2,7 +2,9 @@
 use crate::common::get_json_with;
 use anyhow::{Result, anyhow, bail, ensure};
 use serde_json::{Value, json};
-use std::collections::HashSet;
+use sha2::{Digest, Sha256};
+use std::collections::{HashMap, HashSet};
+use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
@@ -174,7 +176,52 @@ pub fn restrict_efforts(rows: &mut [Value], allowed: &[&str]) {
     }
 }
 
+/// How long a successful online catalog stands in for a failed refresh.
+pub const LAST_GOOD_TTL: Duration = Duration::from_secs(12 * 3600);
+
+/// Last successful catalog per endpoint and credential (keyed by digest, so
+/// no token is retained in clear).
+type LastGood = HashMap<String, (Instant, Vec<Value>)>;
+static LAST_GOOD: LazyLock<Mutex<LastGood>> = LazyLock::new(Default::default);
+
+fn cache_key(url: &str, headers: &[(String, String)]) -> String {
+    let mut h = Sha256::new();
+    h.update(url.as_bytes());
+    for (k, v) in headers {
+        h.update([0]);
+        h.update(k.as_bytes());
+        h.update([0]);
+        h.update(v.as_bytes());
+    }
+    format!("{:x}", h.finalize())
+}
+
+/// Online model catalog. A gateway busy serving model traffic can time out on
+/// `/models`; a refresh that fails then reuses the last successful list for
+/// the same endpoint and credential (up to [`LAST_GOOD_TTL`]) instead of
+/// making the provider look removed. Cancellation is never masked.
 pub async fn fetch(
+    url: &str,
+    headers: &[(String, String)],
+    cancel: &CancellationToken,
+) -> Result<Vec<Value>> {
+    let key = cache_key(url, headers);
+    match fetch_online(url, headers, cancel).await {
+        Ok(rows) => {
+            LAST_GOOD.lock().unwrap_or_else(|e| e.into_inner()).insert(key, (Instant::now(), rows.clone()));
+            Ok(rows)
+        }
+        Err(error) if !cancel.is_cancelled() => {
+            let cached = LAST_GOOD.lock().unwrap_or_else(|e| e.into_inner()).get(&key)
+                .filter(|(at, _)| at.elapsed() <= LAST_GOOD_TTL)
+                .map(|(_, rows)| rows.clone());
+            cached.ok_or(error)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+async fn fetch_online(
     url: &str,
     headers: &[(String, String)],
     cancel: &CancellationToken,
@@ -244,6 +291,44 @@ pub async fn fetch(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Serves the given HTTP responses in order on a local port.
+    fn serve(responses: Vec<&'static str>) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for response in responses {
+                let Ok((mut stream, _)) = listener.accept() else { return };
+                let mut buffer = [0u8; 4096];
+                let _ = std::io::Read::read(&mut stream, &mut buffer);
+                let _ = std::io::Write::write_all(&mut stream, response.as_bytes());
+            }
+        });
+        format!("http://{address}/v1/models")
+    }
+
+    #[tokio::test]
+    async fn failed_refresh_reuses_the_last_successful_catalog() {
+        let ok = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 21\r\nConnection: close\r\n\r\n{\"data\":[{\"id\":\"m\"}]}";
+        let busy = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        let url = serve(vec![ok, busy]);
+        let headers = vec![("x-api-key".to_string(), "secret".to_string())];
+        let cancel = CancellationToken::new();
+        let first = fetch(&url, &headers, &cancel).await.unwrap();
+        let again = fetch(&url, &headers, &cancel).await.unwrap();
+        assert_eq!(first, again);
+        assert_eq!(again[0]["id"], "m");
+        // Another credential has no cached list: the failure is reported.
+        let other = serve(vec![busy]);
+        assert!(fetch(&other, &headers, &cancel).await.is_err());
+        // A cancelled refresh is never answered from the cache.
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        let url = serve(vec![busy]);
+        assert!(fetch(&url, &headers, &cancelled).await.is_err());
+        assert!(!cache_key(&url, &headers).contains("secret"));
+    }
+
     #[test]
     fn capabilities_are_taken_from_metadata_only() {
         assert!(efforts(&json!({"id":"gpt-made-up"})).is_empty());

@@ -4,7 +4,8 @@
 //! `open_ticket --data DIR --spec spec.json`
 //!
 //! spec.json: {"cwd", "goal", "lead", "profile", "selections", "requirements": [..],
-//! "efficiency": {..}, "policy": "record"|"apply"}
+//! "efficiency": {..}, "policy": "record"|"apply", "project_checks": [[argv]..],
+//! "hydration": ["path"..], "isolated_writers": bool, "integration_queue": bool}
 use anyhow::{Context, Result, ensure};
 use sa_adapters::sys::Sys;
 use sa_engine::{CreateParams, Engine, EngineOptions};
@@ -25,6 +26,14 @@ struct Spec {
     efficiency: Option<Value>,
     #[serde(default)]
     policy: Option<String>,
+    #[serde(default)]
+    project_checks: Vec<Vec<String>>,
+    #[serde(default)]
+    hydration: Vec<String>,
+    #[serde(default)]
+    isolated_writers: bool,
+    #[serde(default)]
+    integration_queue: bool,
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
@@ -51,6 +60,13 @@ async fn main() -> Result<()> {
         EngineOptions { efficiency: sa_store::efficiency::shared(settings.clone()), ..Default::default() },
     )?;
     engine.db().with(|q| sa_store::efficiency::save(q.conn(), &settings))?;
+    let project = spec.cwd.to_string_lossy().to_string();
+    if !spec.project_checks.is_empty() {
+        engine.set_project_checks(&project, spec.project_checks.clone())?;
+    }
+    if !spec.hydration.is_empty() {
+        engine.set_workspace_hydration(&project, spec.hydration.clone())?;
+    }
     let ticket = engine
         .create(CreateParams {
             goal: spec.goal.clone(),
@@ -65,6 +81,12 @@ async fn main() -> Result<()> {
     let mut contract = 0;
     for text in &spec.requirements {
         contract = engine.save_requirement(ticket, contract, None, text.clone(), None, None, None)?.contract_revision;
+    }
+    if spec.isolated_writers {
+        engine.set_isolated_writers(ticket, true)?;
+    }
+    if spec.integration_queue {
+        engine.set_integration_queue(ticket, true)?;
     }
     if let Some(mode) = &spec.policy {
         engine.set_execution_policy(&spec.cwd.to_string_lossy(), mode)?;

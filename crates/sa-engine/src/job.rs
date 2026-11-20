@@ -112,6 +112,24 @@ pub(crate) const EFFECTIVE_DEPS_SQL: &str = "WITH RECURSIVE dependency_chain(job
   SELECT d.job,d.needs FROM dependency_chain d WHERE NOT EXISTS(SELECT 1 FROM job_failovers f WHERE f.original=d.needs)
 )";
 
+/// Whether a read-only (`write:false`) task of `agent` can run shell commands,
+/// for hashes, builds or scripts. Claude readers get only Read, Glob and Grep;
+/// Antigravity readers deny every command; Codex runs them in an OS read-only
+/// sandbox. Unknown harnesses are omitted rather than guessed.
+pub(crate) fn readonly_commands(agent: &str) -> Option<bool> {
+    match agent {
+        "codex" => Some(true),
+        "claude" | "antigravity" => Some(false),
+        _ => None,
+    }
+}
+
+/// A prerequisite `n` lets its dependents start once it is `done`, or `partial`
+/// without an isolated workspace: the dependent receives the partial outcome in
+/// `prerequisites` and decides how to use it. An isolated writer's branch must be
+/// `done` before other workspaces merge it.
+pub(crate) const PREREQUISITE_SETTLED_SQL: &str = "(n.state='done' OR (n.state='partial' AND NOT EXISTS(SELECT 1 FROM job_workspaces pw WHERE pw.job=n.id)))";
+
 fn parse(text: &str) -> Value {
     serde_json::from_str(text).unwrap_or(Value::Null)
 }
@@ -262,11 +280,12 @@ pub fn envelope(q: &Q, j: &JobCtx, harness_health: Value) -> Result<Map<String, 
         .unwrap_or(Value::Null);
     let mut caps = Map::new();
     for a in AGENTS {
-        caps.insert(
-            a.into(),
-            json!({"read_project": true, "write_project": p::can_write(a, &j.profile),
-                "native_images": crate::images::supports_native_images(a)}),
-        );
+        let mut cap = json!({"read_project": true, "write_project": p::can_write(a, &j.profile),
+            "native_images": crate::images::supports_native_images(a)});
+        if let Some(commands) = readonly_commands(a) {
+            cap["readonly_commands"] = json!(commands);
+        }
+        caps.insert(a.into(), cap);
     }
     let user_updates: Vec<Value> = q
         .all(

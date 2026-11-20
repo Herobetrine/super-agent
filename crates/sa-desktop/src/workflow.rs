@@ -22,6 +22,8 @@ pub struct WorkflowState {
     suggestions_loading: Option<crate::ops::Pending<sa_engine::check_suggestions::SuggestionReport>>,
     suggestions_error: Option<String>,
     command: String,
+    hydration_ticket: Option<i64>,
+    hydration_input: String,
     confirm: Option<i64>,
     queue_confirm: Option<(i64, i64, String)>,
     error: Option<String>,
@@ -78,6 +80,7 @@ pub fn queue_state_label(state: &str) -> &'static str {
         "validating" => "正在验证候选",
         "repairing" => "已退回原任务修复",
         "awaiting_confirmation" => "验证通过，待你确认",
+        "confirmed" => "已确认，等待空闲后合入",
         "publishing" => "合入中或等待恢复确认",
         "merged" => "已本地合入",
         "blocked" => "需要处理",
@@ -380,6 +383,31 @@ impl WorkflowState {
             });
     }
 
+    /// Ignored generated resources the project needs inside isolated worktrees.
+    fn hydration(&mut self, ui: &mut Ui, pal: &Palette, host: &Host, ticket: i64, action: &mut Option<Action>) {
+        if self.hydration_ticket != Some(ticket) {
+            let Ok(paths) = host.workspace_hydration(ticket) else { return };
+            self.hydration_ticket = Some(ticket);
+            self.hydration_input = paths.join("
+");
+        }
+        ui.add_space(4.0);
+        caption(ui, "补齐的忽略资源（每行一个项目相对路径）", pal);
+        ui.add(
+            egui::TextEdit::multiline(&mut self.hydration_input)
+                .desired_rows(2)
+                .margin(egui::Margin::symmetric(8, 5))
+                .font(theme::mono(12.0))
+                .hint_text(widgets::hint(ui, "assets/generated"))
+                .desired_width(f32::INFINITY),
+        );
+        help(ui, "隔离工作区和合并候选只含 Git 跟踪的文件。这里列出的路径下被 Git 忽略的文件会从原项目复制进去（最多 20 万个文件或 8 GiB）；任务对这些文件的修改不会合入。", pal);
+        if widgets::outline_button(ui, "", "保存补齐路径", pal).clicked() {
+            let paths = self.hydration_input.lines().map(str::trim).filter(|l| !l.is_empty()).map(str::to_string).collect();
+            *action = Some(Action::SetWorkspaceHydration { ticket, paths });
+        }
+    }
+
     fn groups(
         &mut self,
         ui: &mut Ui,
@@ -405,6 +433,7 @@ impl WorkflowState {
                     *action = Some(Action::SetIsolatedWriters { ticket, enabled });
                 }
                 help(ui, "从已提交的干净仓库创建。完成后先验证，再本地合入。已有任务不迁移。", pal);
+                self.hydration(ui, pal, host, ticket, action);
                 let queue_enabled = host.integration_queue_enabled(ticket);
                 if let Ok(mut queue_enabled) = queue_enabled {
                     if ui.add(widgets::Check::new(

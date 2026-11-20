@@ -13,12 +13,14 @@ use std::{
     time::{Duration, Instant},
 };
 
+pub mod hydrate;
 mod process;
 
 pub const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS job_directories(job INTEGER PRIMARY KEY,cwd TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS workspace_policy(ticket INTEGER PRIMARY KEY,isolated INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS job_workspaces(job INTEGER PRIMARY KEY,ticket INTEGER NOT NULL,source TEXT NOT NULL,path TEXT NOT NULL,branch TEXT NOT NULL,base TEXT NOT NULL DEFAULT '',head TEXT NOT NULL DEFAULT '',state TEXT NOT NULL DEFAULT 'planned',validation TEXT NOT NULL DEFAULT '{}',detail TEXT NOT NULL DEFAULT '');
 CREATE TABLE IF NOT EXISTS integration_policy(ticket INTEGER PRIMARY KEY,enabled INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS integration_confirmations(job INTEGER PRIMARY KEY,task_head TEXT NOT NULL,turn INTEGER NOT NULL,created REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS integration_queue(job INTEGER PRIMARY KEY,ticket INTEGER NOT NULL,turn INTEGER NOT NULL,
  state TEXT NOT NULL,attempts INTEGER NOT NULL DEFAULT 0,version TEXT NOT NULL,commands TEXT NOT NULL,
  detail TEXT NOT NULL DEFAULT '',validation TEXT NOT NULL DEFAULT '{}');";
@@ -396,11 +398,12 @@ pub(crate) fn existing_worktree(source: &Path, dest: &Path, branch: &str, record
 }
 
 pub fn provision(w: &Workspace, data: &Path) -> Result<Workspace> {
-    provision_with(w, data, &Scope::detached())
+    provision_with(w, data, &Scope::detached(), &[])
 }
 
-/// `git worktree add` runs under a `workspace.worktree_add` receipt.
-pub(crate) fn provision_with(w: &Workspace, data: &Path, ops: &Scope) -> Result<Workspace> {
+/// `git worktree add` runs under a `workspace.worktree_add` receipt. The
+/// project's ignored resources named in `hydration` are then copied in.
+pub(crate) fn provision_with(w: &Workspace, data: &Path, ops: &Scope, hydration: &[String]) -> Result<Workspace> {
     let mut w = identity(w)?;
     let source = Path::new(&w.source);
     let dest = PathBuf::from(&w.path);
@@ -432,10 +435,27 @@ pub(crate) fn provision_with(w: &Workspace, data: &Path, ops: &Scope) -> Result<
     }
     w.head = head(&dest)?;
     verify(&w)?;
+    let receipt = hydrate::hydrate(source, &dest, hydration)?;
+    if !receipt.is_null() {
+        w.validation["hydration"] = receipt;
+    }
     if w.state == "planned" {
         w.state = "ready".into();
     }
     Ok(w)
+}
+
+/// Remove a worktree the platform created under `data` (task workspaces and
+/// merge candidates). Best effort: a failure leaves the directory for the
+/// operator; paths outside the data directory are never touched.
+pub(crate) fn discard(source: &Path, path: &Path, data: &Path) -> bool {
+    let owned = path.starts_with(data.join("integrations")) || path.starts_with(data.join("workspaces"));
+    if !owned || !path.exists() {
+        return false;
+    }
+    let removed = git(source, &["worktree", "remove", "--force", &path.to_string_lossy()]).is_ok();
+    let _ = git(source, &["worktree", "prune"]);
+    removed
 }
 
 pub fn save(q: &Q, w: &Workspace) -> Result<()> {
@@ -539,11 +559,11 @@ pub(crate) fn validate_with(w: &Workspace, argv: &[String], cancel: &dyn Fn() ->
 /// Build a merge candidate in a separate worktree, validate it, then publish
 /// via fast-forward. Failed candidates are retained for inspection.
 pub fn integrate(w: &Workspace, data: &Path) -> Result<Workspace> {
-    integrate_with(w, data, &Scope::detached())
+    integrate_with(w, data, &Scope::detached(), &[])
 }
 
 /// The fast-forward into the source runs under a `workspace.integrate` receipt.
-pub(crate) fn integrate_with(w: &Workspace, data: &Path, ops: &Scope) -> Result<Workspace> {
+pub(crate) fn integrate_with(w: &Workspace, data: &Path, ops: &Scope, hydration: &[String]) -> Result<Workspace> {
     ensure!(
         w.state == "validated" && w.validation["passed"] == true,
         "先验证该任务的当前版本"
@@ -573,6 +593,7 @@ pub(crate) fn integrate_with(w: &Workspace, data: &Path, ops: &Scope) -> Result<
     )?;
     let mut result = w.clone();
     result.validation["candidate"] = json!(candidate_text);
+    result.validation["candidate_hydration"] = hydrate::hydrate(source, &candidate, hydration)?;
     if git(&candidate, &["merge", "--no-ff", "--no-edit", &w.head]).is_err() {
         result.state = "conflict".into();
         result.detail = "合并冲突；原项目未改变，候选工作区已保留".into();

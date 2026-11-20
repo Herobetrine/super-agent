@@ -231,15 +231,17 @@ pub fn decide_dispatch(input: &DispatchInput) -> DispatchVerdict {
         };
         return verdict("serialize", format!("声明文件与活动中的写入者 {jobs} 重叠；{how}{suffix}"), overlapping);
     }
-    let blind: Vec<i64> = writers.iter().filter(|s| s.files.is_empty()).map(|s| s.job).collect();
-    if !input.isolated && input.files.is_empty() && !blind.is_empty() {
-        let jobs = blind.iter().map(|j| format!("#{j}")).collect::<Vec<_>>().join("、");
+    // Without isolation every writer of a ticket shares the project directory,
+    // and the scheduler admits one writer per directory whatever files they name.
+    if !input.isolated && !writers.is_empty() {
+        let jobs = writers.iter().map(|s| format!("#{}", s.job)).collect::<Vec<_>>().join("、");
         return verdict(
             "serialize",
-            format!("两个写入者都没有声明文件且未启用隔离（另一个：{jobs}）；调度器本来就会按路径串行它们，此处只记录建议。{suffix}"),
+            format!("未启用隔离写入，同一项目目录中的写入者由调度器逐个执行（活动中的写入者：{jobs}），与 files 无关。需要并行写入时请操作员开启隔离写入；只读调查可照常并行。{suffix}"),
             vec![],
         );
     }
+    let blind: Vec<i64> = writers.iter().filter(|s| s.files.is_empty()).map(|s| s.job).collect();
     if risky {
         return verdict(
             "add_review",
@@ -577,7 +579,7 @@ mod tests {
     fn overlapping_declared_files_serialize_including_directory_prefixes() {
         let v = decide_dispatch(&input(true, &["src/a.rs"], vec![writer(7, &["src"]), writer(8, &["docs"])], true));
         assert_eq!((v.selected, v.overlapping), ("serialize", vec![7]));
-        let v = decide_dispatch(&input(true, &["./A.txt"], vec![writer(7, &["a.txt"])], false));
+        let v = decide_dispatch(&input(true, &["./A.txt"], vec![writer(7, &["a.txt"])], true));
         assert_eq!(v.selected, if cfg!(windows) { "serialize" } else { "limited_parallel" });
     }
 
@@ -586,7 +588,11 @@ mod tests {
         let v = decide_dispatch(&input(true, &[], vec![writer(1, &[])], false));
         assert_eq!(v.selected, "serialize");
         assert!(v.overlapping.is_empty());
-        assert!(v.reason.contains("调度器本来就会"));
+        assert!(v.reason.contains("逐个执行") && v.reason.contains("开启隔离写入"));
+        // Disjoint declared files do not run in parallel in a shared directory either.
+        let v = decide_dispatch(&input(true, &["src/a.rs"], vec![writer(1, &["docs/b.md"])], false));
+        assert_eq!(v.selected, "serialize");
+        assert!(v.overlapping.is_empty());
         let v = decide_dispatch(&input(true, &[], vec![writer(1, &[])], true));
         assert_eq!(v.selected, "limited_parallel");
     }

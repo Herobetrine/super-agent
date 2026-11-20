@@ -609,7 +609,7 @@ pub async fn run(
             && engine
                 .integration_queue(ticket)?
                 .iter()
-                .any(|i| matches!(i.state.as_str(), "queued" | "validating" | "awaiting_confirmation" | "publishing"));
+                .any(|i| matches!(i.state.as_str(), "queued" | "validating" | "awaiting_confirmation" | "confirmed" | "publishing"));
         if TERMINAL.contains(&state.as_str()) && pending.is_empty() && !busy(&engine, ticket)? && !awaiting {
             break;
         }

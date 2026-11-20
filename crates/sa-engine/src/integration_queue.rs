@@ -82,15 +82,15 @@ pub(crate) fn get(q: &Q, job: i64) -> Result<IntegrationItem> {
 /// candidate, including a continued writer or changed operator checks.
 pub(crate) fn reconcile(q: &Q) -> Result<()> {
     q.run("UPDATE integration_queue SET state='stale',detail='任务版本已改变，需重新验证'
-      WHERE state='awaiting_confirmation' AND EXISTS(SELECT 1 FROM jobs j WHERE j.id=integration_queue.job
+      WHERE state IN ('awaiting_confirmation','confirmed') AND EXISTS(SELECT 1 FROM jobs j WHERE j.id=integration_queue.job
         AND (j.turn!=integration_queue.turn OR j.state!='done'))", &[])?;
     for row in q.all(
-        "SELECT DISTINCT ticket FROM integration_queue WHERE state='awaiting_confirmation'",
+        "SELECT DISTINCT ticket FROM integration_queue WHERE state IN ('awaiting_confirmation','confirmed')",
         &[],
     )? {
         let ticket = int_of(&row, "ticket");
         let commands = commands(q, ticket)?;
-        q.run("UPDATE integration_queue SET state='stale',detail='项目检查已改变，需重新验证' WHERE ticket=? AND state='awaiting_confirmation' AND commands!=?",&[&ticket,&json!(commands).to_string()])?;
+        q.run("UPDATE integration_queue SET state='stale',detail='项目检查已改变，需重新验证' WHERE ticket=? AND state IN ('awaiting_confirmation','confirmed') AND commands!=?",&[&ticket,&json!(commands).to_string()])?;
     }
     for row in q.all(
         "SELECT j.id,j.ticket,j.turn,t.cwd FROM jobs j JOIN job_workspaces w ON w.job=j.id
@@ -118,6 +118,14 @@ pub(crate) fn recover(q: &Q) -> Result<()> {
       WHERE state='validating'",
         &[],
     )?;
+    // A confirmation waiting for free workspaces belongs to this process; the
+    // operator confirms again after a restart, and carried confirmations lapse.
+    q.run("DELETE FROM integration_confirmations", &[])?;
+    q.run(
+        "UPDATE integration_queue SET state='awaiting_confirmation',detail='重启前已确认但尚未合入，请重新确认'
+      WHERE state='confirmed'",
+        &[],
+    )?;
     q.run(
         "UPDATE integration_queue SET state='stale',detail='验证程序版本已变化，需重新验证'
       WHERE state='awaiting_confirmation' AND version!=?",
@@ -134,6 +142,10 @@ pub(crate) fn commands(q: &Q, ticket: i64) -> Result<Vec<Vec<String>>> {
     let project = crate::services::realpath(Path::new(str_of(&row, "cwd")))?;
     crate::checks::configured(q, &project.to_string_lossy())
 }
+
+/// Publication refused because the source branch moved after validation;
+/// nothing was merged, so the candidate is simply validated again.
+pub(crate) const SOURCE_MOVED: &str = "原项目有新提交，请重新验证";
 
 pub(crate) fn current(q: &Q, item: &IntegrationItem) -> Result<()> {
     ensure!(enabled(q, item.ticket)?, "该工单未启用自动合入队列");
@@ -212,6 +224,7 @@ pub(crate) fn prepare(
     data: &Path,
     commands: &[Vec<String>],
     cancel: &dyn Fn() -> bool,
+    hydration: &[String],
 ) -> Result<Workspace> {
     ensure!(!commands.is_empty(), "必须先配置项目完成检查");
     let mut ready = checkpoint(w, cancel)?;
@@ -243,8 +256,15 @@ pub(crate) fn prepare(
     }
     let home = data.join("integrations");
     std::fs::create_dir_all(&home)?;
+    // A new validation supersedes this job's earlier candidates.
+    let prefix = format!("queue-{}-", w.job);
+    for entry in std::fs::read_dir(&home)?.flatten() {
+        if entry.file_name().to_string_lossy().starts_with(&prefix) {
+            workspaces::discard(source, &entry.path(), data);
+        }
+    }
     let candidate = tempfile::Builder::new()
-        .prefix(&format!("queue-{}-", w.job))
+        .prefix(&prefix)
         .tempdir_in(home)?
         .keep();
     let candidate_text = candidate.to_string_lossy().to_string();
@@ -253,6 +273,7 @@ pub(crate) fn prepare(
         &["worktree", "add", "--detach", &candidate_text, &baseline],
     )?;
     ready.validation["candidate"] = json!(candidate_text);
+    ready.validation["candidate_hydration"] = workspaces::hydrate::hydrate(source, &candidate, hydration)?;
     let merge = workspaces::command_with_cancel(
         &candidate,
         &workspaces::git_argv(&["merge", "--no-ff", "--no-edit", &ready.head]),
@@ -348,10 +369,7 @@ pub(crate) fn publish(
     workspaces::clean(source)?;
     let source_head = workspaces::head(source)?;
     if source_head != candidate_head {
-        ensure!(
-            source_head == validation["baseline"],
-            "原项目有新提交，请重新验证"
-        );
+        ensure!(source_head == validation["baseline"], SOURCE_MOVED);
         ensure!(!cancel(), "合入操作已取消");
         ops.begin(kind::PUBLISH, json!({"job":w.job,"source":w.source,
             "source_ref":w.validation["identity"]["source_ref"],"baseline":source_head,"target":candidate_head}))?;
@@ -382,9 +400,10 @@ pub(crate) fn provision_dependencies(
     data: &Path,
     prerequisites: &[(Workspace, i64)],
     ops: &Scope,
+    hydration: &[String],
 ) -> Result<Workspace> {
     if prerequisites.is_empty() {
-        return workspaces::provision_with(w, data, ops);
+        return workspaces::provision_with(w, data, ops, hydration);
     }
     let prerequisites = prerequisites
         .iter()
@@ -399,13 +418,13 @@ pub(crate) fn provision_dependencies(
             w.validation["prerequisite_heads"] == json!(heads),
             "前置分支已续派或变化，请人工核对当前写任务"
         );
-        return workspaces::provision_with(w, data, ops);
+        return workspaces::provision_with(w, data, ops, hydration);
     }
     ensure!(
         w.state == "planned",
         "已有工作区缺少前置分支快照，不能自动改变基线"
     );
-    let mut ready = workspaces::provision_with(w, data, ops)?;
+    let mut ready = workspaces::provision_with(w, data, ops, hydration)?;
     for (prerequisite, _) in &prerequisites {
         workspaces::verify(prerequisite)?;
         workspaces::clean(Path::new(&prerequisite.path))?;

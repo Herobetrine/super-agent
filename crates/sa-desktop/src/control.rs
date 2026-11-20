@@ -79,6 +79,18 @@ impl Server {
                     "stop" => {
                         engine.cancel(ticket)?;
                     }
+                    "revalidate" => {
+                        let job = owned(&engine, "jobs", args["job"].as_i64(), ticket)?;
+                        engine.revalidate_integration(job)?;
+                    }
+                    "confirm" => {
+                        // Publishes now, or records the confirmation when the source is
+                        // busy; the response reports either outcome or the refusal.
+                        let job = owned(&engine, "jobs", args["job"].as_i64(), ticket)?;
+                        let token = text(&args["token"])?.to_string();
+                        let handle = tokio::runtime::Handle::current();
+                        tokio::task::block_in_place(|| handle.block_on(engine.confirm_integration(job, &token)))?;
+                    }
                     _ => {}
                 }
                 let snapshot = engine.db().try_with(|q| {
@@ -215,14 +227,14 @@ fn read_request(path: &Path, expected_id: &str, generation: &str) -> Result<(Str
     let command = value["command"].as_str().unwrap_or_default();
     let ticket = value["ticket"].as_i64().unwrap_or_default();
     // Operator actions carry one `args` object; status and pause requests have none.
-    let operator = matches!(command, "answer" | "decide" | "retry" | "follow");
+    let operator = matches!(command, "answer" | "decide" | "retry" | "follow" | "confirm" | "revalidate");
     let args = value.get("args").cloned().unwrap_or(Value::Null);
     if object.len() != if operator { 6 } else { 5 }
         || (operator && !args.is_object())
         || value["generation"] != generation
         || value["version"] != 1
         || value["id"] != expected_id
-        || !matches!(command, "status" | "pause_after_handoff" | "resume" | "answer" | "decide" | "retry" | "follow" | "stop")
+        || !matches!(command, "status" | "pause_after_handoff" | "resume" | "answer" | "decide" | "retry" | "follow" | "stop" | "confirm" | "revalidate")
         || ticket <= 0
     {
         bail!("invalid request");

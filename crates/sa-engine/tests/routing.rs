@@ -299,3 +299,59 @@ async fn revoking_policy_during_attachment_snapshot_prevents_commit() {
         json!({"model":"review", "reasoning_effort":"high", "files":["context.txt"]}),
     ));
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn selected_routes_missing_from_the_catalog_reject_ticket_creation() {
+    let fx = Fx::new(script(|_| async move { Ok("verified".into()) }), catalog());
+    for (selection, fragment) in [
+        (json!({"deepseek": route("gone", "low")}), "不在当前模型目录中"),
+        (json!({"deepseek": route("plain", "high")}), "思考强度"),
+    ] {
+        let mut params = fx.params();
+        params.selections = Some(selection);
+        let error = fx.engine.create(params).await.unwrap_err().to_string();
+        assert!(error.contains(fragment), "{error}");
+    }
+    assert_eq!(fx.int("SELECT count(*) FROM tickets"), 0);
+    let mut params = fx.params();
+    params.selections = Some(json!({"deepseek": route("review", "high")}));
+    assert!(fx.engine.create(params).await.is_ok());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn grandchild_uses_the_ticket_route_of_its_own_harness() {
+    let fx = Fx::new(
+        script(|c| async move {
+            match c.depth() {
+                0 if c.turn() == 1 => Ok(send(json!({"id":"impl","to":"codex","body":"implement","write":true}))),
+                1 if c.turn() == 1 => {
+                    assert_eq!(c.req.route.model, "default");
+                    Ok(send(json!({"id":"review","to":"deepseek","body":"review","write":false})))
+                }
+                2 => {
+                    assert_eq!(c.req.route.model, "review");
+                    assert_eq!(c.req.route.reasoning_effort.as_deref(), Some("high"));
+                    Ok("reviewed".into())
+                }
+                _ => Ok("done".into()),
+            }
+        }),
+        catalog(),
+    );
+    for args in [&["init", "-q"][..], &["config", "user.email", "f@localhost"], &["config", "user.name", "F"]] {
+        assert!(std::process::Command::new("git").args(args).current_dir(&fx.project).status().unwrap().success());
+    }
+    std::fs::write(fx.project.join("base.txt"), "base").unwrap();
+    for args in [&["add", "."][..], &["commit", "-qm", "base"]] {
+        assert!(std::process::Command::new("git").args(args).current_dir(&fx.project).status().unwrap().success());
+    }
+    let mut params = fx.params().profile("auto");
+    params.selections = Some(json!({"codex":route("default","low"), "deepseek":route("review","high")}));
+    let ticket = fx.create(params).await;
+    fx.engine.set_isolated_writers(ticket, true).unwrap();
+    fx.engine.start().unwrap();
+    fx.until(|| fx.int("SELECT count(*) FROM jobs WHERE depth=2 AND state IN ('done','failed','partial','cancelled')") == 1).await;
+    let rows = fx.all("SELECT state,result FROM jobs WHERE depth=2");
+    assert_eq!(rows[0]["state"], "done", "{rows:?}");
+    let _ = ticket;
+}
