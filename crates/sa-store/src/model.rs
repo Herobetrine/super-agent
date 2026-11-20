@@ -182,6 +182,11 @@ pub struct Snapshot {
     #[serde(default)]
     pub queued_peers: i64,
     pub native_activity: NativeActivity,
+    /// The activity projection has not reached the end of the journal yet:
+    /// `events` holds only visible events and `native_activity` is empty.
+    /// Request the ticket again with `after == 0` (see `Store::snapshot_within`).
+    #[serde(default)]
+    pub loading: bool,
     #[serde(default)]
     pub usage: crate::usage::TicketUsage,
     /// Current subscription windows for harnesses used by this ticket.

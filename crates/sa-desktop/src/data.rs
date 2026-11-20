@@ -7,6 +7,7 @@
 use anyhow::{Result, bail};
 use sa_store::{DB_FILE, JobsPage, Snapshot, Store, TicketSummary};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 pub trait DataSource {
     /// Short description shown in the sidebar footer.
@@ -15,6 +16,13 @@ pub trait DataSource {
     fn history(&mut self, q: &str) -> Result<Vec<TicketSummary>>;
     /// Ticket snapshot; `after == 0` loads the latest events.
     fn snapshot(&mut self, ticket: i64, after: i64) -> Result<Snapshot>;
+    /// Like `snapshot`, but a source with a long history may stop replaying
+    /// it after `budget` and return a `loading` snapshot instead (see
+    /// `Store::snapshot_within`). Sources without a replay load in full.
+    fn snapshot_within(&mut self, ticket: i64, after: i64, budget: Duration) -> Result<Snapshot> {
+        let _ = budget;
+        self.snapshot(ticket, after)
+    }
     /// Collaboration jobs, newest first, 80 per page.
     fn jobs_page(&mut self, ticket: i64, before: Option<i64>) -> Result<JobsPage>;
     /// A value that changes when the underlying data does, or `None` when the
@@ -63,6 +71,10 @@ impl DataSource for StoreSource {
 
     fn snapshot(&mut self, ticket: i64, after: i64) -> Result<Snapshot> {
         self.store.snapshot(ticket, after)
+    }
+
+    fn snapshot_within(&mut self, ticket: i64, after: i64, budget: Duration) -> Result<Snapshot> {
+        self.store.snapshot_within(ticket, after, budget)
     }
 
     fn jobs_page(&mut self, ticket: i64, before: Option<i64>) -> Result<JobsPage> {

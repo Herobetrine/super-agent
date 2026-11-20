@@ -1748,3 +1748,39 @@ fn collaboration_shows_dependency_outcome_and_platform_evidence() {
         "平台检查未通过 · cargo test -p sa-desktop",
     ] { assert!(h.query_by_label(label).is_some(), "missing collaboration wording: {label}"); }
 }
+/// A source whose history replay never finishes within a load.
+struct LoadingDemo(FrozenDemo);
+impl crate::data::DataSource for LoadingDemo {
+    fn label(&self) -> String { "载入中的演示数据".into() }
+    fn history(&mut self, q: &str) -> anyhow::Result<Vec<sa_store::TicketSummary>> { self.0.history(q) }
+    fn snapshot(&mut self, ticket: i64, after: i64) -> anyhow::Result<sa_store::Snapshot> {
+        let mut snap = self.0.snapshot(ticket, after)?;
+        snap.loading = true;
+        snap.native_activity = Default::default();
+        Ok(snap)
+    }
+    fn jobs_page(&mut self, ticket: i64, before: Option<i64>) -> anyhow::Result<sa_store::JobsPage> { self.0.jobs_page(ticket, before) }
+    fn version(&mut self) -> Option<i64> { Some(1) }
+}
+
+#[test]
+fn a_ticket_whose_history_is_still_replaying_shows_its_messages_and_a_loading_note() {
+    use crate::data::DataSource;
+    const NOTE: &str = "正在载入较早的执行记录 · 工具与子任务活动稍后显示";
+    for loading in [true, false] {
+        let mut h = Harness::builder().with_size(egui::vec2(1280.0, 860.0)).build_eframe(move |cc| {
+            crate::theme::install_fonts(&cc.egui_ctx);
+            let worker = worker::spawn(Box::new(move || {
+                Ok(if loading { Box::new(LoadingDemo(FrozenDemo::new())) as Box<dyn DataSource> } else { Box::new(FrozenDemo::new()) })
+            }), cc.egui_ctx.clone());
+            let mut app = App::new(cc, Options { observe: true, ..Default::default() }, worker, Arc::new(Mutex::new(None)), Err("只读观察".into()));
+            app.select(Some(42));
+            app
+        });
+        until(&mut h, "snapshot shown", |app| app.view.as_ref().and_then(|v| v.snap.as_ref()).is_some());
+        h.run_steps(3);
+        assert_eq!(h.query_by_label(NOTE).is_some(), loading);
+        let events = h.state().view.as_ref().map_or(0, |v| v.events.len());
+        assert!(events > 0, "visible messages are shown while the replay runs");
+    }
+}

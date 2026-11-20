@@ -998,6 +998,7 @@ impl DataSource for DemoSource {
             jobs,
             total_jobs,
             native_activity: t.native.clone(),
+            loading: false,
             usage: Default::default(),
             // Sample windows on the first ticket only, so both the footer
             // segment and a ticket without any window can be looked at.

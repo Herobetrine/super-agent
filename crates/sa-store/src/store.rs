@@ -9,7 +9,7 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, TransactionBehavio
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Database file name inside the data directory.
 pub const DB_FILE: &str = "hub.sqlite3";
@@ -243,11 +243,18 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
-    /// `ProgressJournal.ensure(ticket, end)`: project every row up to `end`.
-    fn ensure(&mut self, ticket: i64, end: i64) -> Result<&Entry> {
+    /// `ProgressJournal.ensure(ticket, end)`: project every row up to `end`,
+    /// or stop after the batch that crosses `deadline` (at least one batch
+    /// runs per call). Returns whether the projection reached `end`.
+    fn ensure(&mut self, ticket: i64, end: i64, deadline: Option<Instant>) -> Result<bool> {
         let entry = self.progress.entry(ticket).or_default();
         let mut stmt = self.conn.prepare_cached(PROGRESS_SCAN)?;
+        let mut batches = 0;
         while entry.seq < end {
+            if batches > 0 && deadline.is_some_and(|at| Instant::now() >= at) {
+                return Ok(false);
+            }
+            batches += 1;
             let rows = stmt
                 .query_map(params![ticket, entry.seq, end, SCAN_BATCH], |r| {
                     Ok(ScanRow {
@@ -271,7 +278,7 @@ impl Store {
                 entry.seq = end;
             }
         }
-        Ok(entry)
+        Ok(true)
     }
 
     fn max_seq(&self, ticket: i64, high: i64) -> Result<i64> {
@@ -323,12 +330,36 @@ impl Store {
 
     /// Ticket snapshot. `after == 0` returns the latest 180 visible events;
     /// otherwise up to 180 events newer than `after`.
+    ///
+    /// The activity projection is always complete. Usage advances by one
+    /// scan batch per call (`usage.pending` until it reaches the end).
     pub fn snapshot(&mut self, ticket: i64, after: i64) -> Result<Snapshot> {
+        self.load(ticket, after, None)
+    }
+
+    /// Like [`Self::snapshot`], but stops replaying history once `budget` is
+    /// spent, so the first view of a ticket with a long journal is not held
+    /// back by the replay. Until the activity projection reaches the end,
+    /// the snapshot has `loading` set, carries only the visible events (no
+    /// activity rows or native task cards) and must be requested again with
+    /// `after == 0`. Usage keeps scanning batches until the budget is spent.
+    pub fn snapshot_within(&mut self, ticket: i64, after: i64, budget: Duration) -> Result<Snapshot> {
+        self.load(ticket, after, Some(Instant::now() + budget))
+    }
+
+    fn load(&mut self, ticket: i64, after: i64, deadline: Option<Instant>) -> Result<Snapshot> {
         id(ticket)?;
         expect((0..=MAX_SAFE).contains(&after), "事件游标无效")?;
         let end = self.max_seq(ticket, MAX_SAFE)?;
-        self.ensure(ticket, end)?;
-        self.usage.entry(ticket).or_default().scan(&self.conn, ticket, end)?;
+        let loaded = self.ensure(ticket, end, deadline)?;
+        let projection = self.usage.entry(ticket).or_default();
+        projection.scan(&self.conn, ticket, end)?;
+        if let Some(at) = deadline {
+            while !projection.caught_up(end) && Instant::now() < at {
+                projection.scan(&self.conn, ticket, end)?;
+            }
+        }
+        let loading = !loaded;
         let conn = &self.conn;
 
         let attention = self.attention_sql()?;
@@ -438,7 +469,9 @@ impl Store {
             })
             .collect::<Result<Vec<_>>>()?;
         let entry = &self.progress[&ticket];
-        merged.extend(entry.read(after, end, after == 0, 180, true));
+        if !loading {
+            merged.extend(entry.read(after, end, after == 0, 180, true));
+        }
         merged.sort_by_key(|e| e.seq);
         let events: Vec<EventView> = if after != 0 {
             merged.truncate(180);
@@ -456,7 +489,11 @@ impl Store {
             .iter()
             .map(|j| (j.id, Some((j.state.clone(), j.turn))))
             .collect();
-        let mut native = entry.native.view();
+        let mut native = if loading {
+            NativeActivity::default()
+        } else {
+            entry.native.view()
+        };
         for task in &mut native.tasks {
             if task.state != "running" {
                 continue;
@@ -544,6 +581,7 @@ impl Store {
         Ok(Snapshot {
             usage,
             quota,
+            loading,
             ticket: detail,
             jobs,
             total_jobs,
@@ -591,8 +629,8 @@ impl Store {
             Some(b) => id(b)? - 1,
         };
         let end = self.max_seq(ticket, high)?;
-        let entry = self.ensure(ticket, end)?;
-        let mut events = entry.read(0, end, true, 81, false);
+        self.ensure(ticket, end, None)?;
+        let mut events = self.progress[&ticket].read(0, end, true, 81, false);
         let more = events.len() > 80;
         events.truncate(80);
         let next = events.last().map(|e| e.seq);

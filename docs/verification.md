@@ -522,3 +522,27 @@ P1B、P2、P4 由三个隔离工作树并行实现。合入前逐个审阅了它
 - **自动清理**：合入记录写入后，平台删除该任务的合并候选和任务工作区；准备新候选前，先删除同一任务的旧候选。依赖已合入前置任务的工作区不再合并它的旧工作区。
 - **在线模型目录沿用上次成功结果**：`catalog::fetch` 按端点和凭据摘要记住最近一次成功的目录，12 小时内某次拉取失败时沿用该结果；取消请求的失败照常报出。复现方法：并发 6 次 Claude 目录探测，有 5 次因网关 `/v1/models` 超时，供应商被标为不可用、模型数为 0。这是 P45 中 Claude 路由偶发「不存在」的直接原因。
 - **验证**：`build --workspace`、`clippy --workspace --all-targets -- -D warnings` 与全量测试（`test --workspace --no-fail-fast -- --test-threads=2`）均退出 0，**848 通过、0 失败、7 忽略**（含目录缓存回归）。桌面发布版 `build --release -p sa-desktop` 退出 0，`target/release/super-agent.exe` SHA-256 为 `56C6E3264BC8DFF8BBC1CCCF6E681081591EE1F4DE90D2D2719B6C03526D038E`（旧版 `566316D8…` 已备份至 `tmpstate/super-agent.before-20261120.exe`）。
+
+## 大工单冷读、API 牌价折算与平台提交说明（2026-11-20）
+
+本轮未发起模型调用，未读写真实工单库，也未提交或推送。
+
+- **冷读**：读线程改为预算内渐进加载，设计见 [Rust 架构路线](rust-port.md#大工单冷读2026-11-20)。在 `scripts/synthetic-journal.py` 生成的合成工单上测量（75.7 万事件，275 MB 负载，发布构建，热文件缓存）：
+  - 首屏 1.03 s → 0.12 s。
+  - 活动与用量全部追平约 2.3–2.6 s，旧行为下用量需约 40 分钟。
+  - 归档试验库 `tmpstate/mcg-p46-neon` 只读运行：首屏 0.13 s，0.41 s 追平。
+  - 两库上预算加载的最终快照与一次性加载逐字段相同（`coldread` 内置比对）。
+  - **未测**：真实 2.5 GB 库的冷磁盘首屏。复制真实库需要用户同意，本轮未复制。
+- **API 牌价折算**：规则、价格来源和原因代码见[用量账目](dev/usage-ledger.md)。抽查价格表与官方定价页逐项一致：
+  - Claude：Opus 5.5、Opus 5、Sonnet 5.5、Sonnet 4.6、Haiku 5.5（含 100K 分档）、Haiku 4.5。
+  - OpenAI：gpt-6.2-sol、gpt-6.1-sol、gpt-6.2-astra。
+  - DeepSeek 与 Gemini 条目只由实现代理读取，没有二次抽查。
+  - 金额是按公开牌价折算的等价值，不是实际账单；2026-11-20 以前的历史全部未定价。
+- **平台提交说明**：检查点和合入提交改为 `Checkpoint task #<job> (ticket <t>): <标题>` 和 `Merge task #…` 等格式，提交正文带工单、任务、轮次和分支，见[合入队列](dev/integration-queue.md)。操作对账不依赖提交说明。
+- **验证**：
+  - `build --workspace` 退出 0。
+  - `clippy --workspace --all-targets -- -D warnings` 无警告。
+  - `test --workspace --no-fail-fast -- --test-threads=2`：**875 通过、0 失败、7 忽略**。
+  - 新增测试：冷读收敛、预算内用量追平、读线程只发一次加载中快照、加载提示界面测试，以及牌价、归属、条件子代理缺口和提交说明等测试。
+  - 发布版未重建，桌面快捷方式仍指向 11-20 12:35 的版本。
+- **未做**：用户桌面端人工验收；真实库冷读复测；用 `api_cost` 做同任务费用对照。

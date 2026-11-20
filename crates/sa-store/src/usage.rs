@@ -1019,6 +1019,11 @@ fn native_session(agent: &str, value: &Value) -> Option<String> {
 }
 
 impl Entry {
+    /// Whether every row up to `end` has been scanned.
+    pub(crate) fn caught_up(&self, end: i64) -> bool {
+        self.seq >= end
+    }
+
     pub(crate) fn scan(&mut self, conn: &Connection, ticket: i64, end: i64) -> Result<()> {
         // events_ticket(ticket,seq) supplies the forward-only cursor. Size
         // guard runs in SQLite before Rust allocates or parses a payload.

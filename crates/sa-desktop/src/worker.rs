@@ -25,6 +25,11 @@ const HISTORY_GAP: Duration = Duration::from_millis(500);
 const REOPEN: Duration = Duration::from_secs(3);
 /// Maximum catch-up rounds per poll when a ticket has a large backlog.
 const CATCH_UP: usize = 8;
+/// Longest a single load may spend replaying a ticket's history, so a long
+/// journal neither delays the first view nor commands such as a new selection.
+const LOAD_BUDGET: Duration = Duration::from_millis(120);
+/// Spacing of loads while a replay or usage scan is still catching up.
+const BUSY_GAP: Duration = Duration::from_millis(10);
 
 pub enum Cmd {
     /// Switch the observed ticket. `epoch` tags every reply for that selection.
@@ -102,6 +107,10 @@ struct Reader {
     seen: Option<i64>,
     /// When the session list was last read.
     history_at: Option<Instant>,
+    /// The selected ticket's history replay or usage scan has not caught up.
+    busy: bool,
+    /// A `loading` snapshot of the selected ticket was already shown.
+    loading_sent: bool,
 }
 
 fn message(e: &anyhow::Error) -> String {
@@ -124,6 +133,8 @@ impl Reader {
             last_error: None,
             seen: None,
             history_at: None,
+            busy: false,
+            loading_sent: false,
         }
     }
 
@@ -175,7 +186,7 @@ impl Reader {
                 return;
             }
             last_load = Some(Instant::now());
-            next_poll = Instant::now() + POLL;
+            next_poll = Instant::now() + if self.busy { BUSY_GAP } else { POLL };
         }
     }
 
@@ -186,6 +197,8 @@ impl Reader {
                 self.selected = ticket.map(|t| (t, epoch));
                 self.cursor = 0;
                 self.last_meta = None;
+                self.busy = false;
+                self.loading_sent = false;
                 true
             }
             Cmd::Search(q) => {
@@ -232,6 +245,8 @@ impl Reader {
         self.seen = None;
         self.cursor = 0;
         self.last_meta = None;
+        self.busy = false;
+        self.loading_sent = false;
         if self.last_error.as_deref() != Some(error.as_str()) {
             self.last_error = Some(error.clone());
             self.send(Msg::SourceError(error));
@@ -292,6 +307,7 @@ impl Reader {
         }
 
         let Some((ticket, epoch)) = self.selected else {
+            self.busy = false;
             return true;
         };
         for _ in 0..CATCH_UP {
@@ -299,7 +315,7 @@ impl Reader {
                 return true;
             };
             let full = self.cursor == 0;
-            let snap = match src.snapshot(ticket, self.cursor) {
+            let snap = match src.snapshot_within(ticket, self.cursor, LOAD_BUDGET) {
                 Ok(s) => s,
                 Err(e) => {
                     let error = message(&e);
@@ -311,6 +327,23 @@ impl Reader {
                     });
                 }
             };
+            if snap.loading {
+                // The history replay has not reached the end: show the visible
+                // events once, then keep loading a full snapshot. A loading
+                // snapshot never advances the cursor, so no activity is lost.
+                self.busy = true;
+                if full && !self.loading_sent {
+                    self.loading_sent = true;
+                    return self.send(Msg::Snapshot {
+                        epoch,
+                        ticket,
+                        full,
+                        snap: Box::new(snap),
+                    });
+                }
+                return true;
+            }
+            self.busy = snap.usage.pending;
             let caught_up = full || snap.events.len() < 180 || snap.cursor <= self.cursor;
             self.cursor = snap.cursor.max(self.cursor);
             // Keep quota in metadata: window updates and clock-driven expiry
@@ -429,6 +462,7 @@ mod tests {
             running_peers: 0,
             queued_peers: 0,
             native_activity: Default::default(),
+            loading: false,
             usage: Default::default(),
             quota: vec![sa_store::quota::Observed {
                 agent: "codex".into(),
@@ -506,6 +540,75 @@ mod tests {
         assert_eq!(expired[0].1.cursor, 1);
         assert!(reader.poll(false));
         assert!(snapshot_messages(&rx).is_empty());
+    }
+
+    /// Replays a long history: `loading` for the first `remaining` loads.
+    struct Replaying {
+        remaining: usize,
+        afters: Arc<std::sync::Mutex<Vec<i64>>>,
+    }
+
+    impl DataSource for Replaying {
+        fn label(&self) -> String {
+            "replaying".into()
+        }
+        fn history(&mut self, _: &str) -> anyhow::Result<Vec<TicketSummary>> {
+            Ok(Vec::new())
+        }
+        fn snapshot(&mut self, _: i64, _: i64) -> anyhow::Result<Snapshot> {
+            anyhow::bail!("the reader must use the budgeted load")
+        }
+        fn snapshot_within(&mut self, _: i64, after: i64, budget: Duration) -> anyhow::Result<Snapshot> {
+            assert_eq!(budget, LOAD_BUDGET);
+            self.afters.lock().unwrap().push(after);
+            let mut snap = quota_snapshot();
+            snap.loading = self.remaining > 0;
+            self.remaining = self.remaining.saturating_sub(1);
+            Ok(snap)
+        }
+        fn jobs_page(&mut self, _: i64, _: Option<i64>) -> anyhow::Result<JobsPage> {
+            anyhow::bail!("no page")
+        }
+        fn version(&mut self) -> Option<i64> {
+            Some(1)
+        }
+    }
+
+    #[test]
+    fn a_loading_snapshot_is_shown_once_and_reloaded_in_full_until_the_replay_ends() {
+        let afters = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (tx, rx) = mpsc::channel();
+        let mut reader = Reader::new(
+            Box::new(|| anyhow::bail!("fixture is already open")),
+            tx,
+            egui::Context::default(),
+        );
+        reader.source = Some(Box::new(Replaying { remaining: 3, afters: afters.clone() }));
+        reader.handle(Cmd::Select { ticket: Some(1), epoch: 7 });
+        assert!(reader.poll(true));
+        let first = snapshot_messages(&rx);
+        assert_eq!(first.len(), 1);
+        assert!(first[0].0 && first[0].1.loading, "the visible events are shown at once");
+        assert!(reader.busy, "the next load follows without the one-second poll");
+        for _ in 0..2 {
+            assert!(reader.poll(false));
+            assert!(snapshot_messages(&rx).is_empty(), "an unfinished replay is not resent");
+            assert!(reader.busy);
+        }
+        assert!(reader.poll(false));
+        let done = snapshot_messages(&rx);
+        assert_eq!(done.len(), 1);
+        assert!(done[0].0 && !done[0].1.loading, "the finished replay replaces the view");
+        assert!(!reader.busy);
+        assert_eq!(*afters.lock().unwrap(), vec![0, 0, 0, 0], "loading never advances the cursor");
+
+        // A new selection starts over and shows its first loading view again.
+        reader.source = Some(Box::new(Replaying { remaining: 1, afters: afters.clone() }));
+        reader.handle(Cmd::Select { ticket: Some(2), epoch: 8 });
+        assert!(reader.poll(true));
+        let again = snapshot_messages(&rx);
+        assert_eq!(again.len(), 1);
+        assert!(again[0].1.loading);
     }
 
     fn history(rx: &Receiver<Msg>, within: Duration) -> Option<String> {

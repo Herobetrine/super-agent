@@ -679,6 +679,16 @@ impl App {
                 ui.add_space(12.0);
                 centered(ui, COLUMN, 24.0, |ui| {
                     ui.spacing_mut().item_spacing.y = 0.0;
+                    if snap.loading {
+                        ui.vertical_centered(|ui| {
+                            ui.label(
+                                RichText::new("正在载入较早的执行记录 · 工具与子任务活动稍后显示")
+                                    .font(theme::body(theme::TINY))
+                                    .color(pal.faint),
+                            );
+                        });
+                        ui.add_space(14.0);
+                    }
                     if partial {
                         ui.vertical_centered(|ui| {
                             ui.label(
