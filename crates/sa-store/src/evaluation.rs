@@ -94,11 +94,43 @@ pub struct JobTrace {
     pub turns: Vec<TurnTrace>,
 }
 
+/// API list-price equivalent of the ticket from the usage ledger (§7.3),
+/// never the actual bill. `amount` is present only when every attempt with
+/// reported usage was priced in a single currency and the usage itself is
+/// complete; otherwise `reason` says why it is absent.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Cost {
     pub amount: Option<f64>,
     pub currency: Option<String>,
+    /// `api_list_price_equivalent`, `partial_price_coverage`,
+    /// `mixed_currencies`, `no_priced_usage` or, in reports written before
+    /// the price table, `price_and_billing_not_available`.
     pub reason: String,
+    /// Price table version; amounts from different tables are not compared.
+    #[serde(default)]
+    pub price_table: Option<String>,
+}
+
+impl Cost {
+    fn from_ledger(cost: &crate::ledger::CostSummary) -> Self {
+        let currency = (cost.totals.len() == 1).then(|| cost.totals[0].currency.clone());
+        let (amount, reason) = if cost.partial {
+            (None, "partial_price_coverage")
+        } else if cost.totals.len() > 1 {
+            (None, "mixed_currencies")
+        } else if cost.attempts_priced == 0 {
+            (None, "no_priced_usage")
+        } else {
+            let amount = cost.totals[0].amount.parse::<f64>().ok().filter(|a| a.is_finite());
+            (amount, if amount.is_some() { "api_list_price_equivalent" } else { "partial_price_coverage" })
+        };
+        Cost {
+            currency: currency.filter(|_| amount.is_some()),
+            amount,
+            reason: reason.into(),
+            price_table: Some(cost.price_table.clone()),
+        }
+    }
 }
 
 /// Only file assertions use this source. Journal state, output, timing and usage
@@ -666,6 +698,8 @@ pub fn evaluate_with_source(
     } else {
         (None, None)
     };
+    // Same read transaction, so the amount describes the same journal state.
+    let cost = Cost::from_ledger(&crate::ledger::ticket_ledger(&conn, ticket)?.api_cost);
     conn.execute_batch("ROLLBACK")?;
     let schema_version = match file_source {
         EvidenceSource::CurrentWorkspace => 1,
@@ -686,11 +720,7 @@ pub fn evaluate_with_source(
         recoveries,
         elapsed_ms,
         usage,
-        cost: Cost {
-            amount: None,
-            currency: None,
-            reason: "price_and_billing_not_available".into(),
-        },
+        cost,
         privacy: "No prompts, results, paths, tool arguments, provider endpoints or credentials exported; dataset identifiers are operator supplied.".into(),
     })
 }
@@ -764,7 +794,18 @@ pub fn compare(left: &Report, right: &Report) -> Result<Comparison> {
             .context("失败数量超过可比较范围")?,
         recoveries_delta: delta(Some(left.recoveries), Some(right.recoveries))
             .context("恢复数量超过可比较范围")?,
-        cost_delta: None,
+        // Only like for like: both amounts known, same currency and table.
+        cost_delta: left
+            .cost
+            .amount
+            .zip(right.cost.amount)
+            .filter(|_| {
+                left.cost.currency.is_some()
+                    && left.cost.currency == right.cost.currency
+                    && left.cost.price_table.is_some()
+                    && left.cost.price_table == right.cost.price_table
+            })
+            .map(|(a, b)| b - a),
     })
 }
 

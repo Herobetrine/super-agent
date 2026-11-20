@@ -92,8 +92,8 @@ fn coverage(ui: &mut Ui, usage: &TicketUsage, pal: &Palette) {
             .wrap(),
         );
     }
-    if usage.jobs.iter().any(|job| job.agent == "claude") || usage.advisor_calls.iter().any(|call| call.agent == "claude") {
-        help(ui, "Claude 仅统计主循环，内部子任务未计入。", pal);
+    if usage.jobs.iter().any(|job| job.native_subagents) || usage.advisor_calls.iter().any(|call| call.native_subagents) {
+        help(ui, "Claude 运行了原生子代理；只统计主循环，子代理用量未计入。", pal);
     }
     if !usage.advisor_calls.is_empty() {
         help(ui, format!("顾问调用已计入总量：已报告 {} 次，未报告 {} 次。", usage.reported_advisor_calls, usage.unreported_advisor_calls), pal);
@@ -224,8 +224,8 @@ pub fn footer(ui: &mut Ui, usage: &TicketUsage, quota: &[Observed], pal: &Palett
                     ui.push_id(job.job, |ui| {
                         ui.collapsing(RichText::new(title).font(theme::body(theme::UI)), |ui| {
                             counts(ui, &job.tokens, pal);
-                            if job.agent == "claude" {
-                                help(ui, "主循环用量，内部子任务未计入。", pal);
+                            if job.native_subagents {
+                                help(ui, "主循环用量，原生子代理未计入。", pal);
                             }
                             help(
                                 ui,
@@ -301,11 +301,93 @@ pub fn footer(ui: &mut Ui, usage: &TicketUsage, quota: &[Observed], pal: &Palett
     });
 }
 
+/// Readable amount: cents above one unit, otherwise up to six decimals.
+fn money(amount: &str, currency: &str) -> String {
+    match amount.parse::<f64>() {
+        Ok(value) if value >= 1.0 => format!("{value:.2} {currency}"),
+        Ok(value) if value.is_finite() => {
+            let text = format!("{value:.6}");
+            let text = text.trim_end_matches('0').trim_end_matches('.');
+            format!("{text} {currency}")
+        }
+        _ => format!("{amount} {currency}"),
+    }
+}
+
+/// List-price equivalent of a usage ledger (§7.3): per currency, with its
+/// coverage and the reasons attempts stayed unpriced. Never the actual bill.
+pub fn ledger_cost(ui: &mut Ui, cost: &sa_store::ledger::CostSummary, pal: &Palette) {
+    let amounts = if cost.totals.is_empty() {
+        "金额未知".to_string()
+    } else {
+        cost.totals.iter().map(|t| money(&t.amount, &t.currency)).collect::<Vec<_>>().join(" · ")
+    };
+    ui.label(mono_value(format!("按 API 牌价折算：{amounts}"), pal));
+    help(
+        ui,
+        format!(
+            "{} 次有用量的执行中已折算 {} 次{}。",
+            cost.attempts_with_usage,
+            cost.attempts_priced,
+            if cost.partial && !cost.totals.is_empty() { "，金额只含已折算部分" } else { "" }
+        ),
+        pal,
+    );
+    for (reason, count) in &cost.unpriced {
+        help(ui, format!("未折算 · {}：{count}", labels::ledger_cost_reason(reason)), pal);
+    }
+    help(
+        ui,
+        format!("价格表 {}；按各供应商官方 API 牌价折算，不是实际账单，订阅额度另计；不同币种不相加。", cost.price_table),
+        pal,
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use egui_kittest::{Harness, kittest::Queryable};
     use sa_store::usage::UsagePerformance;
+
+    #[test]
+    fn ledger_cost_shows_each_currency_coverage_and_unpriced_reasons() {
+        use sa_store::ledger::{CostSummary, CurrencyAmount};
+        assert_eq!(money("0.0165", "USD"), "0.0165 USD");
+        assert_eq!(money("12.345", "USD"), "12.35 USD");
+        let cost = CostSummary {
+            basis: "api_list_price_equivalent".into(),
+            price_table: "2026-11-20".into(),
+            totals: vec![
+                CurrencyAmount { currency: "CNY".into(), amount: "3".into(), attempts: 1 },
+                CurrencyAmount { currency: "USD".into(), amount: "0.0165".into(), attempts: 2 },
+            ],
+            attempts_with_usage: 5,
+            attempts_priced: 3,
+            unpriced: [("model_unknown".to_string(), 2)].into(),
+            partial: true,
+            note: String::new(),
+        };
+        let mut h = Harness::builder()
+            .with_size(egui::vec2(480.0, 300.0))
+            .build_ui(move |ui| {
+                crate::theme::install_fonts(ui.ctx());
+                ledger_cost(ui, &cost, &Palette::light());
+            });
+        h.run_steps(2);
+        assert!(h.query_by_label("按 API 牌价折算：3.00 CNY · 0.0165 USD").is_some());
+        assert!(h.query_by_label_contains("5 次有用量的执行中已折算 3 次，金额只含已折算部分").is_some());
+        assert!(h.query_by_label("未折算 · 无法确定模型：2").is_some());
+        assert!(h.query_by_label_contains("不是实际账单").is_some());
+        let empty = CostSummary { price_table: "2026-11-20".into(), ..Default::default() };
+        let mut h = Harness::builder()
+            .with_size(egui::vec2(480.0, 300.0))
+            .build_ui(move |ui| {
+                crate::theme::install_fonts(ui.ctx());
+                ledger_cost(ui, &empty, &Palette::light());
+            });
+        h.run_steps(2);
+        assert!(h.query_by_label("按 API 牌价折算：金额未知").is_some());
+    }
 
     #[test]
     fn unknown_and_zero_usage_remain_distinct() {

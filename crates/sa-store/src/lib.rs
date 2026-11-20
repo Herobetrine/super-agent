@@ -8,6 +8,7 @@ pub mod journal;
 pub mod knowledge;
 pub mod ledger;
 pub mod model;
+pub mod prices;
 mod native_activity;
 mod progress;
 pub mod providers;

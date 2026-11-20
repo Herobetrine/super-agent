@@ -287,7 +287,7 @@ pub fn ledger_gap(reason: &str) -> &'static str {
     match reason {
         "unreported_attempt" => "执行没有报告用量",
         "no_usage_protocol" => "执行端不提供用量",
-        "native_subagents_excluded" => "Claude 原生子代理未计入",
+        "native_subagents_excluded" => "Claude 运行了原生子代理，其用量未计入",
         "partial_samples" => "样本缺失或被更正",
         "cumulative_unallocated" => "会话累计值无法分到轮次",
         "shared_native_session" => "多个任务共用原生会话",
@@ -296,6 +296,23 @@ pub fn ledger_gap(reason: &str) -> &'static str {
         "advisor_records_incomplete" => "顾问调用记录不完整",
         "no_usage_events" => "任务没有用量事件",
         _ => "其他缺口",
+    }
+}
+
+/// Why an attempt with reported usage has no list-price amount
+/// (docs/dev/usage-ledger.md).
+pub fn ledger_cost_reason(reason: &str) -> &'static str {
+    match reason {
+        "model_unknown" => "无法确定模型",
+        "price_unknown" => "价格表没有该模型的官方牌价",
+        "price_not_effective" => "执行早于价格生效日期",
+        "time_unknown" => "执行时间未知",
+        "nonstandard_mode" => "快速模式或区域加价，价格表不含",
+        "tokens_incomplete" => "计费项未报告完整",
+        "tier_ambiguous" => "无法判定价格档位",
+        "cache_ttl_unknown" => "缓存写入有效期未知",
+        "price_table_invalid" => "价格表无效",
+        _ => "其他原因",
     }
 }
 
@@ -506,6 +523,16 @@ mod tests {
         assert_eq!(check_lines(&receipt)[1], ("需求交付证据：必需项未通过 · 快照 9 · 隔离工作区，尚未合入 · 仅记录".into(), false));
         assert_eq!(delivery_result(&json!({"status":"unknown","reason":"任务目录不在工单项目内"})),
             "需求交付证据：结果未知 · 仅记录 · 任务目录不在工单项目内");
+    }
+
+    #[test]
+    fn every_cost_reason_has_a_label() {
+        for reason in [
+            "model_unknown", "price_unknown", "price_not_effective", "time_unknown", "nonstandard_mode",
+            "tokens_incomplete", "tier_ambiguous", "cache_ttl_unknown", "price_table_invalid",
+        ] {
+            assert_ne!(ledger_cost_reason(reason), "其他原因", "{reason}");
+        }
     }
 
     #[test]

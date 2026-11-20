@@ -332,7 +332,8 @@ impl WorkflowState {
                     Some(Err(error)) => problem(ui, error, pal),
                     Some(Ok(report)) => {
                         let c = &report.coverage;
-                        help(ui, format!("共 {} 次执行，{} 次报告了用量；金额未知（没有价格表）。", c.attempts, c.reported_attempts), pal);
+                        help(ui, format!("共 {} 次执行，{} 次报告了用量。", c.attempts, c.reported_attempts), pal);
+                        crate::usage::ledger_cost(ui, &report.api_cost, pal);
                         for bucket in &report.buckets {
                             let tokens = bucket.tokens.total_tokens.map(|t| format!("{t} Token")).unwrap_or_else(|| "用量未知".into());
                             help(ui, format!("{} · {} · {}：{} 次（{} 次有用量）· {}{}",

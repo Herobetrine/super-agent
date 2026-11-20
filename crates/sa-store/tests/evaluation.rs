@@ -589,3 +589,39 @@ fn missing_schema_snapshot_and_corrupt_manifest_do_not_fall_back_to_workspace() 
     assert_eq!(corrupt.score.unwrap().unknown, 1);
     assert_eq!(corrupt.snapshot_manifest_sha256, None);
 }
+
+#[test]
+fn cost_is_the_ledger_list_price_equivalent_and_compares_like_for_like() {
+    let data = tempfile::tempdir().unwrap();
+    drop(Store::open(data.path()).unwrap());
+    let writer = writer(data.path());
+    // 2026-11-21 12:00 UTC, after the price table's effective date.
+    let ts = 1_795_262_400.0;
+    let run = |input: u64| {
+        let job = create_ticket(&writer, "C:/fixture", "priced", "claude");
+        at(&writer, job, "turn.admitted", json!({}), ts);
+        at(&writer, job, "route.requested", json!({"provider":"p","model":"claude-opus-5-5","mode":"cli"}), ts);
+        at(&writer, job, "native", json!({"type":"result","usage":{"input_tokens":input,"output_tokens":0,
+            "cache_read_input_tokens":0,"cache_creation_input_tokens":0,
+            "cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0}}}), ts + 1.0);
+        at(&writer, job, "reply", json!({"text":"ok"}), ts + 2.0);
+        job.ticket
+    };
+    let (cheap, dear) = (run(1_000_000), run(2_000_000));
+    let left = evaluation::evaluate(data.path(), cheap, None).unwrap();
+    let right = evaluation::evaluate(data.path(), dear, None).unwrap();
+    assert_eq!(left.cost.amount, Some(4.0));
+    assert_eq!(left.cost.currency.as_deref(), Some("USD"));
+    assert_eq!(left.cost.reason, "api_list_price_equivalent");
+    assert_eq!(left.cost.price_table.as_deref(), Some("2026-11-20"));
+    assert_eq!(evaluation::compare(&left, &right).unwrap().cost_delta, Some(4.0));
+    // A report from another price table is not compared.
+    let mut other = right.clone();
+    other.cost.price_table = Some("older".into());
+    assert_eq!(evaluation::compare(&left, &other).unwrap().cost_delta, None);
+    // Reports written before the price table still parse.
+    let mut legacy = serde_json::to_value(&left).unwrap();
+    legacy["cost"] = json!({"amount":null,"currency":null,"reason":"price_and_billing_not_available"});
+    let legacy: Report = serde_json::from_value(legacy).unwrap();
+    assert_eq!((legacy.cost.amount, legacy.cost.price_table), (None, None));
+}

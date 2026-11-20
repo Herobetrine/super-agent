@@ -978,7 +978,8 @@ fn execution_policy_toggle_and_ledger_report_are_reachable() {
         std::thread::sleep(Duration::from_millis(50));
         h.run_steps(1);
     }
-    assert!(h.query_by_label_contains("金额未知").is_some());
+    assert!(h.query_by_label_contains("按 API 牌价折算").is_some());
+    assert!(h.query_by_label_contains("不是实际账单").is_some());
 }
 
 #[test]

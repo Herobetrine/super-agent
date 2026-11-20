@@ -425,6 +425,72 @@ fn claude_result_replaces_main_loop_placeholders_and_resume_counts_per_turn() {
 }
 
 #[test]
+fn claude_is_partial_only_when_the_journal_shows_native_subagents() {
+    let result = json!({"type":"result","subtype":"success","parent_tool_use_id":null,"usage":cl_counts(70, 25)});
+    let (_dir, mut store, writer, job) = fixture("claude");
+    native(&writer, job, result.clone());
+    done(&writer, job);
+    let usage = snapshot(&mut store, job).usage;
+    assert_eq!(usage.jobs[0].scope, UsageScope::MainLoop);
+    assert!(!usage.jobs[0].native_subagents);
+    assert!(!usage.partial, "no subagent evidence, nothing excluded");
+
+    let (_dir, mut store, writer, job) = fixture("claude");
+    native(
+        &writer,
+        job,
+        json!({"type":"assistant","parent_tool_use_id":null,"message":{"id":"m",
+        "content":[{"type":"tool_use","id":"toolu_1","name":"Task","input":{}}]}}),
+    );
+    native(&writer, job, result);
+    done(&writer, job);
+    let usage = snapshot(&mut store, job).usage;
+    assert!(usage.jobs[0].native_subagents);
+    assert!(usage.partial);
+    // modelUsage is never used to add the subagent's tokens.
+    assert_eq!(usage.totals.total_tokens, Some(125));
+}
+
+#[test]
+fn advisor_samples_keep_model_and_subagent_evidence_without_ids() {
+    let marker = sa_store::usage::advisor_usage_sample(
+        "claude",
+        &json!({"type":"assistant","parent_tool_use_id":"toolu_secret","message":{"id":"secret","content":"secret"}}),
+    )
+    .unwrap();
+    assert_eq!(marker, json!({"type":"subagent","parent_tool_use_id":true}));
+    assert!(
+        sa_store::usage::advisor_usage_sample(
+            "claude",
+            &json!({"type":"stream_event","parent_tool_use_id":"toolu_secret"})
+        )
+        .is_none()
+    );
+    let init = sa_store::usage::advisor_usage_sample(
+        "claude",
+        &json!({"type":"system","subtype":"init","model":"claude-opus-5-5","session_id":"secret","tools":["secret"]}),
+    )
+    .unwrap();
+    assert!(!init.to_string().contains("secret"));
+    assert_eq!(init["model"], "claude-opus-5-5");
+
+    let (_dir, mut store, writer, job) = fixture("codex");
+    let id = advice_start(&writer, job, "claude");
+    advice_sample(&writer, job, &id, "claude", json!({"type":"system","subtype":"init","model":"claude-opus-5-5"}));
+    advice_sample(
+        &writer,
+        job,
+        &id,
+        "claude",
+        json!({"type":"assistant","parent_tool_use_id":"toolu_1","message":{"id":"child"}}),
+    );
+    advice_sample(&writer, job, &id, "claude", json!({"type":"result","usage":cl_counts(10, 2)}));
+    advice_done(&writer, job, &id, "done");
+    let usage = snapshot(&mut store, job).usage;
+    assert!(usage.advisor_calls[0].native_subagents);
+}
+
+#[test]
 fn claude_crash_zero_does_not_erase_reported_input() {
     let (_dir, mut store, writer, job) = fixture("claude");
     native(

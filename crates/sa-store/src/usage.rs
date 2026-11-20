@@ -183,6 +183,8 @@ pub struct JobUsage {
     pub partial: bool,
     pub scope: UsageScope,
     pub performance: UsagePerformance,
+    /// The journal shows native subagents ran; their usage is not counted.
+    pub native_subagents: bool,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -218,6 +220,7 @@ pub struct AdvisorUsage {
     pub partial: bool,
     pub scope: UsageScope,
     pub performance: UsagePerformance,
+    pub native_subagents: bool,
 }
 
 /// Retain only protocol fields required by the existing native projector.
@@ -250,19 +253,38 @@ pub fn advisor_usage_sample(agent: &str, value: &Value) -> Option<Value> {
                     "total":counts(&p["tokenUsage"]["total"], &camel),
                     "last":counts(&p["tokenUsage"]["last"], &camel)}}}))
         }
+        "claude" if value["type"] == "system" && value["subtype"] == "init" => {
+            Some(json!({"type":"system", "subtype":"init", "model":model_id(&value["model"])}))
+        }
         "claude" if value["type"] == "assistant" || value["type"] == "result" => {
             if !value["parent_tool_use_id"].is_null() {
-                return None;
+                // Only the fact that a native subagent ran, never its id.
+                return (value["type"] == "assistant")
+                    .then(|| json!({"type":"subagent", "parent_tool_use_id":true}));
             }
+            let usage = |usage: &Value| {
+                let mut sample = counts(usage, &snake);
+                sample["cache_creation"] = counts(
+                    &usage["cache_creation"],
+                    &["ephemeral_5m_input_tokens", "ephemeral_1h_input_tokens"],
+                );
+                for key in ["speed", "inference_geo"] {
+                    if let Some(mode) = usage[key].as_str().filter(|s| s.len() <= 32) {
+                        sample[key] = json!(mode);
+                    }
+                }
+                sample
+            };
             if value["type"] == "assistant" {
-                Some(json!({"type":"assistant", "message":{
-                    "id":identity(&value["message"]["id"]),
-                    "usage":counts(&value["message"]["usage"], &snake)}}))
+                Some(json!({"type":"assistant", "subagent_tool":spawns_subagent(&value["message"]["content"]),
+                    "message":{"id":identity(&value["message"]["id"]),
+                    "model":model_id(&value["message"]["model"]),
+                    "usage":usage(&value["message"]["usage"])}}))
             } else {
                 Some(
                     json!({"type":"result", "is_error":value["is_error"] == true,
                     "subtype":if value["subtype"] == "error_during_execution" { "error_during_execution" } else { "result" },
-                    "usage":counts(&value["usage"], &snake)}),
+                    "usage":usage(&value["usage"])}),
                 )
             }
         }
@@ -303,6 +325,16 @@ struct Attempt {
     sampled_ms: Option<u64>,
     output_tokens: Option<u64>,
     timing_invalid: bool,
+    /// Model reported by this execution's own native frames, with its source
+    /// (`native_init` or `native_message`).
+    model: Option<(String, &'static str)>,
+    /// Lifetime split of the Claude result's cache writes.
+    claude_result_ttl: Option<(u64, u64)>,
+    /// Largest single request prompt seen (Codex), and whether any frame
+    /// left it unknown.
+    request_input_bound: Option<u64>,
+    request_input_unknown: bool,
+    nonstandard_mode: bool,
 }
 
 impl Attempt {
@@ -395,6 +427,17 @@ struct JobState {
     slots: BTreeMap<i64, (i64, u32)>,
     /// Logical turn -> (current slot, admissions seen).
     current: HashMap<i64, (i64, u32)>,
+    /// The journal shows native subagent activity (a frame with a
+    /// `parent_tool_use_id`, or a `Task`/`Agent` tool use) whose usage the
+    /// main-loop counters exclude.
+    subagents: bool,
+    /// Route evidence per slot: the slot's own `route.requested`, else the
+    /// route in force when the slot began (`route_carried`/`route_rotated`).
+    routes: HashMap<i64, (RouteRef, &'static str)>,
+    in_force: Option<(RouteRef, &'static str)>,
+    /// A `route.rotated` changed the job's route, so the job-level route
+    /// no longer describes earlier executions.
+    rotated: bool,
 }
 
 fn number(v: &Value, key: &str) -> Option<u64> {
@@ -407,6 +450,57 @@ fn identity(v: &Value) -> Option<String> {
         Value::String(s) if !s.is_empty() && s.len() <= 256 => Some(s.clone()),
         Value::Number(n) if n.as_u64().is_some() => Some(n.to_string()),
         _ => None,
+    }
+}
+
+/// A model id as reported by a native frame or a route. Synthetic or
+/// malformed values are not evidence.
+fn model_id(v: &Value) -> Option<String> {
+    v.as_str()
+        .filter(|s| {
+            !s.is_empty()
+                && s.len() <= 128
+                && s.bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || b"-._:/@[]".contains(&c))
+        })
+        .map(str::to_string)
+}
+
+/// Claude Code starts a native subagent through the `Task` (older) or
+/// `Agent` tool.
+fn spawns_subagent(content: &Value) -> bool {
+    content.as_array().is_some_and(|blocks| {
+        blocks.iter().any(|block| {
+            block["type"] == "tool_use" && matches!(block["name"].as_str(), Some("Task" | "Agent"))
+        })
+    })
+}
+
+/// Anthropic cache writes split by lifetime, when the frame reports both.
+fn cache_ttl(usage: &Value) -> Option<(u64, u64)> {
+    let split = &usage["cache_creation"];
+    number(split, "ephemeral_5m_input_tokens").zip(number(split, "ephemeral_1h_input_tokens"))
+}
+
+/// Fast mode or US-only inference changes the list price.
+fn nonstandard_mode(usage: &Value) -> bool {
+    usage["speed"].as_str().is_some_and(|speed| speed != "standard") || usage["inference_geo"] == "us"
+}
+
+/// Provider and model of a route payload (`{"provider","model","mode"}`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct RouteRef {
+    pub provider: Option<String>,
+    pub model: Option<String>,
+}
+
+impl RouteRef {
+    fn parse(v: &Value) -> Option<Self> {
+        let route = Self {
+            provider: v["provider"].as_str().filter(|s| !s.is_empty() && s.len() <= 128).map(str::to_string),
+            model: model_id(&v["model"]),
+        };
+        route.model.is_some().then_some(route)
     }
 }
 
@@ -487,6 +581,10 @@ impl JobState {
         let slot = reuse.unwrap_or_else(|| {
             let id = self.slots.len() as i64;
             self.slots.insert(id, (turn, exec));
+            if let Some((route, source)) = &self.in_force {
+                let source = if *source == "route" { "route_carried" } else { source };
+                self.routes.insert(id, (route.clone(), source));
+            }
             id
         });
         let admissions = current.map_or(0, |(_, n)| n) + u32::from(admitted);
@@ -543,13 +641,23 @@ impl JobState {
                     self.partial = true;
                     self.attempts.entry(turn).or_default().timing_invalid = true;
                 }
-                last
+                last.clone()
             }
         };
         self.codex_baselines.insert(thread, next);
         self.codex_total.add(&delta);
         self.codex_turns.entry(turn).or_default().add(&delta);
         let attempt = self.attempts.entry(turn).or_default();
+        // A delta equal to the last request is exactly one request; a larger
+        // delta merges several, and its summed input still bounds each one.
+        let bound = if delta == last { last.input_tokens } else { delta.input_tokens };
+        match bound {
+            Some(bound) => {
+                attempt.request_input_bound =
+                    Some(attempt.request_input_bound.map_or(bound, |max| max.max(bound)));
+            }
+            None => attempt.request_input_unknown = true,
+        }
         attempt.reported = true;
         attempt.output_change(Some(0), delta.output_tokens, at);
     }
@@ -559,9 +667,26 @@ impl JobState {
         // modelUsage includes native children, but changed resume semantics
         // in 2.1.277 and cannot safely be inferred for unversioned old logs.
         if !v["parent_tool_use_id"].is_null() {
+            self.subagents = true;
+            return;
+        }
+        if v["type"] == "system" && v["subtype"] == "init" {
+            if let Some(model) = model_id(&v["model"]) {
+                self.attempts.entry(turn).or_default().model = Some((model, "native_init"));
+            }
             return;
         }
         if v["type"] == "assistant" {
+            if spawns_subagent(&v["message"]["content"]) || v["subagent_tool"] == true {
+                self.subagents = true;
+            }
+            let attempt = self.attempts.entry(turn).or_default();
+            attempt.nonstandard_mode |= nonstandard_mode(&v["message"]["usage"]);
+            if attempt.model.is_none()
+                && let Some(model) = model_id(&v["message"]["model"])
+            {
+                attempt.model = Some((model, "native_message"));
+            }
             let Some(id) = identity(&v["message"]["id"]) else {
                 return;
             };
@@ -575,6 +700,7 @@ impl JobState {
         } else if v["type"] == "result" {
             let tokens = claude(&v["usage"], true);
             let attempt = self.attempts.entry(turn).or_default();
+            attempt.nonstandard_mode |= nonstandard_mode(&v["usage"]);
             attempt.ended = true;
             if v["is_error"] == true {
                 attempt.failed = true;
@@ -590,6 +716,7 @@ impl JobState {
                     attempt.output_change(previous, tokens.output_tokens, at);
                 }
                 attempt.claude_result = Some(tokens);
+                attempt.claude_result_ttl = cache_ttl(&v["usage"]);
             }
             attempt.finish(at);
         }
@@ -751,9 +878,11 @@ impl JobState {
             tokens: tokens.finish(),
             reported_attempts: reported,
             unreported_attempts: unreported,
+            // Claude counters cover the main loop only. They are incomplete
+            // when the journal shows native subagents ran, not by default.
             partial: self.partial
                 || unreported > 0
-                || self.agent == "claude"
+                || self.subagents
                 || self.attempts.values().any(|a| !a.ended || a.failed),
             scope: if self.agent == "claude" {
                 UsageScope::MainLoop
@@ -761,6 +890,23 @@ impl JobState {
                 UsageScope::Harness
             },
             performance,
+            native_subagents: self.subagents,
+        }
+    }
+
+    /// List-price evidence of one execution slot.
+    fn evidence(&self, slot: i64) -> crate::prices::PriceEvidence {
+        let Some(attempt) = self.attempts.get(&slot) else {
+            return Default::default();
+        };
+        let ttl = attempt.claude_result.as_ref().and(attempt.claude_result_ttl);
+        crate::prices::PriceEvidence {
+            cache_write_5m: ttl.map(|t| t.0),
+            cache_write_1h: ttl.map(|t| t.1),
+            request_input_bound: attempt.request_input_bound.filter(|_| !attempt.request_input_unknown),
+            nonstandard_mode: attempt.nonstandard_mode,
+            started_ms: attempt.started_ms,
+            ended_ms: attempt.ended_ms,
         }
     }
 
@@ -819,6 +965,16 @@ pub(crate) struct RawAttempt {
     /// The job's or call's counters are incomplete (replays, regressions,
     /// missing fields, identity conflicts).
     pub partial: bool,
+    /// Model named by this execution's own native frames, with its source.
+    pub native_model: Option<(String, &'static str)>,
+    /// Route in force for this execution, with its source (`route`,
+    /// `route_carried`, `route_rotated` or `advice_route`).
+    pub route: Option<(RouteRef, &'static str)>,
+    /// The job's route changed by rotation at some point.
+    pub rotated: bool,
+    /// The job or call shows native subagent activity.
+    pub subagents: bool,
+    pub evidence: crate::prices::PriceEvidence,
 }
 
 /// Retains compact counters and deduplication identities, never raw payloads.
@@ -838,6 +994,8 @@ struct AdvisorState {
     started_seq: i64,
     state: JobState,
     identity_conflict: bool,
+    /// Route recorded by `advice.started`.
+    route: Option<RouteRef>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -869,12 +1027,21 @@ impl Entry {
              CASE WHEN e.kind IN ('advice.started','advice.result') AND json_valid(e.payload)
                   THEN json_object('attempt_id',json_extract(e.payload,'$.attempt_id'),
                                    'agent',json_extract(e.payload,'$.advisor.agent'),
+                                   'provider',json_extract(e.payload,'$.advisor.provider'),
+                                   'model',json_extract(e.payload,'$.advisor.model'),
                                    'state',json_extract(e.payload,'$.state'),
                                    'usage_complete',json_extract(e.payload,'$.usage_complete'))
-                  WHEN e.kind IN ('native','usage.observed') AND length(CAST(e.payload AS BLOB))<=?4 THEN e.payload END,e.ts
+                  WHEN e.kind IN ('route.requested','route.rotated') AND json_valid(e.payload)
+                  THEN json_object('provider',coalesce(json_extract(e.payload,'$.to.provider'),json_extract(e.payload,'$.provider')),
+                                   'model',coalesce(json_extract(e.payload,'$.to.model'),json_extract(e.payload,'$.model')))
+                  WHEN e.kind IN ('native','usage.observed') AND length(CAST(e.payload AS BLOB))<=?4 THEN e.payload END,e.ts,
+             -- An oversized Claude frame is not parsed, but whether it came
+             -- from a native subagent still decides a coverage gap.
+             CASE WHEN e.kind='native' AND j.agent='claude' AND length(CAST(e.payload AS BLOB))>?4 AND json_valid(e.payload)
+                  THEN json_type(e.payload,'$.parent_tool_use_id') NOT IN ('null') END
              FROM events e LEFT JOIN jobs j ON j.id=e.job
              WHERE e.ticket=?1 AND e.seq>?2 AND e.seq<=?3
-             AND e.kind IN ('native','turn.admitted','reply','failed','cancelled','interrupted','turn.retry_scheduled','turn.gave_up','route.rotated','turn.route_wait','auto.retry','advice.started','advice.result','usage.observed')
+             AND e.kind IN ('native','turn.admitted','reply','failed','cancelled','interrupted','turn.retry_scheduled','turn.gave_up','route.rotated','turn.route_wait','auto.retry','advice.started','advice.result','usage.observed','route.requested')
              ORDER BY e.seq LIMIT ?5",
         )?;
         let mut rows = stmt.query(params![
@@ -919,11 +1086,16 @@ impl Entry {
                 }
                 continue;
             }
-            let native = if kind == "native" {
+            let payload = if matches!(kind.as_str(), "native" | "route.requested" | "route.rotated") {
                 row.get::<_, Option<String>>(5)?
                     .and_then(|text| serde_json::from_str::<Value>(&text).ok())
             } else {
                 None
+            };
+            let (native, route) = if kind == "native" {
+                (payload, None)
+            } else {
+                (None, payload.as_ref().and_then(RouteRef::parse))
             };
             if let Some(value) = &native {
                 self.register_identity(&agent, value, UsageOwner::Job(job));
@@ -932,6 +1104,24 @@ impl Entry {
                 agent,
                 ..Default::default()
             });
+            if row.get::<_, Option<bool>>(7)? == Some(true) {
+                state.subagents = true;
+            }
+            if kind == "route.requested" {
+                // Route evidence never creates an execution of its own.
+                let slot = state.slot(turn, false);
+                if let Some(route) = route {
+                    state.routes.insert(slot, (route.clone(), "route"));
+                    state.in_force = Some((route, "route"));
+                }
+                continue;
+            }
+            if kind == "route.rotated" {
+                state.rotated = true;
+                // The next execution runs on the new route; unknown if the
+                // payload does not name it.
+                state.in_force = route.map(|route| (route, "route_rotated"));
+            }
             // From here on, `turn` names the physical execution slot.
             let turn = state.slot(turn, kind == "turn.admitted");
             let attempt = state.attempts.entry(turn).or_default();
@@ -1024,6 +1214,7 @@ impl Entry {
                     started_seq: self.seq,
                     state,
                     identity_conflict: false,
+                    route: RouteRef::parse(value),
                 }
             });
             return;
@@ -1140,6 +1331,7 @@ impl Entry {
                 partial: view.partial,
                 scope: view.scope,
                 performance: view.performance,
+                native_subagents: view.native_subagents,
             });
         }
         let unreported_advisor_calls = advisor_calls.len() as u64 - reported_advisor_calls;
@@ -1177,6 +1369,11 @@ impl Entry {
                     ended: attempt.ended,
                     failed: attempt.failed,
                     partial: state.partial,
+                    native_model: attempt.model.clone(),
+                    route: state.routes.get(slot).cloned(),
+                    rotated: state.rotated,
+                    subagents: state.subagents,
+                    evidence: state.evidence(*slot),
                 });
             }
             if unallocated.any() {
@@ -1191,6 +1388,13 @@ impl Entry {
                     ended: true,
                     failed: false,
                     partial: state.partial,
+                    native_model: None,
+                    // Session-cumulative usage spans executions; only a route
+                    // that never rotated describes all of it.
+                    route: state.in_force.clone().filter(|_| !state.rotated),
+                    rotated: state.rotated,
+                    subagents: state.subagents,
+                    evidence: Default::default(),
                 });
             }
         }
@@ -1208,6 +1412,11 @@ impl Entry {
                 ended: attempt.is_some_and(|a| a.ended),
                 failed: attempt.is_some_and(|a| a.failed),
                 partial: call.state.partial || call.identity_conflict,
+                native_model: attempt.and_then(|a| a.model.clone()),
+                route: call.route.clone().map(|route| (route, "advice_route")),
+                rotated: false,
+                subagents: call.state.subagents,
+                evidence: call.state.evidence(1),
             });
         }
         out

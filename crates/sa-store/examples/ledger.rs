@@ -36,11 +36,17 @@ scripts\\cargo.cmd run -p sa-store --example ledger -- --data DATA_DIR [--ticket
         evaluation::write_new(output, &serde_json::json!({"summary": report, "ledger": detail}))?;
     } else {
         let report = ledger::status_report(&data, None)?;
+        let cost = &report.api_cost;
+        let totals: Vec<String> = cost.totals.iter().map(|t| format!("{} {}", t.amount, t.currency)).collect();
         println!(
-            "已汇总 {} 张工单：{} 次执行中 {} 次报告了用量；金额未知。",
+            "已汇总 {} 张工单：{} 次执行中 {} 次报告了用量；按 API 牌价折算（价格表 {}，非实际账单）{} 次已折算{}：{}。",
             report.tickets.len(),
             report.coverage.attempts,
-            report.coverage.reported_attempts
+            report.coverage.reported_attempts,
+            cost.price_table,
+            cost.attempts_priced,
+            if cost.partial { "，金额不完整" } else { "" },
+            if totals.is_empty() { "金额未知".into() } else { totals.join("、") }
         );
         evaluation::write_new(output, &report)?;
     }
