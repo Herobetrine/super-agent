@@ -141,10 +141,10 @@ pub(crate) fn resumed_control(q: &Q, ticket: i64) -> Result<Option<Value>> {
 /// Do not infer this from turn numbers, which also advance on normal follow-up.
 fn queued_recovery(q: &Q, root: &Map<String, Value>) -> Result<bool> {
     Ok(q.one(
-        "SELECT kind,payload FROM events WHERE job=? AND kind IN
+        "SELECT kind,payload FROM events WHERE ticket=? AND job=? AND kind IN
          ('turn.retry_scheduled','route.rotated','turn.route_wait','turn.quota_wait','turn.deferred','auto.retry',
           'reply','user.follow','retry','turn.admitted','turn.pause_failure','ticket.handoff_started') ORDER BY seq DESC LIMIT 1",
-        &[&int_of(root, "id")],
+        &[&int_of(root, "ticket"), &int_of(root, "id")],
     )?.is_some_and(|event| {
         if str_of(&event, "kind") == "auto.retry" {
             let payload = serde_json::from_str::<Value>(str_of(&event, "payload")).unwrap_or(Value::Null);

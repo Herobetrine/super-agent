@@ -67,6 +67,8 @@
 
 默认决策（`single`、`limited_parallel`、`retry`、`repair`）不进入 `recent`。无内容可说（`record` 模式、无自动恢复、无非默认决策、无协作者历史）时整个键不出现。总大小限制 4 KiB，超出时先裁掉 `routes`，再裁掉 `recent`。键存在时才在主控的 guide 末尾追加一句 `guides::POLICY`；固定指南的摘要不受影响。子任务不会收到该键。
 
+每个主控轮在上下文快照之前都会生成这一项，因此其中的查询必须走 `events` 的 `(ticket, kind)` 索引。2026-11-20 之前，`check_bounced` 只按 `job` 匹配，在 2.5 GB 的真实工单库上每轮都要全表扫描约 205 s，主控每轮开工前因此空等 3–4 分钟。查询计划回归测试 `route_history_reads_bounced_checks_through_the_ticket_index` 防止这个问题再次出现。
+
 ## 启用步骤与限制
 
 1. 先保持 `record`，对照 `policy_decisions` 与实际结果，确认规则符合预期。

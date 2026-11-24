@@ -463,6 +463,7 @@ mod tests {
             queued_peers: 0,
             native_activity: Default::default(),
             loading: false,
+            lead_resumed: 0,
             usage: Default::default(),
             quota: vec![sa_store::quota::Observed {
                 agent: "codex".into(),

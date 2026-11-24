@@ -192,8 +192,13 @@ pub struct Snapshot {
     /// Current subscription windows for harnesses used by this ticket.
     #[serde(default)]
     pub quota: Vec<crate::quota::Observed>,
-    /// Ascending by seq; at most 180.
+    /// Ascending by seq: at most 180 main-feed events plus the text deltas
+    /// of the lead's in-flight turn. Collaborator rounds that ended before
+    /// `lead_resumed` are folded out (see [`folded_from_feed`]).
     pub events: Vec<EventView>,
+    /// Seq of the lead's latest turn admission; 0 before the first one.
+    #[serde(default)]
+    pub lead_resumed: i64,
     /// Pass back as `after` to receive only newer events.
     pub cursor: i64,
     pub approvals: Vec<Approval>,
@@ -216,4 +221,55 @@ pub struct ActivityPage {
     pub events: Vec<EventView>,
     pub more: bool,
     pub next: Option<i64>,
+}
+
+/// Job states whose current round is still open.
+pub const OPEN_JOB_STATES: &[&str] = &["running", "queued", "waiting", "interrupted"];
+
+/// Event kinds that stay in the main feed even when their round is folded:
+/// they ask for or record a decision by the user.
+pub const DECISION_KINDS: &[&str] = &["ask", "answer", "ask.withdrawn", "approval.request", "approval.decision"];
+
+/// Whether a journal event stays out of the main conversation feed.
+///
+/// Once the lead resumes (a new root turn is admitted), earlier rounds are
+/// summarised by the lead's own replies, so only those replies (with the
+/// user's messages, dispatches and decisions) stay in the main feed:
+/// - the lead's progress rows and stage reports (`activity`) before
+///   `lead_resumed` are folded;
+/// - a collaborator event is folded when it precedes `lead_resumed` and its
+///   round has ended: the job is no longer open, or it has since moved on to a
+///   newer turn. `round` is the job's `(state, turn)`; `None` (a job outside
+///   the snapshot's preview) counts as ended. Collaborator results stay in the
+///   collaboration panel.
+///
+/// Decisions for the user always stay. Collaborator text deltas never reach
+/// the main feed.
+pub fn folded_from_feed(
+    kind: &str,
+    seq: i64,
+    job: Option<i64>,
+    turn: Option<i64>,
+    root: Option<i64>,
+    lead_resumed: i64,
+    round: Option<(&str, i64)>,
+) -> bool {
+    let Some(job) = job else { return false };
+    let Some(root) = root else { return false };
+    if root == job {
+        return kind == "activity" && seq < lead_resumed;
+    }
+    if DECISION_KINDS.contains(&kind) {
+        return false;
+    }
+    if kind == "delta" {
+        return true;
+    }
+    if seq >= lead_resumed {
+        return false;
+    }
+    match round {
+        None => true,
+        Some((state, current)) => !OPEN_JOB_STATES.contains(&state) || turn.is_some_and(|t| t < current),
+    }
 }

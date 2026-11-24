@@ -280,6 +280,7 @@ impl Entry {
         reverse: bool,
         limit: usize,
         except_visible: bool,
+        shown: &dyn Fn(i64, Option<i64>, Option<i64>) -> bool,
     ) -> Vec<EventView> {
         if after >= end || limit == 0 {
             return Vec::new();
@@ -287,7 +288,9 @@ impl Entry {
         let range = self
             .rows
             .range((Bound::Excluded(after), Bound::Included(end)));
-        let keep = |(_, r): &(&i64, &ProgressRow)| !(except_visible && r.visible_original);
+        let keep = |(seq, r): &(&i64, &ProgressRow)| {
+            !(except_visible && r.visible_original) && shown(**seq, r.job, r.turn)
+        };
         let view = |(seq, r): (&i64, &ProgressRow)| EventView {
             seq: *seq,
             kind: "activity".to_owned(),
@@ -344,11 +347,11 @@ mod tests {
         ] {
             entry.absorb(ScanRow { seq: index, job: Some(1), turn: Some(1), ts: index as f64, kind: kind.into(), agent: Some("codex".into()), payload: Some(payload.into()), summary: None, status: None });
         }
-        let rows = entry.read(0, 3, false, 10, false);
+        let rows = entry.read(0, 3, false, 10, false, &|_, _, _| true);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].payload["label"], "为主控保留额度");
         assert_eq!(rows[0].payload["state"], "waiting");
-        assert!(entry.read(0, 3, false, 10, true).is_empty());
+        assert!(entry.read(0, 3, false, 10, true, &|_, _, _| true).is_empty());
     }
 
     #[test]

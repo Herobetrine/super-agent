@@ -382,7 +382,7 @@ impl App {
                     };
                     let events = std::mem::take(&mut snap.events);
                     if full {
-                        v.partial_history = events.len() >= 180;
+                        v.partial_history = events.iter().filter(|e| e.kind != "delta").count() >= 180;
                         v.events = events;
                         self.scroll_to_bottom = true;
                     } else {
@@ -394,6 +394,8 @@ impl App {
                             v.partial_history = true;
                         }
                     }
+                    // Incremental loads keep earlier rows; fold them by the store's rule.
+                    feed::fold_settled_rounds(&mut v.events, &snap.jobs, snap.lead_resumed);
                     v.feed = Arc::new(feed::build_with(&snap.ticket, &snap.jobs, &v.events, &mut v.parsed));
                     if self.opts.expand_all {
                         for item in &v.feed.items {

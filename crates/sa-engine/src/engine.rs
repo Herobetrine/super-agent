@@ -2428,7 +2428,7 @@ impl Inner {
         // Recovery files live outside the project. Restricted harness policies
         // have no confirmed read grant there, so they retain complete prompts.
         let baseline = if efficiency.incremental_context && p::is_full(&job.profile) {
-            self.db.with(|q| context::delivery::baseline(q, job.id, job.session.as_deref(), &route))?
+            self.db.with(|q| context::delivery::baseline(q, job.ticket, job.id, job.session.as_deref(), &route))?
                 .filter(|baseline| baseline.lazy_mcp_schemas == lazy_mcp_schemas)
         } else {
             None
@@ -3034,8 +3034,8 @@ impl Inner {
             .unwrap_or(Value::Null);
         self.db.tx(|q| {
             if !q.live(job.who())? || q.exists(
-                "SELECT 1 FROM events WHERE job=? AND kind='protocol.rejected' AND json_extract(payload,'$.logical_turn')=? AND json_extract(payload,'$.command_sha256')=? LIMIT 1",
-                &[&job.id, &logical, &command_sha256],
+                "SELECT 1 FROM events WHERE ticket=? AND kind='protocol.rejected' AND job=? AND json_extract(payload,'$.logical_turn')=? AND json_extract(payload,'$.command_sha256')=? LIMIT 1",
+                &[&job.ticket, &job.id, &logical, &command_sha256],
             )? {
                 return Ok(None);
             }
@@ -3620,8 +3620,8 @@ impl Inner {
                 if job.primary() && classify::is_retryable(class) && !err.native_retry_exhausted()
                     && pause::status(q, job.ticket)? == PauseStatus::Running {
                     let recent = q.int(
-                        "SELECT count(*) FROM events WHERE job=? AND kind IN ('turn.retry_scheduled','route.rotated') AND ts>?",
-                        &[&job.id, &(at - 3600.0)],
+                        "SELECT count(*) FROM events WHERE ticket=? AND kind IN ('turn.retry_scheduled','route.rotated') AND job=? AND ts>?",
+                        &[&job.ticket, &job.id, &(at - 3600.0)],
                     )?;
                     if recent < CONTINUOUS_RETRIES_PER_HOUR {
                         if let Some(reason) = crate::execution_policy::gate_retry(q, job, class_name(class).as_str())? {

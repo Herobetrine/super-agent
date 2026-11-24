@@ -132,6 +132,23 @@ pub enum Item {
     },
 }
 
+/// Apply [`sa_store::folded_from_feed`] to events accumulated across
+/// incremental loads, and drop the lead's text deltas once its turn is no
+/// longer streaming (the reply replaces them).
+pub fn fold_settled_rounds(events: &mut Vec<EventView>, jobs: &[JobView], lead_resumed: i64) {
+    let root = jobs.iter().find(|j| j.parent.is_none());
+    let root_id = root.map(|j| j.id);
+    let streaming = root.filter(|j| j.state == "running").map(|j| (j.id, j.turn));
+    let rounds: HashMap<i64, (&str, i64)> = jobs.iter().map(|j| (j.id, (j.state.as_str(), j.turn))).collect();
+    events.retain(|e| {
+        if e.kind == "delta" && e.job.is_some() && e.job == root_id {
+            return streaming == e.job.zip(e.turn);
+        }
+        let round = e.job.and_then(|j| rounds.get(&j).copied());
+        !sa_store::folded_from_feed(&e.kind, e.seq, e.job, e.turn, root_id, lead_resumed, round)
+    });
+}
+
 /// Resolve stable dispatch keys only when the snapshot identifies one child.
 fn dispatch_keys(jobs: &[JobView], events: &[EventView]) -> HashMap<(i64, String), i64> {
     let mut keys = HashMap::new();
@@ -1069,6 +1086,43 @@ mod tests {
             agent: None,
             payload,
         }
+    }
+
+    #[test]
+    fn a_resumed_lead_keeps_only_its_own_overview_from_the_settled_round() {
+        let mut lead = job(1, "claude", None);
+        lead.turn = 2;
+        let mut codex = job(2, "codex", Some(1));
+        codex.state = "done".into();
+        let jobs = [lead, codex];
+        let at = |mut e: EventView, turn: i64| {
+            e.turn = Some(turn);
+            e
+        };
+        let mut events = vec![
+            ev(1, "user", 1, json!("目标")),
+            ev(2, "delta", 1, json!("第 1 轮")),
+            ev(3, "reply", 1, json!({"text": "第 1 轮概览"})),
+            ev(4, "activity", 2, json!({"label": "进展汇报 · 已录到点按 E", "category": "report", "state": "reported"})),
+            ev(5, "reply", 2, json!({"text": "录制完成"})),
+            ev(6, "note", 2, json!({"job": 1, "body": "实例路径不存在"})),
+            ev(7, "ask", 2, json!({"id": 1, "question": "有备份吗？"})),
+            at(ev(9, "delta", 1, json!("第 2 轮")), 2),
+        ];
+        fold_settled_rounds(&mut events, &jobs, 8);
+        let kept: Vec<_> = events.iter().map(|e| (e.seq, e.kind.as_str())).collect();
+        assert_eq!(kept, [(1, "user"), (3, "reply"), (7, "ask"), (9, "delta")]);
+
+        let feed = build(&ticket(), &jobs, &events);
+        assert!(!feed.items.iter().any(|i| matches!(i, Item::Report { .. })));
+        assert!(!feed.items.iter().any(|i| matches!(i, Item::Reply { peer: true, .. })));
+        assert!(feed.items.iter().any(|i| matches!(i, Item::Reply { peer: false, streaming: false, .. })));
+
+        // Once the lead's turn 2 replies, its stream text is dropped too.
+        let mut jobs = jobs;
+        jobs[0].state = "waiting".into();
+        fold_settled_rounds(&mut events, &jobs, 8);
+        assert!(!events.iter().any(|e| e.kind == "delta"));
     }
 
     #[test]

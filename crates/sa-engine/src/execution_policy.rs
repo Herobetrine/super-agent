@@ -447,6 +447,16 @@ fn cut(text: &str, max: usize) -> String {
     if text.chars().count() <= max { text.to_string() } else { format!("{}…", text.chars().take(max).collect::<String>()) }
 }
 
+/// Recent collaborator outcomes in the same project. Every lead turn runs
+/// this before its context snapshot, so the `events` lookup must stay on the
+/// `(ticket, kind)` index: matching on `job` alone scans the whole journal
+/// (about 4 minutes per lead turn on a 2.5 GB journal).
+const ROUTE_HISTORY: &str = "SELECT j.agent,j.route_override,j.state,
+           EXISTS(SELECT 1 FROM events e WHERE e.ticket=j.ticket AND e.kind='check.bounced' AND e.job=j.id) AS bounced
+         FROM jobs j JOIN tickets t ON t.id=j.ticket
+         WHERE t.cwd=(SELECT cwd FROM tickets WHERE id=?) AND j.parent IS NOT NULL AND j.state IN ('done','partial','failed')
+         ORDER BY j.id DESC LIMIT 50";
+
 /// The lead's `policy_feedback` packet key. `None` when there is nothing to
 /// say. Bounded by [`FEEDBACK_MAX_BYTES`].
 pub fn feedback(q: &Q, job: &JobCtx) -> Result<Option<Value>> {
@@ -462,14 +472,7 @@ pub fn feedback(q: &Q, job: &JobCtx) -> Result<Option<Value>> {
         .map(|r| json!({"job": r["job"], "point": str_of(r, "point"), "selected": str_of(r, "selected"),
             "reason": cut(str_of(r, "reason"), 160), "applied": int_of(r, "applied") != 0}))
         .collect();
-    let rows = q.all(
-        "SELECT j.agent,j.route_override,j.state,
-           EXISTS(SELECT 1 FROM events e WHERE e.job=j.id AND e.kind='check.bounced') AS bounced
-         FROM jobs j JOIN tickets t ON t.id=j.ticket
-         WHERE t.cwd=(SELECT cwd FROM tickets WHERE id=?) AND j.parent IS NOT NULL AND j.state IN ('done','partial','failed')
-         ORDER BY j.id DESC LIMIT 50",
-        &[&job.ticket],
-    )?;
+    let rows = q.all(ROUTE_HISTORY, &[&job.ticket])?;
     let mut routes: Vec<(String, String, [i64; 4])> = vec![];
     for r in &rows {
         let model = serde_json::from_str::<Value>(str_of(r, "route_override"))
@@ -540,6 +543,26 @@ pub fn decisions(q: &Q, ticket: i64, limit: usize) -> Result<Vec<Value>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Query-plan details SQLite reports for `sql` on a fresh journal schema.
+    pub(crate) fn plan(sql: &str, params: &[&dyn rusqlite::ToSql]) -> Vec<String> {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::Db::open(dir.path()).unwrap();
+        db.with(|q| {
+            Ok(q.all(&format!("EXPLAIN QUERY PLAN {sql}"), params)?
+                .iter()
+                .map(|r| str_of(r, "detail").to_string())
+                .collect())
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn route_history_reads_bounced_checks_through_the_ticket_index() {
+        let plan = plan(ROUTE_HISTORY, &[&1i64]);
+        assert!(plan.iter().any(|d| d.contains("events_ticket_kind")), "{plan:?}");
+        assert!(!plan.iter().any(|d| d.starts_with("SCAN") && d.contains("events")), "{plan:?}");
+    }
 
     fn input(write: bool, files: &[&str], siblings: Vec<Sibling>, isolated: bool) -> DispatchInput {
         DispatchInput {

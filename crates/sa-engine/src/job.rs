@@ -136,11 +136,11 @@ fn parse(text: &str) -> Value {
 
 /// Resilience fields of a child report (`failure`), derived from journaled
 /// retry events since the child's last reply. `None` when not applicable.
-fn failure_of(q: &Q, child: i64, state: &str) -> Result<Option<Value>> {
+fn failure_of(q: &Q, ticket: i64, child: i64, state: &str) -> Result<Option<Value>> {
     let rows = q.all(
-        "SELECT kind,payload FROM events WHERE job=? AND kind IN ('turn.retry_scheduled','route.rotated','turn.gave_up','turn.quota_wait')
-      AND seq>coalesce((SELECT max(seq) FROM events WHERE job=? AND kind='reply'),0) ORDER BY seq",
-        &[&child, &child],
+        "SELECT kind,payload FROM events WHERE ticket=?1 AND kind IN ('turn.retry_scheduled','route.rotated','turn.gave_up','turn.quota_wait') AND job=?2
+      AND seq>coalesce((SELECT max(seq) FROM events WHERE ticket=?1 AND kind='reply' AND job=?2),0) ORDER BY seq",
+        &[&ticket, &child],
     )?;
     let failed = matches!(state, "failed" | "draining");
     if rows.is_empty() && !failed {
@@ -181,11 +181,11 @@ fn failure_of(q: &Q, child: i64, state: &str) -> Result<Option<Value>> {
 /// last reply (or follow), or null. Replaces overwriting `previous_reply`.
 fn recovery_of(q: &Q, j: &JobCtx) -> Result<Value> {
     let row = q.one(
-        "SELECT kind,payload,turn FROM events WHERE job=? AND kind IN
+        "SELECT kind,payload,turn FROM events WHERE ticket=?1 AND job=?2 AND kind IN
       ('turn.retry_scheduled','route.rotated','turn.route_wait','turn.quota_wait','auto.recover','interrupted')
-      AND seq>coalesce((SELECT max(seq) FROM events WHERE job=? AND kind IN ('reply','user.follow')),0)
+      AND seq>coalesce((SELECT max(seq) FROM events WHERE ticket=?1 AND job=?2 AND kind IN ('reply','user.follow')),0)
       ORDER BY seq DESC LIMIT 1",
-        &[&j.id, &j.id],
+        &[&j.ticket, &j.id],
     )?;
     let Some(row) = row else { return Ok(Value::Null) };
     let payload = parse(str_of(&row, "payload"));
@@ -198,9 +198,9 @@ fn recovery_of(q: &Q, j: &JobCtx) -> Result<Value> {
     }
     .unwrap_or(Value::Null);
     let attempt = q.int(
-        "SELECT count(*) FROM events WHERE job=? AND kind IN ('turn.retry_scheduled','route.rotated')
-      AND seq>coalesce((SELECT max(seq) FROM events WHERE job=? AND kind IN ('reply','user.follow')),0)",
-        &[&j.id, &j.id],
+        "SELECT count(*) FROM events WHERE ticket=?1 AND job=?2 AND kind IN ('turn.retry_scheduled','route.rotated')
+      AND seq>coalesce((SELECT max(seq) FROM events WHERE ticket=?1 AND job=?2 AND kind IN ('reply','user.follow')),0)",
+        &[&j.ticket, &j.id],
     )?;
     Ok(json!({
         "kind": kind,
@@ -227,7 +227,7 @@ pub fn envelope(q: &Q, j: &JobCtx, harness_health: Value) -> Result<Map<String, 
       FROM jobs j LEFT JOIN job_failovers f ON f.original=j.id LEFT JOIN job_outcomes o ON o.job=j.id LEFT JOIN job_checks k ON k.job=j.id WHERE j.parent=? AND j.id>? ORDER BY j.id",
         &[&j.id, &floor],
     )? {
-        let failure = failure_of(q, int_of(&r, "id"), str_of(&r, "state"))?;
+        let failure = failure_of(q, j.ticket, int_of(&r, "id"), str_of(&r, "state"))?;
         let mut r = r;
         let replacement = r.remove("replacement").filter(|v| !v.is_null());
         if let Some(outcome) = r.remove("outcome").and_then(|value| value.as_str().map(parse)) {
@@ -259,8 +259,8 @@ pub fn envelope(q: &Q, j: &JobCtx, harness_health: Value) -> Result<Map<String, 
         vec![]
     };
     let next = q.one(
-        "SELECT payload FROM events WHERE job=? AND kind='auto.next' AND seq>coalesce(
-      (SELECT max(seq) FROM events WHERE ticket=? AND kind IN ('user.follow','auto.finish','auto.milestone','auto.discovered','auto.exhausted')),0)
+        "SELECT payload FROM events WHERE ticket=?2 AND kind='auto.next' AND job=?1 AND seq>coalesce(
+      (SELECT max(seq) FROM events WHERE ticket=?2 AND kind IN ('user.follow','auto.finish','auto.milestone','auto.discovered','auto.exhausted')),0)
       ORDER BY seq DESC LIMIT 1",
         &[&j.id, &j.ticket],
     )?;

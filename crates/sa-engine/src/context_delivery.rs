@@ -216,11 +216,11 @@ pub fn full_input(q: &Q, job: i64, before: i64) -> Result<Option<Map<String, Val
 /// Only the newest committed receipt can authorize elision. A changed native
 /// session, route or damaged snapshot forces full replay. Native compaction
 /// preserves this receipt only as proof of handled history for recovery.
-pub fn baseline(q: &Q, job: i64, session: Option<&str>, route: &Route) -> Result<Option<Baseline>> {
+pub fn baseline(q: &Q, ticket: i64, job: i64, session: Option<&str>, route: &Route) -> Result<Option<Baseline>> {
     let Some(session) = session.filter(|s| !s.is_empty()) else { return Ok(None) };
     let Some(row) = q.one(
-        "SELECT payload,sha256 FROM events WHERE job=? AND kind='context.delivered' ORDER BY seq DESC LIMIT 1",
-        &[&job],
+        "SELECT payload,sha256 FROM events WHERE ticket=? AND kind='context.delivered' AND job=? ORDER BY seq DESC LIMIT 1",
+        &[&ticket, &job],
     )? else { return Ok(None) };
     if digest(str_of(&row, "payload")) != str_of(&row, "sha256") { return Ok(None); }
     let Ok(receipt) = serde_json::from_str::<Value>(str_of(&row, "payload")) else { return Ok(None) };
@@ -388,8 +388,8 @@ pub fn acknowledge(
     q: &Q, who: crate::db::Who, route: &Route, mut receipt: Value,
 ) -> Result<()> {
     let Some(reply) = q.one(
-        "SELECT seq,payload FROM events WHERE job=? AND turn=? AND kind='reply' ORDER BY seq DESC LIMIT 1",
-        &[&who.id, &who.turn],
+        "SELECT seq,payload FROM events WHERE ticket=? AND kind='reply' AND job=? AND turn=? ORDER BY seq DESC LIMIT 1",
+        &[&who.ticket, &who.id, &who.turn],
     )? else { return Ok(()) };
     let payload: Value = serde_json::from_str(str_of(&reply, "payload"))?;
     receipt["reply_seq"] = json!(int_of(&reply,"seq"));

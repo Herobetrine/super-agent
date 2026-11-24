@@ -82,7 +82,10 @@ fn activity_pages_backfill_prior_turns_and_merge_live_receipts_without_gaps() {
     }
     let first = reader.snapshot(ticket, original.cursor).unwrap();
     let second = reader.snapshot(ticket, first.cursor).unwrap();
-    assert_eq!(first.events.len(), 180);
+    // 120 activity rows fit one page; the running lead's deltas ride along
+    // without using up its 180 rows.
+    assert_eq!(first.events.len(), 240);
+    assert!(second.events.is_empty());
     let got: Vec<i64> = first
         .events
         .iter()
@@ -296,13 +299,14 @@ fn latest_window_keeps_newest_180_events() {
     let conn = writer(dir.path());
     let job = create_ticket(&conn, "C:/p", "g", "claude");
     let mut last = 0;
+    // Text deltas do not count toward the window (see feed_folding.rs);
+    // replies and activity rows do.
     for i in 0..300 {
-        last = log(
-            &conn,
-            job,
-            if i % 3 == 0 { "native" } else { "delta" },
-            &tool(i),
-        );
+        last = if i % 3 == 0 {
+            log(&conn, job, "native", &tool(i))
+        } else {
+            log(&conn, job, "reply", &json!({"text": format!("reply {i}")}))
+        };
     }
     let snap = store.snapshot(job.ticket, 0).unwrap();
     assert_eq!(snap.events.len(), 180);
