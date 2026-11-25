@@ -14,6 +14,8 @@ pub struct WorkflowState {
     checks_rows: Vec<Vec<String>>,
     checks_input: String,
     checks_loading: Option<crate::ops::Pending<Vec<Vec<String>>>>,
+    #[cfg(test)]
+    next_checks_read: Option<crate::ops::Pending<Vec<Vec<String>>>>,
     checks_error: Option<String>,
     checks_saving: Option<u64>,
     checks_pending_save: Option<(String, Vec<Vec<String>>)>,
@@ -91,6 +93,21 @@ pub fn queue_state_label(state: &str) -> &'static str {
 }
 
 impl WorkflowState {
+    /// Rows the completion-check editor currently shows.
+    #[cfg(test)]
+    pub(crate) fn checks_rows(&self) -> &[Vec<String>] {
+        &self.checks_rows
+    }
+
+    #[cfg(test)]
+    pub(crate) fn hold_next_checks_read(
+        &mut self,
+    ) -> std::sync::mpsc::Sender<Result<Vec<Vec<String>>, String>> {
+        let (pending, tx) = crate::ops::Pending::controlled();
+        self.next_checks_read = Some(pending);
+        tx
+    }
+
     fn save_checks(&mut self, cwd: &str) -> Action {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let request = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -148,7 +165,12 @@ impl WorkflowState {
                 self.checks_rows = vec![vec!["cargo".into(), "test".into(), "--workspace".into()]];
                 None
             } else if let Some(host) = host {
-                Some(host.project_checks(ui.ctx(), cwd))
+                let read = || host.project_checks(ui.ctx(), cwd);
+                #[cfg(test)]
+                let pending = self.next_checks_read.take().unwrap_or_else(read);
+                #[cfg(not(test))]
+                let pending = read();
+                Some(pending)
             } else {
                 let data = data.map(std::path::Path::to_path_buf).unwrap_or_else(sa_store::default_data_dir);
                 let project = sa_engine::services::realpath(std::path::Path::new(cwd))

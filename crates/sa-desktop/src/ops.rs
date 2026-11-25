@@ -22,6 +22,12 @@ pub struct Pending<T> {
 }
 
 impl<T: Send + 'static> Pending<T> {
+    #[cfg(test)]
+    pub(crate) fn controlled() -> (Self, mpsc::Sender<Result<T, String>>) {
+        let (tx, rx) = mpsc::channel();
+        (Self { rx }, tx)
+    }
+
     pub fn spawn(ctx: &egui::Context, f: impl FnOnce() -> Result<T> + Send + 'static) -> Self {
         let (tx, rx) = mpsc::channel();
         let ctx = ctx.clone();
