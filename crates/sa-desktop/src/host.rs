@@ -475,7 +475,6 @@ pub struct Host {
     engine: Engine,
     thread: Option<JoinHandle<()>>,
     runtime: tokio::runtime::Handle,
-    adapters: Arc<HashMap<String, Arc<dyn Adapter>>>,
     catalog_tx: mpsc::Sender<CatalogReply>,
     pub catalogs: mpsc::Receiver<CatalogReply>,
     probe_tx: mpsc::Sender<Result<Vec<String>, String>>,
@@ -511,7 +510,6 @@ impl Host {
         type Ready = (
             Engine,
             tokio::runtime::Handle,
-            Vec<Arc<dyn Adapter>>,
             sa_ext::ProjectExtensions,
         );
         let notify: Notify = Arc::new(notify);
@@ -556,7 +554,7 @@ impl Host {
                     } else {
                         sa_bus::CollabBus::start(&dir, Some(ext.clone())).await.ok()
                     };
-                    let engine = match open_engine(&dir, adapters.clone(), &for_thread, &ext, bus.clone()) {
+                    let engine = match open_engine(&dir, adapters, &for_thread, &ext, bus.clone()) {
                         Ok(e) => e,
                         Err(e) => {
                             let _ = ready_tx.send(Err(format!("{e:#}")));
@@ -581,7 +579,7 @@ impl Host {
                         control.run(control_engine, control_wake).await;
                     });
                     let handle = tokio::runtime::Handle::current();
-                    let _ = ready_tx.send(Ok((engine.clone(), handle, adapters, ext.clone())));
+                    let _ = ready_tx.send(Ok((engine.clone(), handle, ext.clone())));
                     action_loop(&engine, &for_thread, rx, &out_tx, &wake).await;
                     control_task.abort();
                     let _ = control_task.await;
@@ -593,7 +591,7 @@ impl Host {
             })
             .context("无法启动调度线程")?;
         match ready_rx.recv() {
-            Ok(Ok((engine, runtime, adapters, ext))) => {
+            Ok(Ok((engine, runtime, ext))) => {
                 let (catalog_tx, catalogs) = mpsc::channel();
                 let (probe_tx, probes) = mpsc::channel();
                 let reader = rusqlite::Connection::open_with_flags(
@@ -611,12 +609,6 @@ impl Host {
                     engine,
                     thread: Some(thread),
                     runtime,
-                    adapters: Arc::new(
-                        adapters
-                            .into_iter()
-                            .map(|a| (a.agent().to_string(), a))
-                            .collect(),
-                    ),
                     catalog_tx,
                     catalogs,
                     notify,
@@ -647,26 +639,23 @@ impl Host {
     /// Probe one harness catalog concurrently with the action queue (probes
     /// take seconds); the answer arrives on [`catalogs`](Self::catalogs).
     pub fn request_catalog(&self, agent: &str) -> u64 {
+        self.request_catalog_with(agent, false)
+    }
+
+    pub fn request_catalog_with(&self, agent: &str, force: bool) -> u64 {
         static NEXT_REQUEST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let request_id = NEXT_REQUEST.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if self.tx.is_none() {
             return request_id;
         }
-        let adapter = self.adapters.get(agent).cloned();
+        let engine = self.engine.clone();
         let (tx, notify, agent) = (
             self.catalog_tx.clone(),
             self.notify.clone(),
             agent.to_string(),
         );
         self.runtime.spawn(async move {
-            let result = match adapter {
-                Some(a) => a
-                    .catalog()
-                    .await
-                    .map(|c| c.value)
-                    .map_err(|e| format!("{e:#}")),
-                None => Err("未知执行器".into()),
-            };
+            let result = engine.request_catalog(&agent, force).await;
             let _ = tx.send(CatalogReply {
                 agent,
                 request_id,

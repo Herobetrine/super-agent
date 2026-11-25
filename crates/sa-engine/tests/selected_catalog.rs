@@ -28,7 +28,19 @@ impl Adapter for Counted {
             .lock()
             .unwrap()
             .push((self.agent().into(), None));
-        self.inner.catalog()
+        let future = self.inner.catalog();
+        let stale = self.reject_selected;
+        Box::pin(async move {
+            let mut catalog = future.await?;
+            if stale {
+                catalog.value["providers"][0]["models"] = json!([{"id":"default"}]);
+            }
+            Ok(catalog)
+        })
+    }
+
+    fn local_catalog(&self) -> serde_json::Value {
+        self.inner.local_catalog()
     }
 
     fn catalog_for_route(
@@ -96,7 +108,12 @@ async fn admission_uses_selected_catalog_only_for_complete_collaborator_routes()
         let mut params = fx.params();
         params.selections =
             Some(json!({"codex":{"provider":"test-local", "model":"default", "mode":"cli"}}));
-        let ticket = fx.begin(params).await;
+        let ticket = fx.create(params).await;
+        fx.engine.request_catalog("codex", true).await.unwrap();
+        if !reject {
+            fx.engine.request_catalog("deepseek", true).await.unwrap();
+        }
+        fx.engine.start().unwrap();
         fx.finish(ticket, if reject { "partial" } else { "done" })
             .await;
         let probes = probes.lock().unwrap();
@@ -110,34 +127,37 @@ async fn admission_uses_selected_catalog_only_for_complete_collaborator_routes()
             .filter(|(name, _)| name != "codex")
             .filter_map(|(name, route)| route.as_ref().map(|r| (name, r)))
             .collect();
-        assert_eq!(selected.len(), usize::from(explicit));
-        if explicit {
+        // A complete cached route needs no targeted probe; a cache miss needs one.
+        assert_eq!(selected.len(), usize::from(reject));
+        if explicit && !reject {
+            assert_eq!(fx.shared.calls(|c| (c.packet["depth"] == 1).then(|| c.req.route.model.clone())), ["review"]);
+        }
+        if reject {
             assert_eq!(selected[0].0, "deepseek");
             assert_eq!(selected[0].1.model, "review");
         }
-        let root_turns = fx.shared.count(|c| c.packet["depth"] == 0);
         for agent in sa_engine::adapter::AGENTS {
             let full_count = probes
                 .iter()
                 .filter(|(name, route)| name == agent && route.is_none())
                 .count();
-            assert_eq!(
-                full_count,
-                root_turns + usize::from(agent == "deepseek" && !explicit)
-            );
+            // One warm-up per executor; an unpinned collaborator still resolves its live default.
+            assert_eq!(full_count, 1 + usize::from(agent == "deepseek" && !explicit));
         }
         assert_eq!(
             fx.shared.count(|c| c.packet["depth"] == 1),
             usize::from(!reject)
         );
         if reject {
+            let failures = payloads(&fx, "SELECT payload FROM events WHERE kind='turn.gave_up'");
+            assert_eq!(failures[0]["code"], sa_engine::resilience::CODE_ROUTE_NOT_CONFIGURED);
             assert_eq!(fx.int("SELECT count(*) FROM events WHERE kind='route.requested' AND job IN (SELECT id FROM jobs WHERE parent IS NOT NULL)"), 0);
         }
     }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn bound_collaborator_route_is_revalidated_on_its_next_turn() {
+async fn bound_collaborator_route_uses_cached_validation_on_its_next_turn() {
     let mut fx = Fx::new(
         script(|c| async move {
             if c.depth() == 0 && c.turn() == 1 {
@@ -163,6 +183,7 @@ async fn bound_collaborator_route_is_revalidated_on_its_next_turn() {
         })
         .collect();
     fx.engine = Engine::open(&fx.data, counted, quiet()).unwrap();
+    fx.engine.request_catalog("deepseek", true).await.unwrap();
     let ticket = fx.begin(fx.params()).await;
     fx.finish(ticket, "done").await;
     assert_eq!(fx.shared.count(|c| c.packet["depth"] == 1), 2);
@@ -171,12 +192,9 @@ async fn bound_collaborator_route_is_revalidated_on_its_next_turn() {
         .iter()
         .filter(|(name, route)| name == "deepseek" && route.is_some())
         .collect();
-    assert_eq!(selected.len(), 2);
-    assert!(
-        selected
-            .iter()
-            .all(|(_, route)| route.as_ref().unwrap().model == "review")
-    );
+    // Both the initial explicit selection and the later bound route hit the same cached menu.
+    assert!(selected.is_empty());
+    assert_eq!(fx.shared.calls(|c| (c.packet["depth"] == 1).then(|| c.req.route.model.clone())), ["review", "review"]);
 }
 
 /// A ticket-configured route missing from one live probe (a gateway timing out)
@@ -192,7 +210,15 @@ async fn configured_route_missing_from_one_probe_is_retried() {
             self.inner.agent()
         }
         fn catalog(&self) -> BoxFuture<'static, anyhow::Result<Catalog>> {
-            self.inner.catalog()
+            let future = self.inner.catalog();
+            let stale = self.agent() == "deepseek";
+            Box::pin(async move {
+                let mut catalog = future.await?;
+                if stale {
+                    catalog.value["providers"][0]["models"] = json!([{"id":"default"}]);
+                }
+                Ok(catalog)
+            })
         }
         fn catalog_for_route(&self, _route: Route) -> Option<BoxFuture<'static, anyhow::Result<Catalog>>> {
             let miss = {

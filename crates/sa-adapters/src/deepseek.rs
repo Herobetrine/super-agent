@@ -364,35 +364,19 @@ fn set_route(routes: &mut Vec<(String, DsRoute)>, id: String, r: DsRoute) {
     }
 }
 
-/// `discover(signal)` (DS:65-210).
-async fn discover(sys: &Sys, cancel: &CancellationToken) -> Result<Discovery> {
+struct LocalConfiguration {
+    default: Value,
+    native: Map<String, Value>,
+    official: Map<String, Value>,
+    builtin: Option<String>,
+}
+
+fn local_configuration(sys: &Sys) -> Result<LocalConfiguration> {
     let h = dsh_home(sys);
-    let mut routes: Vec<(String, DsRoute)> = vec![];
     let mut native: Map<String, Value> = Map::new();
     let mut defaults: Map<String, Value> = Map::new();
     let mut official: Map<String, Value> = Map::new();
     let mut builtin: Option<String> = None;
-    let node_exe = node(sys);
-    let cli_path = cli(sys);
-    let version = runtime_version(sys);
-    let mut ok = node_exe.is_some()
-        && is_file(&cli_path)
-        && version
-            .as_deref()
-            .is_some_and(|v| SUPPORTED_VERSIONS.contains(&v));
-    if ok && let Some(node) = &node_exe {
-        let output = capture(
-            node,
-            &["--version".into()],
-            &sys.home,
-            sys,
-            "",
-            Duration::from_secs(10),
-            cancel,
-        )
-        .await;
-        ok = output.is_ok_and(|v| node_supported(&v, version.as_deref().unwrap_or_default()));
-    }
     let routes_file = sys.platform_dir().join("deepseek-default.json");
     let base_file = runtime(sys).join("node_modules/@deepseek-ai/dsh-base/cordis.patch.yml");
     let mut files = vec![base_file.clone()];
@@ -448,6 +432,53 @@ async fn discover(sys: &Sys, cancel: &CancellationToken) -> Result<Discovery> {
     }
     for (k, v) in settings["llm-deepseek"].as_object().into_iter().flatten() {
         official.insert(k.clone(), v.clone());
+    }
+    let fallback = json!({
+        "mode": "cli",
+        "provider": defaults.get("provider").and_then(Value::as_str).unwrap_or_default(),
+        "model": defaults.get("model").and_then(Value::as_str).unwrap_or_default(),
+    });
+    let pref = read_json(&routes_file, fallback)?;
+    let valid = pref.as_object().is_some_and(|o| {
+        let mut keys: Vec<&str> = o.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        keys == ["mode", "model", "provider"]
+            && o.values()
+                .all(|v| v.as_str().is_some_and(|s| !s.is_empty()))
+    });
+    let default = if valid {
+        json!({"mode": pref["mode"], "provider": pref["provider"], "model": pref["model"]})
+    } else {
+        json!({})
+    };
+    Ok(LocalConfiguration {default, native, official, builtin})
+}
+
+/// `discover(signal)` (DS:65-210).
+async fn discover(sys: &Sys, cancel: &CancellationToken) -> Result<Discovery> {
+    let h = dsh_home(sys);
+    let mut routes: Vec<(String, DsRoute)> = vec![];
+    let LocalConfiguration { default, native, official, builtin } = local_configuration(sys)?;
+    let node_exe = node(sys);
+    let cli_path = cli(sys);
+    let version = runtime_version(sys);
+    let mut ok = node_exe.is_some()
+        && is_file(&cli_path)
+        && version
+            .as_deref()
+            .is_some_and(|v| SUPPORTED_VERSIONS.contains(&v));
+    if ok && let Some(node) = &node_exe {
+        let output = capture(
+            node,
+            &["--version".into()],
+            &sys.home,
+            sys,
+            "",
+            Duration::from_secs(10),
+            cancel,
+        )
+        .await;
+        ok = output.is_ok_and(|v| node_supported(&v, version.as_deref().unwrap_or_default()));
     }
     let store = h.join(".credentials.yaml");
     let refs = yaml(&store, json!({}))?["refs"]
@@ -624,24 +655,6 @@ async fn discover(sys: &Sys, cancel: &CancellationToken) -> Result<Discovery> {
             }
         }
     }
-    let fallback = json!({
-        "mode": "cli",
-        "provider": defaults.get("provider").and_then(Value::as_str).unwrap_or_default(),
-        "model": defaults.get("model").and_then(Value::as_str).unwrap_or_default(),
-    });
-    let pref = read_json(&routes_file, fallback)?;
-    let valid = pref.as_object().is_some_and(|o| {
-        let mut keys: Vec<&str> = o.keys().map(String::as_str).collect();
-        keys.sort_unstable();
-        keys == ["mode", "model", "provider"]
-            && o.values()
-                .all(|v| v.as_str().is_some_and(|s| !s.is_empty()))
-    });
-    let default = if valid {
-        json!({"mode": pref["mode"], "provider": pref["provider"], "model": pref["model"]})
-    } else {
-        json!({})
-    };
     let failures = futures::future::join_all(routes.iter_mut().map(|(id, route)| {
         let refs = &refs;
         let node = node_exe.as_deref();
@@ -1033,6 +1046,19 @@ fn call_spec(
 impl Adapter for DeepSeek {
     fn agent(&self) -> &'static str {
         "deepseek"
+    }
+
+    fn catalog_revision(&self) -> String {
+        crate::catalog_revision_with(&self.sys, self.agent(), &self.registry)
+    }
+    fn cli_info(&self) -> BoxFuture<'static, Value> {
+        let sys = self.sys.clone();
+        Box::pin(async move { crate::compatibility::info("deepseek", runtime_version(&sys)) })
+    }
+
+    fn local_catalog(&self) -> Value {
+        local_configuration(&self.sys).map(|config| crate::compatibility::local(config.default,
+            node(&self.sys).is_some() && cli(&self.sys).is_file())).unwrap_or_default()
     }
 
     fn catalog(&self) -> BoxFuture<'static, anyhow::Result<Catalog>> {

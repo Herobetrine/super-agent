@@ -71,7 +71,7 @@ fn requested(env: &Sys) -> Result<Option<&str>, AdapterError> {
     }
 }
 
-fn supported(version: &str) -> bool {
+pub(crate) fn supported(version: &str) -> bool {
     let mut parts = version
         .split_whitespace()
         .next()

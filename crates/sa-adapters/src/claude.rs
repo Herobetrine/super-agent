@@ -271,7 +271,7 @@ async fn make_record(
     name: &str,
     cfg: &Value,
     meta: &Value,
-    cache: &ModelCache,
+    cache: Option<&ModelCache>,
     cancel: &CancellationToken,
 ) -> Record {
     let env = &cfg["env"];
@@ -341,7 +341,7 @@ async fn make_record(
             .into_iter()
             .filter(|v| !v.is_empty() && v.encode_utf16().count() < 200 && seen.insert(v.clone()))
             .collect();
-        {
+        if let Some(cache) = cache {
             let url = format!("{}/v1/models?limit=1000", api_base(&base));
             let key = (url.clone(), auth.to_string(), token.clone());
             let probe = {
@@ -513,15 +513,21 @@ async fn discover(
     exe: Option<PathBuf>,
     cancel: &CancellationToken,
 ) -> anyhow::Result<Discovery> {
+    discover_with(sys, exe, cancel, true).await
+}
+
+async fn discover_with(
+    sys: &Sys, exe: Option<PathBuf>, cancel: &CancellationToken, online: bool,
+) -> anyhow::Result<Discovery> {
     let dir = sys.home.join(".cc-switch");
     let device = read_json_or(&dir.join("settings.json"));
     let state = read_json_or(&dir.join("live-state.json"))["apps"]["claude-desktop"].clone();
     let bound = read_json_or(&sys.platform_dir().join("claude-route.json"));
-    let official_probe = first_party(sys, exe.as_ref(), cancel).shared();
+    let official_probe = first_party(sys, exe.as_ref().filter(|_| online), cancel).shared();
     let cache: ModelCache = Arc::default();
     let rows = cc_rows(sys, &["claude", "claude-desktop"])?;
     let records = join_all(rows.iter().map(|row| {
-        let (cache, official) = (&cache, official_probe.clone());
+        let (cache, official) = (online.then_some(&cache), official_probe.clone());
         async move {
             let app = row["app_type"].as_str().unwrap_or_default();
             let id = match &row["id"] {
@@ -574,7 +580,7 @@ async fn discover(
         "当前 Claude Code 配置",
         &cfg,
         &meta,
-        &cache,
+        online.then_some(&cache),
         cancel,
     );
     let (official, mut records, mut native) =
@@ -600,7 +606,7 @@ async fn discover(
                 "ANTHROPIC_AUTH_TOKEN": "PROXY_MANAGED",
             }});
             let mut rec =
-                make_record("cc-switch", "claude-proxy", "CC Switch 路由", &cfg, &json!({}), &cache, cancel)
+                make_record("cc-switch", "claude-proxy", "CC Switch 路由", &cfg, &json!({}), online.then_some(&cache), cancel)
                     .await;
             enrich(&mut rec);
             records.push(rec);
@@ -736,6 +742,19 @@ async fn discover(
 impl Adapter for Claude {
     fn agent(&self) -> &'static str {
         "claude"
+    }
+
+    fn catalog_revision(&self) -> String {
+        crate::catalog_revision_with(&self.sys, self.agent(), &self.registry)
+    }
+    fn cli_info(&self) -> BoxFuture<'static, Value> {
+        crate::compatibility::detect(self.agent(), self.sys.clone(), executable(&self.sys))
+    }
+
+    fn local_catalog(&self) -> Value {
+        // Local mode reads saved source identities and defaults only.
+        discover_with(&self.sys, executable(&self.sys), &CancellationToken::new(), false)
+            .now_or_never().and_then(Result::ok).map(|d| d.catalog).unwrap_or_default()
     }
 
     fn catalog(&self) -> BoxFuture<'static, anyhow::Result<Catalog>> {

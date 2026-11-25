@@ -47,6 +47,7 @@ pub mod codex_config;
 pub mod common;
 pub mod catalog;
 mod cache_policy;
+pub mod compatibility;
 mod images;
 pub mod custom;
 pub mod deepseek;
