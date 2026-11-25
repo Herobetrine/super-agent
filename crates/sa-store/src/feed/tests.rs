@@ -95,7 +95,7 @@ fn sparse_page_work_is_bounded_in_both_directions() {
 }
 
 #[test]
-fn historical_ownership_plans_pin_the_available_index() {
+fn historical_ownership_uses_indexed_slices_or_one_legacy_scan() {
     let db = database();
     write_rows(&db, 1, Some(1), 1, "note");
     write_rows(&db, 1, None, 1, "note");
@@ -108,8 +108,25 @@ fn historical_ownership_plans_pin_the_available_index() {
         for after in [0, 1] {
             let reader = reader(&db, after);
             let fold = reader.fold(Some(1)).unwrap();
+            reader.trace.borrow_mut().clear();
             reader.page(&fold).unwrap();
             let trace = reader.trace.borrow();
+            if index == "events_ticket_kind" {
+                assert_eq!(trace.len(), 1);
+                assert!(
+                    trace[0]
+                        .plan
+                        .iter()
+                        .any(|p| p.contains("CORRELATED SCALAR SUBQUERY"))
+                );
+                assert!(
+                    trace[0]
+                        .plan
+                        .iter()
+                        .any(|p| p.contains("SEARCH pj USING INTEGER PRIMARY KEY"))
+                );
+                continue;
+            }
             for owner in ["job IS 1", "job IS NULL", "job IS 3"] {
                 let samples: Vec<_> = trace.iter().filter(|s| s.sql.contains(owner)).collect();
                 assert!(!samples.is_empty(), "missing {owner}");
@@ -132,6 +149,144 @@ fn historical_ownership_plans_pin_the_available_index() {
             );
         }
     }
+}
+
+#[test]
+fn legacy_feed_work_is_independent_of_unrelated_open_jobs() {
+    let db = database();
+    db.execute_batch(
+        "DROP INDEX events_ticket_job_kind;
+        INSERT INTO tickets(id,goal,cwd,writes,lead,created) VALUES(2,'other','.',0,'codex',0);
+        INSERT INTO jobs(ticket,agent,body,writing,depth,state) VALUES(2,'codex','',0,1,'done');",
+    )
+    .unwrap();
+    write_rows(&db, 20, Some(2), 1, "note");
+    write_rows(&db, 1, Some(1), 2, "note");
+    write_rows(&db, 1, Some(1), 2, "turn.admitted");
+    let cost = |after| {
+        let r = reader(&db, after);
+        let fold = r.fold(Some(1)).unwrap();
+        assert_eq!(fold.open.len(), 2);
+        let page = r.page(&fold).unwrap();
+        assert_eq!(page.iter().map(|e| e.seq).collect::<Vec<_>>(), [21]);
+        r.trace
+            .into_inner()
+            .iter()
+            .map(|s| i64::from(s.steps))
+            .sum::<i64>()
+    };
+    let before = [cost(0), cost(1)];
+    db.execute_batch("WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<1000)
+        INSERT INTO jobs(ticket,agent,body,writing,depth,state) SELECT 2,'codex','',0,1,'running' FROM n").unwrap();
+    assert_eq!(before, [cost(0), cost(1)]);
+}
+
+#[test]
+fn open_round_reads_turn_from_the_covering_index() {
+    let db = database();
+    write_rows(&db, 20_000, Some(3), 1, "note");
+    db.execute_batch(
+        "INSERT INTO events(ts,ticket,job,turn,kind,payload,sha256)
+        VALUES(0,1,3,NULL,'note','{}','')",
+    )
+    .unwrap();
+    write_rows(&db, 1, Some(3), 2, "note"); // Delivered while queued.
+    write_rows(&db, 1, Some(3), 2, "turn.admitted");
+    write_rows(&db, 1, Some(3), 2, "note");
+    write_rows(&db, 1, Some(1), 2, "turn.admitted");
+    for after in [0, 1] {
+        let r = reader(&db, after);
+        let page = r.page(&r.fold(Some(1)).unwrap()).unwrap();
+        assert_eq!(
+            page.iter().map(|e| e.seq).collect::<Vec<_>>(),
+            [20_001, 20_002, 20_004]
+        );
+        let trace = r.trace.borrow();
+        let notes = trace
+            .iter()
+            .find(|s| s.sql.contains("job IS 3") && s.sql.contains("kind='note'"))
+            .unwrap();
+        assert!(
+            notes
+                .plan
+                .iter()
+                .any(|p| p.contains("COVERING INDEX events_ticket_job_kind")),
+            "{:?}",
+            notes.plan
+        );
+        // One indexed turn check per old row, plus the three kept rows and seek overhead.
+        assert!(notes.steps <= 6 * 20_000 + 512, "{} steps", notes.steps);
+    }
+}
+
+#[test]
+fn full_latest_activity_page_skips_historical_open_rounds() {
+    use crate::progress::{Entry, ScanRow};
+    let mut entry = Entry::default();
+    let fold = Fold {
+        root: Some(1),
+        resumed: 1001,
+        open: [(
+            3,
+            OpenRound {
+                state: "running".into(),
+                turn: 2,
+                on_ticket: true,
+            },
+        )]
+        .into(),
+    };
+    for seq in 1..=fold.resumed + PAGE as i64 - 1 {
+        entry.absorb(ScanRow {
+            seq,
+            job: Some(3),
+            turn: Some(if seq < 1000 { 1 } else { 2 }),
+            ts: 0.0,
+            kind: "job.progress".into(),
+            agent: None,
+            payload: None,
+            summary: Some("report".into()),
+            status: None,
+        });
+    }
+    let latest = entry.feed(0, entry.seq, &fold);
+    assert_eq!(latest.len(), PAGE);
+    assert_eq!(latest[0].seq, fold.resumed);
+    assert_eq!(entry.feed_turn_checks.get(), 0);
+    let short = entry.feed(0, entry.seq - 1, &fold);
+    assert_eq!(short.len(), PAGE);
+    assert_eq!(short[0].seq, 1000);
+    assert!(entry.feed_turn_checks.replace(0) > 0);
+    let older = entry.feed(1, entry.seq, &fold);
+    assert_eq!(older.len(), PAGE);
+    assert_eq!(older[0].seq, 1000);
+    assert!(entry.feed_turn_checks.get() > 0);
+}
+
+#[test]
+fn incremental_delta_seek_skips_earlier_turn_admissions() {
+    fn cost(prior_turns: i64) -> i32 {
+        let db = database();
+        db.execute(
+            "WITH RECURSIVE n(t) AS (VALUES(1) UNION ALL SELECT t+1 FROM n WHERE t<?1)
+            INSERT INTO events(ts,ticket,job,turn,kind,payload,sha256)
+            SELECT 0,1,1,t,'turn.admitted','{}','' FROM n",
+            [prior_turns],
+        )
+        .unwrap();
+        let turn = prior_turns + 1;
+        write_rows(&db, 1, Some(1), turn, "turn.admitted");
+        write_rows(&db, 1, Some(1), turn, "delta");
+        let first = db.last_insert_rowid();
+        write_rows(&db, 1, Some(1), turn, "turn.admitted");
+        write_rows(&db, 1, Some(1), turn, "delta");
+        let last = db.last_insert_rowid();
+        let r = reader(&db, first);
+        let page = r.deltas(1, turn, last).unwrap();
+        assert_eq!(page.iter().map(|e| e.seq).collect::<Vec<_>>(), [last]);
+        r.trace.into_inner().iter().map(|s| s.steps).sum()
+    }
+    assert_eq!(cost(10), cost(20_000));
 }
 
 #[test]
