@@ -684,6 +684,7 @@ async fn discover(sys: &Sys, cancel: &CancellationToken) -> Result<Discovery> {
             json!({
                 "id": id,
                 "label": r.label,
+                "sourceIdentity": crate::common::fingerprint("src-", &[json!(r.url), json!(r.api), json!(r.env_ref)]),
                 "models": r.models.values().filter_map(crate::catalog::model).collect::<Vec<_>>(),
                 "available": !r.models.is_empty(),
                 "catalogError": catalog_errors.contains_key(id),

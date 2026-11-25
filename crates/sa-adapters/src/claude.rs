@@ -177,7 +177,8 @@ async fn first_party(sys: &Sys, exe: Option<&PathBuf>, cancel: &CancellationToke
     let flags = ["--safe-mode", "--setting-sources", ""].map(String::from);
     let mut status_args = flags.to_vec();
     status_args.extend(["auth", "status"].map(String::from));
-    let Ok(out) = capture(
+    rec.catalog_error = Some("官方登录状态探测失败".into());
+    let Ok((out, status_code)) = crate::proc::capture_status::<true>(
         exe,
         &status_args,
         &sys.temp,
@@ -195,8 +196,11 @@ async fn first_party(sys: &Sys, exe: Option<&PathBuf>, cancel: &CancellationToke
     };
     let logged_in = status["loggedIn"] == true && status["apiProvider"] == "firstParty";
     if status["loggedIn"] == false {
+        rec.catalog_error = None;
         return rec;
     }
+    if status_code != 0 { return rec; }
+    rec.catalog_error = Some("官方模型目录初始化失败".into());
     let msg = format!(
         "{}\n",
         json!({"type": "control_request", "request_id": "catalog", "request": {"subtype": "initialize"}})
@@ -233,7 +237,9 @@ async fn first_party(sys: &Sys, exe: Option<&PathBuf>, cancel: &CancellationToke
                 continue;
             };
             let r = &v["response"];
-            if r["request_id"] == json!("catalog") && r["subtype"] == json!("success") {
+            if r["request_id"] == json!("catalog") && r["subtype"] == json!("success")
+                && r["response"]["models"].is_array() {
+                rec.catalog_error = None;
                 rec.models = r["response"]["models"]
                     .as_array()
                     .into_iter()
@@ -558,6 +564,7 @@ async fn discover_with(
                 record.models = official.models;
                 record.model_info = official.model_info;
                 record.reason = official.reason;
+                record.catalog_error = official.catalog_error;
             }
             record
         }
@@ -718,7 +725,7 @@ async fn discover_with(
         })
         .collect();
     let default = match active_idx.map(|i| &records[i]) {
-        Some(a) if a.reason.is_empty() => a.route(),
+        Some(a) if a.reason.is_empty() || a.catalog_error.is_some() => a.route(),
         _ => json!({"provider": "", "model": "", "mode": "cli"}),
     };
     let catalog = json!({

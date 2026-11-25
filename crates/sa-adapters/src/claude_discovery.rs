@@ -158,13 +158,14 @@ impl Fixture {
             self.sys.set("FIXTURE_WAIT", wait.to_string_lossy());
         }
         let models = json!({"response":{"request_id":"catalog","subtype":"success","response":{"models":[{"value":"official-model","reasoningEfforts":["high"]}]}}});
+        let status_code = i32::from(status["loggedIn"] == false);
         let script = if cfg!(windows) {
             format!(
-                "@echo off\r\nif \"%~4\"==\"auth\" goto status\r\necho initialized>>\"%FIXTURE_INITIALIZED%\"\r\necho {models}\r\nexit /b 0\r\n:status\r\nif \"%FIXTURE_WAIT%\"==\"\" goto ready\r\n:wait\r\nif not exist \"%FIXTURE_WAIT%\" goto wait\r\n:ready\r\necho {status}\r\nexit /b 0\r\n"
+                "@echo off\r\nif \"%~4\"==\"auth\" goto status\r\n:init\r\nif defined FIXTURE_BLOCK_INIT goto init\r\necho initialized>>\"%FIXTURE_INITIALIZED%\"\r\necho {models}\r\nexit /b 0\r\n:status\r\nif \"%FIXTURE_WAIT%\"==\"\" goto ready\r\n:wait\r\nif not exist \"%FIXTURE_WAIT%\" goto wait\r\n:ready\r\necho {status}\r\nexit /b {status_code}\r\n"
             )
         } else {
             format!(
-                "#!/bin/sh\nif [ \"$4\" = auth ]; then\nwhile [ -n \"$FIXTURE_WAIT\" ] && [ ! -e \"$FIXTURE_WAIT\" ]; do sleep 0.01; done\nprintf '%s\\n' '{status}'\nelse\nprintf initialized >> \"$FIXTURE_INITIALIZED\"\nprintf '%s\\n' '{models}'\nfi\n"
+                "#!/bin/sh\nif [ \"$4\" = auth ]; then\nwhile [ -n \"$FIXTURE_WAIT\" ] && [ ! -e \"$FIXTURE_WAIT\" ]; do sleep 0.01; done\nprintf '%s\\n' '{status}'\nexit {status_code}\nelse\nwhile [ -n \"$FIXTURE_BLOCK_INIT\" ]; do sleep 0.01; done\nprintf initialized >> \"$FIXTURE_INITIALIZED\"\nprintf '%s\\n' '{models}'\nfi\n"
             )
         };
         let path = self.data.path().join(if cfg!(windows) {
@@ -229,6 +230,41 @@ async fn unconfirmed_auth_keeps_initialize_fallback_and_unavailable_reason() {
         assert_eq!(official.models, ["official-model"]);
         assert_eq!(official.reason, "未验证官方登录或模型目录");
     }
+}
+
+#[tokio::test]
+async fn first_party_timeouts_retain_good_rows_and_confirmed_logout_clears_them() {
+    async fn exercise(block_status: bool) {
+        let mut fixture = Fixture::new();
+        // Exercise propagation through CC Switch's official-source alias too.
+        fixture.row("official-alias", "claude", json!({}), "official");
+        let login = json!({"loggedIn":true,"apiProvider":"firstParty"});
+        let cancel = CancellationToken::new();
+        let cli = fixture.cli(login.clone(), None);
+        let good = discover(&fixture.sys, Some(cli), &cancel).await.unwrap().catalog;
+        let source = good["default"]["provider"].clone();
+        assert_eq!(good["default"]["model"], "official-model");
+        let previous = sa_store::catalog_cache::Entry {value: good, fingerprint: String::new(), fetched_at: 0.0};
+        let missing = fixture.data.path().join("unreleased");
+        let cli = fixture.cli(login, block_status.then_some(missing.as_path()));
+        if !block_status { fixture.sys.set("FIXTURE_BLOCK_INIT", "1"); }
+        let mut timed_out = discover(&fixture.sys, Some(cli), &cancel).await.unwrap().catalog;
+        let provider = |catalog: &Value| catalog["providers"].as_array().unwrap().iter()
+            .find(|p| p["id"] == source).unwrap().clone();
+        assert_eq!(provider(&timed_out)["catalogError"], true);
+        previous.merge_failed_sources(&mut timed_out, true);
+        assert_eq!(provider(&timed_out)["models"][0]["id"], "official-model");
+        assert_eq!(timed_out["default"]["model"], "official-model");
+        // The same source now explicitly reports loggedIn=false with exit 1.
+        std::fs::write(&missing, b"released").unwrap();
+        let cli = fixture.cli(json!({"loggedIn":false,"apiProvider":"firstParty"}), None);
+        let mut logged_out = discover(&fixture.sys, Some(cli), &cancel).await.unwrap().catalog;
+        previous.merge_failed_sources(&mut logged_out, true);
+        assert_eq!(provider(&logged_out)["catalogError"], false);
+        assert_eq!(provider(&logged_out)["available"], false);
+        assert_eq!(provider(&logged_out)["models"], json!([]));
+    }
+    tokio::join!(exercise(true), exercise(false));
 }
 
 #[tokio::test]

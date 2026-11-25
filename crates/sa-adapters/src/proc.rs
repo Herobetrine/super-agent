@@ -263,6 +263,14 @@ pub async fn capture(
     timeout: Duration,
     cancel: &CancellationToken,
 ) -> Result<String, AdapterError> {
+    capture_status::<false>(exe, args, cwd, env, input, timeout, cancel).await.map(|(out, _)| out)
+}
+
+/// Some status commands return a structured negative answer with exit code 1.
+pub(crate) async fn capture_status<const ALLOW_EXIT_ONE: bool>(
+    exe: &Path, args: &[String], cwd: &Path, env: &Sys, input: &str,
+    timeout: Duration, cancel: &CancellationToken,
+) -> Result<(String, i32), AdapterError> {
     let mut p = start(exe, args, cwd, env)?;
     p.finish_input(input).await;
     let mut stdout = p.stdout.take().ok_or_else(|| protocol_error("原生输出不可读"))?;
@@ -297,10 +305,12 @@ pub async fn capture(
         }
     };
     let code = p.wait_or_kill(Duration::from_secs(2)).await;
-    if code != Some(0) {
-        return Err(p.exit_error(code));
-    }
-    String::from_utf8(out).map_err(|_| protocol_error("原生目录不是 UTF-8"))
+    let code = match code {
+        Some(0) => 0,
+        Some(1) if ALLOW_EXIT_ONE => 1,
+        _ => return Err(p.exit_error(code)),
+    };
+    Ok((String::from_utf8(out).map_err(|_| protocol_error("原生目录不是 UTF-8"))?, code))
 }
 
 /// `stream(exe, args, input, options, onEvent)` (AC:307-318): write the

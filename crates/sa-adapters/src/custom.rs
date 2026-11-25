@@ -103,6 +103,7 @@ pub fn provider_row(p: &CustomProvider, sys: &Sys) -> Value {
     };
     let mut row = json!({
         "id": p.route_id(),
+        "sourceIdentity": crate::common::fingerprint("src-", &[json!(p.base_url), json!(p.key_env)]),
         "label": format!("{} · 自定义", p.name),
         "available": available,
         "models": models,
