@@ -26,6 +26,9 @@ mod notifications;
 mod ops;
 mod palette;
 mod providers;
+mod recovery_ui;
+#[cfg(test)]
+mod recovery_ui_tests;
 mod review;
 mod sidebar;
 mod theme;
@@ -155,9 +158,16 @@ fn main() {
         Box::new(move |cc| {
             theme::install_fonts(&cc.egui_ctx);
             // The scheduler creates the journal, so start it before the reader.
+            // The typed startup error is kept for the recovery panel; every
+            // other consumer still gets today's message.
+            let mut start_error = None;
             let host = if schedule {
                 let ctx = cc.egui_ctx.clone();
-                host::Host::start(dir, move || ctx.request_repaint()).map_err(|e| format!("{e:#}"))
+                host::Host::start(dir, move || ctx.request_repaint()).map_err(|e| {
+                    let message = format!("{e:#}");
+                    start_error = Some(e);
+                    message
+                })
             } else if opts.demo {
                 Err("演示数据不调度".into())
             } else if opts.observe {
@@ -166,7 +176,11 @@ fn main() {
                 Err("截图模式不调度".into())
             };
             let worker = worker::spawn(opener, cc.egui_ctx.clone());
-            Ok(Box::new(app::App::new(cc, opts, worker, result, host)))
+            let mut app = app::App::new(cc, opts, worker, result, host);
+            if let Some(error) = &start_error {
+                app.set_start_error(error);
+            }
+            Ok(Box::new(app))
         }),
     );
     if let Err(e) = run {

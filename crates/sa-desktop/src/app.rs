@@ -140,6 +140,8 @@ pub struct App {
     pub host: Option<Host>,
     /// Why the window is an observer (another workbench owns the journal, …).
     pub host_error: Option<String>,
+    /// Recovery options when the startup error is a [`sa_store::journal::JournalError`].
+    pub(crate) recovery: Option<crate::recovery_ui::RecoveryPanel>,
     pub composer: Composer,
     pub models: Option<crate::models::ModelDialog>,
     pub diff: DiffState,
@@ -252,6 +254,7 @@ impl App {
             extensions: None,
             ctx: cc.egui_ctx.clone(),
             host_error: host.as_ref().err().cloned(),
+            recovery: None,
             host: host.ok(),
             worker,
             opts,
@@ -649,6 +652,7 @@ impl eframe::App for App {
         self.models_dialog(ctx);
         self.providers_dialog(ctx);
         self.efficiency_dialog(ctx);
+        self.recovery_dialog(ctx);
         self.extensions_dialog(ctx);
         self.palette_ui(ctx);
         self.rename_dialog(ctx);
