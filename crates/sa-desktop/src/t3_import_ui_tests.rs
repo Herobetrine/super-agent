@@ -20,7 +20,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -448,6 +448,9 @@ fn projects_only_import_shows_progress_then_the_project_result() {
     h.run_steps(3);
     assert_eq!(h.state().t3.step_name(), "closed");
     until(&mut h, "card hidden", |a| a.t3.card_state() == "hidden");
+    until(&mut h, "project added to welcome cache", |a| {
+        a.t3_recent().iter().any(|entry| entry.name.as_deref() == Some("Alpha"))
+    });
 }
 
 #[test]
@@ -622,6 +625,32 @@ fn export_only_import_persists_first_import_and_leaves_the_link_available() {
     until(&mut reopened, "quiet link opened selection", |a| a.t3.step_name() == "select");
 }
 
+#[test]
+fn export_only_with_all_threads_failed_shows_failure_and_retry() {
+    let fx = fixture(false);
+    let conn = Connection::open(fx.folder.join("statev2.sqlite")).unwrap();
+    conn.execute_batch("UPDATE orchestration_v2_projection_messages SET payload_json = '{malformed'").unwrap();
+    conn.close().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let mut h = writable(data.path(), &fx, listed_beta(&fx));
+    open_dialog(&mut h);
+    until(&mut h, "select", |a| a.t3.step_name() == "select");
+    click_in_view(&mut h, Role::Button, "全不选");
+    assert_eq!(h.state().t3.picked(), [false; 3]);
+    h.get_by_role_and_label(Role::Button, "开始导入").click();
+    until(&mut h, "export failed", |a| a.t3.step_name() == "done");
+    let archive = fs::read_dir(data.path().join("archives").join("t3"))
+        .unwrap().next().unwrap().unwrap().path().canonicalize().unwrap();
+    assert!(archive.join("errors.txt").is_file());
+    assert!(label_visible(&h, "导入失败"));
+    assert!(label_visible(&h, &format!(
+        "无法完成导入：没有导出任何对话，原因见 {} 中的 errors.txt。", archive.display()
+    )));
+    assert!(label_visible(&h, "关闭") && !label_visible(&h, "打开归档文件夹"));
+    h.get_by_role_and_label(Role::Button, "重试").click();
+    until(&mut h, "retry returns to selection", |a| a.t3.step_name() == "select");
+}
+
 // ---- the welcome list ------------------------------------------------------
 
 #[test]
@@ -641,6 +670,13 @@ fn recent_projects_list_tickets_first_then_up_to_eight_with_t3_names() {
         .collect();
     let mut h = writable(data.path(), &fx, imported);
     until(&mut h, "history", |a| a.history_loaded && a.t3.imported_ready());
+    let resolutions = Arc::new(AtomicUsize::new(0));
+    let count = Arc::clone(&resolutions);
+    let paint_thread = std::thread::current().id();
+    h.state_mut().t3.recent_resolving = Some(Arc::new(move || {
+        assert_ne!(std::thread::current().id(), paint_thread);
+        count.fetch_add(1, Ordering::Relaxed);
+    }));
     h.state_mut().history = vec![sa_store::TicketSummary {
         id: 1,
         goal: "goal".into(),
@@ -653,7 +689,12 @@ fn recent_projects_list_tickets_first_then_up_to_eight_with_t3_names() {
         archived: false,
         attention: None,
     }];
-    h.run_steps(3);
+    h.state_mut().t3_history_changed();
+    until(&mut h, "recent cache updated from history", |a| {
+        a.t3_recent().first().is_some_and(|entry| entry.path == ticket_dir.to_string_lossy())
+    });
+    h.run_steps(10);
+    assert_eq!(resolutions.load(Ordering::Relaxed), 1, "repaints must use the cache");
     assert!(label_visible(&h, "最近的项目"));
     // Eight entries: the ticket project plus seven imported ones.
     let shown: Vec<String> = (0..10).map(|i| format!("T3 项目 {i}")).filter(|n| label_visible(&h, n)).collect();

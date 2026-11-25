@@ -78,12 +78,18 @@ pub struct T3State {
     imported: Vec<Project>,
     imported_load: Option<Pending<Vec<Project>>>,
     imported_loaded: bool,
+    ticket_paths: Vec<String>,
+    recent: Vec<Recent>,
+    recent_load: Option<Pending<Vec<Recent>>>,
+    recent_dirty: bool,
     dialog: Option<Dialog>,
     /// Holds the export thread at its first progress report (tests only).
     #[cfg(test)]
     pub hold: Option<Arc<AtomicBool>>,
     #[cfg(test)]
     pub next_picked_folder: Option<PathBuf>,
+    #[cfg(test)]
+    pub recent_resolving: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl T3State {
@@ -94,11 +100,17 @@ impl T3State {
             imported: Vec::new(),
             imported_load: None,
             imported_loaded: false,
+            ticket_paths: Vec::new(),
+            recent: Vec::new(),
+            recent_load: None,
+            recent_dirty: true,
             dialog: None,
             #[cfg(test)]
             hold: None,
             #[cfg(test)]
             next_picked_folder: None,
+            #[cfg(test)]
+            recent_resolving: None,
         }
     }
 
@@ -107,21 +119,27 @@ impl T3State {
     }
 
     /// Drop the cached imported projects and the card verdict after an import.
-    fn invalidate(&mut self) {
+    fn projects_changed(&mut self) {
         self.imported_loaded = false;
-        self.card = Card::Idle;
+        self.imported_load = None;
+        self.card = Card::Hidden;
     }
 
     /// Whether the imported projects of the welcome list were read, for tests.
     #[cfg(test)]
     pub fn imported_ready(&self) -> bool {
-        self.imported_loaded && !self.imported.is_empty()
+        self.recent_ready() && !self.imported.is_empty()
     }
 
     /// Whether the welcome page stopped changing its layout, for tests.
     #[cfg(test)]
     pub fn settled(&self) -> bool {
-        matches!(self.card, Card::Shown(_) | Card::Hidden) && self.imported_loaded
+        matches!(self.card, Card::Shown(_) | Card::Hidden) && self.recent_ready()
+    }
+
+    #[cfg(test)]
+    fn recent_ready(&self) -> bool {
+        self.imported_loaded && !self.recent_dirty && self.recent_load.is_none()
     }
 
     /// Card state, for tests.
@@ -373,23 +391,61 @@ impl App {
         self.opts.data.clone().unwrap_or_else(sa_store::default_data_dir)
     }
 
-    /// Entries of "最近的项目": ticket projects first, then imported ones.
-    pub(crate) fn t3_recent(&mut self) -> Vec<Recent> {
-        if self.t3_available() {
-            if let Some(result) = self.t3.imported_load.as_ref().and_then(Pending::poll) {
-                self.t3.imported_load = None;
-                self.t3.imported_loaded = true;
-                if let Ok(list) = result {
-                    self.t3.imported = list;
+    pub(crate) fn t3_history_changed(&mut self) {
+        let paths = self.history.iter().map(|ticket| &ticket.cwd);
+        if !paths.clone().eq(&self.t3.ticket_paths) {
+            self.t3.ticket_paths = paths.cloned().collect();
+            self.t3.recent_dirty = true;
+        }
+    }
+
+    pub(crate) fn t3_poll_recent(&mut self) {
+        if !self.writable() {
+            return;
+        }
+        if self.t3_available() && !self.t3.imported_loaded {
+            match self.t3.imported_load.as_ref() {
+                Some(pending) => {
+                    let Some(result) = pending.poll() else { return };
+                    self.t3.imported_load = None;
+                    self.t3.imported_loaded = true;
+                    if let Ok(list) = result && list != self.t3.imported {
+                        self.t3.imported = list;
+                        self.t3.recent_dirty = true;
+                    }
+                }
+                None => {
+                    let data = self.t3_data_dir();
+                    self.t3.imported_load = Some(Pending::spawn(&self.ctx, move || projects::list(&journal(&data)?)));
+                    return;
                 }
             }
-            if !self.t3.imported_loaded && self.t3.imported_load.is_none() {
-                let data = self.t3_data_dir();
-                self.t3.imported_load = Some(Pending::spawn(&self.ctx, move || projects::list(&journal(&data)?)));
+        }
+        if let Some(pending) = &self.t3.recent_load {
+            let Some(result) = pending.poll() else { return };
+            self.t3.recent_load = None;
+            if !self.t3.recent_dirty && let Ok(recent) = result {
+                self.t3.recent = recent;
             }
         }
-        let cwds: Vec<String> = self.history.iter().map(|t| t.cwd.clone()).collect();
-        projects::recent(&cwds, &self.t3.imported, RECENT_LIMIT)
+        if std::mem::take(&mut self.t3.recent_dirty) {
+            let paths = self.t3.ticket_paths.clone();
+            let imported = self.t3.imported.clone();
+            #[cfg(test)]
+            let probe = self.t3.recent_resolving.clone();
+            self.t3.recent_load = Some(Pending::spawn(&self.ctx, move || {
+                #[cfg(test)]
+                if let Some(probe) = probe {
+                    probe();
+                }
+                Ok(projects::recent(&paths, &imported, RECENT_LIMIT))
+            }));
+        }
+    }
+
+    /// Cached entries of "最近的项目". Painting does not resolve paths.
+    pub(crate) fn t3_recent(&self) -> &[Recent] {
+        &self.t3.recent
     }
 
     fn t3_poll_card(&mut self) {
@@ -634,7 +690,9 @@ impl App {
             dialog.step = match result {
                 Ok(added) => {
                     run.added = added.and_then(|n| usize::try_from(n).ok()).unwrap_or(0);
-                    self.t3.invalidate();
+                    if run.added > 0 {
+                        self.t3.projects_changed();
+                    }
                     if run.export {
                         run.stage = self.t3_spawn_export(&run);
                         Step::Run(run)
@@ -677,7 +735,6 @@ impl App {
                 let Stage::Export { pending, .. } = &run.stage else { return };
                 let Some(result) = pending.poll() else { return };
                 let added = run.added;
-                self.t3.invalidate();
                 if result.as_ref().is_ok_and(|report| report.exported > 0) {
                     self.t3.card = Card::Hidden;
                     self.submit(Action::RecordT3Export);
@@ -696,6 +753,12 @@ impl App {
                             folder: run.folder.clone(),
                             threads: run.threads,
                         }
+                    }
+                    Ok(report) if report.exported == 0 && !report.failed.is_empty() => {
+                        Outcome::Failed(format!(
+                            "没有导出任何对话，原因见 {} 中的 errors.txt",
+                            report.folder.display()
+                        ))
                     }
                     Ok(report) if !report.failed.is_empty() => Outcome::Partial {
                         added,

@@ -669,6 +669,13 @@ fn run_fork_contains_only_inherited_history_through_cutoff_and_side_chat_stays_l
         ("queued", 2, "cancelled", "2024-03-07T00:00:02.000Z"),
         ("at-cutoff", 3, "rolled_back", "2024-03-10T00:00:00.000Z"),
         ("past-cutoff", 4, "completed", "2024-03-10T00:00:01.000Z"),
+        (
+            "delivered-cancelled",
+            5,
+            "cancelled",
+            "2024-03-10T00:00:02.000Z",
+        ),
+        ("not-started", 6, "queued", "2024-03-10T00:00:03.000Z"),
     ] {
         db.execute(
             "INSERT INTO orchestration_v2_projection_runs VALUES (?1,'parent',?2,?3,?4)",
@@ -685,7 +692,7 @@ fn run_fork_contains_only_inherited_history_through_cutoff_and_side_chat_stays_l
             "INSERT INTO orchestration_v2_projection_turn_items VALUES
              (?1,'parent',?1,?2,'user_message','completed','2024-03-08',?3)",
             params![run, ordinal * 2, json!({
-                "messageId": run, "inputIntent": if run == "queued" { "queued_turn" } else { "started_turn" },
+                "messageId": run, "inputIntent": if matches!(run, "queued" | "not-started") { "queued_turn" } else { "started_turn" },
             }).to_string()],
         ).unwrap();
     }
@@ -693,6 +700,8 @@ fn run_fork_contains_only_inherited_history_through_cutoff_and_side_chat_stays_l
         r#"INSERT INTO orchestration_v2_projection_turn_items VALUES (
            'tool-at-cutoff','parent','at-cutoff',7,'command_execution','completed',
            '2024-03-08','{"input":"fixture-cutoff-tool","output":"PRIVATE_RESULT"}');
+           INSERT INTO orchestration_v2_projection_messages VALUES (
+           'orphan-rewind','parent','before-rewind','system','2024-03-08','{"text":"unanchored rewind"}','');
            INSERT INTO orchestration_v2_projection_messages VALUES (
            'side-only','side-chat',NULL,'user','2024-03-09','{"text":"side-only"}','');"#,
     )
@@ -730,6 +739,109 @@ fn run_fork_contains_only_inherited_history_through_cutoff_and_side_chat_stays_l
     assert!(fs::read_to_string(md).unwrap().contains("side-only"));
     let jl = fs::read_to_string(jl).unwrap();
     assert!(!jl.contains("forked_from") && !jl.contains("body prior"));
+
+    // The parent's own view follows current visibility. The fork preserves
+    // the run that was rolled back only after the child was created.
+    let (md, jl) = thread_files(&report.folder, "parent");
+    for archive in [md, jl] {
+        let body = fs::read_to_string(archive).unwrap();
+        assert!(body.contains("body prior") && body.contains("body past-cutoff"));
+        assert!(body.contains("body delivered-cancelled"));
+        for hidden in [
+            "body before-rewind",
+            "body queued",
+            "body not-started",
+            "body at-cutoff",
+            "fixture-cutoff-tool",
+            "unanchored rewind",
+        ] {
+            assert!(
+                !body.contains(hidden),
+                "{hidden} in parent's local timeline"
+            );
+        }
+    }
+}
+
+#[test]
+fn deleted_parent_is_only_read_through_the_live_fork() {
+    let fixture = Fixture::new();
+    let db = Connection::open(fixture.folder.join(DB)).unwrap();
+    insert_thread(&db, "deleted-parent", "DeletedParent", json!({}));
+    insert_thread(
+        &db,
+        "live-fork",
+        "LiveFork",
+        fork_header("deleted-parent", "parent-run", false),
+    );
+    db.execute_batch(
+        r#"UPDATE orchestration_v2_projection_threads SET deleted_at = '2024-03-12'
+               WHERE thread_id = 'deleted-parent';
+           CREATE TABLE orchestration_v2_projection_runs (
+             run_id TEXT PRIMARY KEY, thread_id TEXT, ordinal INTEGER, status TEXT, completed_at TEXT
+           );
+           INSERT INTO orchestration_v2_projection_runs
+               VALUES ('parent-run','deleted-parent',1,'completed','2024-03-08');
+           INSERT INTO orchestration_v2_projection_messages VALUES
+               ('parent-message','deleted-parent','parent-run','user','2024-03-08',
+                '{"text":"visible inherited question"}','');
+           INSERT INTO orchestration_v2_projection_turn_items VALUES
+               ('parent-anchor','deleted-parent','parent-run',1,'user_message','completed',
+                '2024-03-08','{"messageId":"parent-message"}'),
+               ('parent-tool','deleted-parent','parent-run',2,'command_execution','completed',
+                '2024-03-08','{"input":"fixture-tool"}');"#,
+    ).unwrap();
+    db.close().unwrap();
+    let report = fixture.export();
+    assert_eq!((report.total, report.exported), (5, 5));
+    assert!(report.failed.is_empty());
+    let files = archive_files(&report.folder);
+    assert!(!files.iter().any(|file| {
+        file.to_string_lossy()
+            .contains(&id_digest("deleted-parent"))
+    }));
+    let (_, jl) = thread_files(&report.folder, "live-fork");
+    let events: Vec<Value> = fs::read_to_string(jl)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(events[0]["forked_from"]["history"], "expanded");
+    assert!(events[0]["forked_from"]["archive_path"].is_null());
+    assert_eq!(events[1]["text"], "visible inherited question");
+    assert_eq!(events[1]["inherited_from"], "deleted-parent");
+    assert_eq!(events[2]["details"]["input"], "fixture-tool");
+    assert_eq!(events[2]["inherited_from"], "deleted-parent");
+}
+
+#[test]
+fn unanchored_message_is_merged_between_ordinal_anchors() {
+    let fixture = Fixture::new();
+    let db = Connection::open(fixture.folder.join(DB)).unwrap();
+    insert_thread(&db, "mixed", "Mixed", json!({}));
+    db.execute_batch(r#"
+        INSERT INTO orchestration_v2_projection_messages VALUES
+            ('a','mixed',NULL,'assistant','2024-03-09T01:03:00Z','{"text":"reply"}',''),
+            ('s','mixed',NULL,'system','2024-03-09T01:02:00Z','{"text":"notice"}',''),
+            ('u','mixed',NULL,'user','2024-03-09T01:01:00Z','{"text":"question"}','');
+        INSERT INTO orchestration_v2_projection_turn_items VALUES
+            ('u-anchor','mixed',NULL,10,'user_message','completed','2024-03-09','{"messageId":"u"}'),
+            ('a-anchor','mixed',NULL,20,'assistant_message','completed','2024-03-09','{"messageId":"a"}');
+    "#).unwrap();
+    db.close().unwrap();
+    let report = fixture.export();
+    let (md, jl) = thread_files(&report.folder, "mixed");
+    let md = fs::read_to_string(md).unwrap();
+    assert!(md.find("question").unwrap() < md.find("notice").unwrap());
+    assert!(md.find("notice").unwrap() < md.find("reply").unwrap());
+    let records: Vec<Value> = fs::read_to_string(jl)
+        .unwrap()
+        .lines()
+        .skip(1)
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let ids: Vec<_> = records.iter().map(|r| r["id"].as_str().unwrap()).collect();
+    assert_eq!(ids, ["u", "s", "a"]);
 }
 
 #[test]
@@ -743,6 +855,8 @@ fn unresolved_fork_cutoff_references_the_exact_parent_archive_and_run() {
         "Unresolved",
         fork_header("parent", "missing-run", false),
     );
+    // The child is newer. The live parent must be published before it can be linked.
+    db.execute_batch("UPDATE orchestration_v2_projection_threads SET updated_at = '2024-03-09' WHERE thread_id = 'parent'").unwrap();
     db.close().unwrap();
     let report = fixture.export();
     assert!(report.failed.is_empty());
@@ -761,6 +875,37 @@ fn unresolved_fork_cutoff_references_the_exact_parent_archive_and_run() {
     let md = fs::read_to_string(md).unwrap();
     assert!(md.contains(&format!("[parent](../../{link}) · 运行 missing-run")));
     assert!(md.contains("无法确定完整继承范围，请参阅父对话及分叉点"));
+}
+
+#[test]
+fn fork_retains_ids_when_its_live_parent_fails_to_publish() {
+    let fixture = Fixture::new();
+    let db = Connection::open(fixture.folder.join(DB)).unwrap();
+    insert_thread(&db, "failed-parent", "FailedParent", json!({}));
+    insert_thread(
+        &db,
+        "child",
+        "Child",
+        fork_header("failed-parent", "unknown-run", false),
+    );
+    db.execute_batch(
+        "INSERT INTO orchestration_v2_projection_messages VALUES
+         ('bad-parent-message','failed-parent',NULL,'user','2024-03-09','{invalid','')",
+    )
+    .unwrap();
+    db.close().unwrap();
+    let report = fixture.export();
+    assert_eq!((report.total, report.exported), (6, 5));
+    assert_eq!(report.failed[0].0, "failed-parent");
+    let (md, jl) = thread_files(&report.folder, "child");
+    let md = fs::read_to_string(md).unwrap();
+    assert!(md.contains("failed-parent") && md.contains("unknown-run"));
+    assert!(!md.contains("](../../"));
+    let header: Value =
+        serde_json::from_str(fs::read_to_string(jl).unwrap().lines().next().unwrap()).unwrap();
+    assert_eq!(header["forked_from"]["thread_id"], "failed-parent");
+    assert_eq!(header["forked_from"]["run_id"], "unknown-run");
+    assert!(header["forked_from"]["archive_path"].is_null());
 }
 
 #[test]
