@@ -447,6 +447,7 @@ impl App {
                 (ActionKind::Follow, Ok(_)) => {}
                 (ActionKind::Routes, r) => self.routes_saved(r.map(|_| ())),
                 (ActionKind::Efficiency, r) => self.efficiency_saved(r.map(|_| ())),
+                (ActionKind::T3Import, r) => self.t3_projects_imported(r),
                 (ActionKind::Knowledge, r) => self.knowledge_saved(r.map(|_| ())),
                 (ActionKind::Providers, r) => self.providers_saved(r.map(|_| ())),
                 (ActionKind::Meta, Ok(_)) => {}

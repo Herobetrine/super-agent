@@ -152,6 +152,8 @@ pub enum Action {
     SaveEfficiency {
         settings: sa_store::efficiency::Settings,
     },
+    /// Add the chosen T3 Code projects to the welcome page; the result carries the added count.
+    ImportT3Projects(Vec<sa_store::t3_import::T3Project>),
     /// `saveRoutes` (ST:239-290): routes of a stopped ticket.
     SaveRoutes {
         ticket: i64,
@@ -270,6 +272,7 @@ impl Action {
             | Action::SetLeadRouting { .. }
             | Action::SaveAdvisor { .. } => ActionKind::Routes,
             Action::SaveEfficiency { .. } => ActionKind::Efficiency,
+            Action::ImportT3Projects(_) => ActionKind::T3Import,
             Action::KnowledgeAdd { .. } | Action::KnowledgeArchive { .. } => ActionKind::Knowledge,
             Action::ProviderSave { .. }
             | Action::ProviderRemove { .. }
@@ -323,6 +326,7 @@ pub enum ActionKind {
     Plan,
     Routes,
     Efficiency,
+    T3Import,
     Knowledge,
     Providers,
     Meta,
@@ -911,6 +915,7 @@ fn open_engine(
         .tx(|q| {
             q.conn().execute_batch(sa_store::STUDIO_PLAN)?;
             sa_store::efficiency::init(q.conn())?;
+            sa_store::projects::init(q.conn())?;
             q.conn().execute_batch("CREATE TABLE IF NOT EXISTS studio_model_policy(singleton INTEGER PRIMARY KEY CHECK(singleton=1),allow_lead_routing INTEGER NOT NULL CHECK(allow_lead_routing IN (0,1)))")?;
             Ok(q.conn().execute_batch(sa_store::TICKET_META)?)
         })?;
@@ -1124,6 +1129,15 @@ async fn execute(engine: &Engine, shared: &Shared, action: Action) -> Result<Opt
             engine.db().tx(|q| sa_store::efficiency::save(q.conn(), &settings))?;
             *shared.efficiency.write().unwrap_or_else(|p| p.into_inner()) = settings;
             Ok(None)
+        }
+        Action::ImportT3Projects(chosen) => {
+            // `projects::add` opens its own IMMEDIATE transaction, which cannot
+            // nest inside `Db::tx`. `with` still serialises on the journal
+            // connection, so the insert cannot interleave with an engine write.
+            let added = engine
+                .db()
+                .with(|q| sa_store::t3_import::import_projects(q.conn(), &chosen))?;
+            Ok(Some(i64::try_from(added)?))
         }
         Action::SaveRoutes {
             ticket,

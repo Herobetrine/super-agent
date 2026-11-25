@@ -5,7 +5,7 @@ use anyhow::{Context, Result, bail};
 use std::path::PathBuf;
 
 pub const USAGE: &str = "用法: super-agent [--data <目录>] [--project <目录>] [--ticket <编号>] [--demo] [--observe] [--schedule] [--dark] \
-[--inspector [collab|native|plan|approvals|diff]] [--dialog models|advisor|providers|rotation|extensions|palette|efficiency] [--at-top] [--expand-all] [--screenshot <输出.png> [--size 宽x高]]";
+[--inspector [collab|native|plan|approvals|diff]] [--dialog models|advisor|providers|rotation|extensions|palette|efficiency|t3import|t3import-run] [--t3-folder <目录>] [--at-top] [--expand-all] [--screenshot <输出.png> [--size 宽x高]]";
 
 #[derive(Clone, Debug, Default)]
 pub struct Options {
@@ -29,6 +29,8 @@ pub struct Options {
     pub dialog: Option<String>,
     /// Project folder of the new-conversation draft (screenshot review aid).
     pub project: Option<PathBuf>,
+    /// T3 Code data folder used instead of the default one (synthetic fixtures).
+    pub t3_folder: Option<PathBuf>,
 }
 
 fn parse_size(s: &str) -> Result<(f32, f32)> {
@@ -65,10 +67,11 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Options> {
             "--at-top" => o.at_top = true,
             "--expand-all" => o.expand_all = true,
             "--dialog" => match value("--dialog")?.as_str() {
-                d @ ("models" | "advisor" | "providers" | "rotation" | "extensions" | "palette" | "efficiency") => o.dialog = Some(d.into()),
+                d @ ("models" | "advisor" | "providers" | "rotation" | "extensions" | "palette" | "efficiency" | "t3import" | "t3import-run") => o.dialog = Some(d.into()),
                 other => bail!("未知对话框：{other}"),
             },
             "--project" => o.project = Some(PathBuf::from(value("--project")?)),
+            "--t3-folder" => o.t3_folder = Some(PathBuf::from(value("--t3-folder")?)),
             "--screenshot" => o.screenshot = Some(PathBuf::from(value("--screenshot")?)),
             "--size" => o.size = Some(parse_size(&value("--size")?)?),
             "--inspector" => {
