@@ -158,41 +158,6 @@ fn recent_with(
     result
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::cell::RefCell;
-
-    #[test]
-    fn recent_does_not_resolve_candidates_past_the_cap_when_no_names_are_pending() {
-        let make = |path: &str, pinned| Project {
-            path: path.into(),
-            name: path.into(),
-            pinned,
-            source: "t3".into(),
-            source_id: None,
-            source_updated: None,
-            added: 0.0,
-        };
-        let imported = [make("later", false), make("first", true)];
-        let resolved = RefCell::new(Vec::new());
-        let resolve = |path: &str| {
-            resolved.borrow_mut().push(path.to_owned());
-            PathBuf::from(path)
-        };
-        assert_eq!(recent_with(&[], &imported, 1, resolve)[0].path, "first");
-        assert_eq!(&*resolved.borrow(), &["first"]);
-        resolved.borrow_mut().clear();
-        assert_eq!(
-            recent_with(&["first".into(), "unused".into()], &imported, 1, resolve)[0]
-                .name
-                .as_deref(),
-            Some("first")
-        );
-        assert_eq!(&*resolved.borrow(), &["first"]);
-    }
-}
-
 pub(crate) fn path_key(path: &str) -> PathBuf {
     if cfg!(windows) {
         // Same approach as sa-ext::directory (which depends on sa-store via
@@ -235,4 +200,39 @@ pub(crate) fn path_keys(conn: &Connection, sql: &str) -> Result<HashSet<PathBuf>
     Ok(stmt
         .query_map([], |row| Ok(path_key(row.get_ref(0)?.as_str()?)))?
         .collect::<rusqlite::Result<_>>()?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::RefCell;
+
+    #[test]
+    fn recent_does_not_resolve_candidates_past_the_cap_when_no_names_are_pending() {
+        let make = |path: &str, pinned| Project {
+            path: path.into(),
+            name: path.into(),
+            pinned,
+            source: "t3".into(),
+            source_id: None,
+            source_updated: None,
+            added: 0.0,
+        };
+        let imported = [make("later", false), make("first", true)];
+        let resolved = RefCell::new(Vec::new());
+        let resolve = |path: &str| {
+            resolved.borrow_mut().push(path.to_owned());
+            PathBuf::from(path)
+        };
+        assert_eq!(recent_with(&[], &imported, 1, resolve)[0].path, "first");
+        assert_eq!(&*resolved.borrow(), &["first"]);
+        resolved.borrow_mut().clear();
+        assert_eq!(
+            recent_with(&["first".into(), "unused".into()], &imported, 1, resolve)[0]
+                .name
+                .as_deref(),
+            Some("first")
+        );
+        assert_eq!(&*resolved.borrow(), &["first"]);
+    }
 }
