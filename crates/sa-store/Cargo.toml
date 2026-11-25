@@ -19,4 +19,7 @@ url = "2"
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security_Cryptography"] }
 
 [dev-dependencies]
+proc-macro2 = { version = "1", features = ["span-locations"] }
+syn = { version = "2", default-features = false, features = ["parsing"] }
 tempfile.workspace = true
+toml_edit = { version = "0.25", default-features = false, features = ["parse"] }

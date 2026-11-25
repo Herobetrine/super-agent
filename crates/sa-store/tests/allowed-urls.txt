@@ -1,0 +1,22 @@
+# Exact URL literals. To allow a specific prefix, put "prefix " before the URL.
+# Use a space on either side of the comment marker so URL fragments stay intact.
+https://generativelanguage.googleapis.com # default Antigravity provider API
+https://antigravity.google/docs/cli/install # Antigravity CLI installation
+https://antigravity.google/download # Antigravity desktop download
+https://code.claude.com/docs/en/quickstart # Claude Code installation
+https://claude.com/download # Claude desktop download
+https://developers.openai.com/codex/cli/ # Codex CLI installation
+https://developers.openai.com/codex/app/windows/ # Codex desktop installation
+https://download.deepseek.com/desktop/dsh-latest-windows-x64.exe # DeepSeek Harness desktop download
+https://www.deepseek.com/zh/harness/ # DeepSeek Harness home page
+https://github.com/deepseek-ai/deepseek-harness#run-from-npm # DeepSeek Harness CLI installation
+http://127.0.0.1:{}/mcp # loopback MCP bus URL template
+http://{host}:{port} # template for a proxy address the user configures
+https://mcp.example.org/mcp # MCP server address input placeholder, never requested
+https://api.example.com/v1 # custom provider input placeholder, never requested
+https://github.com/owner/repo/pull/123 # PR link input placeholder, never requested
+https://github.com/owner/repo/pull/number # example PR link in validation error
+https://github.com/{}/{}/pull/{} # validated GitHub PR link template
+https://github\.com/([A-Za-z0-9][A-Za-z0-9-]{0,38})/([A-Za-z0-9_.-]{1,100})/pull/([1-9][0-9]{0,14})/?$ # GitHub PR validator regex
+https:// # literal scheme checked by link and price source validators
+https://ntfy.sh # default server for the optional phone push (M0.5)
