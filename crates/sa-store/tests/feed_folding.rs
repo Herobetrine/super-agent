@@ -170,3 +170,181 @@ fn the_folding_rule_keeps_lead_events_decisions_and_open_rounds() {
     assert!(fold("delta", 500, Some(2), Some(3), Some(("running", 3))), "collaborator deltas never show");
     assert!(!folded_from_feed("reply", 10, Some(2), Some(1), None, 100, Some(("done", 1))), "no root, no folding");
 }
+
+/// Independent full-scan oracle for this fixture's journal kinds. The two
+/// supplemental kinds both produce activity, and no raw delta uses a page slot.
+fn check_page(store: &mut Store, conn: &Connection, lead: Job, after: i64) -> i64 {
+    let rounds = conn
+        .prepare("SELECT id,state,turn,ticket FROM jobs")
+        .unwrap()
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                (r.get::<_, String>(1)?, r.get::<_, i64>(2)?, r.get::<_, i64>(3)?),
+            ))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<std::collections::HashMap<_, _>>>()
+        .unwrap();
+    let rows = conn
+        .prepare("SELECT seq,kind,job,turn FROM events WHERE ticket=? ORDER BY seq")
+        .unwrap()
+        .query_map([lead.ticket], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<i64>>(2)?,
+                r.get::<_, Option<i64>>(3)?,
+            ))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    let resumed = rows
+        .iter()
+        .rev()
+        .find(|(_, k, j, _)| k == "turn.admitted" && *j == Some(lead.id))
+        .map_or(0, |r| r.0);
+    let end = rows.last().unwrap().0;
+    let mut expected = Vec::new();
+    let mut deltas = Vec::new();
+    for (seq, kind, job, turn) in rows {
+        if seq <= after {
+            continue;
+        }
+        let shown_kind = match kind.as_str() {
+            "turn.admitted" | "job.progress" | "retry" => "activity",
+            "delta" => {
+                if job == Some(lead.id) && turn == Some(lead.turn) {
+                    deltas.push(seq);
+                }
+                continue;
+            }
+            "user" | "note" | "reply" | "ask" => kind.as_str(),
+            k => panic!("unclassified fixture kind {k}"),
+        };
+        let round = job
+            .and_then(|j| rounds.get(&j))
+            .filter(|(_, _, ticket)| shown_kind != "activity" || *ticket == lead.ticket)
+            .map(|(s, t, _)| (s.as_str(), *t));
+        if !folded_from_feed(shown_kind, seq, job, turn, Some(lead.id), resumed, round) {
+            expected.push(seq);
+        }
+    }
+    if after == 0 {
+        expected = expected.split_off(expected.len().saturating_sub(180));
+    } else {
+        expected.truncate(180);
+    }
+    let cursor = if after != 0 && expected.len() == 180 {
+        *expected.last().unwrap()
+    } else {
+        end
+    };
+    expected.extend(deltas.into_iter().filter(|s| *s <= cursor));
+    expected.sort_unstable();
+    let actual = store.snapshot(lead.ticket, after).unwrap();
+    assert_eq!((actual.lead_resumed, actual.cursor), (resumed, cursor));
+    assert_eq!(
+        actual.events.iter().map(|e| e.seq).collect::<Vec<_>>(),
+        expected,
+        "after={after}"
+    );
+    cursor
+}
+
+#[test]
+fn full_and_incremental_snapshots_match_full_scan_with_and_without_writer_index() {
+    for indexed in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        drop(Store::open(dir.path()).unwrap());
+        let conn = writer(dir.path());
+        if !indexed {
+            conn.execute_batch("DROP INDEX events_ticket_job_kind")
+                .unwrap();
+        }
+        let mut store = Store::open_read_only(dir.path()).unwrap();
+        let lead = create_ticket(&conn, ".", "paged history", "claude");
+        let mut cursor = check_page(&mut store, &conn, lead, 0);
+        conn.execute_batch("BEGIN").unwrap();
+        let busy = peer(&conn, lead, "codex", "waiting");
+        for turn in 1..=45 {
+            let root = Job { turn, ..lead };
+            log(&conn, root, "turn.admitted", &json!({}));
+            log(
+                &conn,
+                root,
+                "job.progress",
+                &json!({"summary":"old lead progress"}),
+            );
+            for _ in 0..48 {
+                log(&conn, root, "delta", &json!("old lead stream"));
+            }
+            for _ in 0..5 {
+                log(&conn, root, "reply", &json!({"text":"overview"}));
+            }
+            let done = peer(&conn, lead, "codex", "done");
+            for _ in 0..48 {
+                log(&conn, done, "delta", &json!("old collaborator stream"));
+            }
+            for _ in 0..8 {
+                log(&conn, done, "note", &json!({"body":"finished round"}));
+            }
+            log(&conn, done, "ask", &json!({"question":"keep?"}));
+        }
+        log(&conn, busy, "note", &json!({"body":"earlier turn"}));
+        conn.execute("UPDATE jobs SET turn=2 WHERE id=?", [busy.id])
+            .unwrap();
+        let busy = Job { turn: 2, ..busy };
+        log(&conn, busy, "note", &json!({"body":"open turn"}));
+        log(
+            &conn,
+            busy,
+            "job.progress",
+            &json!({"summary":"open round progress"}),
+        );
+        conn.execute(
+            "INSERT INTO events(ts,ticket,job,turn,kind,payload,sha256) VALUES
+            (0,?1,NULL,NULL,'note','{}',''),(0,?1,?2,NULL,'note','{}',''),
+            (0,?1,NULL,NULL,'job.progress','{\"summary\":\"unowned\"}','')",
+            params![lead.ticket, busy.id],
+        )
+        .unwrap();
+        let below_resume = conn.last_insert_rowid() - 2;
+        // The schema has separate ticket and job foreign keys. Legacy SQL
+        // looked up a raw event's owner by id, but activity used ticket jobs.
+        let other = create_ticket(&conn, ".", "other ticket", "claude");
+        let foreign = Job { ticket: lead.ticket, ..other };
+        log(&conn, foreign, "note", &json!({}));
+        log(&conn, foreign, "job.progress", &json!({"summary":"foreign progress"}));
+        let lead = Job { turn: 46, ..lead };
+        conn.execute(
+            "UPDATE jobs SET turn=?,state='running' WHERE id=?",
+            params![lead.turn, lead.id],
+        )
+        .unwrap();
+        log(&conn, lead, "turn.admitted", &json!({}));
+        log(&conn, lead, "delta", &json!("first attempt"));
+        log(&conn, lead, "retry", &json!({}));
+        log(&conn, lead, "turn.admitted", &json!({}));
+        for _ in 0..220 {
+            log(&conn, lead, "note", &json!({"body":"current"}));
+            log(&conn, lead, "delta", &json!("stream"));
+        }
+        log(
+            &conn,
+            lead,
+            "job.progress",
+            &json!({"summary":"current lead progress"}),
+        );
+        conn.execute_batch("COMMIT").unwrap();
+        let end = check_page(&mut store, &conn, lead, 0);
+        check_page(&mut store, &conn, lead, below_resume);
+        while cursor < end {
+            let next = check_page(&mut store, &conn, lead, cursor);
+            assert!(next > cursor);
+            cursor = next;
+        }
+        assert_eq!(check_page(&mut store, &conn, lead, end), end);
+    }
+}

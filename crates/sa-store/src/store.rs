@@ -1,7 +1,8 @@
 //! Journal connection and read operations (port of `runtime/studio.cjs` reads).
 
+use crate::feed::{self, PAGE};
 use crate::model::*;
-use crate::progress::{Entry, ScanRow, VISIBLE};
+use crate::progress::{Entry, ScanRow};
 use crate::schema::{ADDITIONS, SCHEMA, STUDIO_PLAN};
 use anyhow::{Context, Result, bail, ensure};
 use rusqlite::types::ValueRef;
@@ -10,9 +11,6 @@ use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-
-/// `seq, kind, ts, job, turn, payload` of a main-feed event row.
-type RawEvent = (i64, String, f64, Option<i64>, Option<i64>, String);
 
 /// Database file name inside the data directory.
 pub const DB_FILE: &str = "hub.sqlite3";
@@ -62,7 +60,7 @@ fn id(v: i64) -> Result<i64> {
     Ok(v)
 }
 
-fn json(text: &str) -> Result<Value> {
+pub(super) fn json(text: &str) -> Result<Value> {
     serde_json::from_str(text).with_context(|| format!("invalid JSON in journal: {:.80}", text))
 }
 
@@ -131,6 +129,7 @@ fn job_view(raw: RawJob) -> Result<JobView> {
 }
 
 pub struct Store {
+    feed_indexes: feed::Indexes,
     conn: Connection,
     /// Per-ticket progress projection (`ProgressJournal.seen` + TEMP view).
     progress: HashMap<i64, Entry>,
@@ -152,6 +151,7 @@ impl Store {
         .with_context(|| format!("open {} read-only", path.display()))?;
         conn.busy_timeout(Duration::from_millis(5000))?;
         Ok(Self {
+            feed_indexes: feed::Indexes::detect(&conn)?,
             conn,
             progress: HashMap::new(),
             usage: HashMap::new(),
@@ -192,6 +192,7 @@ impl Store {
         tx.commit()?;
         conn.execute_batch(STUDIO_PLAN)?;
         Ok(Self {
+            feed_indexes: feed::Indexes::detect(&conn)?,
             conn,
             progress: HashMap::new(),
             usage: HashMap::new(),
@@ -432,86 +433,29 @@ impl Store {
         // Collaborator rounds the lead has resumed past leave the main feed
         // (`folded_from_feed`), so they must not use up its 180 rows either.
         let root = jobs.iter().find(|j| j.parent.is_none());
-        let lead_resumed: i64 = match root {
-            Some(root) => conn
-                .prepare_cached("SELECT coalesce(max(seq),0) FROM events WHERE ticket=? AND kind='turn.admitted' AND job=? AND seq<=?")?
-                .query_row(params![ticket, root.id, end], |r| r.get(0))?,
-            None => 0,
-        };
-        let rounds: HashMap<i64, (String, i64)> = conn
-            .prepare_cached("SELECT id,state,turn FROM jobs WHERE ticket=?")?
-            .query_map([ticket], |r| Ok((r.get::<_, i64>(0)?, (r.get::<_, String>(1)?, r.get::<_, i64>(2)?))))?
-            .collect::<rusqlite::Result<_>>()?;
-        let root_id = root.map(|j| j.id);
-        let shown = |kind: &str, seq: i64, job: Option<i64>, turn: Option<i64>| {
-            let round = job.and_then(|j| rounds.get(&j)).map(|(state, turn)| (state.as_str(), *turn));
-            !folded_from_feed(kind, seq, job, turn, root_id, lead_resumed, round)
-        };
-
-        // Work only on visible events. Project reply text before crossing IPC.
-        // Text deltas are read separately below: only the lead's in-flight
-        // turn needs them, and a finished turn's deltas repeat its reply.
-        let kinds = VISIBLE
-            .iter()
-            .filter(|k| **k != "delta")
-            .map(|k| format!("'{k}'"))
-            .collect::<Vec<_>>()
-            .join(",");
-        let open = OPEN_JOB_STATES.iter().map(|k| format!("'{k}'")).collect::<Vec<_>>().join(",");
-        let decisions = DECISION_KINDS.iter().map(|k| format!("'{k}'")).collect::<Vec<_>>().join(",");
-        let columns = "seq,kind,ts,job,turn,CASE
-      WHEN kind='reply' THEN json_object('text',substr(json_extract(payload,'$.text'),1,64000))
-      WHEN kind='mcp.result' THEN json_object('id',json_extract(payload,'$.id'),'server',json_extract(payload,'$.server'),
-        'tool',json_extract(payload,'$.tool'),'state',json_extract(payload,'$.state'))
-      WHEN kind IN ('user','user.follow','delta','failed','cancelled','interrupted','auto.recover') THEN
-        CASE WHEN json_type(payload)='text' THEN json_quote(substr(json_extract(payload,'$'),1,64000)) ELSE payload END
-      ELSE payload END payload";
-        let order = if after != 0 { "ASC" } else { "DESC" };
-        // Same rule as `folded_from_feed`; a job missing from `jobs` counts as ended.
-        let sql = format!(
-            "SELECT {columns} FROM events WHERE ticket=?1 AND seq>?2 AND seq<=?3 AND kind IN ({kinds})
-      AND NOT (job IS NOT NULL AND job IS NOT ?4 AND ?4 IS NOT NULL AND kind NOT IN ({decisions}) AND seq<?5
-        AND coalesce((SELECT pj.state NOT IN ({open}) OR coalesce(events.turn<pj.turn,0) FROM jobs pj WHERE pj.id=events.job),1))
-      ORDER BY seq {order} LIMIT 180"
-        );
-        let view = |r: &Row| -> rusqlite::Result<RawEvent> {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))
-        };
-        let to_event = |row: rusqlite::Result<RawEvent>| {
-            let (seq, kind, ts, job, turn, payload) = row?;
-            Ok(EventView { seq, kind, ts, job, turn, agent: None, payload: json(&payload)? })
-        };
-        let mut merged = conn
-            .prepare_cached(&sql)?
-            .query_map(params![ticket, after, end, root_id, lead_resumed], view)?
-            .map(to_event)
-            .collect::<Result<Vec<_>>>()?;
+        let reader = feed::Reader::new(conn, self.feed_indexes, ticket, after, end);
+        let fold = reader.fold(root.map(|j| j.id))?;
+        let lead_resumed = fold.resumed;
+        let mut merged = reader.page(&fold)?;
         let entry = &self.progress[&ticket];
         if !loading {
-            let keep = |seq: i64, job: Option<i64>, turn: Option<i64>| shown("activity", seq, job, turn);
-            merged.extend(entry.read(after, end, after == 0, 180, true, &keep));
+            merged.extend(entry.feed(after, end, &fold));
         }
         merged.sort_by_key(|e| e.seq);
         let mut events: Vec<EventView> = if after != 0 {
-            merged.truncate(180);
+            merged.truncate(PAGE);
             merged
         } else {
-            let skip = merged.len().saturating_sub(180);
+            let skip = merged.len().saturating_sub(PAGE);
             merged.split_off(skip)
         };
         let cursor = match events.last() {
-            Some(last) if after != 0 && events.len() == 180 => last.seq,
+            Some(last) if after != 0 && events.len() == PAGE => last.seq,
             _ => end,
         };
         // The lead's in-flight turn streams its reply as deltas.
         if let Some(root) = root.filter(|j| j.state == "running") {
-            let deltas = conn
-                .prepare_cached(&format!(
-                    "SELECT {columns} FROM events WHERE ticket=? AND kind='delta' AND job=? AND turn=? AND seq>? AND seq<=? ORDER BY seq"
-                ))?
-                .query_map(params![ticket, root.id, root.turn, after, cursor], view)?
-                .map(to_event)
-                .collect::<Result<Vec<_>>>()?;
+            let deltas = reader.deltas(root.id, root.turn, cursor)?;
             if !deltas.is_empty() {
                 events.extend(deltas);
                 events.sort_by_key(|e| e.seq);
