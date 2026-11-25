@@ -198,7 +198,6 @@ struct Slot {
     cancel: CancellationToken,
     task: Option<JoinHandle<()>>,
     turn: Arc<Turn>,
-    _power: BusyGuard,
 }
 
 #[derive(Default)]
@@ -1032,13 +1031,10 @@ impl Engine {
                 .map(|row| str_of(&row, "cwd").to_string())
                 .ok_or_else(|| anyhow::anyhow!("工单不存在"))
         })?;
-        let _power = self.track_work();
         let manifest = self.inner.snapshot(&cwd, files).await?;
         let validation = Value::Array(manifest.clone());
         let directory = self.inner.data_dir.join("objects");
-        let image_power = self.track_work();
-        let _ = tokio::task::spawn_blocking(move || {
-            let _power = image_power;
+        let _ = self.inner.power.spawn_blocking(move || {
             crate::images::from_manifest(&validation, &directory)
         })
         .await??;
@@ -1530,8 +1526,7 @@ impl Inner {
         *ready = None;
         let inner = self.clone();
         // `git init` and the initial commit run under operation receipts.
-        let (repository, ids) = tokio::task::spawn_blocking(move || {
-            let _power = inner.power.track();
+        let (repository, ids) = self.power.spawn_blocking(move || {
             let scope = inner.scope(owner);
             let result = crate::project_git::ensure_observed(&directory, &||
                 cancel.is_cancelled() || inner.stopping.load(Ordering::SeqCst), &scope);
@@ -2126,6 +2121,7 @@ impl Inner {
             // the slot is always registered before it can be removed.
             let power = self.power.track();
             let task = tokio::spawn(async move {
+                let _power = power;
                 if let Err(e) = inner.execute(&t).await {
                     inner.scheduler_failed("journal_error", format!("无法保存任务状态：{e}"));
                 }
@@ -2139,7 +2135,6 @@ impl Inner {
                     cancel: turn.cancel.clone(),
                     task: Some(task),
                     turn: turn.clone(),
-                    _power: power,
                 },
             );
         }
@@ -2237,11 +2232,11 @@ impl Inner {
         if names.is_empty() {
             return Ok(vec![]);
         }
-        let result = self
+        let snapshot = self
             .opts
             .snapshotter
-            .snapshot(PathBuf::from(cwd), names.to_vec(), self.data_dir.join("objects"))
-            .await?;
+            .snapshot(PathBuf::from(cwd), names.to_vec(), self.data_dir.join("objects"));
+        let result = self.power.track().scope(snapshot).await?;
         let sha = |s: &str| s.len() == 64 && s.bytes().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c));
         let rows = result.as_array().cloned().unwrap_or_default();
         let ok = rows.len() == names.len()
@@ -2328,7 +2323,7 @@ impl Inner {
             // receipts settled with the workspace row below.
             let inner = self.clone();
             let owner = crate::operations::Owner::job(job.ticket, job.id);
-            let (ready, verdicts, crashed) = tokio::task::spawn_blocking(move || {
+            let (ready, verdicts, crashed) = self.power.spawn_blocking(move || {
                 let scope = inner.scope(owner);
                 let ready = crate::integration_queue::provision_dependencies(&w,&data,&prerequisites,&scope,&hydration);
                 let verdicts = scope.settle(ready.is_ok());
@@ -2446,7 +2441,7 @@ impl Inner {
         *turn.packet() = packet.clone();
         let manifest = packet.get("files").cloned().unwrap_or(Value::Null);
         let objects = self.data_dir.join("objects");
-        let images = tokio::task::spawn_blocking(move || crate::images::from_manifest(&manifest, &objects))
+        let images = self.power.spawn_blocking(move || crate::images::from_manifest(&manifest, &objects))
             .await.map_err(|_| anyhow!("图片校验任务异常"))??;
         if !images.is_empty() && !crate::images::supports_native_images(&job.agent) {
             return Err(anyhow!(crate::images::UNSUPPORTED).into());
@@ -2567,7 +2562,8 @@ impl Inner {
             return Ok(());
         }
         lock(&turn.activity).set_phase(ActivityPhase::Spawning, now());
-        let mut native = tokio::spawn(runner.run_turn(adapter, request, host, tx, turn.cancel.clone()));
+        let run = runner.run_turn(adapter, request, host, tx, turn.cancel.clone());
+        let mut native = tokio::spawn(self.power.track().scope(run));
         let wall = self.opts.runner.wall_clock();
         let deadline = tokio::time::sleep(wall.unwrap_or(Duration::MAX / 4));
         tokio::pin!(deadline);
@@ -2660,7 +2656,7 @@ impl Inner {
     async fn check_fingerprint(self: &Arc<Self>, turn: &Arc<Turn>) -> Result<Option<String>, TurnError> {
         let owner = self.clone();
         let turn = turn.clone();
-        Ok(tokio::task::spawn_blocking(move || {
+        Ok(self.power.spawn_blocking(move || {
             crate::workspaces::fingerprint(Path::new(&turn.job.cwd), &||
                 turn.aborted() || owner.stopping.load(Ordering::SeqCst))
         }).await.map_err(|_| anyhow!("工作树指纹计算异常"))??)
@@ -2682,7 +2678,7 @@ impl Inner {
         if unchanged && !(plan.criteria && plan.gate) { return Ok(None); }
         let commands = plan.commands.clone();
         let cwd = PathBuf::from(&job.cwd);
-        let environment = tokio::task::spawn_blocking(move || crate::verification::environment(&cwd, &commands))
+        let environment = self.power.spawn_blocking(move || crate::verification::environment(&cwd, &commands))
             .await.map_err(|_| anyhow!("检查环境识别异常"))?;
         plan.bind_environment(&environment);
         let cached = plan.cached(fingerprint.as_deref());
@@ -2700,7 +2696,7 @@ impl Inner {
                 let running = turn.clone();
                 let command = argv.clone();
                 let started = Instant::now();
-                let result = tokio::task::spawn_blocking(move || {
+                let result = self.power.spawn_blocking(move || {
                     crate::workspaces::command_with_cancel(Path::new(&running.job.cwd), &command,
                         Duration::from_secs(600), Some(&|| running.aborted() || owner.stopping.load(Ordering::SeqCst)))
                 }).await.map_err(|_| anyhow!("完成检查执行异常"))?;
@@ -2752,7 +2748,7 @@ impl Inner {
         let request = crate::delivery::AutoRequest {
             ticket: job.ticket, job: job.id, turn: job.turn, cwd: job.cwd.clone(), unchanged,
         };
-        let result = tokio::task::spawn_blocking(move || {
+        let result = self.power.spawn_blocking(move || {
             engine.auto_delivery(&request, &|| running.aborted())
         }).await.map_err(|_| anyhow!("交付证据采集异常"))?;
         if turn.aborted() { return Err(anyhow!("任务已中止").into()); }
