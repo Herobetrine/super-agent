@@ -1,9 +1,11 @@
 //! Local settings for optional phone notifications.
 
-use anyhow::{Context, Result};
+use anyhow::{Result, anyhow, ensure};
 use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
-use url::{Host, Url};
+use url::{Host, Position, Url};
+
+pub const SERVER_CREDENTIALS_ERROR: &str = "服务器地址里不能包含用户名或密码";
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -52,12 +54,21 @@ pub fn load(conn: &Connection) -> Result<Settings> {
         )
         .optional()?;
     value
-        .map(|text| serde_json::from_str(&text).context("读取手机推送设置失败"))
+        .map(|text| {
+            // A deserialization error can quote malformed stored values.
+            serde_json::from_str(&text).map_err(|_| anyhow!("读取手机推送设置失败"))
+        })
         .transpose()
         .map(Option::unwrap_or_default)
 }
 
 pub fn save(conn: &Connection, s: &Settings) -> Result<()> {
+    let address = s.server.trim();
+    let has_credentials = Url::parse(address).map_or_else(
+        |_| malformed_url_has_userinfo(address),
+        |url| url_has_credentials(&url),
+    );
+    ensure!(!has_credentials, "{SERVER_CREDENTIALS_ERROR}");
     init(conn)?;
     conn.execute(
         "INSERT INTO studio_notify(singleton,settings) VALUES(1,?1)
@@ -73,6 +84,7 @@ pub enum ServerProblem {
     NeedsHttps,
     Invalid,
     HasPath,
+    HasCredentials,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -99,7 +111,9 @@ pub fn check(s: &Settings) -> Check {
         Some(ServerProblem::Empty)
     } else {
         match Url::parse(address) {
+            Err(_) if malformed_url_has_userinfo(address) => Some(ServerProblem::HasCredentials),
             Err(_) => Some(ServerProblem::Invalid),
+            Ok(url) if url_has_credentials(&url) => Some(ServerProblem::HasCredentials),
             Ok(url)
                 if matches!(url.scheme(), "http" | "https")
                     && (url.path() != "/"
@@ -134,6 +148,43 @@ pub fn check(s: &Settings) -> Check {
         short_topic: s.topic.chars().count() < 12,
         nothing_selected: !(s.needs_you || s.done || s.unfinished),
     }
+}
+
+/// Return a safe replacement only when userinfo must be removed.
+pub fn redact_server_credentials(address: &str) -> Option<String> {
+    let address = address.trim();
+    match Url::parse(address) {
+        Ok(url) if url_has_credentials(&url) => Some(format!(
+            "{}{}",
+            &url[..Position::BeforeUsername],
+            &url[Position::BeforeHost..]
+        )),
+        Ok(_) => None,
+        // A malformed authority can still contain credentials. Do not display it.
+        Err(_) => malformed_url_has_userinfo(address).then(String::new),
+    }
+}
+
+fn url_has_credentials(url: &Url) -> bool {
+    !url.username().is_empty() || url.password().is_some()
+}
+
+fn malformed_url_has_userinfo(address: &str) -> bool {
+    let locator = match address.split_once(':') {
+        Some((scheme, rest))
+            if scheme.eq_ignore_ascii_case("http")
+                || scheme.eq_ignore_ascii_case("https")
+                || rest.starts_with("//") =>
+        {
+            rest
+        }
+        _ => address,
+    };
+    locator
+        .trim_start_matches(['/', '\\'])
+        .split(['/', '\\', '?', '#'])
+        .next()
+        .is_some_and(|authority| authority.contains('@'))
 }
 
 fn has_non_root_path(address: &str) -> bool {

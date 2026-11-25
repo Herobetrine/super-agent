@@ -183,6 +183,23 @@ fn send_rejects_a_non_root_endpoint_before_opening_a_connection() {
 }
 
 #[test]
+fn send_rejects_credentials_without_echoing_them_or_connecting() {
+    let server = TcpListener::bind("127.0.0.1:0").unwrap();
+    server.set_nonblocking(true).unwrap();
+    let address = server.local_addr().unwrap();
+    assert_eq!(
+        send(
+            &format!("http://fixture-user:fixture-password@{address}"),
+            TOPIC,
+            &test_push(),
+            TIMEOUT
+        ),
+        Err(SendError::Other(notify::SERVER_CREDENTIALS_ERROR.into()))
+    );
+    assert_eq!(server.accept().unwrap_err().kind(), ErrorKind::WouldBlock);
+}
+
+#[test]
 fn send_reports_forbidden_and_does_not_follow_redirects() {
     let (server, worker) = stub(|mut stream| {
         read_publish(&mut stream);
@@ -356,4 +373,24 @@ fn recovered_settings_do_not_replace_a_newly_saved_value() {
     settings.publish(Ok(saved.clone()));
     settings.recover(Settings::default());
     assert_eq!(settings.get(), Ok(saved));
+}
+
+#[test]
+fn completion_epoch_changes_when_stopped_and_reenabled_between_frames() {
+    let settings = NotifySettings::default();
+    let enabled = selected();
+    settings.publish(Ok(enabled.clone()));
+    let epoch = settings.completion_epoch();
+    assert!(epoch.is_some());
+    settings.publish(Ok(enabled.clone()));
+    assert_eq!(settings.completion_epoch(), epoch);
+    settings.publish(Ok(Settings {
+        done: false,
+        unfinished: false,
+        ..enabled.clone()
+    }));
+    assert!(settings.completion_epoch().is_none());
+    settings.publish(Ok(enabled));
+    assert!(settings.completion_epoch().is_some());
+    assert_ne!(settings.completion_epoch(), epoch);
 }
