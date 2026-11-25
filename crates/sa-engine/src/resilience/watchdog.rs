@@ -13,6 +13,7 @@ use super::{ResilienceConfig, TurnResult};
 use crate::adapter::{
     Adapter, AdapterError, AdapterEvent, ErrorClass, RunOutcome, RunRequest, TurnHost,
 };
+use crate::power::BusyGuard;
 use futures::FutureExt;
 use futures::future::BoxFuture;
 use serde_json::{Value, json};
@@ -222,7 +223,12 @@ pub(crate) async fn run_turn(
         ctl: ctl_tx,
     });
     let resumed = request.session_id.clone();
-    let mut task = tokio::spawn(adapter.run(request, host, tx, token.clone()));
+    let run = adapter.run(request, host, tx, token.clone());
+    let power = BusyGuard::inherit();
+    let mut task = tokio::spawn(async move {
+        let _power = power;
+        run.await
+    });
     let mut w = Watch::new(config, Instant::now());
     let mut rx_open = true;
     let mut ctl_open = true;

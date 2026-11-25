@@ -1,6 +1,7 @@
 //! Pluggable engine services: project extensions (MCP/skills, `SA_TOOL`) and
 //! attachment snapshots. Real MCP lands later; tests supply fakes.
 
+use crate::power::BusyGuard;
 use anyhow::{Context, Result, bail, ensure};
 use futures::future::BoxFuture;
 use rusqlite::Connection;
@@ -126,12 +127,48 @@ impl Snapshotter for FsSnapshotter {
         names: Vec<String>,
         directory: PathBuf,
     ) -> BoxFuture<'static, Result<Value>> {
-        Box::pin(async move {
-            tokio::task::spawn_blocking(move || snapshot_files(&project, &names, &directory))
-                .await
-                .context("快照任务异常")?
-        })
+        Box::pin(copy_in_background(move || snapshot_files(&project, &names, &directory)))
     }
+}
+
+async fn copy_in_background(copy: impl FnOnce() -> Result<Value> + Send + 'static) -> Result<Value> {
+    let power = BusyGuard::inherit();
+    tokio::task::spawn_blocking(move || {
+        let _power = power;
+        copy()
+    })
+    .await
+    .context("快照任务异常")?
+}
+
+#[cfg(all(test, windows))]
+#[tokio::test]
+async fn cancelled_snapshot_waiter_leaves_the_copy_guard_held() {
+    use crate::power::Power;
+    use std::{sync::mpsc, time::Duration};
+    use tokio::{sync::oneshot, time::timeout};
+
+    let power = Power::for_test();
+    let (started, copying) = oneshot::channel();
+    let (finish, release) = mpsc::channel();
+    let waiter = tokio::spawn(power.track().scope(copy_in_background(move || {
+        let _ = started.send(());
+        let _ = release.recv();
+        Ok(Value::Null)
+    })));
+    timeout(Duration::from_secs(10), copying).await.unwrap().unwrap();
+    waiter.abort();
+    assert!(waiter.await.unwrap_err().is_cancelled());
+    assert_eq!(power.running(), 1);
+
+    finish.send(()).unwrap();
+    timeout(Duration::from_secs(10), async {
+        while power.running() != 0 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .unwrap();
 }
 
 fn snapshot_files(project: &Path, names: &[String], directory: &Path) -> Result<Value> {
