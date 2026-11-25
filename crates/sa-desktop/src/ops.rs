@@ -50,13 +50,20 @@ impl<T: Send + 'static> Pending<T> {
     }
 
     pub fn spawn(ctx: &egui::Context, f: impl FnOnce() -> Result<T> + Send + 'static) -> Self {
+        Self::spawn_joinable(ctx, f).0
+    }
+
+    pub(crate) fn spawn_joinable(
+        ctx: &egui::Context,
+        f: impl FnOnce() -> Result<T> + Send + 'static,
+    ) -> (Self, std::thread::JoinHandle<()>) {
         let (tx, rx) = mpsc::channel();
         let ctx = ctx.clone();
-        std::thread::spawn(move || {
+        let thread = std::thread::spawn(move || {
             let _ = tx.send(f().map_err(|e| format!("{e:#}")));
             ctx.request_repaint();
         });
-        Self { rx }
+        (Self { rx }, thread)
     }
 
     /// `Some` once the work has finished.

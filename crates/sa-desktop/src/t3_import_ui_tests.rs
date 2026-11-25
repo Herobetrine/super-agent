@@ -167,6 +167,15 @@ fn enabled(h: &Harness<'_, App>, role: Role, label: &str) -> bool {
     !h.get_by_role_and_label(role, label).accesskit_node().is_disabled()
 }
 
+fn click_in_view(h: &mut Harness<'_, App>, role: Role, label: &str) {
+    h.get_by_role_and_label(role, label).scroll_to_me();
+    h.run_steps(3);
+    // The scroll or async dialog layout can move the widget. Reacquire its
+    // coordinates before sending the pointer events.
+    h.get_by_role_and_label(role, label).click();
+    h.run_steps(3);
+}
+
 fn open_dialog(h: &mut Harness<'_, App>) {
     // The card and the recent list arrive asynchronously and move the link.
     until(h, "welcome page settled", |a| a.t3.settled());
@@ -368,6 +377,31 @@ fn step_two_selection_rules() {
     assert_eq!(h.state().t3.step_name(), "closed");
 }
 
+#[test]
+fn selection_step_can_switch_folders_and_resets_both_selections() {
+    let first = fixture(false);
+    let second = fixture(false);
+    let data = tempfile::tempdir().unwrap();
+    let mut h = writable(data.path(), &first, listed_beta(&first));
+    open_dialog(&mut h);
+    until(&mut h, "first folder", |a| a.t3.step_name() == "select");
+    assert!(contains_visible(&h, &first.folder.to_string_lossy()));
+    click_in_view(&mut h, Role::Button, "全不选");
+    assert_eq!(h.state().t3.picked(), [false; 3]);
+    click_in_view(&mut h, Role::CheckBox, "把对话导出为本地归档（仅供查阅）");
+    assert!(!enabled(&h, Role::Button, "开始导入"));
+
+    h.state_mut().t3.next_picked_folder = Some(second.folder.clone());
+    h.get_by_role_and_label(Role::Button, "选择文件夹…").click();
+    until(&mut h, "new folder's selections", |a| a.t3.picked() == [true, true, false]);
+    assert!(contains_visible(&h, &second.folder.to_string_lossy()));
+    assert_eq!(
+        h.get_by_role_and_label(Role::CheckBox, "把对话导出为本地归档（仅供查阅）")
+            .accesskit_node().toggled(),
+        Some(egui::accesskit::Toggled::True)
+    );
+}
+
 // ---- steps 3 and 4 ---------------------------------------------------------
 
 /// Block the journal's writer so the project import stays in flight.
@@ -472,6 +506,39 @@ fn stop_asks_for_the_current_conversation_then_shows_the_stopped_result() {
 }
 
 #[test]
+fn closing_the_app_waits_for_the_export_pair_and_index() {
+    let fx = fixture(false);
+    let data = tempfile::tempdir().unwrap();
+    let mut h = writable(data.path(), &fx, listed_beta(&fx));
+    let hold = Arc::new(AtomicBool::new(true));
+    h.state_mut().t3.hold = Some(hold.clone());
+    start_import(&mut h, true);
+    until(&mut h, "first conversation", |a| a.t3.export_progress() == Some(1));
+    let archives = data.path().join("archives").join("t3");
+    let started = fs::read_dir(archives).unwrap().next().unwrap().unwrap().path();
+    assert!(!started.join("index.md").exists());
+    let stop = h.state().t3.export_stop_flag();
+    let release = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !stop.load(Ordering::Relaxed) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        hold.store(false, Ordering::Relaxed);
+        assert!(stop.load(Ordering::Relaxed));
+    });
+    eframe::App::on_exit(h.state_mut(), None);
+    release.join().unwrap();
+    let folder = h.state().t3.archive_folder().expect("archive after shutdown");
+    let index = fs::read_to_string(folder.join("index.md")).unwrap();
+    let project = fs::read_dir(folder.join("threads")).unwrap().next().unwrap().unwrap().path();
+    let files: Vec<_> = fs::read_dir(project).unwrap().map(|file| file.unwrap().path()).collect();
+    assert_eq!(files.len(), 2);
+    let md = files.iter().find(|path| path.extension().is_some_and(|ext| ext == "md")).unwrap();
+    assert!(md.with_extension("jsonl").is_file());
+    assert!(index.contains(md.file_name().unwrap().to_string_lossy().replace(' ', "%20").as_str()));
+}
+
+#[test]
 fn a_failed_conversation_gives_the_partial_result() {
     let fx = fixture(true);
     let data = tempfile::tempdir().unwrap();
@@ -497,15 +564,62 @@ fn a_failed_export_gives_the_failure_result_and_retry_starts_over() {
     let mut h = writable(data.path(), &fx, listed_beta(&fx));
     start_import(&mut h, true);
     until(&mut h, "done", |a| a.t3.step_name() == "done");
-    assert!(label_visible(&h, "导入失败"));
-    assert!(contains_visible(&h, "无法完成导入："));
-    assert!(label_visible(&h, "重试") && label_visible(&h, "关闭"));
+    assert!(label_visible(&h, "导入部分完成"));
+    assert!(contains_visible(&h, "已加入 1 个项目。对话导出失败："));
+    assert!(label_visible(&h, "重试导出") && label_visible(&h, "完成"));
     assert!(!label_visible(&h, "打开归档文件夹"));
-    h.get_by_role_and_label(Role::Button, "重试").click();
-    until(&mut h, "select again", |a| a.t3.step_name() == "select");
-    // The project went in with the first attempt, so it is listed now.
-    assert_eq!(h.query_all_by_label("已在列表中").count(), 2);
-    assert_eq!(h.state().t3.picked(), vec![false, false, false]);
+    fs::remove_file(data.path().join("archives")).unwrap();
+    let blocker = hold_journal(data.path());
+    h.get_by_role_and_label(Role::Button, "重试导出").click();
+    // An export can finish with the journal locked. A repeated project import
+    // would be blocked by that writer lock.
+    until(&mut h, "retry finished", |a| a.t3.archive_folder().is_some());
+    blocker.execute_batch("ROLLBACK").unwrap();
+    assert!(label_visible(&h, "已加入 1 个项目，已导出 3 个对话。"));
+    let conn = Connection::open(data.path().join(sa_store::DB_FILE)).unwrap();
+    assert_eq!(projects::list(&conn).unwrap().iter().filter(|p| p.source == "t3").count(), 1);
+}
+
+#[test]
+fn all_conversations_failing_also_offers_export_only_retry_after_project_import() {
+    let fx = fixture(false);
+    let conn = Connection::open(fx.folder.join("statev2.sqlite")).unwrap();
+    conn.execute_batch("UPDATE orchestration_v2_projection_messages SET payload_json = '{malformed'").unwrap();
+    conn.close().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let mut h = writable(data.path(), &fx, listed_beta(&fx));
+    start_import(&mut h, true);
+    until(&mut h, "all exports failed", |a| a.t3.step_name() == "done");
+    assert!(label_visible(&h, "导入部分完成"));
+    assert!(contains_visible(&h, "已加入 1 个项目。对话导出失败："));
+    assert!(contains_visible(&h, "errors.txt"));
+    assert!(label_visible(&h, "重试导出"));
+}
+
+#[test]
+fn export_only_import_persists_first_import_and_leaves_the_link_available() {
+    let fx = fixture(false);
+    let data = tempfile::tempdir().unwrap();
+    let mut h = writable(data.path(), &fx, listed_beta(&fx));
+    open_dialog(&mut h);
+    until(&mut h, "select", |a| a.t3.step_name() == "select");
+    click_in_view(&mut h, Role::Button, "全不选");
+    assert_eq!(h.state().t3.picked(), [false; 3]);
+    h.get_by_role_and_label(Role::Button, "开始导入").click();
+    until(&mut h, "exported", |a| a.t3.archive_folder().is_some());
+    assert!(label_visible(&h, "已导出 3 个对话。"));
+    let conn = Connection::open(data.path().join(sa_store::DB_FILE)).unwrap();
+    until(&mut h, "journal marker", |_| sa_store::t3_import::has_imported(&conn).unwrap());
+    assert!(!projects::has_source(&conn, "t3").unwrap());
+    drop(conn);
+    drop(h);
+
+    let mut reopened = writable(data.path(), &fx, Vec::new());
+    until(&mut reopened, "welcome settled on restart", |a| a.t3.settled());
+    assert_eq!(reopened.state().t3.card_state(), "hidden");
+    assert!(!label_visible(&reopened, "开始导入…"));
+    open_dialog(&mut reopened);
+    until(&mut reopened, "quiet link opened selection", |a| a.t3.step_name() == "select");
 }
 
 // ---- the welcome list ------------------------------------------------------
@@ -556,4 +670,31 @@ fn recent_projects_list_tickets_first_then_up_to_eight_with_t3_names() {
     h.get_by_label("T3 项目 8").click();
     h.run_steps(3);
     assert_eq!(h.state().composer.project.as_deref(), Some(work.path().join("imp-8").as_path()));
+}
+
+#[test]
+fn welcome_import_link_can_be_scrolled_into_view_and_clicked_at_minimum_size() {
+    let fx = fixture(false);
+    let data = tempfile::tempdir().unwrap();
+    let work = tempfile::tempdir().unwrap();
+    let seed = (0..8).map(|index| {
+        let dir = work.path().join(format!("project-{index}"));
+        fs::create_dir(&dir).unwrap();
+        project(&dir, &format!("项目 {index} {}", "较长的项目名".repeat(6)), "manual", false, "2024-03-01")
+    }).collect();
+    let mut h = writable(data.path(), &fx, seed);
+    h.set_size(egui::vec2(880.0, 600.0));
+    h.state_mut().composer.draft = "一行输入\n".repeat(12);
+    until(&mut h, "small welcome settled", |a| a.t3.settled());
+    assert_eq!(h.state().t3.card_state(), "shown");
+    let link = h.get_by_role_and_label(Role::Button, "从 T3 Code 导入…");
+    let before = link.rect().center().y;
+    link.scroll_to_me();
+    h.run_steps(3);
+    let link = h.get_by_role_and_label(Role::Button, "从 T3 Code 导入…");
+    assert!(link.rect().center().y < before, "the welcome body must scroll the link into view");
+    link.click();
+    h.run_steps(3);
+    assert_ne!(h.state().t3.step_name(), "closed", "the scrolled link must accept a pointer click");
+    until(&mut h, "import link opened the dialog", |a| a.t3.step_name() == "select");
 }

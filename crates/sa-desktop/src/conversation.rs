@@ -133,7 +133,11 @@ impl App {
         }
         let Some(view) = self.view.as_ref() else {
             if self.writable() && self.source.error.is_none() {
-                self.welcome(ui);
+                let height = ui.available_height();
+                egui::ScrollArea::vertical()
+                    .id_salt("welcome-body")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| self.welcome(ui, height));
             } else {
                 self.empty_state(ui);
             }
@@ -298,12 +302,11 @@ impl App {
 
     /// New-conversation home: greeting, starter prompts and recent projects,
     /// left-aligned with the composer below.
-    fn welcome(&mut self, ui: &mut Ui) {
+    fn welcome(&mut self, ui: &mut Ui, height: f32) {
         let pal = self.pal.clone();
-        let h = ui.available_height();
         // Sit a little above the middle of the free space.
         let extra = if self.t3_card_showing() { 120.0 } else { 0.0 };
-        ui.add_space(((h - 330.0 - extra - 40.0) * 0.4).max(16.0));
+        ui.add_space(((height - 330.0 - extra - 40.0) * 0.4).max(16.0));
         let mut pick_draft: Option<String> = None;
         let mut pick_project: Option<std::path::PathBuf> = None;
         centered(ui, COLUMN, 20.0, |ui| {

@@ -690,6 +690,10 @@ impl eframe::App for App {
         }
     }
 
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.t3_finish_on_exit();
+    }
+
     fn raw_input_hook(&mut self, _ctx: &egui::Context, raw: &mut egui::RawInput) {
         // Screenshots must not depend on where the mouse happens to be.
         if self.shot.is_some() {

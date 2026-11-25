@@ -2,9 +2,10 @@
 
 use crate::projects::{self, Project};
 use anyhow::{Context, Result, ensure};
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde::Serialize;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
@@ -19,6 +20,8 @@ const PROJECTS: &str = "projection_projects";
 const THREADS: &str = "orchestration_v2_projection_threads";
 const MESSAGES: &str = "orchestration_v2_projection_messages";
 const ITEMS: &str = "orchestration_v2_projection_turn_items";
+const RUNS: &str = "orchestration_v2_projection_runs";
+const ATTEMPTS: &str = "orchestration_v2_projection_run_attempts";
 const LIVE_THREADS: &str = "FROM orchestration_v2_projection_threads t
     JOIN projection_projects p ON p.project_id = t.project_id
     WHERE t.deleted_at IS NULL AND p.deleted_at IS NULL";
@@ -317,7 +320,7 @@ fn source_projects(conn: &Connection, schema: &Schema) -> Result<Vec<ArchiveProj
         .collect::<rusqlite::Result<_>>()?)
 }
 
-fn ticket_paths(store: &Connection) -> Result<HashSet<String>> {
+fn ticket_paths(store: &Connection) -> Result<HashSet<PathBuf>> {
     let has_tickets: bool = store.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'tickets')",
         [],
@@ -384,6 +387,38 @@ pub fn import_projects(store: &Connection, chosen: &[T3Project]) -> Result<usize
     projects::add(store, &selected)
 }
 
+/// Record that at least one conversation was archived, including export-only imports.
+pub fn record_export(store: &Connection) -> Result<()> {
+    let tx = store.unchecked_transaction()?;
+    tx.execute_batch(
+        "CREATE TABLE IF NOT EXISTS studio_t3_import (
+            singleton INTEGER PRIMARY KEY CHECK(singleton = 1)
+        );
+        INSERT OR IGNORE INTO studio_t3_import VALUES (1);",
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+pub fn has_imported(store: &Connection) -> Result<bool> {
+    if projects::has_source(store, "t3")? {
+        return Ok(true);
+    }
+    let has_marker_table: bool = store.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'studio_t3_import')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_marker_table {
+        return Ok(false);
+    }
+    Ok(
+        store.query_row("SELECT EXISTS(SELECT 1 FROM studio_t3_import)", [], |r| {
+            r.get(0)
+        })?,
+    )
+}
+
 fn resolve_output_path(root: &Path) -> Result<PathBuf> {
     let absolute = std::path::absolute(root)?;
     let mut existing = absolute.as_path();
@@ -402,7 +437,7 @@ fn resolve_output_path(root: &Path) -> Result<PathBuf> {
 
 fn safe_output_root(root: &Path, source_folder: &Path) -> Result<PathBuf> {
     let resolved = resolve_output_path(root)?;
-    let key = |path: &Path| projects::path_key(&path.to_string_lossy());
+    let key = |path: &Path| projects::normalized_path(&path.to_string_lossy());
     let output_key = key(&resolved);
     let protect = |path: &Path| -> Result<()> {
         let source_key = key(path).trim_end_matches('/').to_owned();
@@ -522,6 +557,15 @@ struct ArchiveThread {
     created_at: String,
     updated_at: String,
     archived: bool,
+}
+
+fn read_thread_header(conn: &Connection, thread: &str) -> Result<Value> {
+    let raw: String = conn.query_row(
+        "SELECT payload_json FROM orchestration_v2_projection_threads WHERE thread_id = ?1",
+        [thread],
+        |row| row.get(0),
+    )?;
+    payload(&raw, "对话信息")
 }
 
 fn source_threads(conn: &Connection, schema: &Schema) -> Result<Vec<ArchiveThread>> {
@@ -657,25 +701,57 @@ struct Message {
     raw: String,
 }
 
-fn messages(conn: &Connection, thread: &str) -> Result<Vec<Message>> {
-    let mut stmt = conn.prepare(
-        "SELECT message_id, role, created_at, payload_json
-         FROM orchestration_v2_projection_messages WHERE thread_id = ?1
-         ORDER BY created_at, message_id",
-    )?;
-    Ok(stmt
-        .query_map([thread], |row| {
-            Ok(Message {
-                id: row.get(0)?,
-                role: row.get(1)?,
-                time: row.get(2)?,
-                raw: row.get(3)?,
-            })
-        })?
-        .collect::<rusqlite::Result<_>>()?)
+fn messages(
+    conn: &Connection,
+    thread: &str,
+    items: &TurnItems,
+    boundary: Option<&RunBoundary>,
+) -> Result<Vec<Message>> {
+    let run_column = if boundary.is_some() { "run_id" } else { "NULL" };
+    let mut stmt = conn.prepare(&format!(
+        "SELECT message_id, role, created_at, payload_json, {run_column}
+         FROM orchestration_v2_projection_messages WHERE thread_id = ?1"
+    ))?;
+    let mut rows = stmt.query([thread])?;
+    let mut messages = Vec::new();
+    while let Some(row) = rows.next()? {
+        let id: String = row.get(0)?;
+        if let Some(boundary) = boundary
+            && !items.message_ordinals.contains_key(&id)
+            && (items.hidden_messages.contains(&id)
+                || !boundary.includes_run(row.get_ref(4)?.as_str_or_null()?))
+        {
+            continue;
+        }
+        messages.push(Message {
+            id,
+            role: row.get(1)?,
+            time: row.get(2)?,
+            raw: row.get(3)?,
+        });
+    }
+    let ordinal = |msg: &Message| {
+        items
+            .message_ordinals
+            .get(&msg.id)
+            .copied()
+            .unwrap_or(i64::MAX)
+    };
+    messages.sort_by(|left, right| {
+        ordinal(left)
+            .cmp(&ordinal(right))
+            .then_with(|| left.time.cmp(&right.time))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    Ok(messages)
 }
 
-fn write_message(markdown: &mut impl Write, lines: &mut impl Write, msg: &Message) -> Result<()> {
+fn write_message(
+    markdown: &mut impl Write,
+    lines: &mut impl Write,
+    msg: &Message,
+    inherited_from: Option<&str>,
+) -> Result<()> {
     let body = payload(&msg.raw, "消息")?;
     let text = body["text"].as_str().context("消息缺少文本")?;
     let attachments: Vec<&str> = body["attachments"]
@@ -689,9 +765,14 @@ fn write_message(markdown: &mut impl Write, lines: &mut impl Write, msg: &Messag
         "assistant" => "助手",
         _ => "系统",
     };
+    let inherited = if inherited_from.is_some() {
+        " · 继承"
+    } else {
+        ""
+    };
     writeln!(
         markdown,
-        "\n### {label} · {}\n\n{text}",
+        "\n### {label} · {}{inherited}\n\n{text}",
         markdown_text(&msg.time)
     )?;
     if !attachments.is_empty() {
@@ -705,7 +786,7 @@ fn write_message(markdown: &mut impl Write, lines: &mut impl Write, msg: &Messag
         lines,
         &json!({
             "type": "message", "id": msg.id, "role": msg.role, "created_at": msg.time,
-            "text": text, "attachments": attachments,
+            "text": text, "attachments": attachments, "inherited_from": inherited_from,
         }),
     )
 }
@@ -721,27 +802,57 @@ struct Tool {
 
 struct TurnItems {
     message_ordinals: BTreeMap<String, i64>,
+    hidden_messages: HashSet<String>,
     tools: VecDeque<Tool>,
 }
 
-fn turn_items(conn: &Connection, thread: &str) -> Result<TurnItems> {
-    let mut stmt = conn.prepare(
-        "SELECT ordinal, type, status, payload_json
+fn turn_items(
+    conn: &Connection,
+    thread: &str,
+    boundary: Option<&RunBoundary>,
+) -> Result<TurnItems> {
+    let run_column = if boundary.is_some() { "run_id" } else { "NULL" };
+    let mut stmt = conn.prepare(&format!(
+        "SELECT ordinal, type, status, payload_json, {run_column}
          FROM orchestration_v2_projection_turn_items WHERE thread_id = ?1
-         AND type <> 'reasoning' ORDER BY ordinal",
-    )?;
+         AND type <> 'reasoning' ORDER BY ordinal"
+    ))?;
     let mut rows = stmt.query([thread])?;
     let mut message_ordinals = BTreeMap::new();
+    let mut hidden_messages = HashSet::new();
     let mut tools = VecDeque::new();
     while let Some(row) = rows.next()? {
         let ordinal: i64 = row.get(0)?;
         let kind: String = row.get(1)?;
+        let run_id = row.get_ref(4)?.as_str_or_null()?;
+        let is_message = matches!(kind.as_str(), "user_message" | "assistant_message");
+        if let Some(boundary) = boundary
+            && !boundary.includes_run(run_id)
+        {
+            // A message can have an anchor on a different run than its own
+            // row. Remember excluded anchors without decoding later tools.
+            if is_message
+                && let Ok(body) = serde_json::from_str::<Value>(row.get_ref(3)?.as_str()?)
+                && let Some(id) = body["messageId"].as_str()
+            {
+                hidden_messages.insert(id.to_owned());
+            }
+            continue;
+        }
         let raw: String = row.get(3)?;
         let body = payload(&raw, "对话步骤")?;
-        if matches!(kind.as_str(), "user_message" | "assistant_message") {
+        let visible = boundary.is_none_or(|boundary| boundary.item_visible(run_id, &kind, &body));
+        if is_message {
             if let Some(id) = body["messageId"].as_str() {
-                message_ordinals.entry(id.to_owned()).or_insert(ordinal);
+                if visible {
+                    message_ordinals.entry(id.to_owned()).or_insert(ordinal);
+                } else {
+                    hidden_messages.insert(id.to_owned());
+                }
             }
+            continue;
+        }
+        if !visible {
             continue;
         }
         let time = ["startedAt", "completedAt", "updatedAt"]
@@ -761,6 +872,7 @@ fn turn_items(conn: &Connection, thread: &str) -> Result<TurnItems> {
     }
     Ok(TurnItems {
         message_ordinals,
+        hidden_messages,
         tools,
     })
 }
@@ -891,15 +1003,239 @@ fn tool_summary(
     (format!("{label}{suffix}"), details)
 }
 
-fn write_tool(markdown: &mut impl Write, lines: &mut impl Write, tool: &Tool) -> Result<()> {
-    writeln!(markdown, "\n> 工具：{}", markdown_text(&tool.summary))?;
+fn write_tool(
+    markdown: &mut impl Write,
+    lines: &mut impl Write,
+    tool: &Tool,
+    inherited_from: Option<&str>,
+) -> Result<()> {
+    let inherited = if inherited_from.is_some() {
+        " · 继承"
+    } else {
+        ""
+    };
+    writeln!(
+        markdown,
+        "\n> 工具：{}{inherited}",
+        markdown_text(&tool.summary)
+    )?;
     jsonl(
         lines,
         &json!({
             "type": "tool", "kind": tool.kind, "ordinal": tool.ordinal, "status": tool.status,
-            "summary": tool.summary, "details": tool.details,
+            "summary": tool.summary, "details": tool.details, "inherited_from": inherited_from,
         }),
     )
+}
+
+struct RunBoundary {
+    ordinal: i64,
+    runs: BTreeMap<String, String>,
+    legacy: bool,
+    superseded_roots: BTreeMap<String, HashSet<String>>,
+    interrupt_requests: HashSet<String>,
+}
+
+impl RunBoundary {
+    fn includes_run(&self, run: Option<&str>) -> bool {
+        run.map_or(self.legacy, |id| self.runs.contains_key(id))
+    }
+
+    fn item_visible(&self, run: Option<&str>, kind: &str, item: &Value) -> bool {
+        let Some(run) = run else { return true };
+        match kind {
+            "user_message" if item["inputIntent"] == "queued_turn" => !matches!(
+                self.runs.get(run).map(String::as_str),
+                Some("queued" | "cancelled")
+            ),
+            "run_interrupt_result" => {
+                self.interrupt_requests.contains(run)
+                    || !self.superseded_roots.get(run).is_some_and(|roots| {
+                        item["nodeId"]
+                            .as_str()
+                            .is_some_and(|node| roots.contains(node))
+                    })
+            }
+            _ => true,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct ForkPoint {
+    thread_id: String,
+    run_id: String,
+}
+
+fn fork_point(header: &Value) -> Result<Option<ForkPoint>> {
+    let source = &header["forkedFrom"];
+    if source["type"] != "run" || header["lineage"]["sideChat"] == true {
+        return Ok(None);
+    }
+    let field = |key| {
+        source[key]
+            .as_str()
+            .filter(|id| !id.is_empty())
+            .with_context(|| format!("分叉点缺少 {key}"))
+    };
+    Ok(Some(ForkPoint {
+        thread_id: field("threadId")?.to_owned(),
+        run_id: field("runId")?.to_owned(),
+    }))
+}
+
+fn has_columns(conn: &Connection, table: &str, required: &[&str]) -> Result<bool> {
+    let mut stmt = conn.prepare("SELECT name FROM pragma_table_info(?1)")?;
+    let columns: HashSet<String> = stmt
+        .query_map([table], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(required.iter().all(|name| columns.contains(*name)))
+}
+
+struct ArchiveCatalog<'a> {
+    threads: BTreeMap<&'a str, &'a ArchiveThread>,
+    files: BTreeMap<&'a str, Result<String>>,
+    run_cutoffs: bool,
+    attempts: bool,
+}
+
+impl ArchiveCatalog<'_> {
+    fn boundary(
+        &self,
+        conn: &Connection,
+        point: &ForkPoint,
+        fork_created: &str,
+        legacy: bool,
+    ) -> Result<Option<RunBoundary>> {
+        let ordinal = conn.query_row(
+            "SELECT ordinal FROM orchestration_v2_projection_runs WHERE thread_id = ?1 AND run_id = ?2",
+            params![point.thread_id, point.run_id],
+            |row| row.get::<_, i64>(0),
+        ).optional()?;
+        let Some(ordinal) = ordinal else {
+            return Ok(None);
+        };
+        // The cutoff uses the parent's run ordinal, not its item's ordinal or
+        // wall clock. A rollback after the fork does not erase inherited rows.
+        let mut stmt = conn.prepare(
+            "SELECT run_id, status FROM orchestration_v2_projection_runs
+             WHERE thread_id = ?1 AND ordinal <= ?2
+             AND NOT COALESCE(status = 'rolled_back' AND julianday(completed_at) < julianday(?3), 0)",
+        )?;
+        let mut runs: BTreeMap<String, String> = stmt
+            .query_map(params![point.thread_id, ordinal, fork_created], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        let mut superseded_roots = BTreeMap::<String, HashSet<String>>::new();
+        let mut interrupt_requests = HashSet::new();
+        if self.attempts {
+            let mut stmt = conn.prepare(
+                "SELECT run_id, root_node_id, status
+                 FROM orchestration_v2_projection_run_attempts
+                 WHERE thread_id = ?1 AND status IN ('cancelled', 'superseded')",
+            )?;
+            let mut rows = stmt.query([&point.thread_id])?;
+            while let Some(row) = rows.next()? {
+                let id: String = row.get(0)?;
+                let status: String = row.get(2)?;
+                if status == "superseded" {
+                    superseded_roots.entry(id).or_default().insert(row.get(1)?);
+                } else if let Some(run_status) = runs.get_mut(&id)
+                    && run_status == "rolled_back"
+                {
+                    *run_status = status;
+                }
+            }
+            if !superseded_roots.is_empty() {
+                let mut stmt = conn.prepare(
+                    "SELECT DISTINCT run_id FROM orchestration_v2_projection_turn_items
+                     WHERE thread_id = ?1 AND type = 'run_interrupt_request' AND run_id IS NOT NULL",
+                )?;
+                interrupt_requests = stmt
+                    .query_map([&point.thread_id], |r| r.get(0))?
+                    .collect::<rusqlite::Result<_>>()?;
+            }
+        } else {
+            let has_interrupt: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM orchestration_v2_projection_turn_items
+                   WHERE thread_id = ?1 AND type = 'run_interrupt_result')",
+                [&point.thread_id],
+                |row| row.get(0),
+            )?;
+            if has_interrupt || runs.values().any(|status| status == "rolled_back") {
+                return Ok(None);
+            }
+        }
+        Ok(Some(RunBoundary {
+            ordinal,
+            runs,
+            legacy,
+            superseded_roots,
+            interrupt_requests,
+        }))
+    }
+
+    /// Resolve nested forks from the current child back to the oldest source.
+    fn inherited(
+        &self,
+        conn: &Connection,
+        thread: &ArchiveThread,
+        point: &ForkPoint,
+    ) -> Option<Vec<(&str, RunBoundary)>> {
+        if !self.run_cutoffs {
+            return None;
+        }
+        let mut point = point.clone();
+        let mut child_created = thread.created_at.as_str();
+        let mut seen = HashSet::from([thread.id.as_str()]);
+        let mut chain = Vec::new();
+        loop {
+            let parent = self.threads.get(point.thread_id.as_str())?;
+            if !seen.insert(parent.id.as_str()) {
+                return None;
+            }
+            let header = read_thread_header(conn, &parent.id).ok()?;
+            let legacy = header["historyOrigin"] == "v1_import";
+            let boundary = self
+                .boundary(conn, &point, child_created, legacy)
+                .ok()
+                .flatten()?;
+            chain.push((parent.id.as_str(), boundary));
+            child_created = &parent.created_at;
+            match fork_point(&header).ok()? {
+                Some(ancestor) => point = ancestor,
+                None => return Some(chain),
+            }
+        }
+    }
+}
+
+fn write_timeline(
+    conn: &Connection,
+    thread: &str,
+    boundary: Option<&RunBoundary>,
+    md: &mut impl Write,
+    jl: &mut impl Write,
+) -> Result<()> {
+    let inherited_from = boundary.map(|_| thread);
+    let mut items = turn_items(conn, thread, boundary)?;
+    for msg in messages(conn, thread, &items, boundary)? {
+        let anchor = items.message_ordinals.get(&msg.id);
+        while items.tools.front().is_some_and(|tool| match anchor {
+            Some(ordinal) => tool.ordinal < *ordinal,
+            None => tool.time.as_ref().is_some_and(|time| time <= &msg.time),
+        }) {
+            if let Some(tool) = items.tools.pop_front() {
+                write_tool(md, jl, &tool, inherited_from)?;
+            }
+        }
+        write_message(md, jl, &msg, inherited_from)?;
+    }
+    for tool in items.tools {
+        write_tool(md, jl, &tool, inherited_from)?;
+    }
+    Ok(())
 }
 
 fn write_thread(
@@ -908,17 +1244,13 @@ fn write_thread(
     relative: &str,
     thread: &ArchiveThread,
     project: &ArchiveProject,
+    catalog: &ArchiveCatalog<'_>,
 ) -> Result<()> {
     let stem = root.join(relative);
     fs::create_dir_all(stem.parent().context("对话归档缺少父目录")?)?;
     let mut markdown = NewFile::open(root.join(format!("{relative}.md")))?;
     let mut lines = NewFile::open(root.join(format!("{relative}.jsonl")))?;
-    let raw: String = conn.query_row(
-        "SELECT payload_json FROM orchestration_v2_projection_threads WHERE thread_id = ?1",
-        [&thread.id],
-        |row| row.get(0),
-    )?;
-    let header = payload(&raw, "对话信息")?;
+    let header = read_thread_header(conn, &thread.id)?;
     let model = header["modelSelection"]["model"].as_str();
     let md = markdown.writer();
     let jl = lines.writer();
@@ -940,29 +1272,46 @@ fn write_thread(
     metadata["model"] = json!(model);
     metadata["project_title"] = json!(project.title);
     metadata["project_path"] = json!(project.path);
+    let mut inherited = None;
+    if let Some(point) = fork_point(&header)? {
+        inherited = catalog.inherited(conn, thread, &point);
+        let parent = catalog
+            .files
+            .get(point.thread_id.as_str())
+            .and_then(|result| result.as_ref().ok())
+            .map(|stem| format!("{stem}.md"));
+        let ordinal = inherited
+            .as_ref()
+            .and_then(|chain| chain.first())
+            .map(|(_, cutoff)| cutoff.ordinal);
+        let label = markdown_text(&point.thread_id);
+        let link = parent.as_ref().map_or_else(
+            || format!("{label}（无可用归档路径）"),
+            |parent| format!("[{label}](../../{})", link_path(parent)),
+        );
+        let summary = if inherited.is_some() {
+            "已包含继承记录"
+        } else {
+            "无法确定完整继承范围，请参阅父对话及分叉点"
+        };
+        writeln!(
+            md,
+            "\n> 分叉自 {link} · 运行 {} · {summary}",
+            markdown_text(&point.run_id)
+        )?;
+        metadata["forked_from"] = json!({
+            "thread_id": point.thread_id, "run_id": point.run_id,
+            "archive_path": parent, "cutoff_ordinal": ordinal,
+            "history": if inherited.is_some() { "expanded" } else { "reference" },
+        });
+    }
     jsonl(jl, &metadata)?;
-
-    let TurnItems {
-        message_ordinals,
-        mut tools,
-    } = turn_items(conn, &thread.id)?;
-    for msg in messages(conn, &thread.id)? {
-        // Use the original turn item as an anchor. Messages with no corresponding
-        // item (e.g. a system message) are placed by the tool's persisted time.
-        let anchor = message_ordinals.get(&msg.id);
-        while tools.front().is_some_and(|tool| match anchor {
-            Some(ordinal) => tool.ordinal < *ordinal,
-            None => tool.time.as_ref().is_some_and(|time| time <= &msg.time),
-        }) {
-            if let Some(tool) = tools.pop_front() {
-                write_tool(md, jl, &tool)?;
-            }
+    if let Some(chain) = inherited {
+        for (parent, boundary) in chain.iter().rev() {
+            write_timeline(conn, parent, Some(boundary), md, jl)?;
         }
-        write_message(md, jl, &msg)?;
     }
-    for tool in tools {
-        write_tool(md, jl, &tool)?;
-    }
+    write_timeline(conn, &thread.id, None, md, jl)?;
     markdown.finish()?;
     lines.finish()?;
     markdown.keep = true;
@@ -980,11 +1329,52 @@ fn thread_stem(thread: &ArchiveThread, project_slug: &str) -> Result<String> {
         }),
         "对话创建日期格式无效"
     );
-    let id = slug(&thread.id.chars().take(8).collect::<String>());
+    let digest = format!("{:x}", Sha256::digest(thread.id.as_bytes()));
+    let id = &digest[..16];
     Ok(format!(
         "threads/{project_slug}/{date}-{}-{id}",
         slug(&thread.title)
     ))
+}
+
+fn archive_catalog<'a>(
+    conn: &Connection,
+    threads: &'a [ArchiveThread],
+    slugs: &BTreeMap<&str, String>,
+) -> Result<ArchiveCatalog<'a>> {
+    let mut seen = HashSet::new();
+    let mut files = BTreeMap::new();
+    for thread in threads {
+        let stem = thread_stem(thread, &slugs[thread.project_id.as_str()]).map(|base| {
+            let mut stem = base.clone();
+            for suffix in 2u64.. {
+                if seen.insert(stem.to_lowercase()) {
+                    break;
+                }
+                stem = format!("{base}-{suffix}");
+            }
+            stem
+        });
+        files.insert(thread.id.as_str(), stem);
+    }
+    Ok(ArchiveCatalog {
+        threads: threads
+            .iter()
+            .map(|thread| (thread.id.as_str(), thread))
+            .collect(),
+        files,
+        run_cutoffs: has_columns(
+            conn,
+            RUNS,
+            &["thread_id", "run_id", "ordinal", "status", "completed_at"],
+        )? && has_columns(conn, ITEMS, &["run_id"])?
+            && has_columns(conn, MESSAGES, &["run_id"])?,
+        attempts: has_columns(
+            conn,
+            ATTEMPTS,
+            &["thread_id", "run_id", "root_node_id", "status"],
+        )?,
+    })
 }
 
 struct IndexEntry<'a> {
@@ -1028,6 +1418,7 @@ pub fn export_threads(
     let projects = source_projects(conn, &schema)?;
     let threads = source_threads(conn, &schema)?;
     let slugs = project_slugs(&projects);
+    let catalog = archive_catalog(conn, &threads, &slugs)?;
     let by_id: BTreeMap<_, _> = projects.iter().map(|p| (p.id.as_str(), p)).collect();
     let folder = new_archive(conn, archives_root, t3_folder)?;
     let mut report = Report {
@@ -1051,9 +1442,11 @@ pub fn export_threads(
         }
         let project = by_id[thread.project_id.as_str()];
         let result = (|| {
-            let file = thread_stem(thread, &slugs[project.id.as_str()])?;
-            write_thread(conn, &report.folder, &file, thread, project)?;
-            Ok::<_, anyhow::Error>(file)
+            let file = catalog.files[thread.id.as_str()]
+                .as_ref()
+                .map_err(|reason| anyhow::anyhow!("{reason:#}"))?;
+            write_thread(conn, &report.folder, file, thread, project, &catalog)?;
+            Ok::<_, anyhow::Error>(file.clone())
         })();
         let file = match result {
             Ok(file) => {

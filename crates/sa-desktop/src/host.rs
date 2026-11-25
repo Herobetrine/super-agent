@@ -154,6 +154,8 @@ pub enum Action {
     },
     /// Add the chosen T3 Code projects to the welcome page; the result carries the added count.
     ImportT3Projects(Vec<sa_store::t3_import::T3Project>),
+    /// Persist that the T3 archive contains at least one completed conversation.
+    RecordT3Export,
     /// `saveRoutes` (ST:239-290): routes of a stopped ticket.
     SaveRoutes {
         ticket: i64,
@@ -273,6 +275,7 @@ impl Action {
             | Action::SaveAdvisor { .. } => ActionKind::Routes,
             Action::SaveEfficiency { .. } => ActionKind::Efficiency,
             Action::ImportT3Projects(_) => ActionKind::T3Import,
+            Action::RecordT3Export => ActionKind::Meta,
             Action::KnowledgeAdd { .. } | Action::KnowledgeArchive { .. } => ActionKind::Knowledge,
             Action::ProviderSave { .. }
             | Action::ProviderRemove { .. }
@@ -1128,6 +1131,10 @@ async fn execute(engine: &Engine, shared: &Shared, action: Action) -> Result<Opt
             // the running policy and the next startup's policy unchanged.
             engine.db().tx(|q| sa_store::efficiency::save(q.conn(), &settings))?;
             *shared.efficiency.write().unwrap_or_else(|p| p.into_inner()) = settings;
+            Ok(None)
+        }
+        Action::RecordT3Export => {
+            engine.db().with(|q| sa_store::t3_import::record_export(q.conn()))?;
             Ok(None)
         }
         Action::ImportT3Projects(chosen) => {

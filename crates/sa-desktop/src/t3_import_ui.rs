@@ -1,7 +1,7 @@
 //! "从 T3 Code 导入": the welcome-page card and link, and the four-step dialog
 //! (data location, selection, progress, result).
 //!
-//! The journal is only ever written through the host (`Action::ImportT3Projects`);
+//! The journal is only ever written through the host;
 //! every other file or SQLite access here runs on a background thread. The
 //! conversation export writes only below `<data dir>\archives\t3\`.
 
@@ -14,11 +14,13 @@ use sa_store::t3_import::{self, Report, Scan, ScanError, T3Project};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::time::Duration;
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 /// eframe storage key of "不再提示".
 pub const DISMISS_KEY: &str = "t3_import_dismissed";
 const DATABASE: &str = "statev2.sqlite";
+const EXIT_WAIT: Duration = Duration::from_secs(30);
 /// Entries of the welcome page's "最近的项目".
 pub const RECENT_LIMIT: usize = 8;
 
@@ -80,6 +82,8 @@ pub struct T3State {
     /// Holds the export thread at its first progress report (tests only).
     #[cfg(test)]
     pub hold: Option<Arc<AtomicBool>>,
+    #[cfg(test)]
+    pub next_picked_folder: Option<PathBuf>,
 }
 
 impl T3State {
@@ -93,6 +97,8 @@ impl T3State {
             dialog: None,
             #[cfg(test)]
             hold: None,
+            #[cfg(test)]
+            next_picked_folder: None,
         }
     }
 
@@ -158,6 +164,14 @@ impl T3State {
         match self.dialog.as_ref().map(|d| &d.step) {
             Some(Step::Run(run)) => Some(run.shared.done.load(Ordering::Relaxed)),
             _ => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn export_stop_flag(&self) -> Arc<AtomicBool> {
+        match &self.dialog.as_ref().expect("import dialog").step {
+            Step::Run(run) => run.stop.clone(),
+            _ => panic!("expected an active export"),
         }
     }
 
@@ -245,13 +259,27 @@ struct Run {
     added: usize,
 }
 
+impl Run {
+    fn new(folder: PathBuf, threads: usize, export: bool, added: usize) -> Self {
+        Self {
+            export,
+            folder,
+            threads,
+            stage: Stage::Projects,
+            stop: Arc::default(),
+            stopping: false,
+            shared: Arc::default(),
+            added,
+        }
+    }
+}
+
 enum Stage {
     Projects,
-    Export(Pending<Report>),
+    Export { pending: Pending<Report>, worker: Option<JoinHandle<()>> },
 }
 
 impl Drop for Run {
-    /// Closing the program while exporting is the same as pressing "停止".
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
     }
@@ -260,6 +288,7 @@ impl Drop for Run {
 enum Outcome {
     Success { added: usize, exported: Option<(usize, PathBuf)> },
     Partial { added: usize, exported: usize, total: usize, failed: usize, folder: PathBuf },
+    ExportFailed { added: usize, reason: String, folder: PathBuf, threads: usize },
     Failed(String),
     Stopped { added: usize, exported: usize, total: usize, folder: PathBuf },
 }
@@ -268,7 +297,7 @@ impl Outcome {
     fn title(&self) -> &'static str {
         match self {
             Self::Success { .. } => "导入完成",
-            Self::Partial { .. } => "导入部分完成",
+            Self::Partial { .. } | Self::ExportFailed { .. } => "导入部分完成",
             Self::Failed(_) => "导入失败",
             Self::Stopped { .. } => "已停止",
         }
@@ -285,6 +314,8 @@ impl Outcome {
             Self::Partial { added, exported, total, failed, .. } => format!(
                 "已加入 {added} 个项目，已导出 {exported}/{total} 个对话。{failed} 个对话导出失败，原因见归档文件夹中的 errors.txt。"
             ),
+            Self::ExportFailed { added, reason, .. } =>
+                format!("已加入 {added} 个项目。对话导出失败：{reason}。"),
             Self::Failed(reason) => format!("无法完成导入：{reason}。"),
             Self::Stopped { added, exported, total, .. } => format!(
                 "已停止导入。已加入 {added} 个项目，已导出 {exported}/{total} 个对话。再次导入会保存到新的文件夹，不会覆盖已有文件。"
@@ -320,6 +351,7 @@ enum Intent {
     Pick,
     Rescan,
     Start,
+    RetryExport,
     Stop,
     OpenArchive(PathBuf),
 }
@@ -371,7 +403,7 @@ impl App {
             Card::Idle => match folder {
                 Some(folder) => Card::Probing(Pending::spawn(&ctx, move || {
                     let present = folder.join(DATABASE).is_file();
-                    let imported = present && projects::has_source(&journal(&data)?, "t3")?;
+                    let imported = present && t3_import::has_imported(&journal(&data)?)?;
                     Ok(Quick { present, imported })
                 })),
                 None => Card::Hidden,
@@ -499,7 +531,21 @@ impl App {
         self.t3.dialog = Some(dialog);
     }
 
-    fn t3_spawn_export(&self, run: &Run) -> Pending<Report> {
+    fn t3_pick_folder(&mut self, start: Option<PathBuf>) -> Pending<Option<PathBuf>> {
+        #[cfg(test)]
+        if let Some(folder) = self.t3.next_picked_folder.take() {
+            return Pending::spawn(&self.ctx, move || Ok(Some(folder)));
+        }
+        Pending::spawn(&self.ctx, move || {
+            let mut picker = rfd::FileDialog::new().set_title("选择 T3 Code 数据文件夹");
+            if let Some(start) = start.filter(|p| p.is_dir()) {
+                picker = picker.set_directory(start);
+            }
+            Ok(picker.pick_folder())
+        })
+    }
+
+    fn t3_spawn_export(&self, run: &Run) -> Stage {
         let folder = run.folder.clone();
         let archives = self.t3_data_dir().join("archives").join("t3");
         let stop = run.stop.clone();
@@ -509,7 +555,7 @@ impl App {
         let hold = self.t3.hold.clone();
         #[cfg(not(test))]
         let hold: Option<Arc<AtomicBool>> = None;
-        Pending::spawn(&self.ctx, move || {
+        let (pending, worker) = Pending::spawn_joinable(&self.ctx, move || {
             t3_import::export_threads(&folder, &archives, &stop, &|progress| {
                 shared.total.store(progress.total, Ordering::Relaxed);
                 shared.done.store(progress.done, Ordering::Relaxed);
@@ -520,12 +566,35 @@ impl App {
                     }
                 }
             })
-        })
+        });
+        Stage::Export { pending, worker: Some(worker) }
+    }
+
+    pub(crate) fn t3_finish_on_exit(&mut self) {
+        let Some(mut dialog) = self.t3.dialog.take() else { return };
+        if let Step::Run(run) = &mut dialog.step
+            && let Stage::Export { worker, .. } = &mut run.stage
+            && let Some(thread) = worker.take()
+        {
+            run.stop.store(true, Ordering::Relaxed);
+            let deadline = Instant::now() + EXIT_WAIT;
+            while !thread.is_finished() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            if thread.is_finished() {
+                let _ = thread.join();
+                // Process the final report while the host can still record it.
+                self.t3_poll_dialog(&mut dialog);
+            } else {
+                eprintln!("等待 T3 对话归档完成超时");
+            }
+        }
+        self.t3.dialog = Some(dialog);
     }
 
     fn t3_start(&mut self, dialog: &mut Dialog) {
         let Step::Select(sel) = &dialog.step else { return };
-        if !sel.can_start() {
+        if dialog.picking.is_some() || !sel.can_start() {
             return;
         }
         let chosen: Vec<T3Project> = sel
@@ -536,18 +605,9 @@ impl App {
             .filter(|(p, on)| **on && p.exists && !p.already_listed)
             .map(|(p, _)| p.clone())
             .collect();
-        let mut run = Run {
-            export: sel.will_export(),
-            folder: sel.scan.folder.clone(),
-            threads: sel.scan.threads,
-            stage: Stage::Projects,
-            stop: Arc::default(),
-            stopping: false,
-            shared: Arc::default(),
-            added: 0,
-        };
+        let mut run = Run::new(sel.scan.folder.clone(), sel.scan.threads, sel.will_export(), 0);
         if chosen.is_empty() {
-            run.stage = Stage::Export(self.t3_spawn_export(&run));
+            run.stage = self.t3_spawn_export(&run);
             dialog.step = Step::Run(run);
             return;
         }
@@ -560,6 +620,13 @@ impl App {
         };
     }
 
+    fn t3_retry_export(&self, dialog: &mut Dialog) {
+        let Step::Done(Outcome::ExportFailed { added, folder, threads, .. }) = &dialog.step else { return };
+        let mut run = Run::new(folder.clone(), *threads, true, *added);
+        run.stage = self.t3_spawn_export(&run);
+        dialog.step = Step::Run(run);
+    }
+
     /// The host answered `Action::ImportT3Projects`.
     pub(crate) fn t3_projects_imported(&mut self, result: Result<Option<i64>, String>) {
         let Some(mut dialog) = self.t3.dialog.take() else { return };
@@ -569,7 +636,7 @@ impl App {
                     run.added = added.and_then(|n| usize::try_from(n).ok()).unwrap_or(0);
                     self.t3.invalidate();
                     if run.export {
-                        run.stage = Stage::Export(self.t3_spawn_export(&run));
+                        run.stage = self.t3_spawn_export(&run);
                         Step::Run(run)
                     } else {
                         Step::Done(Outcome::Success { added: run.added, exported: None })
@@ -607,10 +674,14 @@ impl App {
                 };
             }
             Step::Run(run) => {
-                let Stage::Export(pending) = &run.stage else { return };
+                let Stage::Export { pending, .. } = &run.stage else { return };
                 let Some(result) = pending.poll() else { return };
                 let added = run.added;
                 self.t3.invalidate();
+                if result.as_ref().is_ok_and(|report| report.exported > 0) {
+                    self.t3.card = Card::Hidden;
+                    self.submit(Action::RecordT3Export);
+                }
                 dialog.step = Step::Done(match result {
                     Ok(report) if report.stopped => Outcome::Stopped {
                         added,
@@ -618,6 +689,14 @@ impl App {
                         total: report.total,
                         folder: report.folder,
                     },
+                    Ok(report) if added > 0 && report.exported == 0 && !report.failed.is_empty() => {
+                        Outcome::ExportFailed {
+                            added,
+                            reason: format!("{}（详见 {}）", report.failed[0].1, report.folder.join("errors.txt").display()),
+                            folder: run.folder.clone(),
+                            threads: run.threads,
+                        }
+                    }
                     Ok(report) if !report.failed.is_empty() => Outcome::Partial {
                         added,
                         exported: report.exported,
@@ -626,6 +705,12 @@ impl App {
                         folder: report.folder,
                     },
                     Ok(report) => Outcome::Success { added, exported: Some((report.exported, report.folder)) },
+                    Err(reason) if added > 0 => Outcome::ExportFailed {
+                        added,
+                        reason,
+                        folder: run.folder.clone(),
+                        threads: run.threads,
+                    },
                     Err(error) => Outcome::Failed(error),
                 });
             }
@@ -663,7 +748,9 @@ impl App {
                         locate_ui(ui, locate, &dialog.folder, &dialog.default_folder, dialog.picking.is_some(), &pal, &mut intent);
                     }
                     Step::Select(sel) => {
-                        select_ui(ui, sel, &data, max_height, &pal, &mut intent);
+                        let can_pick = dialog.picking.is_none();
+                        folder_row(ui, dialog.folder.as_deref(), can_pick, &pal, &mut intent);
+                        select_ui(ui, sel, &data, max_height, can_pick, &pal, &mut intent);
                     }
                     Step::Run(run) => run_ui(ui, run, &pal, &mut intent),
                     Step::Done(outcome) => done_ui(ui, outcome, &pal, &mut intent),
@@ -675,17 +762,11 @@ impl App {
         match intent {
             Some(Intent::Close) => return,
             Some(Intent::Pick) if dialog.picking.is_none() => {
-                let start = dialog.folder.clone();
-                dialog.picking = Some(Pending::spawn(&self.ctx, move || {
-                    let mut picker = rfd::FileDialog::new().set_title("选择 T3 Code 数据文件夹");
-                    if let Some(start) = start.filter(|p| p.is_dir()) {
-                        picker = picker.set_directory(start);
-                    }
-                    Ok(picker.pick_folder())
-                }));
+                dialog.picking = Some(self.t3_pick_folder(dialog.folder.clone()));
             }
             Some(Intent::Rescan) => self.t3_rescan(&mut dialog),
             Some(Intent::Start) => self.t3_start(&mut dialog),
+            Some(Intent::RetryExport) => self.t3_retry_export(&mut dialog),
             Some(Intent::Stop) => {
                 if let Step::Run(run) = &mut dialog.step {
                     run.stop.store(true, Ordering::Relaxed);
@@ -793,7 +874,7 @@ fn project_name(p: &T3Project) -> String {
     }
 }
 
-fn select_ui(ui: &mut Ui, sel: &mut Select, data: &Path, max_height: f32, pal: &theme::Palette, intent: &mut Option<Intent>) {
+fn select_ui(ui: &mut Ui, sel: &mut Select, data: &Path, max_height: f32, can_start_now: bool, pal: &theme::Palette, intent: &mut Option<Intent>) {
     egui::ScrollArea::vertical().max_height(max_height).auto_shrink([false, true]).show(ui, |ui| {
         ui.horizontal(|ui| {
             widgets::section(ui, &format!("项目（{}）", sel.scan.projects.len()), pal);
@@ -856,10 +937,11 @@ fn select_ui(ui: &mut Ui, sel: &mut Select, data: &Path, max_height: f32, pal: &
         mute(ui, &format!("保存位置：{}\\archives\\t3\\{{日期时间}}\\", data.display()), pal);
         mute(ui, "导出的对话仅供查阅，不能在 Super Agent 里继续。", pal);
     });
-    let can_start = sel.can_start();
+    let has_selection = sel.can_start();
+    let can_start = can_start_now && has_selection;
     ui.add_space(16.0);
     ui.horizontal(|ui| {
-        if !can_start {
+        if !has_selection {
             mute(ui, "没有可导入的新内容", pal);
         }
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -886,7 +968,7 @@ fn run_ui(ui: &mut Ui, run: &mut Run, pal: &theme::Palette, intent: &mut Option<
                 ui.label("正在导入项目…");
             });
         }
-        Stage::Export(_) => {
+        Stage::Export { .. } => {
             let text = if run.stopping {
                 format!("正在完成当前对话后停止（{done}/{total}）…")
             } else {
@@ -901,7 +983,7 @@ fn run_ui(ui: &mut Ui, run: &mut Run, pal: &theme::Palette, intent: &mut Option<
             ui.add(egui::ProgressBar::new(fraction).desired_width(ui.available_width()).desired_height(8.0));
         }
     }
-    let can_stop = matches!(run.stage, Stage::Export(_)) && !run.stopping;
+    let can_stop = matches!(run.stage, Stage::Export { .. }) && !run.stopping;
     footer(ui, |ui| {
         ui.add_enabled_ui(can_stop, |ui| {
             let label = if run.stopping { "正在停止…" } else { "停止" };
@@ -929,6 +1011,11 @@ fn done_ui(ui: &mut Ui, outcome: &Outcome, pal: &theme::Palette, intent: &mut Op
         }
         if widgets::primary_button(ui, "", "完成", pal, true).clicked() {
             *intent = Some(Intent::Close);
+        }
+        if matches!(outcome, Outcome::ExportFailed { .. })
+            && widgets::outline_button(ui, "", "重试导出", pal).clicked()
+        {
+            *intent = Some(Intent::RetryExport);
         }
         if let Some(folder) = outcome.archive()
             && widgets::outline_button(ui, "", "打开归档文件夹", pal).clicked()
