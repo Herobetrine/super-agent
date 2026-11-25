@@ -41,7 +41,10 @@ mod workflow;
 #[cfg(test)]
 mod workflow_tests;
 
-use std::sync::{Arc, Mutex};
+use std::{
+    path::PathBuf,
+    sync::{Arc, Mutex},
+};
 
 pub(crate) const DEFAULT_WINDOW: (f32, f32) = (1440.0, 900.0);
 pub(crate) const MIN_WINDOW: (f32, f32) = (880.0, 600.0);
@@ -104,6 +107,57 @@ fn icon() -> Option<egui::IconData> {
     })
 }
 
+/// Shared by native startup and the recovery harness, which supplies fake
+/// adapters only when this branch actually starts a scheduler.
+fn create_app(
+    cc: &eframe::CreationContext<'_>,
+    opts: cli::Options,
+    dir: PathBuf,
+    opener: data::Opener,
+    shot_result: Arc<Mutex<Option<Result<(), String>>>>,
+    start_host: impl FnOnce(PathBuf, egui::Context) -> anyhow::Result<host::Host>,
+) -> app::App {
+    theme::install_fonts(&cc.egui_ctx);
+    // Start the scheduler before the reader so it can create the journal.
+    let host = if opts.demo {
+        Err(anyhow::anyhow!("演示数据不调度"))
+    } else if opts.observe {
+        Err(anyhow::anyhow!("以 --observe 启动，不调度"))
+    } else if opts.screenshot.is_some() && !opts.schedule {
+        Err(anyhow::anyhow!("截图模式不调度"))
+    } else {
+        start_host(dir.clone(), cc.egui_ctx.clone())
+    };
+    let host_error = host.as_ref().err();
+    let observer = !opts.demo
+        && (opts.observe
+            || host_error.is_some_and(|error| {
+                error
+                    .chain()
+                    .any(|cause| cause.to_string() == sa_engine::owner::BUSY)
+            }));
+    let panel = if observer {
+        None
+    } else {
+        host_error
+            .and_then(|error| error.downcast_ref::<sa_store::journal::JournalError>())
+            .and_then(|error| recovery_ui::RecoveryPanel::from_journal(error, &dir, false))
+    };
+    let worker = worker::spawn(opener, cc.egui_ctx.clone());
+    let mut app = app::App::new(
+        cc,
+        opts,
+        worker,
+        shot_result,
+        host.map_err(|error| format!("{error:#}")),
+    );
+    app.recovery = panel;
+    if observer {
+        app.inspect_recovery(&cc.egui_ctx, dir);
+    }
+    app
+}
+
 fn main() {
     let opts = match cli::parse(std::env::args().skip(1)) {
         Ok(o) => o,
@@ -141,9 +195,6 @@ fn main() {
     }
 
     let dir = opts.data.clone().unwrap_or_else(sa_store::default_data_dir);
-    // Demo data never schedules; screenshots only with `--schedule` (so a regression
-    // capture never claims the live journal); `--observe` keeps the window read-only.
-    let schedule = !opts.demo && !opts.observe && (opts.screenshot.is_none() || opts.schedule);
     let opener: data::Opener = if opts.demo {
         Box::new(|| Ok(Box::new(demo::DemoSource::new()) as Box<dyn data::DataSource>))
     } else {
@@ -156,31 +207,14 @@ fn main() {
         "super-agent",
         native,
         Box::new(move |cc| {
-            theme::install_fonts(&cc.egui_ctx);
-            // The scheduler creates the journal, so start it before the reader.
-            // The typed startup error is kept for the recovery panel; every
-            // other consumer still gets today's message.
-            let mut start_error = None;
-            let host = if schedule {
-                let ctx = cc.egui_ctx.clone();
-                host::Host::start(dir, move || ctx.request_repaint()).map_err(|e| {
-                    let message = format!("{e:#}");
-                    start_error = Some(e);
-                    message
-                })
-            } else if opts.demo {
-                Err("演示数据不调度".into())
-            } else if opts.observe {
-                Err("以 --observe 启动，不调度".into())
-            } else {
-                Err("截图模式不调度".into())
-            };
-            let worker = worker::spawn(opener, cc.egui_ctx.clone());
-            let mut app = app::App::new(cc, opts, worker, result, host);
-            if let Some(error) = &start_error {
-                app.set_start_error(error);
-            }
-            Ok(Box::new(app))
+            Ok(Box::new(create_app(
+                cc,
+                opts,
+                dir,
+                opener,
+                result,
+                |dir, ctx| host::Host::start(dir, move || ctx.request_repaint()),
+            )))
         }),
     );
     if let Err(e) = run {

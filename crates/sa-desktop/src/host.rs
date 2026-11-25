@@ -502,9 +502,20 @@ impl Host {
 
     /// Restore while the engine and any journal readers are closed. Claim the
     /// scheduler lock so another desktop cannot start during the restore.
-    pub fn restore_snapshot(dir: &Path, snapshot: &Path) -> Result<()> {
+    pub fn restore_snapshot(
+        dir: &Path,
+        snapshot: &Path,
+        expected: &sa_store::journal::RestoreIdentity,
+    ) -> Result<sa_store::journal::RestoreOutcome> {
         let _owner = owner::claim(dir)?;
-        sa_store::journal::restore_snapshot(dir, snapshot)
+        sa_store::journal::restore_snapshot(dir, snapshot, expected)
+    }
+
+    /// Retry only the marker cleanup after an installed restore.
+    #[allow(dead_code)] // Called by the recovery panel once it handles restore outcomes.
+    pub fn retry_restore_cleanup(dir: &Path) -> Result<sa_store::journal::RestoreOutcome> {
+        let _owner = owner::claim(dir)?;
+        sa_store::journal::retry_restore_cleanup(dir)
     }
 
     /// [`start`](Self::start) with explicit harness adapters (tests).

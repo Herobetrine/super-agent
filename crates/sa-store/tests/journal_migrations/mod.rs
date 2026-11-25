@@ -1,5 +1,6 @@
 use super::{
-    JournalError, Migration, backup, open_journal, open_with_migrations, restore_snapshot,
+    JournalError, Migration, RestoreOutcome, backup, inspect, open_journal, open_with_migrations,
+    restore_snapshot,
 };
 use crate::DB_FILE;
 use anyhow::Result;
@@ -87,6 +88,7 @@ fn failed_step_leaves_marker_and_can_restore_the_pre_step_state() {
         snapshot,
         from: 1,
         to: 2,
+        identity,
     }) = error.downcast_ref::<JournalError>()
     else {
         panic!("{error:#}");
@@ -106,7 +108,10 @@ fn failed_step_leaves_marker_and_can_restore_the_pre_step_state() {
     fs::write(dir.path().join("hub.sqlite3-wal"), b"wal fixture").unwrap();
     fs::write(dir.path().join("hub.sqlite3-shm"), b"shm fixture").unwrap();
 
-    restore_snapshot(dir.path(), snapshot).unwrap();
+    assert!(matches!(
+        restore_snapshot(dir.path(), snapshot, identity).unwrap(),
+        RestoreOutcome::Installed
+    ));
     assert!(!marker.exists());
     assert!(snapshot.is_file());
     let damaged = fs::read_dir(dir.path())
@@ -127,6 +132,49 @@ fn failed_step_leaves_marker_and_can_restore_the_pre_step_state() {
         assert_eq!(fs::read(sidecar).unwrap().as_slice(), bytes.as_slice());
     }
     assert_eq!(value(&open_journal(dir.path()).unwrap()), 42);
+}
+
+#[test]
+fn backup_failure_drops_an_unpublished_partial_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let snapshot = dir.path().join("hub-00000000000000000001.sqlite3");
+    let error = backup::publish_snapshot(&snapshot, |pending| {
+        fs::write(pending, b"partial snapshot")?;
+        anyhow::bail!("injected backup failure");
+    })
+    .unwrap_err();
+    assert_eq!(error.to_string(), "injected backup failure");
+    assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
+}
+
+#[test]
+fn relocated_migration_marker_resolves_new_and_legacy_snapshot_names() {
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("original");
+    drop(fixture(&dir));
+    let failing = migration(2, |_| anyhow::bail!("stop after marker"));
+    open_with_migrations(&dir, &[failing]).unwrap_err();
+    let marker = backup::marker_path(&dir);
+    let bytes = fs::read(&marker).unwrap();
+    let mut payload: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let name = payload["snapshot"].as_str().unwrap().to_owned();
+    assert_eq!(Path::new(&name).file_name().unwrap(), name.as_str());
+    let moved = root.path().join("moved");
+    fs::rename(&dir, &moved).unwrap();
+    for snapshot in [name.clone().into(), dir.join("backups").join(&name)] {
+        payload["snapshot"] = serde_json::to_value(snapshot).unwrap();
+        fs::write(
+            backup::marker_path(&moved),
+            serde_json::to_vec(&payload).unwrap(),
+        )
+        .unwrap();
+        let error = inspect(&moved).unwrap();
+        assert!(matches!(
+            &error,
+            JournalError::MigrationInterrupted { snapshot, from: 1, to: 2, .. }
+                if *snapshot == moved.join("backups").join(&name) && snapshot.is_file()
+        ));
+    }
 }
 
 #[test]

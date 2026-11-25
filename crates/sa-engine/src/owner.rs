@@ -8,11 +8,13 @@
 //!   `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`. The job handle lives in a static
 //!   for the whole process: closing it would terminate this process too, so
 //!   only process exit (abnormal included) closes it, and Windows then
-//!   terminates every harness CLI the process started.
+//!   terminates the ordinary harness children. Desktop relaunch explicitly
+//!   requests breakaway so the replacement survives.
 
 use anyhow::{Context, Result};
 use std::fs::{self, File, OpenOptions};
 use std::path::Path;
+use std::process::{Child, Command};
 #[cfg(windows)]
 use std::sync::OnceLock;
 
@@ -47,7 +49,11 @@ pub fn claim(dir: &Path) -> Result<Owner> {
 
 /// Whether another process currently owns `dir`.
 pub fn is_claimed(dir: &Path) -> bool {
-    let Ok(f) = OpenOptions::new().read(true).write(true).open(dir.join(LOCK_FILE)) else {
+    let Ok(f) = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(dir.join(LOCK_FILE))
+    else {
         return false;
     };
     match f.try_lock() {
@@ -57,6 +63,19 @@ pub fn is_claimed(dir: &Path) -> bool {
         }
         Err(_) => true,
     }
+}
+
+/// Spawn a desktop replacement outside this process's Windows Job.
+/// An enclosing Job may still apply its own restrictions. Ordinary harness
+/// commands use their usual spawn paths and remain subject to containment.
+pub fn spawn_detached(mut command: Command) -> std::io::Result<Child> {
+    #[cfg(windows)]
+    if JOB.get().is_some_and(Option::is_some) {
+        use std::os::windows::process::CommandExt;
+        use windows_sys::Win32::System::Threading::CREATE_BREAKAWAY_FROM_JOB;
+        command.creation_flags(CREATE_BREAKAWAY_FROM_JOB);
+    }
+    command.spawn()
 }
 
 #[cfg(windows)]
@@ -88,7 +107,8 @@ mod win {
             }
             let job = Handle(raw);
             let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = mem::zeroed();
-            limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            limits.BasicLimitInformation.LimitFlags =
+                JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_BREAKAWAY_OK;
             if SetInformationJobObject(
                 job.0,
                 JobObjectExtendedLimitInformation,
@@ -101,6 +121,16 @@ mod win {
             }
             Ok(job)
         }
+    }
+
+    #[cfg(test)]
+    pub(super) fn contains(job: &Handle, child: &std::process::Child) -> io::Result<bool> {
+        use std::os::windows::io::AsRawHandle;
+        let mut contained = 0;
+        if unsafe { IsProcessInJob(child.as_raw_handle(), job.0, &mut contained) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(contained != 0)
     }
 }
 
@@ -117,5 +147,32 @@ mod tests {
         assert_eq!(err.to_string(), BUSY);
         drop(first);
         claim(dir.path()).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn only_explicit_relaunch_breaks_away_from_the_desktop_job() {
+        use std::process::Stdio;
+        let dir = tempfile::tempdir().unwrap();
+        let _owner = claim(dir.path()).unwrap();
+        let Some(job) = JOB.get().and_then(Option::as_ref) else {
+            // An enclosing Job can forbid containment.
+            return;
+        };
+        let wait_for_input = || {
+            let mut command = Command::new("cmd.exe");
+            command
+                .args(["/d", "/c", "set /p SA_TEST_INPUT="])
+                .stdin(Stdio::piped());
+            command
+        };
+        let mut ordinary = wait_for_input().spawn().unwrap();
+        let contained = win::contains(job, &ordinary);
+        ordinary.wait().unwrap();
+        assert!(contained.unwrap());
+        let mut detached = spawn_detached(wait_for_input()).unwrap();
+        let contained = win::contains(job, &detached);
+        detached.wait().unwrap();
+        assert!(!contained.unwrap());
     }
 }
