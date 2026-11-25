@@ -13,6 +13,10 @@ use std::{
 };
 use tokio_util::sync::CancellationToken;
 
+// Wall-clock assertions get an exclusive fixture. Other scenarios can run
+// together; concurrency inside each engine and its adapters is unrestricted.
+static FIXTURES: tokio::sync::RwLock<()> = tokio::sync::RwLock::const_new(());
+
 struct Slow {
     inner: Arc<dyn Adapter>,
     local: bool,
@@ -120,27 +124,39 @@ async fn reopen(fx: &mut Fx, agents: &[Arc<Slow>]) {
     fx.engine = Engine::open(&fx.data, adapters, quiet()).unwrap();
 }
 
+async fn received_packet(fx: &Fx, ticket: i64) -> (f64, Value) {
+    fx.engine.start().unwrap();
+    fx.until(|| fx.shared.count(|c| c.req.ticket == ticket) > 0)
+        .await;
+    fx.shared
+        .calls(|c| (c.req.ticket == ticket).then(|| (c.received_at, c.packet.clone())))
+        .into_iter()
+        .next()
+        .unwrap()
+}
+
 async fn packet(fx: &Fx, ticket: i64) -> Value {
-    let find = || {
-        fx.shared
-            .calls(|c| (c.req.ticket == ticket).then(|| c.packet.clone()))
-            .pop()
-    };
-    tokio::time::timeout(Duration::from_secs(1), async {
-        fx.engine.start().unwrap();
-        fx.until(|| find().is_some()).await;
-        find().unwrap()
-    })
-    .await
-    .expect("lead did not reach its packet within one second")
+    let (received, packet) = received_packet(fx, ticket).await;
+    let job = packet["job"].as_i64().unwrap();
+    let turn = packet["turn"].as_i64().unwrap();
+    let admission = fx.engine.db().with(|q| q.one(
+        "SELECT ts FROM events WHERE ticket=? AND job=? AND turn=? AND kind='turn.admitted' ORDER BY seq LIMIT 1",
+        &[&ticket, &job, &turn],
+    )).unwrap().unwrap();
+    let elapsed = received - admission["ts"].as_f64().unwrap();
+    assert!(
+        (0.0..1.0).contains(&elapsed),
+        "ticket {ticket} took {elapsed:.3}s from admission to packet"
+    );
+    packet
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cold_admissions_share_slow_refresh_then_restart_uses_persisted_menu() {
+    let _fixture = FIXTURES.write().await;
     let mut fx = fixture();
     let lead = Slow::new(&fx, "codex", true, Duration::from_secs(5));
     reopen(&mut fx, std::slice::from_ref(&lead)).await;
-    lead.gate.open();
     for _ in 0..3 {
         let id = fx.create(fx.params()).await;
         let menu = packet(&fx, id).await["delegate_models"]["codex"].clone();
@@ -148,6 +164,7 @@ async fn cold_admissions_share_slow_refresh_then_restart_uses_persisted_menu() {
         assert_eq!(menu["models"], json!(["default"]));
         fx.finish(id, "done").await;
     }
+    lead.gate.open();
     fx.until(|| fx.int("SELECT count(*) FROM catalog_cache WHERE agent='codex'") == 1)
         .await;
     assert_eq!(lead.full.load(SeqCst), 1);
@@ -174,6 +191,7 @@ async fn cold_admissions_share_slow_refresh_then_restart_uses_persisted_menu() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn unknown_default_waits_for_only_its_own_shared_discovery() {
+    let _fixture = FIXTURES.write().await;
     let mut fx = fixture();
     let lead = Slow::new(&fx, "codex", false, Duration::ZERO);
     let peer = Slow::new(&fx, "claude", false, Duration::from_secs(5));
@@ -182,8 +200,13 @@ async fn unknown_default_waits_for_only_its_own_shared_discovery() {
     fx.until(|| lead.full.load(SeqCst) == 1 && peer.full.load(SeqCst) == 1)
         .await;
     assert_eq!(fx.shared.count(|_| true), 0);
+    let released = sa_engine::db::now();
     lead.gate.open();
-    let result = packet(&fx, id).await;
+    let (received, result) = received_packet(&fx, id).await;
+    assert!(
+        (0.0..1.0).contains(&(received - released)),
+        "lead waited after its own probe was released"
+    );
     assert_eq!(result["delegate_models"]["claude"]["partial"], true);
     assert_eq!(lead.full.load(SeqCst), 1);
     assert_eq!(peer.full.load(SeqCst), 1);
@@ -194,6 +217,7 @@ async fn unknown_default_waits_for_only_its_own_shared_discovery() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn desktop_and_three_cached_admissions_share_one_slow_refresh() {
+    let _fixture = FIXTURES.write().await;
     let mut fx = fixture();
     let original = Slow::new(&fx, "codex", true, Duration::ZERO);
     original.gate.open();
@@ -230,6 +254,7 @@ async fn desktop_and_three_cached_admissions_share_one_slow_refresh() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn changed_revision_failed_refresh_preserves_menu_and_saved_entry() {
+    let _fixture = FIXTURES.write().await;
     let mut fx = fixture();
     let lead = Slow::new(&fx, "codex", true, Duration::ZERO);
     reopen(&mut fx, std::slice::from_ref(&lead)).await;
@@ -259,6 +284,7 @@ async fn changed_revision_failed_refresh_preserves_menu_and_saved_entry() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn new_ticket_binds_changed_local_default_while_existing_ticket_keeps_binding() {
+    let _fixture = FIXTURES.write().await;
     let mut fx = fixture();
     let original = Slow::new(&fx, "codex", true, Duration::ZERO);
     original.gate.open();
@@ -293,6 +319,7 @@ async fn new_ticket_binds_changed_local_default_while_existing_ticket_keeps_bind
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn stale_unknown_default_waits_for_current_binding() {
+    let _fixture = FIXTURES.read().await;
     let mut fx = fixture();
     let old = Slow::new(&fx, "codex", false, Duration::ZERO);
     old.gate.open();
@@ -317,6 +344,7 @@ async fn stale_unknown_default_waits_for_current_binding() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn refresh_merges_only_failed_unchanged_sources_and_persists_the_menu() {
+    let _fixture = FIXTURES.write().await;
     let mut old = t1_catalog();
     old["providers"] = json!([
         {"id":"a","models":[{"id":"old-a"}]},
@@ -360,6 +388,7 @@ async fn refresh_merges_only_failed_unchanged_sources_and_persists_the_menu() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn fresh_empty_default_recovers_on_next_ticket_without_manual_refresh() {
+    let _fixture = FIXTURES.read().await;
     let mut fx = fixture();
     let lead = Slow::new(&fx, "codex", false, Duration::ZERO);
     reopen(&mut fx, std::slice::from_ref(&lead)).await;
@@ -385,6 +414,7 @@ async fn fresh_empty_default_recovers_on_next_ticket_without_manual_refresh() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn creation_revalidates_removed_custom_provider_after_revision_change() {
+    let _fixture = FIXTURES.read().await;
     let mut fx = fixture();
     let lead = Slow::new(&fx, "codex", true, Duration::ZERO);
     reopen(&mut fx, std::slice::from_ref(&lead)).await;
@@ -422,6 +452,7 @@ async fn creation_revalidates_removed_custom_provider_after_revision_change() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn creation_distinguishes_unreadable_list_from_explicitly_disabled_route() {
+    let _fixture = FIXTURES.read().await;
     let fx = fixture();
     let mut partial = t1_catalog();
     partial["providers"][0]["catalogError"] = json!(true);
@@ -444,6 +475,7 @@ async fn creation_distinguishes_unreadable_list_from_explicitly_disabled_route()
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn failing_endpoint_keeps_current_saved_models_selectable_at_creation() {
+    let _fixture = FIXTURES.read().await;
     let mut fx = fixture();
     let lead = Slow::new(&fx, "codex", true, Duration::ZERO);
     reopen(&mut fx, std::slice::from_ref(&lead)).await;
@@ -483,6 +515,7 @@ async fn failing_endpoint_keeps_current_saved_models_selectable_at_creation() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn failover_uses_completed_refresh_for_its_only_provisional_alternative() {
+    let _fixture = FIXTURES.read().await;
     let release_child = Gate::new();
     let gate = release_child.clone();
     let mut fx = Fx::new(
@@ -550,6 +583,7 @@ async fn failover_uses_completed_refresh_for_its_only_provisional_alternative() 
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn expired_menu_miss_uses_one_targeted_probe_before_running() {
+    let _fixture = FIXTURES.write().await;
     let mut fx = fixture();
     let lead = Slow::new(&fx, "codex", true, Duration::ZERO);
     reopen(&mut fx, std::slice::from_ref(&lead)).await;

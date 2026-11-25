@@ -119,6 +119,7 @@ pub fn t2_catalog() -> Value {
 
 pub struct Call {
     pub name: String,
+    pub received_at: f64,
     pub packet: Value,
     pub req: RunRequest,
 }
@@ -171,6 +172,7 @@ impl Adapter for Fake {
         events: EventSink,
         cancel: CancellationToken,
     ) -> BoxFuture<'static, Result<RunOutcome, AdapterError>> {
+        let received_at = sa_engine::db::now();
         // Scheduled turns end with the JSON envelope; advisor turns are plain text.
         let packet: Value = if req.prompt.starts_with(sa_engine::advice::GUIDE) {
             Value::Null
@@ -181,6 +183,7 @@ impl Adapter for Fake {
         let job = packet["job"].clone();
         self.shared.calls.lock().unwrap().push(Call {
             name: self.name.into(),
+            received_at,
             packet: packet.clone(),
             req: req.clone(),
         });
