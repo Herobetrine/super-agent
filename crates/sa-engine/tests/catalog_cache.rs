@@ -71,13 +71,14 @@ impl Adapter for Slow {
         self.full.fetch_add(1, SeqCst);
         let (delay, gate, fail) = (self.delay, self.gate.clone(), self.fail.load(SeqCst));
         let generation = self.revision.load(SeqCst);
+        let catalog = self.inner.catalog();
         Box::pin(async move {
             gate.wait().await;
             tokio::time::sleep(delay).await;
             anyhow::ensure!(!fail, "injected catalog failure");
-            let mut value = t1_catalog();
+            let mut value = catalog.await?.value;
             value["generation"] = json!(generation);
-            if generation > 0 {
+            if generation > 0 && value["default"]["model"] == "default" {
                 value["default"]["model"] = json!("review");
             }
             Ok(Catalog { value })
@@ -85,10 +86,14 @@ impl Adapter for Slow {
     }
     fn catalog_for_route(&self, _: Route) -> Option<BoxFuture<'static, anyhow::Result<Catalog>>> {
         self.selected.fetch_add(1, SeqCst);
-        Some(Box::pin(async {
-            let mut value = t1_catalog();
-            value["providers"][0]["models"] = json!([{"id":"default"},{"id":"new-model"}]);
-            Ok(Catalog { value })
+        let catalog = self.inner.catalog();
+        Some(Box::pin(async move {
+            let mut catalog = catalog.await?;
+            catalog.value["providers"][0]["models"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!({"id":"new-model"}));
+            Ok(catalog)
         }))
     }
     fn run(
@@ -350,6 +355,196 @@ async fn refresh_merges_only_failed_unchanged_sources_and_persists_the_menu() {
         json!(["new-b"])
     );
     fx.finish(id, "done").await;
+    fx.engine.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fresh_empty_default_recovers_on_next_ticket_without_manual_refresh() {
+    let mut fx = fixture();
+    let lead = Slow::new(&fx, "codex", false, Duration::ZERO);
+    reopen(&mut fx, std::slice::from_ref(&lead)).await;
+    lead.gate.open();
+    let mut incomplete = t1_catalog();
+    incomplete["default"]["model"] = json!("");
+    incomplete["providers"][0]["models"] = json!([]);
+    fx.shared.set_catalog(catalog_of(incomplete));
+    let cached = fx.engine.request_catalog("codex", true).await.unwrap();
+    assert_eq!(cached["default"]["model"], "");
+
+    fx.shared.set_catalog(catalog_of(t1_catalog()));
+    let id = fx.begin(fx.params()).await;
+    fx.finish(id, "done").await;
+    assert_eq!(
+        fx.shared.calls(|c| Some(c.req.route.model.clone())),
+        ["default"]
+    );
+    assert_eq!(lead.full.load(SeqCst), 2);
+    assert_eq!(lead.selected.load(SeqCst), 0);
+    fx.engine.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn creation_revalidates_removed_custom_provider_after_revision_change() {
+    let mut fx = fixture();
+    let lead = Slow::new(&fx, "codex", true, Duration::ZERO);
+    reopen(&mut fx, std::slice::from_ref(&lead)).await;
+    lead.gate.open();
+    let mut catalog = t1_catalog();
+    catalog["providers"].as_array_mut().unwrap().push(json!({
+        "id":"custom-removed","models":[{"id":"saved-model"}]
+    }));
+    fx.shared.set_catalog(catalog_of(catalog));
+    fx.engine.request_catalog("codex", true).await.unwrap();
+    let params = || {
+        let mut params = fx.params();
+        params.selections = Some(json!({"codex":{
+            "provider":"custom-removed","model":"saved-model","mode":"cli"
+        }}));
+        params
+    };
+    fx.create(params()).await;
+    assert_eq!(lead.selected.load(SeqCst), 0);
+
+    fx.shared.set_catalog(catalog_of(t1_catalog()));
+    lead.revision.store(1, SeqCst);
+    let error = fx.engine.create(params()).await.unwrap_err().to_string();
+    assert!(
+        ["codex", "custom-removed", "saved-model"]
+            .iter()
+            .all(|part| error.contains(*part)),
+        "{error}"
+    );
+    assert_eq!(lead.selected.load(SeqCst), 1);
+    assert_eq!(lead.full.load(SeqCst), 1);
+    assert_eq!(fx.int("SELECT count(*) FROM tickets"), 1);
+    fx.engine.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn creation_distinguishes_unreadable_list_from_explicitly_disabled_route() {
+    let fx = fixture();
+    let mut partial = t1_catalog();
+    partial["providers"][0]["catalogError"] = json!(true);
+    fx.shared.set_catalog(catalog_of(partial));
+    for (provider, model, accepted) in [
+        ("test-local", "unknown", true),
+        ("test-local", "disabled", false),
+        ("removed", "unknown", false),
+    ] {
+        let mut params = fx.params();
+        params.selections = Some(json!({"codex":{"provider":provider,"model":model,"mode":"cli"}}));
+        assert_eq!(
+            fx.engine.create(params).await.is_ok(),
+            accepted,
+            "{provider}/{model}"
+        );
+    }
+    fx.engine.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn failing_endpoint_keeps_current_saved_models_selectable_at_creation() {
+    let mut fx = fixture();
+    let lead = Slow::new(&fx, "codex", true, Duration::ZERO);
+    reopen(&mut fx, std::slice::from_ref(&lead)).await;
+    lead.gate.open();
+    let mut catalog = t1_catalog();
+    catalog["providers"][0]["sourceIdentity"] = json!("custom-endpoint");
+    catalog["providers"][0]["models"] =
+        json!([{"id":"old"},{"id":"shared","reasoningEfforts":["high"]}]);
+    fx.shared.set_catalog(catalog_of(catalog.clone()));
+    fx.engine.request_catalog("codex", true).await.unwrap();
+
+    lead.revision.store(1, SeqCst);
+    let models = json!([{"id":"new"},{"id":"shared","reasoningEfforts":[]}]);
+    catalog["providers"][0]["models"] = models;
+    catalog["providers"][0]["catalogError"] = json!(true);
+    catalog["providers"][0]["defaultModel"] = json!("new");
+    catalog["default"]["model"] = json!("new");
+    fx.shared.set_catalog(catalog_of(catalog));
+    let merged = fx.engine.request_catalog("codex", true).await.unwrap();
+    assert_eq!(
+        merged["providers"][0]["models"],
+        json!([{"id":"new"},{"id":"shared","reasoningEfforts":[]},{"id":"old"}])
+    );
+    assert_eq!(merged["providers"][0]["defaultModel"], "new");
+    assert_eq!(merged["default"]["model"], "new");
+    let selection = json!({"provider":"test-local","model":"new","mode":"cli"});
+    let menu = sa_engine::protocol::options(Some(&merged), Some(&selection))
+        .unwrap()
+        .unwrap();
+    assert_eq!(menu["models"], json!(["new", "shared", "old"]));
+    let mut params = fx.params();
+    params.selections = Some(json!({"codex":selection}));
+    fx.create(params).await;
+    assert_eq!(lead.selected.load(SeqCst), 0);
+    fx.engine.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn failover_uses_completed_refresh_for_its_only_provisional_alternative() {
+    let release_child = Gate::new();
+    let gate = release_child.clone();
+    let mut fx = Fx::new(
+        script(move |c| {
+            let gate = gate.clone();
+            async move {
+                if c.depth() == 0 && c.turn() == 1 {
+                    return Ok(send(json!({})));
+                }
+                if c.depth() > 0 && c.name == "deepseek" {
+                    gate.wait().await;
+                    let mut error = AdapterError::new(
+                        ErrorClass::RouteUnavailable,
+                        "fixture route unavailable",
+                    );
+                    error.code = Some(sa_engine::resilience::CODE_ROUTE_NOT_CONFIGURED.into());
+                    return Err(error);
+                }
+                Ok("done".into())
+            }
+        }),
+        t1_catalog(),
+    );
+    let lead = Slow::new(&fx, "codex", true, Duration::ZERO);
+    let alternative = Slow::new(&fx, "claude", false, Duration::ZERO);
+    let child = Slow::new(&fx, "deepseek", true, Duration::ZERO);
+    lead.gate.open();
+    child.gate.open();
+    reopen(&mut fx, &[lead, alternative.clone(), child]).await;
+    // Codex can run its locally configured default, but its published menu
+    // confirmed it unavailable for delegation. It comes first in failover order.
+    let mut unavailable = t1_catalog();
+    unavailable["providers"][0]["available"] = json!(false);
+    fx.shared.set_catalog(catalog_of(unavailable));
+    fx.engine.request_catalog("codex", true).await.unwrap();
+    fx.shared.set_catalog(catalog_of(t1_catalog()));
+    let ticket = fx.begin(fx.params().failover(true)).await;
+    fx.until(|| fx.shared.count(|c| c.name == "deepseek") == 1)
+        .await;
+    let menus = fx.shared.calls(|c| {
+        (c.req.ticket == ticket && c.packet["depth"] == 0)
+            .then(|| c.packet["delegate_models"].clone())
+    });
+    assert_eq!(menus.len(), 1);
+    assert_eq!(menus[0]["codex"]["available"], false);
+    assert!(menus[0]["codex"].get("partial").is_none());
+    assert_eq!(menus[0]["claude"]["partial"], true);
+    assert_eq!(menus[0]["claude"]["available"], false);
+
+    let (cached, refresh) = fx.engine.catalog_updates("claude", false);
+    assert!(cached.is_none());
+    alternative.gate.open();
+    refresh.unwrap().await.unwrap();
+    release_child.open();
+    fx.finish(ticket, "done").await;
+    let replacements = fx.all(
+        "SELECT j.agent,j.state,j.result FROM job_failovers f JOIN jobs j ON j.id=f.replacement",
+    );
+    assert_eq!(replacements.len(), 1);
+    assert_eq!(replacements[0]["agent"], "claude");
+    assert_eq!(replacements[0]["state"], "done");
+    assert_eq!(replacements[0]["result"], "done");
     fx.engine.close().await;
 }
 

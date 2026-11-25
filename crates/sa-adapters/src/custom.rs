@@ -287,7 +287,7 @@ pub async fn probe_models(
     cancel: &CancellationToken,
 ) -> Result<Vec<String>> {
     Ok(probe_catalog(provider, sys, cancel)
-        .await?
+        .await?.0
         .iter()
         .filter_map(|m| m["id"].as_str().map(str::to_string))
         .collect())
@@ -297,7 +297,7 @@ async fn probe_catalog(
     provider: &CustomProvider,
     sys: &Sys,
     cancel: &CancellationToken,
-) -> Result<Vec<Value>> {
+) -> Result<(Vec<Value>, Option<String>)> {
     let p = validate(provider)?;
     let key = match key(&p, sys) {
         Ok(k) => k,
@@ -308,13 +308,18 @@ async fn probe_catalog(
     let key = key.or_else(|| {
         local_host(url.host_str().unwrap_or_default()).then(|| LOCAL_PLACEHOLDER.to_string())
     });
-    let models = crate::catalog::fetch(&models_url(&p), &auth_headers(&p, key.as_deref()), cancel)
+    let (mut models, error) = crate::catalog::fetch_with_status(&models_url(&p), &auth_headers(&p, key.as_deref()), cancel)
         .await
         .map_err(|e| anyhow!("获取模型失败：{e}"))?;
+    if error.is_some() {
+        let mut saved: Vec<_> = p.models.iter().map(|id| json!({"id":id,"label":id})).collect();
+        sa_store::catalog_cache::supplement_models(&mut saved, &models);
+        models = saved;
+    }
     if models.len() > MAX_MODELS {
         bail!("模型数量超过 {MAX_MODELS}，无法保存完整目录");
     }
-    Ok(models)
+    Ok((models, error))
 }
 
 /// Refresh custom providers at the same time as native catalogs, retaining exact
@@ -352,7 +357,7 @@ pub async fn refresh(
             continue;
         };
         match result {
-            Ok(mut models) => {
+            Ok((mut models, error)) => {
                 crate::catalog::supplement(&mut models, &metadata);
                 if p.agent == "claude" {
                     crate::catalog::restrict_efforts(
@@ -367,8 +372,14 @@ pub async fn refresh(
                 }
                 row["models"] = json!(models);
                 row["available"] = json!(true);
-                row["detail"] = json!("供应商在线完整模型目录");
-                row["catalog_complete"] = json!(true);
+                row["catalog_complete"] = json!(error.is_none());
+                if let Some(error) = error {
+                    row["catalogError"] = json!(true);
+                    row["cachedModels"] = json!(true);
+                    row["detail"] = json!(format!("在线目录获取失败：{error}；已保留已保存型号和上次目录"));
+                } else {
+                    row["detail"] = json!("供应商在线完整模型目录");
+                }
             }
             Err(error) => {
                 row["detail"] = json!(format!("在线目录获取失败：{error}；以下仅为已保存型号"));
@@ -565,6 +576,34 @@ mod tests {
         assert!(rows[1].get("catalogError").is_none());
         assert!(!catalog.to_string().contains("first-fixture"));
         assert!(!catalog.to_string().contains("second-fixture"));
+    }
+
+    #[tokio::test]
+    async fn warm_http_cache_supplements_changed_saved_models_after_endpoint_failure() {
+        let (bases, server) = paired_catalogs([
+            (200, json!({"data":[{"id":"online-old"}]})),
+            (200, json!({"data":[{"id":"other"}]})),
+        ]).await;
+        let mut customs = [
+            provider("codex", &bases[0], "FIRST"),
+            provider("codex", &bases[1], "SECOND"),
+        ];
+        customs[1].id = "gw2".into();
+        let sys = sys(&[("FIRST","key-a"),("SECOND","key-b")]);
+        let cancel = CancellationToken::new();
+        let mut first = json!({"providers":[]});
+        refresh(&mut first, &customs, &sys, &cancel).await;
+        server.await.unwrap(); // Both listeners have closed.
+        assert_eq!(first["providers"][0]["models"][0]["id"], "online-old");
+        customs[0].models = vec!["new-saved".into()];
+        let mut current = json!({"providers":[]});
+        refresh(&mut current, &customs[..1], &sys, &cancel).await;
+        let row = &current["providers"][0];
+        assert_eq!(row["catalogError"], true);
+        assert_eq!(row["catalog_complete"], false);
+        assert_eq!(row["defaultModel"], "new-saved");
+        assert_eq!(row["models"][0]["id"], "new-saved");
+        assert_eq!(row["models"][1]["id"], "online-old");
     }
 
     #[test]

@@ -14,10 +14,24 @@ pub struct Entry {
     pub value: Value,
 }
 
+/// Keep the current row for each configured model, including its capabilities.
+pub fn supplement_models(current: &mut Vec<Value>, cached: &[Value]) {
+    let ids: std::collections::HashSet<_> = current
+        .iter()
+        .filter_map(|model| model["id"].as_str().map(str::to_owned))
+        .collect();
+    current.extend(
+        cached
+            .iter()
+            .filter(|model| model["id"].as_str().is_some_and(|id| !ids.contains(id)))
+            .cloned(),
+    );
+}
+
 impl Entry {
     /// Iterate the new directory so removed sources stay removed. An adapter
     /// whose route ID survives endpoint edits also supplies a source identity.
-    pub fn merge_failed_sources(&self, live: &mut Value, unchanged_revision: bool) {
+    pub fn merge_failed_sources(&self, live: &mut Value, same_fingerprint: bool) {
         let Some(previous) = self.value["providers"].as_array() else {
             return;
         };
@@ -30,8 +44,15 @@ impl Entry {
             let Some(old) = previous.iter().find(|old| {
                 old["id"].is_string()
                     && old["id"] == row["id"]
-                    && (old["sourceIdentity"] == row["sourceIdentity"]
-                        || (unchanged_revision && old.get("sourceIdentity").is_none()))
+                    && match (
+                        old["sourceIdentity"].as_str().filter(|id| !id.is_empty()),
+                        row["sourceIdentity"].as_str().filter(|id| !id.is_empty()),
+                    ) {
+                        (Some(before), Some(after)) => before == after,
+                        // Older snapshots may predate the per-source identity.
+                        (None, _) => same_fingerprint,
+                        (Some(_), None) => false,
+                    }
                     && (old["catalogError"] != true || old["cachedModels"] == true)
                     && old["models"]
                         .as_array()
@@ -39,9 +60,16 @@ impl Entry {
             }) else {
                 continue;
             };
-            row["models"] = old["models"].clone();
+            let Some(models) = row["models"].as_array_mut() else {
+                continue;
+            };
+            let was_empty = models.is_empty();
+            supplement_models(
+                models,
+                old["models"].as_array().expect("matched cached models"),
+            );
             row["cachedModels"] = Value::Bool(true);
-            if row.get("unavailable_reason").is_none() {
+            if was_empty && row.get("unavailable_reason").is_none() {
                 row["available"] = Value::Bool(old["available"] != false);
             }
             if row["defaultModel"].as_str().is_none_or(str::is_empty)

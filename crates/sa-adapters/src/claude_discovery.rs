@@ -268,6 +268,37 @@ async fn first_party_timeouts_retain_good_rows_and_confirmed_logout_clears_them(
 }
 
 #[tokio::test]
+async fn first_party_auth_timeout_after_credentials_change_drops_old_account_models() {
+    let mut fixture = Fixture::new();
+    let credentials = native_file(&fixture.sys).with_file_name(".credentials.json");
+    std::fs::create_dir_all(credentials.parent().unwrap()).unwrap();
+    std::fs::write(&credentials, br#"{"account":"first"}"#).unwrap();
+    let login = json!({"loggedIn":true,"apiProvider":"firstParty"});
+    let cli = fixture.cli(login, None);
+    let cancel = CancellationToken::new();
+    let good = discover(&fixture.sys, Some(cli.clone()), &cancel).await.unwrap().catalog;
+    let revision = crate::catalog_revision(&fixture.sys, "claude");
+    let id = good["default"]["provider"].clone();
+    let source = |cat: &Value| cat["providers"].as_array().unwrap().iter()
+        .find(|row| row["id"] == id).unwrap().clone();
+    assert!(source(&good).get("sourceIdentity").is_none());
+    assert_eq!(source(&good)["models"][0]["id"], "official-model");
+
+    std::fs::write(credentials, br#"{"account":"second-account"}"#).unwrap();
+    let current = crate::catalog_revision(&fixture.sys, "claude");
+    assert_ne!(revision, current);
+    fixture.sys.set("FIXTURE_WAIT", fixture.data.path().join("unreleased").to_string_lossy());
+    let mut failed = discover(&fixture.sys, Some(cli), &cancel).await.unwrap().catalog;
+    assert_eq!(source(&failed)["catalogError"], true);
+    assert!(source(&failed).get("sourceIdentity").is_none());
+    let previous = sa_store::catalog_cache::Entry { value: good, fingerprint: revision.clone(), fetched_at: 0.0 };
+    previous.merge_failed_sources(&mut failed, revision == current);
+    assert_eq!(source(&failed)["models"], json!([]));
+    assert_eq!(source(&failed)["available"], false);
+    assert_ne!(failed["default"]["model"], "official-model");
+}
+
+#[tokio::test]
 async fn same_credentials_share_success_and_failure_only_within_one_discovery() {
     for failed in [false, true] {
         let fixture = Fixture::new();

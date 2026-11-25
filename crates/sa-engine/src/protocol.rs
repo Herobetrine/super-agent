@@ -193,6 +193,28 @@ fn not_unavailable(o: &Map<String, Value>) -> bool {
     matches!(o.get("available"), None | Some(Value::Bool(true)))
 }
 
+fn mode_offers(cat: &Map<String, Value>, selected: &Route) -> bool {
+    match_row(cat.get("modes"), &selected.mode).is_some_and(|mode| {
+        mode.get("available") == Some(&Value::Bool(true))
+            && (!truthy(mode.get("providers"))
+                || mode.get("providers").and_then(Value::as_array)
+                    .is_some_and(|ids| ids.iter().any(|id| id.as_str() == Some(&selected.provider))))
+    })
+}
+
+/// Absence from a source whose live listing failed is inconclusive at creation.
+/// Missing providers, disabled modes and explicitly disabled models remain conclusive.
+pub(crate) fn model_listing_failed(cat: &Value, selected: &Route) -> bool {
+    let Some(cat) = cat.as_object() else { return false };
+    if !not_unavailable(cat) || !mode_offers(cat, selected) { return false; }
+    match_row(cat.get("providers"), &selected.provider).is_some_and(|source| {
+        source.get("catalogError") == Some(&Value::Bool(true))
+            && !source.contains_key("unavailable_reason")
+            && !source.get("models").and_then(Value::as_array).into_iter().flatten()
+                .any(|model| model["id"].as_str() == Some(&selected.model))
+    })
+}
+
 /// `options(cat, picked)` (PR:33-66). `Err` mirrors `route()` throwing.
 pub fn options(cat: Option<&Value>, picked: Option<&Value>) -> Result<Option<Value>, String> {
     let Some(Value::Object(cat)) = cat else {
@@ -202,22 +224,8 @@ pub fn options(cat: Option<&Value>, picked: Option<&Value>) -> Result<Option<Val
         return Ok(None);
     }
     let selected = route(picked)?;
-    let mode = match_row(cat.get("modes"), &selected.mode);
-    let source = match_row(cat.get("providers"), &selected.provider);
-    let Some(mode) = mode else { return Ok(None) };
-    if mode.get("available") != Some(&Value::Bool(true)) {
-        return Ok(None);
-    }
-    if truthy(mode.get("providers")) {
-        let allowed = mode
-            .get("providers")
-            .and_then(Value::as_array)
-            .is_some_and(|a| a.iter().any(|p| p.as_str() == Some(&selected.provider)));
-        if !allowed {
-            return Ok(None);
-        }
-    }
-    let Some(source) = source else { return Ok(None) };
+    if !mode_offers(cat, &selected) { return Ok(None); }
+    let Some(source) = match_row(cat.get("providers"), &selected.provider) else { return Ok(None) };
     if !not_unavailable(source) {
         return Ok(None);
     }
