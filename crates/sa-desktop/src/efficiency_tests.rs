@@ -51,8 +51,8 @@ fn harness(data: &Path, observe: bool, demo: bool) -> Harness<'static, App> {
 }
 
 fn until(h: &mut Harness<'_, App>, cond: impl Fn(&App) -> bool) {
-    let end = Instant::now() + Duration::from_secs(10);
-    while Instant::now() < end {
+    let end = Instant::now() + Duration::from_secs(60);
+    loop {
         h.step();
         if cond(h.state()) {
             h.run_steps(3);
@@ -60,6 +60,9 @@ fn until(h: &mut Harness<'_, App>, cond: impl Fn(&App) -> bool) {
                 settle_dialog(h);
             }
             return;
+        }
+        if Instant::now() >= end {
+            break;
         }
         std::thread::sleep(Duration::from_millis(20));
     }
@@ -308,7 +311,7 @@ fn efficiency_observer_reads_saved_values_and_demo_can_preview() {
     );
     assert!(h.get_by_role_and_label(Role::SpinButton, "协作者并发上限").accesskit_node().is_disabled());
     assert!(h.get_by_role_and_label(Role::CheckBox, "额度保护").accesskit_node().is_disabled());
-    let end = Instant::now() + Duration::from_secs(10);
+    let end = Instant::now() + Duration::from_secs(60);
     while h.state_mut().saved_efficiency().as_ref() != Some(&saved) {
         assert!(Instant::now() < end, "observer settings did not load");
         h.step();

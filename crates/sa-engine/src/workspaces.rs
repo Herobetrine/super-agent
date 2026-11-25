@@ -7,7 +7,7 @@ use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{
-    fs,
+    fs, io,
     path::{Path, PathBuf},
     process::{Command, Stdio},
     time::{Duration, Instant},
@@ -251,19 +251,35 @@ fn check_command(cwd: &Path, argv: &[String]) -> Result<Command> {
     Ok(cmd)
 }
 
+fn retry_temp_file<T>(mut open: impl FnMut() -> io::Result<T>) -> io::Result<T> {
+    for delay_ms in [25, 50, 100, 200] {
+        match open() {
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                std::thread::sleep(Duration::from_millis(delay_ms));
+            }
+            result => return result,
+        }
+    }
+    open()
+}
+
 fn run_command(
     cwd: &Path, argv: &[String], timeout: Duration, cancel: Option<&dyn Fn() -> bool>, combined: bool, limit: Option<u64>,
 ) -> Result<CommandOutput> {
-    let output = tempfile::NamedTempFile::new()?;
-    let errors = tempfile::NamedTempFile::new()?;
-    let stdout = output.reopen()?;
+    let output = retry_temp_file(tempfile::NamedTempFile::new)?;
+    let errors = retry_temp_file(tempfile::NamedTempFile::new)?;
+    let stdout = retry_temp_file(|| output.reopen())?;
     // A cloned handle shares the file offset, preserving stdout/stderr order.
-    let stderr = if combined { stdout.try_clone()? } else { errors.reopen()? };
+    let stderr = if combined {
+        stdout.try_clone()?
+    } else {
+        retry_temp_file(|| errors.reopen())?
+    };
     let mut cmd = check_command(cwd, argv)?;
     cmd.stdout(stdout).stderr(stderr);
     let mut result = wait_command(&mut cmd, timeout, cancel)?;
     use std::io::{Read, Seek, SeekFrom};
-    let mut reader = output.reopen()?;
+    let mut reader = retry_temp_file(|| output.reopen())?;
     if combined {
         let len = reader.metadata()?.len();
         reader.seek(SeekFrom::Start(len.saturating_sub(4000)))?;
@@ -723,6 +739,50 @@ pub(crate) fn integrate_with(w: &Workspace, data: &Path, ops: &Scope, hydration:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn temp_file_retry_succeeds_after_permission_denied() {
+        let mut attempts = 0;
+        let result = retry_temp_file(|| {
+            attempts += 1;
+            if attempts <= 2 {
+                Err(io::ErrorKind::PermissionDenied.into())
+            } else {
+                Ok("opened")
+            }
+        });
+        assert_eq!(result.unwrap(), "opened");
+        assert_eq!(attempts, 3);
+    }
+
+    #[test]
+    fn temp_file_retry_returns_last_error_at_attempt_limit() {
+        let mut attempts = 0;
+        let error = retry_temp_file(|| {
+            attempts += 1;
+            Err::<(), _>(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("denied on attempt {attempts}"),
+            ))
+        })
+        .unwrap_err();
+        assert_eq!(attempts, 5);
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(error.to_string(), "denied on attempt 5");
+    }
+
+    #[test]
+    fn temp_file_retry_returns_other_errors_immediately() {
+        let mut attempts = 0;
+        let error = retry_temp_file(|| {
+            attempts += 1;
+            Err::<(), _>(io::Error::new(io::ErrorKind::NotFound, "missing file"))
+        })
+        .unwrap_err();
+        assert_eq!(attempts, 1);
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert_eq!(error.to_string(), "missing file");
+    }
 
     fn fixture_git(path: &Path, args: &[&str]) {
         let out = Command::new("git")

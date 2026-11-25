@@ -77,6 +77,32 @@ fn harness(data: &Path) -> Harness<'static, State> {
         )
 }
 
+fn wait_for_checks(
+    h: &mut Harness<'_, State>,
+    what: &str,
+    ready: impl Fn(&Harness<'_, State>) -> bool,
+) {
+    let end = Instant::now() + Duration::from_secs(60);
+    loop {
+        h.step();
+        if ready(h) {
+            return;
+        }
+        assert!(Instant::now() < end, "{what}");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn wait_for_checks_editor(h: &mut Harness<'_, State>) {
+    // Recommendations render above the editor and can move its click targets.
+    wait_for_checks(h, "completion checks and recommendations did not load", |h| {
+        h.query_by_label("推荐检查").is_some()
+            && h.query_by_label("添加检查")
+                .is_some_and(|node| !node.accesskit_node().is_disabled())
+    });
+    h.run_steps(3);
+}
+
 #[test]
 fn workspace_actions_require_valid_input_and_explicit_confirmation() {
     let data = tempfile::tempdir().unwrap();
@@ -217,7 +243,7 @@ fn observer_collaboration_panel_never_exposes_workflow_writes() {
             app.select(Some(1));
             app
         });
-    let end = Instant::now() + Duration::from_secs(8);
+    let end = Instant::now() + Duration::from_secs(60);
     while Instant::now() < end {
         h.step();
         if h.state().view.as_ref().is_some_and(|v| v.snap.is_some()) {
@@ -237,7 +263,7 @@ fn observer_collaboration_panel_never_exposes_workflow_writes() {
     );
     h.get_by_label("完成检查").click();
     h.run_steps(3);
-    let end = Instant::now() + Duration::from_secs(5);
+    let end = Instant::now() + Duration::from_secs(60);
     while h.query_by_label(r#"["git","diff","--check"]"#).is_none() {
         assert!(Instant::now() < end, "observer checks did not load");
         h.step();
@@ -283,13 +309,7 @@ fn completion_checks_add_remove_save_and_limit() {
     h.state_mut().checks = true;
     h.run_steps(3);
     h.get_by_label("完成检查").click();
-    h.run_steps(3);
-    let end = Instant::now() + Duration::from_secs(5);
-    while h.get_by_label("添加检查").accesskit_node().is_disabled() {
-        assert!(Instant::now() < end, "completion checks did not load");
-        h.step();
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    wait_for_checks_editor(&mut h);
     for index in 1..=4 {
         let input = h.get_by_role_and_label(Role::TextInput, "完成检查命令");
         input.focus();
@@ -317,19 +337,15 @@ fn completion_checks_add_remove_save_and_limit() {
         other => panic!("unexpected action: {other:?}"),
     };
     assert!(h.state().host.submit(action));
-    let result = h.state().host.rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let result = h.state().host.rx.recv_timeout(Duration::from_secs(60)).unwrap();
     assert!(result.result.is_ok(), "{:?}", result.result);
     h.state_mut().ui.checks_result(request, result.result.map(|_| ()));
     assert_eq!(h.state().host.engine().project_checks(".").unwrap(), expected);
     // A fresh editor must load the persisted project commands.
     h.state_mut().ui = WorkflowState::default();
-    h.run_steps(3);
-    let end = Instant::now() + Duration::from_secs(5);
-    while h.query_by_label("移除检查 3").is_none() {
-        assert!(Instant::now() < end, "saved checks did not reload");
-        h.step();
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    wait_for_checks(&mut h, "saved checks did not reload", |h| {
+        h.query_by_label("移除检查 3").is_some()
+    });
     assert!(h.query_by_label(r#"["git","check-3"]"#).is_some());
 }
 
@@ -341,13 +357,7 @@ fn completion_check_engine_validation_returns_inline_and_unlocks_editor() {
     h.state_mut().checks = true;
     h.run_steps(3);
     h.get_by_label("完成检查").click();
-    h.run_steps(3);
-    let end = Instant::now() + Duration::from_secs(5);
-    while h.get_by_label("添加检查").accesskit_node().is_disabled() {
-        assert!(Instant::now() < end, "completion checks did not load");
-        h.step();
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    wait_for_checks_editor(&mut h);
     let input = h.get_by_role_and_label(Role::TextInput, "完成检查命令");
     input.focus();
     input.type_text(r#"[""]"#);
@@ -359,7 +369,7 @@ fn completion_check_engine_validation_returns_inline_and_unlocks_editor() {
     let action = h.state_mut().actions.pop().unwrap();
     let request = match &action { Action::SaveProjectChecks { request, .. } => *request, other => panic!("unexpected action: {other:?}") };
     h.state().host.submit(action);
-    let outcome = h.state().host.rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let outcome = h.state().host.rx.recv_timeout(Duration::from_secs(60)).unwrap();
     assert!(outcome.result.is_err());
     h.state_mut().ui.checks_result(request, outcome.result.map(|_| ()));
     h.run_steps(3);
@@ -382,12 +392,9 @@ fn recommended_checks_require_one_explicit_adoption_and_preserve_existing() {
     h.state_mut().checks = true;
     h.run_steps(3);
     h.get_by_label("完成检查").click();
-    let end = Instant::now() + Duration::from_secs(5);
-    while h.query_by_label("推荐检查").is_none() || h.query_by_label("移除检查 1").is_none() {
-        assert!(Instant::now() < end, "recommendations did not load");
-        h.step();
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    wait_for_checks(&mut h, "recommendations did not load", |h| {
+        h.query_by_label("推荐检查").is_some() && h.query_by_label("移除检查 1").is_some()
+    });
     h.run_steps(3);
     if h.query_by_label("采用推荐检查").is_none() {
         h.get_by_label("推荐检查").click();
@@ -408,19 +415,25 @@ fn recommended_checks_require_one_explicit_adoption_and_preserve_existing() {
         }
         other => panic!("unexpected action {other:?}"),
     };
-    // Visit a different project and return before the write runs. The old
-    // project read must not overwrite the eventual save acknowledgement.
+    // Visit a different project, then read the original project's stored
+    // commands again while the adoption is still pending.
     let other_project = tempfile::tempdir().unwrap();
     h.state_mut().checks_cwd = other_project.path().to_string_lossy().into_owned();
     h.run_steps(3);
     h.state_mut().checks_cwd = cwd.clone();
-    h.run_steps(3);
+    wait_for_checks(&mut h, "original project's checks did not reload", |h| {
+        h.query_by_role_and_label(Role::Label, r#"["git","diff","--check"]"#)
+            .is_some()
+            && h.query_by_label("保存完成检查").is_some()
+    });
     assert!(h.get_by_label("保存完成检查").accesskit_node().is_disabled());
     assert!(h.state().host.submit(action));
-    let outcome = h.state().host.rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let outcome = h.state().host.rx.recv_timeout(Duration::from_secs(60)).unwrap();
     assert!(outcome.result.is_ok(), "{:?}", outcome.result);
     h.state_mut().ui.checks_result(request, outcome.result.map(|_| ()));
-    h.run_steps(3);
+    wait_for_checks(&mut h, "recommendations did not reload", |h| {
+        h.query_by_label("采用推荐检查").is_some()
+    });
     assert_eq!(h.state().host.engine().project_checks(&cwd).unwrap(), expected);
     assert!(h.get_by_label("采用推荐检查").accesskit_node().is_disabled());
     assert!(h.state().actions.is_empty());
@@ -478,7 +491,7 @@ fn delivery_app(data: &Path) -> Harness<'static, App> {
 }
 
 fn wait_delivery_ui(h: &mut Harness<'static, App>, ready: impl Fn(&Harness<'static, App>) -> bool) {
-    let end = Instant::now() + Duration::from_secs(8);
+    let end = Instant::now() + Duration::from_secs(60);
     loop {
         h.run_steps(3);
         if ready(h) { return; }
@@ -972,7 +985,7 @@ fn execution_policy_toggle_and_ledger_report_are_reachable() {
     h.get_by_label("用量账目").click();
     h.run_steps(3);
     h.get_by_label("生成用量账目").click();
-    let deadline = Instant::now() + Duration::from_secs(20);
+    let deadline = Instant::now() + Duration::from_secs(60);
     while h.query_by_label_contains("次报告了用量").is_none() {
         assert!(Instant::now() < deadline, "ledger report did not arrive");
         std::thread::sleep(Duration::from_millis(50));

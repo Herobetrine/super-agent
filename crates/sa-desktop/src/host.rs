@@ -1901,14 +1901,16 @@ pub(crate) mod tests {
         );
     }
 
+    // Both waits return as soon as their condition holds; the generous cap
+    // only keeps a healthy run from failing when the machine is loaded.
     fn outcome(host: &Host) -> Outcome {
         host.rx
-            .recv_timeout(Duration::from_secs(10))
+            .recv_timeout(Duration::from_secs(60))
             .expect("outcome")
     }
 
     fn until(cond: impl Fn() -> bool) {
-        let end = Instant::now() + Duration::from_secs(10);
+        let end = Instant::now() + Duration::from_secs(60);
         while Instant::now() < end {
             if cond() {
                 return;

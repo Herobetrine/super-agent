@@ -37,11 +37,14 @@ fn harness(data: &std::path::Path, profile: &str) -> Harness<'static, App> {
 
 /// Step frames until `cond` holds (background threads advance in real time).
 fn until(h: &mut Harness<'_, App>, what: &str, cond: impl Fn(&App) -> bool) {
-    let end = Instant::now() + Duration::from_secs(20);
-    while Instant::now() < end {
+    let end = Instant::now() + Duration::from_secs(60);
+    loop {
         h.step();
         if cond(h.state()) {
             return;
+        }
+        if Instant::now() >= end {
+            break;
         }
         std::thread::sleep(Duration::from_millis(30));
     }
@@ -750,8 +753,8 @@ fn providers_dialog_saves_custom_providers_and_rotation() {
     );
 }
 
-/// The `sa-ext` fixture MCP server next to this test binary (built by
-/// `cargo build --workspace`), if present.
+/// Cargo places the `sa-ext` fixture in the profile directory above
+/// the test binary's `deps` directory.
 fn fixture_mcp() -> Option<std::path::PathBuf> {
     let deps = std::env::current_exe().ok()?.parent()?.to_path_buf();
     let exe = deps.parent()?.join(format!(
@@ -904,7 +907,11 @@ fn extensions_directory_scope_editor_defaults_and_draft_isolation() {
     let data = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
     let other = tempfile::tempdir().unwrap();
-    let fixture = fixture_mcp().expect("build workspace MCP fixture before this UI test");
+    let fixture = fixture_mcp().expect(if cfg!(windows) {
+        r"Missing sa-ext-fixture-mcp.exe. Run `scripts\cargo.cmd build -p sa-ext --bins` with the same target directory and profile as this test."
+    } else {
+        "Missing sa-ext-fixture-mcp. Run `cargo build -p sa-ext --bins` with the same target directory and profile as this test."
+    });
     let secret = data.path().join("directory-mcp-secret");
     std::fs::write(&secret, "directory-proof").unwrap();
     let mut h = harness(data.path(), "readonly");
@@ -1226,15 +1233,15 @@ fn live_badge_and_failover_toggle() {
         .unwrap()
         .jobs[0]
         .id;
-    let mut badge = None;
-    for _ in 0..80 {
+    let end = Instant::now() + Duration::from_secs(60);
+    let badge = loop {
         h.step();
-        badge = h.state_mut().live_badges().remove(&root).map(|b| b.0);
-        if badge.as_deref() == Some("等待审批") {
-            break;
+        let badge = h.state_mut().live_badges().remove(&root).map(|b| b.0);
+        if badge.as_deref() == Some("等待审批") || Instant::now() >= end {
+            break badge;
         }
         std::thread::sleep(Duration::from_millis(30));
-    }
+    };
     assert_eq!(badge.as_deref(), Some("等待审批"));
     let ticket = h.state().view.as_ref().unwrap().id;
     h.run_steps(2);
