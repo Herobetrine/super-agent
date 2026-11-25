@@ -6,7 +6,7 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde::Serialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, Write};
@@ -22,6 +22,7 @@ const MESSAGES: &str = "orchestration_v2_projection_messages";
 const ITEMS: &str = "orchestration_v2_projection_turn_items";
 const RUNS: &str = "orchestration_v2_projection_runs";
 const ATTEMPTS: &str = "orchestration_v2_projection_run_attempts";
+const UNFINISHED: &str = "export.partial";
 const LIVE_THREADS: &str = "FROM orchestration_v2_projection_threads t
     JOIN projection_projects p ON p.project_id = t.project_id
     WHERE t.deleted_at IS NULL AND p.deleted_at IS NULL";
@@ -594,51 +595,49 @@ fn source_threads(conn: &Connection, schema: &Schema) -> Result<Vec<ArchiveThrea
         .collect::<rusqlite::Result<_>>()?)
 }
 
-struct NewFile {
-    path: PathBuf,
-    writer: Option<BufWriter<File>>,
-    keep: bool,
+fn stage(path: &Path) -> Result<BufWriter<tempfile::NamedTempFile>> {
+    let mut name = path.file_name().context("归档文件缺少名称")?.to_os_string();
+    name.push(".partial");
+    let file = tempfile::Builder::new()
+        .prefix(&name)
+        .rand_bytes(0)
+        .tempfile_in(path.parent().context("归档文件缺少父目录")?)?;
+    Ok(BufWriter::new(file))
 }
 
-impl NewFile {
-    fn open(path: PathBuf) -> Result<Self> {
-        let file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)?;
-        Ok(Self {
-            path,
-            writer: Some(BufWriter::new(file)),
-            keep: false,
-        })
-    }
-
-    fn writer(&mut self) -> &mut BufWriter<File> {
-        self.writer.as_mut().expect("new archive file is open")
-    }
-
-    fn finish(&mut self) -> Result<()> {
-        let writer = self.writer();
-        writer.flush()?;
-        writer.get_ref().sync_all()?;
-        Ok(())
-    }
+fn finish(mut writer: BufWriter<tempfile::NamedTempFile>) -> Result<tempfile::NamedTempFile> {
+    writer.flush()?;
+    writer.get_ref().as_file().sync_all()?;
+    Ok(writer.into_inner().map_err(|error| error.into_error())?)
 }
 
-impl Drop for NewFile {
-    fn drop(&mut self) {
-        drop(self.writer.take());
-        if !self.keep {
-            let _ = fs::remove_file(&self.path);
-        }
-    }
+fn write_new(path: PathBuf, body: impl FnOnce(&mut dyn Write) -> Result<()>) -> Result<()> {
+    let mut file = stage(&path)?;
+    body(&mut file)?;
+    finish(file)?
+        .persist_noclobber(path)
+        .map_err(|error| error.error)?;
+    Ok(())
 }
 
-fn write_new(path: PathBuf, body: impl FnOnce(&mut BufWriter<File>) -> Result<()>) -> Result<()> {
-    let mut file = NewFile::open(path)?;
-    body(file.writer())?;
-    file.finish()?;
-    file.keep = true;
+fn write_pair(
+    markdown: &Path,
+    jsonl: &Path,
+    body: impl FnOnce(&mut dyn Write, &mut dyn Write) -> Result<()>,
+) -> Result<()> {
+    let mut md = stage(markdown)?;
+    let mut jl = stage(jsonl)?;
+    body(&mut md, &mut jl)?;
+    let md = finish(md)?;
+    let jl = finish(jl)?;
+    // Both files are complete before either final name becomes visible. A
+    // process exit between the two publications leaves the archive marker.
+    md.persist_noclobber(markdown)
+        .map_err(|error| error.error)?;
+    if let Err(error) = jl.persist_noclobber(jsonl) {
+        fs::remove_file(markdown).context("无法清理未发布的对话文件对")?;
+        return Err(error.error.into());
+    }
     Ok(())
 }
 
@@ -682,7 +681,7 @@ fn payload(raw: &str, kind: &str) -> Result<Value> {
     Ok(value)
 }
 
-fn jsonl(out: &mut impl Write, value: &Value) -> Result<()> {
+fn jsonl(out: &mut dyn Write, value: &Value) -> Result<()> {
     serde_json::to_writer(&mut *out, value)?;
     out.write_all(b"\n")?;
     Ok(())
@@ -705,9 +704,13 @@ fn messages(
     conn: &Connection,
     thread: &str,
     items: &TurnItems,
-    boundary: Option<&RunBoundary>,
+    visibility: &RunVisibility,
 ) -> Result<Vec<Message>> {
-    let run_column = if boundary.is_some() { "run_id" } else { "NULL" };
+    let run_column = if visibility.message_run {
+        "run_id"
+    } else {
+        "NULL"
+    };
     let mut stmt = conn.prepare(&format!(
         "SELECT message_id, role, created_at, payload_json, {run_column}
          FROM orchestration_v2_projection_messages WHERE thread_id = ?1"
@@ -716,10 +719,9 @@ fn messages(
     let mut messages = Vec::new();
     while let Some(row) = rows.next()? {
         let id: String = row.get(0)?;
-        if let Some(boundary) = boundary
-            && !items.message_ordinals.contains_key(&id)
+        if !items.message_ordinals.contains_key(&id)
             && (items.hidden_messages.contains(&id)
-                || !boundary.includes_run(row.get_ref(4)?.as_str_or_null()?))
+                || !visibility.includes_run(row.get_ref(4)?.as_str_or_null()?))
         {
             continue;
         }
@@ -730,25 +732,12 @@ fn messages(
             raw: row.get(3)?,
         });
     }
-    let ordinal = |msg: &Message| {
-        items
-            .message_ordinals
-            .get(&msg.id)
-            .copied()
-            .unwrap_or(i64::MAX)
-    };
-    messages.sort_by(|left, right| {
-        ordinal(left)
-            .cmp(&ordinal(right))
-            .then_with(|| left.time.cmp(&right.time))
-            .then_with(|| left.id.cmp(&right.id))
-    });
     Ok(messages)
 }
 
 fn write_message(
-    markdown: &mut impl Write,
-    lines: &mut impl Write,
+    markdown: &mut dyn Write,
+    lines: &mut dyn Write,
     msg: &Message,
     inherited_from: Option<&str>,
 ) -> Result<()> {
@@ -803,15 +792,15 @@ struct Tool {
 struct TurnItems {
     message_ordinals: BTreeMap<String, i64>,
     hidden_messages: HashSet<String>,
-    tools: VecDeque<Tool>,
+    tools: Vec<Tool>,
 }
 
-fn turn_items(
-    conn: &Connection,
-    thread: &str,
-    boundary: Option<&RunBoundary>,
-) -> Result<TurnItems> {
-    let run_column = if boundary.is_some() { "run_id" } else { "NULL" };
+fn turn_items(conn: &Connection, thread: &str, visibility: &RunVisibility) -> Result<TurnItems> {
+    let run_column = if visibility.item_run {
+        "run_id"
+    } else {
+        "NULL"
+    };
     let mut stmt = conn.prepare(&format!(
         "SELECT ordinal, type, status, payload_json, {run_column}
          FROM orchestration_v2_projection_turn_items WHERE thread_id = ?1
@@ -820,15 +809,13 @@ fn turn_items(
     let mut rows = stmt.query([thread])?;
     let mut message_ordinals = BTreeMap::new();
     let mut hidden_messages = HashSet::new();
-    let mut tools = VecDeque::new();
+    let mut tools = Vec::new();
     while let Some(row) = rows.next()? {
         let ordinal: i64 = row.get(0)?;
         let kind: String = row.get(1)?;
         let run_id = row.get_ref(4)?.as_str_or_null()?;
         let is_message = matches!(kind.as_str(), "user_message" | "assistant_message");
-        if let Some(boundary) = boundary
-            && !boundary.includes_run(run_id)
-        {
+        if !visibility.includes_run(run_id) {
             // A message can have an anchor on a different run than its own
             // row. Remember excluded anchors without decoding later tools.
             if is_message
@@ -841,7 +828,8 @@ fn turn_items(
         }
         let raw: String = row.get(3)?;
         let body = payload(&raw, "对话步骤")?;
-        let visible = boundary.is_none_or(|boundary| boundary.item_visible(run_id, &kind, &body));
+        let status: String = row.get(2)?;
+        let visible = visibility.item_visible(run_id, &kind, &status, &body);
         if is_message {
             if let Some(id) = body["messageId"].as_str() {
                 if visible {
@@ -859,9 +847,8 @@ fn turn_items(
             .into_iter()
             .find_map(|key| body[key].as_str())
             .map(str::to_owned);
-        let status: String = row.get(2)?;
         let (summary, details) = tool_summary(&kind, &status, &body);
-        tools.push_back(Tool {
+        tools.push(Tool {
             kind,
             ordinal,
             status,
@@ -1004,8 +991,8 @@ fn tool_summary(
 }
 
 fn write_tool(
-    markdown: &mut impl Write,
-    lines: &mut impl Write,
+    markdown: &mut dyn Write,
+    lines: &mut dyn Write,
     tool: &Tool,
     inherited_from: Option<&str>,
 ) -> Result<()> {
@@ -1028,27 +1015,37 @@ fn write_tool(
     )
 }
 
-struct RunBoundary {
-    ordinal: i64,
+struct RunVisibility {
+    cutoff: Option<i64>,
     runs: BTreeMap<String, String>,
     legacy: bool,
+    message_run: bool,
+    item_run: bool,
     superseded_roots: BTreeMap<String, HashSet<String>>,
     interrupt_requests: HashSet<String>,
 }
 
-impl RunBoundary {
+impl RunVisibility {
     fn includes_run(&self, run: Option<&str>) -> bool {
-        run.map_or(self.legacy, |id| self.runs.contains_key(id))
+        if self.cutoff.is_some() {
+            run.map_or(self.legacy, |id| self.runs.contains_key(id))
+        } else {
+            run.and_then(|id| self.runs.get(id))
+                .is_none_or(|status| status != "rolled_back")
+        }
     }
 
-    fn item_visible(&self, run: Option<&str>, kind: &str, item: &Value) -> bool {
-        let Some(run) = run else { return true };
+    fn item_visible(&self, run: Option<&str>, kind: &str, status: &str, item: &Value) -> bool {
         match kind {
-            "user_message" if item["inputIntent"] == "queued_turn" => !matches!(
-                self.runs.get(run).map(String::as_str),
-                Some("queued" | "cancelled")
-            ),
+            "user_message" if item["inputIntent"] == "queued_turn" => {
+                status != "pending"
+                    && !matches!(
+                        run.and_then(|id| self.runs.get(id)).map(String::as_str),
+                        Some("queued" | "cancelled")
+                    )
+            }
             "run_interrupt_result" => {
+                let Some(run) = run else { return true };
                 self.interrupt_requests.contains(run)
                     || !self.superseded_roots.get(run).is_some_and(|roots| {
                         item["nodeId"]
@@ -1093,10 +1090,12 @@ fn has_columns(conn: &Connection, table: &str, required: &[&str]) -> Result<bool
 }
 
 struct ArchiveCatalog<'a> {
-    threads: BTreeMap<&'a str, &'a ArchiveThread>,
     files: BTreeMap<&'a str, Result<String>>,
+    run_status: bool,
     run_cutoffs: bool,
     attempts: bool,
+    item_run: bool,
+    message_run: bool,
 }
 
 impl ArchiveCatalog<'_> {
@@ -1106,7 +1105,7 @@ impl ArchiveCatalog<'_> {
         point: &ForkPoint,
         fork_created: &str,
         legacy: bool,
-    ) -> Result<Option<RunBoundary>> {
+    ) -> Result<Option<RunVisibility>> {
         let ordinal = conn.query_row(
             "SELECT ordinal FROM orchestration_v2_projection_runs WHERE thread_id = ?1 AND run_id = ?2",
             params![point.thread_id, point.run_id],
@@ -1122,26 +1121,63 @@ impl ArchiveCatalog<'_> {
              WHERE thread_id = ?1 AND ordinal <= ?2
              AND NOT COALESCE(status = 'rolled_back' AND julianday(completed_at) < julianday(?3), 0)",
         )?;
-        let mut runs: BTreeMap<String, String> = stmt
+        let runs: BTreeMap<String, String> = stmt
             .query_map(params![point.thread_id, ordinal, fork_created], |row| {
                 Ok((row.get(0)?, row.get(1)?))
             })?
             .collect::<rusqlite::Result<_>>()?;
+        if !self.attempts {
+            let has_interrupt: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM orchestration_v2_projection_turn_items
+                   WHERE thread_id = ?1 AND type = 'run_interrupt_result')",
+                [&point.thread_id],
+                |row| row.get(0),
+            )?;
+            if has_interrupt || runs.values().any(|status| status == "rolled_back") {
+                return Ok(None);
+            }
+        }
+        self.visibility(conn, &point.thread_id, Some((ordinal, legacy)), runs)
+            .map(Some)
+    }
+
+    fn local_visibility(&self, conn: &Connection, thread: &str) -> Result<RunVisibility> {
+        let mut runs = BTreeMap::new();
+        if self.run_status {
+            let mut stmt = conn.prepare_cached(
+                "SELECT run_id, status FROM orchestration_v2_projection_runs
+                 WHERE thread_id = ?1 AND status IN ('rolled_back', 'queued', 'cancelled')",
+            )?;
+            runs = stmt
+                .query_map([thread], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<rusqlite::Result<_>>()?;
+        }
+        self.visibility(conn, thread, None, runs)
+    }
+
+    fn visibility(
+        &self,
+        conn: &Connection,
+        thread: &str,
+        cutoff: Option<(i64, bool)>,
+        mut runs: BTreeMap<String, String>,
+    ) -> Result<RunVisibility> {
         let mut superseded_roots = BTreeMap::<String, HashSet<String>>::new();
         let mut interrupt_requests = HashSet::new();
         if self.attempts {
-            let mut stmt = conn.prepare(
+            let mut stmt = conn.prepare_cached(
                 "SELECT run_id, root_node_id, status
                  FROM orchestration_v2_projection_run_attempts
                  WHERE thread_id = ?1 AND status IN ('cancelled', 'superseded')",
             )?;
-            let mut rows = stmt.query([&point.thread_id])?;
+            let mut rows = stmt.query([thread])?;
             while let Some(row) = rows.next()? {
                 let id: String = row.get(0)?;
                 let status: String = row.get(2)?;
                 if status == "superseded" {
                     superseded_roots.entry(id).or_default().insert(row.get(1)?);
-                } else if let Some(run_status) = runs.get_mut(&id)
+                } else if cutoff.is_some()
+                    && let Some(run_status) = runs.get_mut(&id)
                     && run_status == "rolled_back"
                 {
                     *run_status = status;
@@ -1153,27 +1189,19 @@ impl ArchiveCatalog<'_> {
                      WHERE thread_id = ?1 AND type = 'run_interrupt_request' AND run_id IS NOT NULL",
                 )?;
                 interrupt_requests = stmt
-                    .query_map([&point.thread_id], |r| r.get(0))?
+                    .query_map([thread], |r| r.get(0))?
                     .collect::<rusqlite::Result<_>>()?;
             }
-        } else {
-            let has_interrupt: bool = conn.query_row(
-                "SELECT EXISTS(SELECT 1 FROM orchestration_v2_projection_turn_items
-                   WHERE thread_id = ?1 AND type = 'run_interrupt_result')",
-                [&point.thread_id],
-                |row| row.get(0),
-            )?;
-            if has_interrupt || runs.values().any(|status| status == "rolled_back") {
-                return Ok(None);
-            }
         }
-        Ok(Some(RunBoundary {
-            ordinal,
+        Ok(RunVisibility {
+            cutoff: cutoff.map(|(ordinal, _)| ordinal),
             runs,
-            legacy,
+            legacy: cutoff.is_some_and(|(_, legacy)| legacy),
+            message_run: self.message_run,
+            item_run: self.item_run,
             superseded_roots,
             interrupt_requests,
-        }))
+        })
     }
 
     /// Resolve nested forks from the current child back to the oldest source.
@@ -1182,27 +1210,35 @@ impl ArchiveCatalog<'_> {
         conn: &Connection,
         thread: &ArchiveThread,
         point: &ForkPoint,
-    ) -> Option<Vec<(&str, RunBoundary)>> {
+    ) -> Option<Vec<(String, RunVisibility)>> {
         if !self.run_cutoffs {
             return None;
         }
         let mut point = point.clone();
-        let mut child_created = thread.created_at.as_str();
-        let mut seen = HashSet::from([thread.id.as_str()]);
+        let mut child_created = thread.created_at.clone();
+        let mut seen = HashSet::from([thread.id.clone()]);
         let mut chain = Vec::new();
         loop {
-            let parent = self.threads.get(point.thread_id.as_str())?;
-            if !seen.insert(parent.id.as_str()) {
+            if !seen.insert(point.thread_id.clone()) {
                 return None;
             }
-            let header = read_thread_header(conn, &parent.id).ok()?;
+            // T3 retains pre-fork rows even when the parent is deleted.
+            let (created, raw): (String, String) = conn
+                .query_row(
+                    "SELECT created_at, payload_json FROM orchestration_v2_projection_threads
+                 WHERE thread_id = ?1",
+                    [&point.thread_id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .ok()?;
+            let header = payload(&raw, "对话信息").ok()?;
             let legacy = header["historyOrigin"] == "v1_import";
             let boundary = self
-                .boundary(conn, &point, child_created, legacy)
+                .boundary(conn, &point, &child_created, legacy)
                 .ok()
                 .flatten()?;
-            chain.push((parent.id.as_str(), boundary));
-            child_created = &parent.created_at;
+            chain.push((point.thread_id, boundary));
+            child_created = created;
             match fork_point(&header).ok()? {
                 Some(ancestor) => point = ancestor,
                 None => return Some(chain),
@@ -1211,29 +1247,70 @@ impl ArchiveCatalog<'_> {
     }
 }
 
+enum TimelineEntry {
+    Message(Message),
+    Tool(Tool),
+}
+
+fn message_order(a: &Message, b: &Message) -> std::cmp::Ordering {
+    a.time.cmp(&b.time).then_with(|| a.id.cmp(&b.id))
+}
+
 fn write_timeline(
     conn: &Connection,
     thread: &str,
-    boundary: Option<&RunBoundary>,
-    md: &mut impl Write,
-    jl: &mut impl Write,
+    visibility: &RunVisibility,
+    md: &mut dyn Write,
+    jl: &mut dyn Write,
 ) -> Result<()> {
-    let inherited_from = boundary.map(|_| thread);
-    let mut items = turn_items(conn, thread, boundary)?;
-    for msg in messages(conn, thread, &items, boundary)? {
-        let anchor = items.message_ordinals.get(&msg.id);
-        while items.tools.front().is_some_and(|tool| match anchor {
-            Some(ordinal) => tool.ordinal < *ordinal,
-            None => tool.time.as_ref().is_some_and(|time| time <= &msg.time),
-        }) {
-            if let Some(tool) = items.tools.pop_front() {
-                write_tool(md, jl, &tool, inherited_from)?;
-            }
+    let inherited_from = visibility.cutoff.map(|_| thread);
+    let items = turn_items(conn, thread, visibility)?;
+    let mut committed = Vec::new();
+    let mut unanchored = Vec::new();
+    for msg in messages(conn, thread, &items, visibility)? {
+        if let Some(&ordinal) = items.message_ordinals.get(&msg.id) {
+            committed.push((ordinal, TimelineEntry::Message(msg)));
+        } else {
+            unanchored.push(msg);
         }
-        write_message(md, jl, &msg, inherited_from)?;
     }
-    for tool in items.tools {
-        write_tool(md, jl, &tool, inherited_from)?;
+    committed.extend(
+        items
+            .tools
+            .into_iter()
+            .map(|tool| (tool.ordinal, TimelineEntry::Tool(tool))),
+    );
+    committed.sort_by(|(a, left), (b, right)| {
+        a.cmp(b).then_with(|| match (left, right) {
+            (TimelineEntry::Message(left), TimelineEntry::Message(right)) => {
+                message_order(left, right)
+            }
+            (TimelineEntry::Message(_), TimelineEntry::Tool(_)) => std::cmp::Ordering::Less,
+            (TimelineEntry::Tool(_), TimelineEntry::Message(_)) => std::cmp::Ordering::Greater,
+            _ => std::cmp::Ordering::Equal,
+        })
+    });
+    unanchored.sort_by(message_order);
+    let mut unanchored = unanchored.into_iter().peekable();
+    for (_, entry) in committed {
+        let time = match &entry {
+            TimelineEntry::Message(msg) => Some(msg.time.as_str()),
+            TimelineEntry::Tool(tool) => tool.time.as_deref(),
+        };
+        // Merge by time without reordering committed entries whose timestamps
+        // disagree with their ordinals.
+        while let Some(msg) =
+            unanchored.next_if(|msg| time.is_some_and(|time| msg.time.as_str() <= time))
+        {
+            write_message(md, jl, &msg, inherited_from)?;
+        }
+        match entry {
+            TimelineEntry::Message(msg) => write_message(md, jl, &msg, inherited_from)?,
+            TimelineEntry::Tool(tool) => write_tool(md, jl, &tool, inherited_from)?,
+        }
+    }
+    for msg in unanchored {
+        write_message(md, jl, &msg, inherited_from)?;
     }
     Ok(())
 }
@@ -1245,78 +1322,77 @@ fn write_thread(
     thread: &ArchiveThread,
     project: &ArchiveProject,
     catalog: &ArchiveCatalog<'_>,
+    written: &BTreeMap<&str, String>,
 ) -> Result<()> {
     let stem = root.join(relative);
     fs::create_dir_all(stem.parent().context("对话归档缺少父目录")?)?;
-    let mut markdown = NewFile::open(root.join(format!("{relative}.md")))?;
-    let mut lines = NewFile::open(root.join(format!("{relative}.jsonl")))?;
-    let header = read_thread_header(conn, &thread.id)?;
-    let model = header["modelSelection"]["model"].as_str();
-    let md = markdown.writer();
-    let jl = lines.writer();
-    writeln!(md, "# {}\n", markdown_text(&thread.title))?;
-    for (label, value) in [
-        ("项目", project.title.as_str()),
-        ("项目路径", &project.path),
-        ("模型", model.unwrap_or("未知")),
-        ("供应商", &thread.provider),
-        ("创建时间", &thread.created_at),
-        ("更新时间", &thread.updated_at),
-        ("已归档", if thread.archived { "是" } else { "否" }),
-        ("对话 ID", &thread.id),
-    ] {
-        writeln!(md, "- {label}：{}", markdown_text(value))?;
-    }
-    let mut metadata = serde_json::to_value(thread)?;
-    metadata["type"] = json!("thread");
-    metadata["model"] = json!(model);
-    metadata["project_title"] = json!(project.title);
-    metadata["project_path"] = json!(project.path);
-    let mut inherited = None;
-    if let Some(point) = fork_point(&header)? {
-        inherited = catalog.inherited(conn, thread, &point);
-        let parent = catalog
-            .files
-            .get(point.thread_id.as_str())
-            .and_then(|result| result.as_ref().ok())
-            .map(|stem| format!("{stem}.md"));
-        let ordinal = inherited
-            .as_ref()
-            .and_then(|chain| chain.first())
-            .map(|(_, cutoff)| cutoff.ordinal);
-        let label = markdown_text(&point.thread_id);
-        let link = parent.as_ref().map_or_else(
-            || format!("{label}（无可用归档路径）"),
-            |parent| format!("[{label}](../../{})", link_path(parent)),
-        );
-        let summary = if inherited.is_some() {
-            "已包含继承记录"
-        } else {
-            "无法确定完整继承范围，请参阅父对话及分叉点"
-        };
-        writeln!(
-            md,
-            "\n> 分叉自 {link} · 运行 {} · {summary}",
-            markdown_text(&point.run_id)
-        )?;
-        metadata["forked_from"] = json!({
-            "thread_id": point.thread_id, "run_id": point.run_id,
-            "archive_path": parent, "cutoff_ordinal": ordinal,
-            "history": if inherited.is_some() { "expanded" } else { "reference" },
-        });
-    }
-    jsonl(jl, &metadata)?;
-    if let Some(chain) = inherited {
-        for (parent, boundary) in chain.iter().rev() {
-            write_timeline(conn, parent, Some(boundary), md, jl)?;
-        }
-    }
-    write_timeline(conn, &thread.id, None, md, jl)?;
-    markdown.finish()?;
-    lines.finish()?;
-    markdown.keep = true;
-    lines.keep = true;
-    Ok(())
+    write_pair(
+        &root.join(format!("{relative}.md")),
+        &root.join(format!("{relative}.jsonl")),
+        |md, jl| {
+            let header = read_thread_header(conn, &thread.id)?;
+            let model = header["modelSelection"]["model"].as_str();
+            writeln!(md, "# {}\n", markdown_text(&thread.title))?;
+            for (label, value) in [
+                ("项目", project.title.as_str()),
+                ("项目路径", &project.path),
+                ("模型", model.unwrap_or("未知")),
+                ("供应商", &thread.provider),
+                ("创建时间", &thread.created_at),
+                ("更新时间", &thread.updated_at),
+                ("已归档", if thread.archived { "是" } else { "否" }),
+                ("对话 ID", &thread.id),
+            ] {
+                writeln!(md, "- {label}：{}", markdown_text(value))?;
+            }
+            let mut metadata = serde_json::to_value(thread)?;
+            metadata["type"] = json!("thread");
+            metadata["model"] = json!(model);
+            metadata["project_title"] = json!(project.title);
+            metadata["project_path"] = json!(project.path);
+            let mut inherited = None;
+            if let Some(point) = fork_point(&header)? {
+                inherited = catalog.inherited(conn, thread, &point);
+                let parent = written
+                    .get(point.thread_id.as_str())
+                    .map(|stem| format!("{stem}.md"));
+                let ordinal = inherited
+                    .as_ref()
+                    .and_then(|chain| chain.first())
+                    .and_then(|(_, visibility)| visibility.cutoff);
+                let label = markdown_text(&point.thread_id);
+                let link = parent.as_ref().map_or_else(
+                    || format!("{label}（无可用归档路径）"),
+                    |parent| format!("[{label}](../../{})", link_path(parent)),
+                );
+                let summary = if inherited.is_some() {
+                    "已包含继承记录"
+                } else if parent.is_some() {
+                    "无法确定完整继承范围，请参阅父对话及分叉点"
+                } else {
+                    "无法确定完整继承范围，已记录分叉点"
+                };
+                writeln!(
+                    md,
+                    "\n> 分叉自 {link} · 运行 {} · {summary}",
+                    markdown_text(&point.run_id)
+                )?;
+                metadata["forked_from"] = json!({
+                    "thread_id": point.thread_id, "run_id": point.run_id,
+                    "archive_path": parent, "cutoff_ordinal": ordinal,
+                    "history": if inherited.is_some() { "expanded" } else { "reference" },
+                });
+            }
+            jsonl(jl, &metadata)?;
+            if let Some(chain) = inherited {
+                for (parent, visibility) in chain.iter().rev() {
+                    write_timeline(conn, parent, visibility, md, jl)?;
+                }
+            }
+            let local = catalog.local_visibility(conn, &thread.id)?;
+            write_timeline(conn, &thread.id, &local, md, jl)
+        },
+    )
 }
 
 fn thread_stem(thread: &ArchiveThread, project_slug: &str) -> Result<String> {
@@ -1357,24 +1433,47 @@ fn archive_catalog<'a>(
         });
         files.insert(thread.id.as_str(), stem);
     }
+    let item_run = has_columns(conn, ITEMS, &["run_id"])?;
+    let message_run = has_columns(conn, MESSAGES, &["run_id"])?;
     Ok(ArchiveCatalog {
-        threads: threads
-            .iter()
-            .map(|thread| (thread.id.as_str(), thread))
-            .collect(),
         files,
+        run_status: (item_run || message_run)
+            && has_columns(conn, RUNS, &["thread_id", "run_id", "status"])?,
         run_cutoffs: has_columns(
             conn,
             RUNS,
             &["thread_id", "run_id", "ordinal", "status", "completed_at"],
-        )? && has_columns(conn, ITEMS, &["run_id"])?
-            && has_columns(conn, MESSAGES, &["run_id"])?,
-        attempts: has_columns(
-            conn,
-            ATTEMPTS,
-            &["thread_id", "run_id", "root_node_id", "status"],
-        )?,
+        )? && item_run
+            && message_run,
+        attempts: item_run
+            && has_columns(
+                conn,
+                ATTEMPTS,
+                &["thread_id", "run_id", "root_node_id", "status"],
+            )?,
+        item_run,
+        message_run,
     })
+}
+
+fn export_order<'a>(conn: &Connection, threads: &'a [ArchiveThread]) -> Vec<&'a ArchiveThread> {
+    let live: BTreeMap<_, _> = threads.iter().map(|t| (t.id.as_str(), t)).collect();
+    let mut scheduled = HashSet::new();
+    let mut order = Vec::with_capacity(threads.len());
+    for thread in threads {
+        let mut chain = Vec::new();
+        let mut next = Some(thread);
+        while let Some(thread) = next.filter(|t| scheduled.insert(t.id.as_str())) {
+            chain.push(thread);
+            next = read_thread_header(conn, &thread.id)
+                .ok()
+                .and_then(|header| fork_point(&header).ok().flatten())
+                .and_then(|point| live.get(point.thread_id.as_str()).copied());
+        }
+        // Publish each live parent before writing its child's archive link.
+        order.extend(chain.into_iter().rev());
+    }
+    order
 }
 
 struct IndexEntry<'a> {
@@ -1385,8 +1484,14 @@ struct IndexEntry<'a> {
 fn write_index(folder: &Path, groups: BTreeMap<(&str, &str), Vec<IndexEntry<'_>>>) -> Result<()> {
     write_new(folder.join("index.md"), |out| {
         writeln!(out, "# T3 Code 对话归档")?;
-        for ((title, _), entries) in groups {
+        for ((title, _), mut entries) in groups {
             writeln!(out, "\n## {}\n", markdown_text(title))?;
+            entries.sort_by(|a, b| {
+                b.thread
+                    .updated_at
+                    .cmp(&a.thread.updated_at)
+                    .then_with(|| a.thread.id.cmp(&b.thread.id))
+            });
             for IndexEntry { thread, file } in entries {
                 let title = markdown_text(&thread.title);
                 let updated = markdown_text(&thread.updated_at);
@@ -1419,6 +1524,7 @@ pub fn export_threads(
     let threads = source_threads(conn, &schema)?;
     let slugs = project_slugs(&projects);
     let catalog = archive_catalog(conn, &threads, &slugs)?;
+    let order = export_order(conn, &threads);
     let by_id: BTreeMap<_, _> = projects.iter().map(|p| (p.id.as_str(), p)).collect();
     let folder = new_archive(conn, archives_root, t3_folder)?;
     let mut report = Report {
@@ -1428,6 +1534,12 @@ pub fn export_threads(
         failed: Vec::new(),
         stopped: false,
     };
+    let unfinished = report.folder.join(UNFINISHED);
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&unfinished)?
+        .write_all("导出尚未完成。带 .partial 后缀的文件尚未发布。\n".as_bytes())?;
     write_new(report.folder.join("projects.json"), |out| {
         serde_json::to_writer_pretty(&mut *out, &projects)?;
         out.write_all(b"\n")?;
@@ -1435,7 +1547,8 @@ pub fn export_threads(
     })?;
 
     let mut groups = BTreeMap::<_, Vec<_>>::new();
-    for (index, thread) in threads.iter().enumerate() {
+    let mut written = BTreeMap::new();
+    for (index, thread) in order.into_iter().enumerate() {
         if stop.load(Ordering::Relaxed) {
             report.stopped = true;
             break;
@@ -1445,12 +1558,21 @@ pub fn export_threads(
             let file = catalog.files[thread.id.as_str()]
                 .as_ref()
                 .map_err(|reason| anyhow::anyhow!("{reason:#}"))?;
-            write_thread(conn, &report.folder, file, thread, project, &catalog)?;
+            write_thread(
+                conn,
+                &report.folder,
+                file,
+                thread,
+                project,
+                &catalog,
+                &written,
+            )?;
             Ok::<_, anyhow::Error>(file.clone())
         })();
         let file = match result {
             Ok(file) => {
                 report.exported += 1;
+                written.insert(thread.id.as_str(), file.clone());
                 Some(file)
             }
             Err(reason) => {
@@ -1469,7 +1591,6 @@ pub fn export_threads(
             total: report.total,
         });
     }
-    write_index(&report.folder, groups)?;
     if !report.failed.is_empty() {
         write_new(report.folder.join("errors.txt"), |out| {
             for (id, reason) in &report.failed {
@@ -1478,5 +1599,70 @@ pub fn export_threads(
             Ok(())
         })?;
     }
+    write_index(&report.folder, groups)?;
+    fs::remove_file(unfinished)?;
     Ok(report)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::Command;
+    use std::time::Instant;
+
+    #[test]
+    fn interrupted_thread_keeps_only_unfinished_names() {
+        const CHILD_DIR: &str = "SA_T3_PARTIAL_PAIR_TEST_DIR";
+        if let Some(dir) = std::env::var_os(CHILD_DIR) {
+            let dir = PathBuf::from(dir);
+            write_pair(
+                &dir.join("thread.md"),
+                &dir.join("thread.jsonl"),
+                |md, jl| {
+                    md.write_all(b"complete Markdown")?;
+                    jl.write_all(b"{\"incomplete\":")?;
+                    md.flush()?;
+                    jl.flush()?;
+                    fs::write(dir.join("ready"), [])?;
+                    loop {
+                        std::thread::park();
+                    }
+                },
+            )
+            .unwrap();
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "t3_import::tests::interrupted_thread_keeps_only_unfinished_names",
+            ])
+            .env(CHILD_DIR, dir.path())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut ready = false;
+        while Instant::now() < deadline && child.try_wait().unwrap().is_none() {
+            if dir.path().join("ready").is_file() {
+                ready = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let _ = child.kill();
+        child.wait().unwrap();
+        assert!(ready, "child did not reach the middle of writing the pair");
+        assert!(!dir.path().join("thread.md").exists());
+        assert!(!dir.path().join("thread.jsonl").exists());
+        assert_eq!(
+            fs::read(dir.path().join("thread.md.partial")).unwrap(),
+            b"complete Markdown"
+        );
+        assert_eq!(
+            fs::read(dir.path().join("thread.jsonl.partial")).unwrap(),
+            b"{\"incomplete\":"
+        );
+    }
 }

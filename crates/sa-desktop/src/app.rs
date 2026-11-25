@@ -357,6 +357,7 @@ impl App {
                         self.notice_transitions(&rows);
                     }
                     self.history = rows;
+                    self.t3_history_changed();
                     self.history_loaded = true;
                     if !self.auto_selected && self.view.is_none() && query.is_empty() && !self.writable() {
                         self.auto_selected = true;
@@ -582,6 +583,7 @@ impl eframe::App for App {
         self.poll_knowledge();
         self.poll_extensions();
         self.drain();
+        self.t3_poll_recent();
         if self.applied_dark != Some(self.dark) {
             self.pal = Palette::of(self.dark);
             theme::apply(ctx, &self.pal);

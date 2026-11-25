@@ -92,28 +92,48 @@ pub fn recent(
     imported: &[Project],
     limit: usize,
 ) -> Vec<Recent> {
+    recent_with(ticket_cwds_newest_first, imported, limit, path_key)
+}
+
+fn recent_with(
+    ticket_cwds_newest_first: &[String],
+    imported: &[Project],
+    limit: usize,
+    resolve: impl Fn(&str) -> PathBuf,
+) -> Vec<Recent> {
+    if limit == 0 {
+        return Vec::new();
+    }
     let names: HashMap<_, _> = imported
         .iter()
-        .map(|p| (path_key(&p.path), &p.name))
+        .map(|p| (p.path.as_str(), &p.name))
         .collect();
     let mut seen = HashSet::new();
     let mut result = Vec::new();
+    let mut unnamed = HashMap::new();
     for path in ticket_cwds_newest_first {
         if result.len() == limit {
-            return result;
+            break;
         }
-        let key = path_key(path);
-        if !path.is_empty()
-            && !normalized_path(path).contains("super-agent-project-")
-            && seen.insert(key.clone())
-        {
+        if path.is_empty() || normalized_path(path).contains("super-agent-project-") {
+            continue;
+        }
+        let key = resolve(path);
+        if seen.insert(key.clone()) {
+            let name = names.get(path.as_str()).map(|name| (*name).clone());
+            if name.is_none() && !imported.is_empty() {
+                unnamed.insert(key, result.len());
+            }
             result.push(Recent {
                 path: path.clone(),
-                name: names.get(&key).map(|name| (*name).clone()),
+                name,
             });
         }
     }
 
+    if result.len() == limit && unnamed.is_empty() {
+        return result;
+    }
     let mut sorted: Vec<_> = imported.iter().collect();
     sorted.sort_by(|a, b| {
         b.pinned
@@ -121,10 +141,14 @@ pub fn recent(
             .then_with(|| b.source_updated.cmp(&a.source_updated))
     });
     for p in sorted {
-        if result.len() == limit {
+        if result.len() == limit && unnamed.is_empty() {
             break;
         }
-        if seen.insert(path_key(&p.path)) {
+        let key = resolve(&p.path);
+        if let Some(index) = unnamed.remove(&key) {
+            result[index].name = Some(p.name.clone());
+        }
+        if result.len() < limit && seen.insert(key) {
             result.push(Recent {
                 path: p.path.clone(),
                 name: Some(p.name.clone()),
@@ -132,6 +156,41 @@ pub fn recent(
         }
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::RefCell;
+
+    #[test]
+    fn recent_does_not_resolve_candidates_past_the_cap_when_no_names_are_pending() {
+        let make = |path: &str, pinned| Project {
+            path: path.into(),
+            name: path.into(),
+            pinned,
+            source: "t3".into(),
+            source_id: None,
+            source_updated: None,
+            added: 0.0,
+        };
+        let imported = [make("later", false), make("first", true)];
+        let resolved = RefCell::new(Vec::new());
+        let resolve = |path: &str| {
+            resolved.borrow_mut().push(path.to_owned());
+            PathBuf::from(path)
+        };
+        assert_eq!(recent_with(&[], &imported, 1, resolve)[0].path, "first");
+        assert_eq!(&*resolved.borrow(), &["first"]);
+        resolved.borrow_mut().clear();
+        assert_eq!(
+            recent_with(&["first".into(), "unused".into()], &imported, 1, resolve)[0]
+                .name
+                .as_deref(),
+            Some("first")
+        );
+        assert_eq!(&*resolved.borrow(), &["first"]);
+    }
 }
 
 pub(crate) fn path_key(path: &str) -> PathBuf {

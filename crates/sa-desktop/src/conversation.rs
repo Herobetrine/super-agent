@@ -345,7 +345,7 @@ impl App {
                     ui.add_space(indent);
                     ui.label(RichText::new("最近的项目").font(theme::body(theme::SMALL)).color(pal.faint));
                     ui.add_space(4.0);
-                    for entry in &recent {
+                    for entry in recent {
                         let cwd = entry.path.as_str();
                         let name = entry.name.clone().unwrap_or_else(|| labels::basename(cwd));
                         let active = self.composer.project.as_ref().is_some_and(|p| p.to_string_lossy() == cwd);
