@@ -45,6 +45,71 @@ async fn create(fx: &Fx, profile: &str) -> i64 {
         .await
 }
 
+// ACP read_file notifications in the smoke journal. The completed read has
+// locations and rawInput but no content or rawOutput.
+fn acp_read(update: &str, status: &str) -> Value {
+    json!({"method": "session/update", "params": {"sessionId": "session-1", "update": {
+        "sessionUpdate": update, "toolCallId": "call_1", "kind": "read", "status": status,
+        "title": "File notes/codex.txt", "name": "read_file", "locations": [{"path": "notes/codex.txt"}],
+        "rawInput": {"Path": "notes/codex.txt"}
+    }}})
+}
+
+#[test]
+fn antigravity_acp_proof_requires_an_identified_terminal_tool_update() {
+    use sa_engine::protocol::tools_proof;
+
+    assert_eq!(tools_proof(&acp_read("tool_call_update", "failed")), Some("attempt"));
+    assert_eq!(tools_proof(&acp_read("tool_call_update", "in_progress")), None);
+    assert_eq!(tools_proof(&acp_read("agent_message_chunk", "completed")), None);
+    let mut missing_id = acp_read("tool_call_update", "completed");
+    missing_id["params"]["update"].as_object_mut().unwrap().remove("toolCallId");
+    assert_eq!(tools_proof(&missing_id), None);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn antigravity_acp_completed_read_allows_exhaustion() {
+    let fx = setup(script(|c| async move {
+        if c.phase() == Some("work") {
+            return Ok(done());
+        }
+        assert_eq!(c.turn(), 2);
+        c.emit("native", acp_read("tool_call", "in_progress"));
+        c.emit("native", acp_read("tool_call_update", "completed"));
+        Ok(ended())
+    }));
+    let id = fx.begin(fx.params().lead("antigravity").profile("auto")).await;
+    fx.finish(id, "done").await;
+    let completed = fx.int(
+        "SELECT seq FROM events WHERE kind='native' AND json_extract(payload,'$.params.update.status')='completed'",
+    );
+    assert!(completed > 0);
+    let receipts = payloads(&fx, "SELECT payload FROM events WHERE kind='auto.exhausted'");
+    assert_eq!(receipts.len(), 1);
+    assert_eq!(receipts[0]["last_probe_seq"], json!(completed));
+    assert_eq!(receipts[0]["last_success_seq"], json!(completed));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn antigravity_acp_without_a_finished_inspection_is_refused() {
+    let fx = setup(script(|c| async move {
+        if c.phase() == Some("work") {
+            c.emit("native", acp_read("tool_call_update", "completed"));
+            return Ok(done());
+        }
+        c.emit("native", acp_read("tool_call", "in_progress"));
+        Ok(ended())
+    }));
+    let id = fx.begin(fx.params().lead("antigravity").profile("auto")).await;
+    fx.until(|| !fx.all("SELECT seq FROM events WHERE turn=2 AND kind='auto.next'").is_empty()).await;
+    let hints = payloads(&fx, "SELECT payload FROM events WHERE turn=2 AND kind='auto.next'");
+    assert_eq!(hints[0]["body"], "需要当前探查阶段的实际工具结果。");
+    assert_eq!(fx.int("SELECT probe FROM continuous_runs"), 0);
+    assert_eq!(fx.int("SELECT success FROM continuous_runs"), 0);
+    assert_ne!(root_state(&fx.engine, id), "done");
+    assert_eq!(fx.int("SELECT count(*) FROM events WHERE kind='auto.exhausted'"), 0);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn new_continuous_goal_must_follow_a_real_inspection() {
     let phase = Arc::new(AtomicUsize::new(0));

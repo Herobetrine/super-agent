@@ -339,6 +339,16 @@ pub fn tools_proof(e: &Value) -> Option<&'static str> {
             return Some(if done && exit_ok { "ok" } else { "attempt" });
         }
     }
+    if s("method") == Some("session/update") {
+        let update = &e["params"]["update"];
+        if update["sessionUpdate"] == "tool_call_update" && valid_text(update.get("toolCallId"), usize::MAX) {
+            return match update["status"].as_str() {
+                Some("completed") => Some("ok"),
+                Some("failed") => Some("attempt"),
+                _ => None,
+            };
+        }
+    }
     let step = o.get("step_update");
     if s("event") == Some("step_update")
         && step.and_then(|x| x.get("step_type")).and_then(Value::as_str) == Some("tool")
