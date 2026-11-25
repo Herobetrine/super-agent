@@ -70,12 +70,50 @@ struct ProbeKey {
     source: String,
     overrides: String,
     settings_fingerprint: String,
-    exe_stamp: Option<(u64, SystemTime)>,
+    exe_stamp: Option<FileStamp>,
+    credential_stamp: Vec<Option<FileStamp>>,
+}
+
+type FileStamp = (u64, SystemTime);
+
+fn file_stamp(path: &Path) -> Option<FileStamp> {
+    let metadata = std::fs::metadata(path).ok()?;
+    Some((metadata.len(), metadata.modified().ok()?))
+}
+
+fn adc_credential_stamp(sys: &Sys) -> Option<FileStamp> {
+    // ADC checks its explicit environment path before the local gcloud file.
+    let path = if let Some(path) = sys
+        .var("GOOGLE_APPLICATION_CREDENTIALS")
+        .or_else(|| sys.var("google_application_credentials"))
+    {
+        crate::sys::resolve(&sys.temp, path)
+    } else {
+        let config = if cfg!(windows) {
+            PathBuf::from(sys.var("APPDATA")?)
+        } else {
+            Path::new(sys.var("HOME")?).join(".config")
+        };
+        config.join("gcloud/application_default_credentials.json")
+    };
+    file_stamp(&path)
+}
+
+fn google_account_stamp(sys: &Sys) -> Vec<Option<FileStamp>> {
+    // agy runs with `--gemini-dir <home>/.gemini`, whose Google login lives in
+    // these Gemini CLI files. Only their metadata is read, never the contents.
+    let root = sys.home.join(".gemini");
+    ["oauth_creds.json", "google_accounts.json"]
+        .iter()
+        .map(|name| file_stamp(&root.join(name)))
+        .collect()
 }
 
 struct DiscoveryInputs {
     exe: Option<PathBuf>,
-    exe_stamp: Option<(u64, SystemTime)>,
+    exe_stamp: Option<FileStamp>,
+    adc_credential_stamp: Option<FileStamp>,
+    google_account_stamp: Vec<Option<FileStamp>>,
     settings: Value,
     settings_fingerprint: String,
 }
@@ -83,15 +121,14 @@ struct DiscoveryInputs {
 impl DiscoveryInputs {
     fn read(sys: &Sys) -> Self {
         let exe = executable(sys);
-        let exe_stamp = exe.as_ref().and_then(|path| {
-            let metadata = std::fs::metadata(path).ok()?;
-            Some((metadata.len(), metadata.modified().ok()?))
-        });
+        let exe_stamp = exe.as_deref().and_then(file_stamp);
         let settings = native_settings(sys);
         let settings_fingerprint = fingerprint("agy-settings-", std::slice::from_ref(&settings));
         Self {
             exe,
             exe_stamp,
+            adc_credential_stamp: adc(sys).then(|| adc_credential_stamp(sys)).flatten(),
+            google_account_stamp: google_account_stamp(sys),
             settings,
             settings_fingerprint,
         }
@@ -104,18 +141,34 @@ impl DiscoveryInputs {
             overrides: overrides.to_string(),
             settings_fingerprint: self.settings_fingerprint.clone(),
             exe_stamp: self.exe_stamp,
+            credential_stamp: match source {
+                "adc" => vec![self.adc_credential_stamp],
+                "google" => self.google_account_stamp.clone(),
+                _ => Vec::new(),
+            },
         }
     }
 }
 
 struct Fetched<T> {
-    value: T,
+    // A failed probe keeps its ordering information but offers no cache hit.
+    value: Option<T>,
     started: Instant,
 }
 
 impl<T> Fetched<T> {
     fn fresh(&self, window: Duration) -> Option<&T> {
-        (self.started.elapsed() < window).then_some(&self.value)
+        self.value.as_ref().filter(|_| self.is_fresh(window))
+    }
+
+    fn is_fresh(&self, window: Duration) -> bool {
+        self.started.elapsed() < window
+    }
+
+    fn invalidate_through(&mut self, cutoff: Instant) {
+        if self.started <= cutoff && self.value.take().is_some() {
+            self.started = cutoff;
+        }
     }
 }
 
@@ -169,20 +222,23 @@ impl ProbeCache {
         {
             return;
         }
-        if let Some(models) = models {
-            let listed: HashSet<_> = models.iter().filter_map(|m| m["id"].as_str()).collect();
-            let source = self.sources.entry(key.clone()).or_default();
-            source.efforts.retain(|id, effort| {
-                effort.started > started || id == "@native" || listed.contains(id.as_str())
-            });
-            source.models = Some(Fetched { value: models, started });
-        } else if let Some(source) = self.sources.get_mut(key) {
-            source.models = None;
-            source.efforts.retain(|_, effort| effort.started > started);
-            if source.efforts.is_empty() {
-                self.sources.remove(key);
+        let source = self.sources.entry(key.clone()).or_default();
+        let listed = models.as_ref().map(|models| {
+            models
+                .iter()
+                .filter_map(|m| m["id"].as_str())
+                .collect::<HashSet<_>>()
+        });
+        for (id, effort) in &mut source.efforts {
+            if listed
+                .as_ref()
+                .is_none_or(|ids| id != "@native" && !ids.contains(id.as_str()))
+            {
+                effort.invalidate_through(started);
             }
         }
+        source.models = Some(Fetched { value: models, started });
+        self.prune_expired_keys();
     }
 
     fn record_effort(
@@ -192,9 +248,7 @@ impl ProbeCache {
         started: Instant,
         effort: Option<Effort>,
     ) {
-        let Some(source) = self.sources.get_mut(key) else {
-            return;
-        };
+        let source = self.sources.entry(key.clone()).or_default();
         if source
             .efforts
             .get(model)
@@ -202,13 +256,32 @@ impl ProbeCache {
         {
             return;
         }
-        if let Some(effort) = effort {
-            source
-                .efforts
-                .insert(model.into(), Fetched { value: effort, started });
-        } else {
-            source.efforts.remove(model);
+        source
+            .efforts
+            .insert(model.into(), Fetched { value: effort, started });
+        self.prune_expired_keys();
+    }
+
+    fn evict_through(&mut self, key: &ProbeKey, completed: Instant) {
+        if let Some(source) = self.sources.get_mut(key) {
+            // Preserve ordering markers so outstanding older probes cannot
+            // resurrect a value that was already invalidated.
+            if let Some(models) = &mut source.models {
+                models.invalidate_through(completed);
+            }
+            for effort in source.efforts.values_mut() {
+                effort.invalidate_through(completed);
+            }
         }
+        self.prune_expired_keys();
+    }
+
+    fn prune_expired_keys(&mut self) {
+        let freshness = self.freshness;
+        self.sources.retain(|_, source| {
+            source.models.as_ref().is_some_and(|item| item.is_fresh(freshness))
+                || source.efforts.values().any(|item| item.is_fresh(freshness))
+        });
     }
 }
 
@@ -366,7 +439,7 @@ fn environment(
 struct Discovery {
     rows: Vec<Row>,
     catalog: Value,
-    cached_key: Option<ProbeKey>,
+    used_cached_probes: bool,
 }
 
 fn native_models(output: &str) -> Result<Vec<Value>, String> {
@@ -461,7 +534,7 @@ async fn discover(
         rows.retain(|row| row.id == route.provider);
     }
     let mut providers: Vec<Value> = vec![];
-    let mut cached_key = None;
+    let mut used_cached_probes = false;
     for id in ids {
         let mut models: Vec<Value> = vec![];
         let mut catalog_error = None;
@@ -528,7 +601,7 @@ async fn discover(
                         } else {
                             let started = Instant::now();
                             let effort = probe_effort(key, env, cancel, id).await;
-                            if complete && !cancel.is_cancelled() {
+                            if (complete || effort.is_none()) && !cancel.is_cancelled() {
                                 probes
                                     .lock()
                                     .unwrap()
@@ -550,9 +623,7 @@ async fn discover(
                     used_cache |= hit;
                 }
             }
-            if used_cache {
-                cached_key = Some(key);
-            }
+            used_cached_probes |= used_cache;
         }
         providers.push(json!({
             "id": id,
@@ -664,7 +735,7 @@ async fn discover(
     Ok(Discovery {
         rows,
         catalog,
-        cached_key,
+        used_cached_probes,
     })
 }
 
@@ -736,14 +807,25 @@ impl Adapter for Antigravity {
         Box::pin(async move {
             let inputs = DiscoveryInputs::read(&adapter.sys);
             let source = request.route.provider.clone();
-            let result = run(&adapter, &inputs, request, host, Emit(events), cancel).await;
+            let mut discovery_completed = None;
+            let result = run(
+                &adapter,
+                &inputs,
+                request,
+                host,
+                Emit(events),
+                cancel,
+                &mut discovery_completed,
+            )
+            .await;
             if result.as_ref().is_err_and(|e| e.class != ErrorClass::Cancelled)
+                && let Some(completed) = discovery_completed
                 && matches!(source.as_str(), "google" | "adc")
                 && let Some(cli) = &inputs.exe
                 && let Ok((_, overrides)) = environment(&adapter.sys, &source, None, false)
             {
                 let key = inputs.probe_key(cli, &source, overrides);
-                adapter.probes.lock().unwrap().sources.remove(&key);
+                adapter.probes.lock().unwrap().evict_through(&key, completed);
             }
             result
         })
@@ -767,6 +849,7 @@ async fn run(
     host: Arc<dyn TurnHost>,
     emit: Emit,
     cancel: CancellationToken,
+    discovery_completed: &mut Option<Instant>,
 ) -> Result<RunOutcome, AdapterError> {
     let sys = &adapter.sys;
     crate::images::check(&req)?;
@@ -782,16 +865,16 @@ async fn run(
                     probe_failed(&e.message)
                 }
             })?;
+        *discovery_completed = Some(Instant::now());
         if cancel.is_cancelled() {
             return Err(crate::proc::cancelled());
         }
         match select(&d.catalog, &req.route) {
             Ok(s) => break (d, s),
             Err(error) => {
-                let Some(key) = d.cached_key else {
+                if !d.used_cached_probes {
                     return Err(error);
-                };
-                adapter.probes.lock().unwrap().sources.remove(&key);
+                }
                 read_cache = false;
             }
         }
@@ -1069,19 +1152,28 @@ mod tests {
         fn accept_notes(&self, _: &[i64]) {}
     }
 
-    #[test]
-    fn older_probe_results_cannot_overwrite_or_remove_newer_results() {
-        let key = ProbeKey {
+    fn cache_key(settings_fingerprint: &str) -> ProbeKey {
+        ProbeKey {
             exe: "agy".into(),
             source: "google".into(),
             overrides: "{}".into(),
-            settings_fingerprint: "settings".into(),
+            settings_fingerprint: settings_fingerprint.into(),
             exe_stamp: None,
-        };
-        let mut cache = ProbeCache {
+            credential_stamp: Vec::new(),
+        }
+    }
+
+    fn empty_probe_cache() -> ProbeCache {
+        ProbeCache {
             sources: HashMap::new(),
             freshness: PROBE_FRESHNESS,
-        };
+        }
+    }
+
+    #[test]
+    fn older_probe_results_cannot_overwrite_or_remove_newer_results() {
+        let key = cache_key("settings");
+        let mut cache = empty_probe_cache();
         let newer = Instant::now();
         let older = newer - Duration::from_secs(1);
         let old_models = Arc::new(vec![json!({"id": "model-old"})]);
@@ -1110,6 +1202,50 @@ mod tests {
         cache.record_models(&key, newer, None);
         assert!(cache.effort(&key, "model-new").is_none());
         assert!(cache.models(&key).is_none());
+    }
+
+    #[test]
+    fn newer_failure_markers_reject_late_successes_for_models_and_effort() {
+        let key = cache_key("settings");
+        let mut cache = empty_probe_cache();
+        let newer = Instant::now();
+        let older = newer - Duration::from_secs(1);
+        let models = Arc::new(vec![json!({"id": "model-a"})]);
+        cache.record_models(&key, newer, None);
+        cache.record_effort(&key, "model-a", newer, None);
+
+        cache.record_models(&key, older, Some(Arc::clone(&models)));
+        cache.record_effort(&key, "model-a", older, Some(Effort::Fixed));
+        assert!(cache.models(&key).is_none());
+        assert!(cache.effort(&key, "model-a").is_none());
+
+        let retried = newer + Duration::from_nanos(1);
+        cache.record_models(&key, retried, Some(models));
+        cache.record_effort(&key, "model-a", retried, Some(Effort::Fixed));
+        assert!(cache.models(&key).is_some());
+        assert!(matches!(cache.effort(&key, "model-a"), Some(Effort::Fixed)));
+    }
+
+    #[test]
+    fn cache_writes_prune_expired_keys_including_failure_markers() {
+        let mut cache = empty_probe_cache();
+        let old = cache_key("old");
+        let failed = cache_key("failed");
+        let current = cache_key("current");
+        let now = Instant::now();
+        let expired = now - Duration::from_secs(2);
+        cache.record_models(&old, expired, Some(Arc::new(vec![json!({"id": "model-a"})])));
+        cache.record_models(&failed, expired, None);
+        cache.record_effort(&failed, "model-a", expired, None);
+        assert!(cache.sources.contains_key(&old));
+        assert!(cache.sources.contains_key(&failed));
+
+        cache.freshness = Duration::from_secs(1);
+        cache.record_models(&current, now, None);
+        assert!(!cache.sources.contains_key(&old));
+        assert!(!cache.sources.contains_key(&failed));
+        assert!(cache.sources.contains_key(&current));
+        assert!(cache.models(&current).is_none());
     }
 
     fn fake_cli() -> &'static Path {
@@ -1201,6 +1337,23 @@ int main(int argc, char **argv) {
         char input[8192];
         while (fgets(input, sizeof(input), stdin)) {}
         puts("{\"event\":\"init\",\"conversation_id\":\"fixture-session\"}");
+        const char *gate = getenv("FAKE_AGY_RUN_GATE");
+        if (gate) {
+            fflush(stdout);
+            FILE *ready = NULL;
+            for (int i = 0; i < 1500 && !ready; i++) {
+                ready = fopen(gate, "r");
+                if (!ready) {
+#ifdef _WIN32
+                    Sleep(10);
+#else
+                    usleep(10000);
+#endif
+                }
+            }
+            if (!ready) return 9;
+            fclose(ready);
+        }
         const char *step = getenv("FAKE_AGY_STEP");
         if (step) puts(step);
         const char *result = getenv("FAKE_AGY_RESULT");
