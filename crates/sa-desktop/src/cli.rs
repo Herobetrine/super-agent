@@ -1,11 +1,11 @@
 //! Command line: `super-agent [--data <dir>] [--project <dir>] [--ticket <id>] [--demo] [--observe] [--schedule] [--dark]
-//! [--inspector [tab]] [--dialog models|advisor|providers|rotation|extensions|palette|efficiency] [--screenshot <out.png> [--size WxH]]`.
+//! [--inspector [tab]] [--dialog models|advisor|providers|rotation|extensions|palette|efficiency|notify] [--screenshot <out.png> [--size WxH]]`.
 
 use anyhow::{Context, Result, bail};
 use std::path::PathBuf;
 
 pub const USAGE: &str = "用法: super-agent [--data <目录>] [--project <目录>] [--ticket <编号>] [--demo] [--observe] [--schedule] [--dark] \
-[--inspector [collab|native|plan|approvals|diff]] [--dialog models|advisor|providers|rotation|extensions|palette|efficiency|t3import|t3import-run] [--t3-folder <目录>] [--at-top] [--expand-all] [--screenshot <输出.png> [--size 宽x高]]";
+[--inspector [collab|native|plan|approvals|diff]] [--dialog models|advisor|providers|rotation|extensions|palette|efficiency|notify|t3import|t3import-run] [--t3-folder <目录>] [--at-top] [--expand-all] [--screenshot <输出.png> [--size 宽x高]]";
 
 #[derive(Clone, Debug, Default)]
 pub struct Options {
@@ -67,7 +67,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Options> {
             "--at-top" => o.at_top = true,
             "--expand-all" => o.expand_all = true,
             "--dialog" => match value("--dialog")?.as_str() {
-                d @ ("models" | "advisor" | "providers" | "rotation" | "extensions" | "palette" | "efficiency" | "t3import" | "t3import-run") => o.dialog = Some(d.into()),
+                d @ ("models" | "advisor" | "providers" | "rotation" | "extensions" | "palette" | "efficiency" | "notify" | "t3import" | "t3import-run") => o.dialog = Some(d.into()),
                 other => bail!("未知对话框：{other}"),
             },
             "--project" => o.project = Some(PathBuf::from(value("--project")?)),

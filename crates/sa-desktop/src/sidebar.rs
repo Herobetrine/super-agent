@@ -368,6 +368,9 @@ impl App {
             if button(ui, icon::GAUGE, "Token 与缓存", "Token 与缓存") {
                 self.open_efficiency();
             }
+            if button(ui, icon::DEVICE_MOBILE, "手机推送与隐私", "手机推送与隐私") {
+                self.open_notify();
+            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.spacing_mut().item_spacing.x = 2.0;
                 let (ic, tip) = if self.dark {

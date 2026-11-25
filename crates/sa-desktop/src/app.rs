@@ -154,6 +154,15 @@ pub struct App {
     pub observer_efficiency: crate::efficiency::ObserverEfficiency,
     /// "从 T3 Code 导入": welcome card, imported projects and the dialog.
     pub t3: crate::t3_import_ui::T3State,
+    pub notify: Option<crate::notify_ui::NotifyDialog>,
+    /// Background queue for automatic phone pushes.
+    pub pusher: crate::push::Pusher,
+    /// Pushes that passed the gate; the real queue is bypassed under test.
+    #[cfg(test)]
+    pub pushed: Vec<crate::push::Push>,
+    /// Overrides the viewport focus state under test.
+    #[cfg(test)]
+    pub test_focus: Option<bool>,
     pub palette: Option<crate::palette::PaletteState>,
     /// Focus the sidebar search on the next frame.
     pub focus_search: bool,
@@ -245,6 +254,12 @@ impl App {
             efficiency: None,
             observer_efficiency: Default::default(),
             t3: crate::t3_import_ui::T3State::new(get(crate::t3_import_ui::DISMISS_KEY).as_deref() == Some("1")),
+            notify: None,
+            pusher: crate::push::Pusher::new(),
+            #[cfg(test)]
+            pushed: Vec::new(),
+            #[cfg(test)]
+            test_focus: None,
             palette: None,
             focus_search: false,
             show_archived: false,
@@ -280,6 +295,7 @@ impl App {
             Some("efficiency") => app.open_efficiency(),
             Some("t3import") => app.open_t3_import(),
             Some("t3import-run") => app.open_t3_import_auto(),
+            Some("notify") => app.open_notify(),
             Some("extensions") => app.open_extensions(crate::extensions::ExtScope::Defaults),
             Some("palette") => app.palette = Some(Default::default()),
             Some("rotation") => {
@@ -663,6 +679,7 @@ impl eframe::App for App {
         self.efficiency_dialog(ctx);
         self.recovery_dialog(ctx);
         self.t3_import_dialog(ctx);
+        self.notify_dialog(ctx);
         self.extensions_dialog(ctx);
         self.palette_ui(ctx);
         self.rename_dialog(ctx);
@@ -741,7 +758,7 @@ impl App {
 
     /// Tell the operator when a ticket finishes or fails (in-app notice, and
     /// a taskbar flash when the window is in the background).
-    fn notice_transitions(&mut self, rows: &[TicketSummary]) {
+    pub(crate) fn notice_transitions(&mut self, rows: &[TicketSummary]) {
         let mut done = None;
         for r in rows {
             let prev = self.known_states.insert(r.id, r.state.clone());
@@ -750,6 +767,10 @@ impl App {
                     ticket: r.id,
                     kind: crate::notifications::NoticeKind::Completion,
                     status: labels::job_state(&r.state).to_string(),
+                });
+                self.push_event(crate::push::Event::Finished {
+                    ticket: r.id,
+                    state: r.state.clone(),
                 });
                 done = Some(format!(
                     "工单 #{} {}：{}",
@@ -768,6 +789,10 @@ impl App {
             }
             self.attention(false);
         }
+    }
+
+    pub(crate) fn shot_active(&self) -> bool {
+        self.shot.is_some()
     }
 
     fn post_notice(&mut self, notice: crate::notifications::Notice) {
@@ -843,6 +868,15 @@ impl App {
                 .chain(self.question_watch.poll(&self.ctx, &data));
             for notice in notices {
                 self.attention(true);
+                match notice.kind {
+                    crate::notifications::NoticeKind::Approval => {
+                        self.push_event(crate::push::Event::Approval { ticket: notice.ticket });
+                    }
+                    crate::notifications::NoticeKind::Question => {
+                        self.push_event(crate::push::Event::Question { ticket: notice.ticket });
+                    }
+                    crate::notifications::NoticeKind::Completion => {}
+                }
                 self.post_notice(notice);
             }
         }

@@ -451,6 +451,7 @@ impl App {
                 (ActionKind::Knowledge, r) => self.knowledge_saved(r.map(|_| ())),
                 (ActionKind::Providers, r) => self.providers_saved(r.map(|_| ())),
                 (ActionKind::Meta, Ok(_)) => {}
+                (ActionKind::Notify, r) => self.notify_saved(r.map(|_| ())),
                 (_, Err(e)) => self.composer.message = Some((e, true)),
             }
         }

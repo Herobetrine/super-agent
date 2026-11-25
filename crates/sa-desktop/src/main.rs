@@ -23,12 +23,16 @@ mod labels;
 mod markdown;
 mod models;
 mod notifications;
+mod notify_ui;
+#[cfg(test)]
+mod notify_ui_tests;
 mod ops;
 mod palette;
 mod providers;
 mod recovery_ui;
 #[cfg(test)]
 mod recovery_ui_tests;
+mod push;
 mod review;
 mod sidebar;
 mod t3_import_ui;

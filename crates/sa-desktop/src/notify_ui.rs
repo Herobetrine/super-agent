@@ -1,0 +1,577 @@
+//! The "手机推送与隐私" dialog: ntfy settings, a test push and a plain statement
+//! of what Super Agent sends where. Settings live in the journal database and
+//! apply as soon as they are saved.
+
+use crate::{
+    app::App,
+    host::Action,
+    ops::Pending,
+    push::{self, Event, SendError},
+    theme, widgets,
+};
+use egui::{Align, Color32, Layout, RichText, Ui};
+use sa_store::notify::{self, ServerProblem, Settings, TopicProblem};
+use std::time::Duration;
+
+const TEST_TIMEOUT: Duration = Duration::from_secs(10);
+const COPIED_FOR: f64 = 1.5;
+
+type Saved = Result<Settings, String>;
+
+pub struct NotifyDialog {
+    pub draft: Settings,
+    pub saving: bool,
+    pub error: Option<String>,
+    /// Saved settings read by this dialog (windows without a scheduler, retries).
+    loaded: Option<Saved>,
+    loading: Option<Pending<Settings>>,
+    load_error: Option<String>,
+    ready: bool,
+    testing: Option<Pending<Result<(), SendError>>>,
+    /// Outcome of the last test push; cleared when the server or topic changes.
+    pub test: Option<Result<(), SendError>>,
+    test_key: (String, String),
+}
+
+fn read_settings(ctx: &egui::Context, data: std::path::PathBuf) -> Pending<Settings> {
+    Pending::spawn(ctx, move || {
+        let conn = rusqlite::Connection::open_with_flags(
+            data.join(sa_store::DB_FILE),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?;
+        notify::load(&conn)
+    })
+}
+
+/// Why a push could not be delivered, as shown to the operator.
+fn reason(error: &SendError) -> String {
+    match error {
+        SendError::Connect => "无法连接服务器".into(),
+        SendError::Timeout => "连接超时（10 秒）".into(),
+        SendError::Tls => "无法建立安全连接（证书校验失败）".into(),
+        SendError::Status(code) => format!("服务器返回 {code}"),
+        SendError::Other(text) => text.clone(),
+    }
+}
+
+fn at_text(at: std::time::SystemTime) -> String {
+    chrono::DateTime::<chrono::Local>::from(at)
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string()
+}
+
+fn note(ui: &mut Ui, text: &str, color: Color32) {
+    ui.add(
+        egui::Label::new(RichText::new(text).font(theme::body(theme::SMALL)).color(color)).wrap(),
+    );
+}
+
+fn field_label(ui: &mut Ui, text: &str, pal: &theme::Palette) {
+    ui.label(RichText::new(text).font(theme::strong(theme::UI)).color(pal.ink));
+}
+
+/// Copy button whose caption turns into "已复制" for a moment.
+fn copy_button(ui: &mut Ui, key: &'static str, idle: &str, text: &str, pal: &theme::Palette) -> bool {
+    let id = egui::Id::new(key);
+    let now = ui.input(|i| i.time);
+    let recent = ui
+        .data(|d| d.get_temp::<f64>(id))
+        .is_some_and(|at| now - at < COPIED_FOR);
+    let caption = if recent { "已复制" } else { idle };
+    let clicked = widgets::outline_button(ui, "", caption, pal).clicked();
+    if clicked {
+        ui.ctx().copy_text(text.to_string());
+        ui.data_mut(|d| d.insert_temp(id, now));
+    }
+    if recent {
+        ui.ctx().request_repaint_after(Duration::from_millis(300));
+    }
+    clicked
+}
+
+/// Gate for automatic pushes: only while the window is in the background and
+/// the saved settings could be read. Independent of the system-toast toggle.
+pub(crate) fn forward(
+    focused: bool,
+    event: Event,
+    settings: Option<&Saved>,
+    sink: impl FnOnce(Event, &Settings),
+) {
+    if focused {
+        return;
+    }
+    if let Some(Ok(settings)) = settings {
+        sink(event, settings);
+    }
+}
+
+impl App {
+    pub fn open_notify(&mut self) {
+        if self.notify.is_some() {
+            return;
+        }
+        let mut dialog = NotifyDialog {
+            draft: Settings::default(),
+            saving: false,
+            error: None,
+            loaded: None,
+            loading: None,
+            load_error: None,
+            ready: true,
+            testing: None,
+            test: None,
+            test_key: Default::default(),
+        };
+        if let Some(host) = &self.host {
+            match host.notify_settings() {
+                Ok(settings) => {
+                    dialog.draft = settings.clone();
+                    dialog.loaded = Some(Ok(settings));
+                }
+                Err(error) => {
+                    dialog.ready = false;
+                    dialog.load_error = Some(error.clone());
+                    dialog.loaded = Some(Err(error));
+                }
+            }
+        } else if self.opts.demo {
+            dialog.loaded = Some(Ok(Settings::default()));
+        } else {
+            dialog.ready = false;
+            dialog.loading = Some(read_settings(&self.ctx, self.data_dir()));
+        }
+        self.notify = Some(dialog);
+    }
+
+    fn data_dir(&self) -> std::path::PathBuf {
+        self.opts.data.clone().unwrap_or_else(sa_store::default_data_dir)
+    }
+
+    pub fn notify_saved(&mut self, result: Result<(), String>) {
+        match result {
+            Ok(()) => {
+                self.notify = None;
+                self.composer.message =
+                    Some(("手机推送与隐私设置已保存，立即生效。".into(), false));
+            }
+            Err(error) => {
+                if let Some(dialog) = self.notify.as_mut() {
+                    dialog.saving = false;
+                    dialog.error = Some(format!("无法保存设置。{error}"));
+                } else {
+                    self.composer.message = Some((error, true));
+                }
+            }
+        }
+    }
+
+    pub fn notify_dialog(&mut self, ctx: &egui::Context) {
+        let writable = self.writable();
+        let demo = self.opts.demo;
+        let data = self.data_dir();
+        // What is in effect now, not what the form holds.
+        let live: Option<Saved> = self.host.as_ref().map(|host| host.notify_settings());
+        let last_push = self.pusher.last();
+        let pal = self.pal.clone();
+        let Some(dialog) = self.notify.as_mut() else {
+            return;
+        };
+        if let Some(result) = dialog.loading.as_ref().and_then(Pending::poll) {
+            dialog.loading = None;
+            match result {
+                Ok(settings) => {
+                    dialog.draft = settings.clone();
+                    dialog.loaded = Some(Ok(settings));
+                    dialog.load_error = None;
+                    dialog.ready = true;
+                }
+                Err(error) => {
+                    dialog.loaded = Some(Err(error.clone()));
+                    dialog.load_error = Some(error);
+                }
+            }
+        }
+        if let Some(result) = dialog.testing.as_ref().and_then(Pending::poll) {
+            dialog.testing = None;
+            dialog.test = Some(result.unwrap_or_else(|error| Err(SendError::Other(error))));
+        }
+        let key = (dialog.draft.server.clone(), dialog.draft.topic.clone());
+        if dialog.test.is_some() && key != dialog.test_key {
+            dialog.test = None;
+        }
+        let saved = live.clone().or_else(|| dialog.loaded.clone());
+        let busy = dialog.saving || dialog.testing.is_some();
+        let editable = (writable || demo) && dialog.ready && !busy;
+        let on = editable && dialog.draft.enabled;
+        let check = notify::check(&dialog.draft);
+        let problem = check.server.is_some() || check.topic.is_some();
+        let can_test = writable && on && !problem;
+        let failed_load = dialog.load_error.is_some() && dialog.loading.is_none();
+        let mut close = false;
+        let mut save = false;
+        let mut retry = false;
+        let mut test = false;
+        let modal = egui::Modal::new(egui::Id::new("sa-notify"))
+            .frame(widgets::modal_frame(&pal))
+            .show(ctx, |ui| {
+                ui.set_width(560.0);
+                close = widgets::modal_header(
+                    ui,
+                    "",
+                    "手机推送与隐私",
+                    "保存后立即生效。推送由本机直接发往你填写的 ntfy 服务器，不经过 Super Agent 的任何服务器。",
+                    &pal,
+                );
+                if demo {
+                    note(ui, "演示预览，可试选控件。设置仅用于本次预览。", pal.mute);
+                    ui.add_space(10.0);
+                } else if !writable {
+                    note(ui, "只读观察窗口。请在正在调度的主窗口保存设置。", pal.mute);
+                    ui.add_space(10.0);
+                }
+                if dialog.loading.is_some() {
+                    ui.horizontal(|ui| {
+                        widgets::spinner(ui);
+                        ui.label("正在读取已保存设置…");
+                    });
+                    ui.add_space(8.0);
+                }
+                if failed_load {
+                    let text = format!(
+                        "无法读取已保存设置。{}",
+                        dialog.load_error.as_deref().unwrap_or_default()
+                    );
+                    ui.add(egui::Label::new(RichText::new(text).color(pal.fail.fg)).wrap());
+                    ui.add_space(8.0);
+                }
+                let max_height = (ctx.content_rect().height() - 240.0).max(180.0);
+                egui::ScrollArea::vertical().max_height(max_height).show(ui, |ui| {
+                    widgets::section(ui, "手机推送", &pal);
+                    ui.add_space(8.0);
+                    ui.add_enabled(
+                        editable,
+                        widgets::Check::new(&mut dialog.draft.enabled, "向手机推送提醒"),
+                    );
+                    note(
+                        ui,
+                        "通过 ntfy 推送。在手机上安装 ntfy 应用并订阅同一个主题，即可收到提醒。推送只含工单编号和状态，不含对话、项目名称或文件内容。",
+                        pal.mute,
+                    );
+                    ui.add_space(12.0);
+
+                    field_label(ui, "服务器", &pal);
+                    ui.add_space(4.0);
+                    let r = ui.add_enabled(
+                        on,
+                        egui::TextEdit::singleline(&mut dialog.draft.server)
+                            .margin(egui::Margin::symmetric(8, 5))
+                            .hint_text(widgets::hint(ui, "https://ntfy.sh"))
+                            .desired_width(ui.available_width()),
+                    );
+                    r.widget_info(|| {
+                        egui::WidgetInfo::labeled(egui::WidgetType::TextEdit, on, "服务器")
+                    });
+                    note(
+                        ui,
+                        "可以改成自建的 ntfy 服务器。使用 ntfy.sh 时，推送会经过 ntfy.sh 的服务器。",
+                        pal.mute,
+                    );
+                    if let Some(problem) = check.server {
+                        ui.add_space(2.0);
+                        note(
+                            ui,
+                            match problem {
+                                ServerProblem::Empty => "请填写服务器地址",
+                                ServerProblem::NeedsHttps => {
+                                    "请使用 https 地址；只有本机或局域网地址可以用 http"
+                                }
+                                ServerProblem::Invalid => "服务器地址格式不对",
+                            },
+                            pal.fail.fg,
+                        );
+                    }
+                    ui.add_space(12.0);
+
+                    field_label(ui, "主题", &pal);
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            ui.add_enabled_ui(
+                                !dialog.draft.topic.is_empty()
+                                    && !busy
+                                    && (dialog.draft.enabled || !(writable || demo)),
+                                |ui| {
+                                    copy_button(ui, "sa-notify-copy-topic", "复制", &dialog.draft.topic, &pal);
+                                },
+                            );
+                            ui.add_enabled_ui(on, |ui| {
+                                if widgets::outline_button(ui, "", "生成随机主题", &pal).clicked() {
+                                    dialog.draft.topic = notify::random_topic();
+                                }
+                            });
+                            let r = ui.add_enabled(
+                                on,
+                                egui::TextEdit::singleline(&mut dialog.draft.topic)
+                                    .margin(egui::Margin::symmetric(8, 5))
+                                    .hint_text(widgets::hint(ui, "例如 sa-…"))
+                                    .desired_width(ui.available_width()),
+                            );
+                            r.widget_info(|| {
+                                egui::WidgetInfo::labeled(egui::WidgetType::TextEdit, on, "主题")
+                            });
+                        });
+                    });
+                    note(
+                        ui,
+                        "主题相当于收件地址，知道主题的人都能收到这些推送。请使用难以猜到的随机主题。",
+                        pal.mute,
+                    );
+                    if let Some(problem) = check.topic {
+                        ui.add_space(2.0);
+                        note(
+                            ui,
+                            match problem {
+                                TopicProblem::Empty => "请填写主题",
+                                TopicProblem::Invalid => {
+                                    "主题只能包含字母、数字、- 和 _，最多 64 个字符"
+                                }
+                            },
+                            pal.fail.fg,
+                        );
+                    } else if dialog.draft.enabled && check.short_topic {
+                        ui.add_space(2.0);
+                        note(
+                            ui,
+                            "主题较短，容易被猜到。建议点击“生成随机主题”。",
+                            pal.warn.fg,
+                        );
+                    }
+                    ui.add_space(16.0);
+
+                    widgets::section(ui, "推送哪些提醒", &pal);
+                    ui.add_space(8.0);
+                    ui.add_enabled_ui(on, |ui| {
+                        ui.add(widgets::Check::new(
+                            &mut dialog.draft.needs_you,
+                            "需要你处理：有问题待回答，或有操作待审批",
+                        ));
+                        ui.add_space(4.0);
+                        ui.add(widgets::Check::new(&mut dialog.draft.done, "已完成"));
+                        ui.add_space(4.0);
+                        ui.add(widgets::Check::new(
+                            &mut dialog.draft.unfinished,
+                            "异常结束：失败、部分完成或已中断（手动停止的工单不推送）",
+                        ));
+                    });
+                    if dialog.draft.enabled && check.nothing_selected {
+                        ui.add_space(4.0);
+                        note(ui, "未选择任何提醒，将不会收到推送。", pal.warn.fg);
+                    }
+                    ui.add_space(8.0);
+                    note(
+                        ui,
+                        "仅在窗口不在前台时推送，与系统通知一致。同一个待办或同一次工单结束只推送一次；启动前已经存在的待办不会补发。推送只作提醒，不能在手机上直接操作，请回到电脑上的 Super Agent 处理。",
+                        pal.mute,
+                    );
+                    ui.add_space(12.0);
+
+                    ui.horizontal(|ui| {
+                        if dialog.testing.is_some() {
+                            widgets::spinner(ui);
+                        }
+                        ui.add_enabled_ui(can_test, |ui| {
+                            let caption = if dialog.testing.is_some() {
+                                "正在发送…"
+                            } else {
+                                "发送测试推送"
+                            };
+                            test = widgets::outline_button(ui, "", caption, &pal).clicked();
+                        });
+                        if demo {
+                            note(ui, "演示预览不会发送真实推送。", pal.mute);
+                        }
+                    });
+                    if let Some(result) = &dialog.test {
+                        ui.add_space(4.0);
+                        match result {
+                            Ok(()) => {
+                                let unsaved = saved.as_ref().is_none_or(|s| s.as_ref().ok() != Some(&dialog.draft));
+                                let text = if unsaved {
+                                    "测试推送已发送。当前设置还没有保存，确认无误后请点击“保存”。如果手机没有收到，请检查订阅的主题是否完全一致，以及 ntfy 是否允许通知。"
+                                } else {
+                                    "测试推送已发送。如果手机没有收到，请检查订阅的主题是否完全一致，以及 ntfy 是否允许通知。"
+                                };
+                                note(ui, text, pal.ok.fg);
+                            }
+                            Err(error) => {
+                                note(ui, &format!("发送失败：{}", reason(error)), pal.fail.fg);
+                            }
+                        }
+                    }
+                    if let Some(last) = &last_push {
+                        ui.add_space(8.0);
+                        let text = match &last.result {
+                            Ok(()) => format!("最近一次自动推送：{}，已送达服务器", at_text(last.at)),
+                            Err(error) => format!(
+                                "最近一次自动推送失败：{}，{}",
+                                at_text(last.at),
+                                reason(error)
+                            ),
+                        };
+                        note(ui, &text, pal.mute);
+                    }
+
+                    ui.add_space(16.0);
+                    widgets::rule(ui, pal.line_soft);
+                    ui.add_space(16.0);
+                    widgets::section(ui, "数据与隐私", &pal);
+                    ui.add_space(8.0);
+                    note(
+                        ui,
+                        "Super Agent 不收集遥测或使用数据，也不会把任何数据发给 Super Agent 的开发者。",
+                        pal.ink,
+                    );
+                    ui.add_space(8.0);
+                    note(ui, "工单、对话、用量记录和设置都保存在本机：", pal.ink);
+                    let path = data.display().to_string();
+                    ui.horizontal(|ui| {
+                        let width = (ui.available_width() - 100.0).max(120.0);
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(width, 0.0),
+                            Layout::top_down(Align::Min),
+                            |ui| {
+                                ui.set_width(width);
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(&path)
+                                            .font(theme::mono(theme::SMALL))
+                                            .color(pal.mute),
+                                    )
+                                    .wrap(),
+                                );
+                            },
+                        );
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            copy_button(ui, "sa-notify-copy-path", "复制路径", &path, &pal);
+                        });
+                    });
+                    ui.add_space(8.0);
+                    note(
+                        ui,
+                        "Super Agent 本身只在以下情况联网（不含执行端执行任务时运行的命令和工具）：",
+                        pal.ink,
+                    );
+                    for line in [
+                        "执行端（Codex、Claude、Gemini、DeepSeek 等）与各自的服务通信；",
+                        "你配置的自定义供应商和 MCP 服务器；",
+                        "你开启的手机推送。",
+                    ] {
+                        ui.horizontal_top(|ui| {
+                            ui.add_space(8.0);
+                            note(ui, &format!("· {line}"), pal.ink);
+                        });
+                    }
+                    ui.add_space(8.0);
+                    match &saved {
+                        Some(Ok(s)) if s.enabled => {
+                            note(ui, &format!("手机推送：已开启，发往 {}", s.server.trim()), pal.ink)
+                        }
+                        Some(Ok(_)) => note(ui, "手机推送：未开启", pal.ink),
+                        Some(Err(_)) => note(ui, "手机推送：无法读取设置", pal.ink),
+                        None => {}
+                    }
+                    ui.add_space(8.0);
+                    note(ui, "开发时的自动测试会阻止加入遥测或数据分析组件。", pal.mute);
+                });
+                if let Some(error) = &dialog.error {
+                    ui.add_space(12.0);
+                    ui.add(egui::Label::new(RichText::new(error).color(pal.fail.fg)).wrap());
+                }
+                ui.add_space(16.0);
+                ui.horizontal(|ui| {
+                    if failed_load {
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if widgets::quiet_button(ui, "", "关闭", &pal, false).clicked() {
+                                close = true;
+                            }
+                            retry = widgets::primary_button(ui, "", "重试", &pal, true).clicked();
+                        });
+                        return;
+                    }
+                    ui.add_enabled_ui(editable, |ui| {
+                        if widgets::quiet_button(ui, "", "恢复默认", &pal, false).clicked() {
+                            dialog.draft = Settings::default();
+                            dialog.error = None;
+                        }
+                    });
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        save = widgets::primary_button(
+                            ui,
+                            "",
+                            if dialog.saving { "正在保存…" } else { "保存" },
+                            &pal,
+                            writable && editable && !problem,
+                        )
+                        .clicked();
+                        ui.add_enabled_ui(!busy, |ui| {
+                            if widgets::quiet_button(ui, "", "取消", &pal, false).clicked() {
+                                close = true;
+                            }
+                        });
+                    });
+                });
+            });
+        if !busy && (close || modal.should_close()) {
+            self.notify = None;
+            return;
+        }
+        if retry {
+            dialog.load_error = None;
+            dialog.loading = Some(read_settings(ctx, data));
+            return;
+        }
+        if test {
+            let (server, topic) = (dialog.draft.server.clone(), dialog.draft.topic.clone());
+            dialog.test = None;
+            dialog.test_key = (server.clone(), topic.clone());
+            dialog.testing = Some(Pending::spawn(ctx, move || {
+                Ok(push::send(&server, &topic, &push::test_push(), TEST_TIMEOUT))
+            }));
+        }
+        if save {
+            dialog.saving = true;
+            dialog.error = None;
+            let mut settings = dialog.draft.clone();
+            settings.server = settings.server.trim().to_string();
+            self.submit(Action::SaveNotify(settings));
+        }
+    }
+
+    /// Whether the window currently has the keyboard focus (toast gate).
+    pub(crate) fn window_focused(&self) -> bool {
+        #[cfg(test)]
+        if let Some(focused) = self.test_focus {
+            return focused;
+        }
+        self.ctx.input(|input| input.viewport().focused).unwrap_or(true)
+    }
+
+    /// Queue a phone push for `event` while the window is in the background.
+    /// Never blocks: the network call runs on the pusher's worker thread.
+    pub(crate) fn push_event(&mut self, event: Event) {
+        if !self.writable() || self.opts.demo || self.shot_active() {
+            return;
+        }
+        let focused = self.window_focused();
+        let settings = self.host.as_ref().map(|host| host.notify_settings());
+        #[cfg(test)]
+        let sink = |event: Event, settings: &Settings| {
+            if let Some(push) = push::push_for(&event, settings) {
+                self.pushed.push(push);
+            }
+        };
+        #[cfg(not(test))]
+        let sink = |event: Event, settings: &Settings| self.pusher.notify(event, settings);
+        forward(focused, event, settings.as_ref(), sink);
+    }
+}
