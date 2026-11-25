@@ -295,7 +295,7 @@ impl ProbeFixture {
             .lines()
             .filter_map(|line| {
                 let mut fields = line.split('\t');
-                assert_eq!(fields.next(), Some("google"));
+                assert_eq!(fields.next(), Some(self.req.route.provider.as_str()));
                 let action = fields.next().unwrap();
                 fields.next().unwrap(); // Model column retained for the existing fixtures.
                 (action == kind).then(|| fields.map(str::to_owned).collect())
@@ -356,6 +356,9 @@ async fn cached_model_miss_refreshes_once_and_preserves_probe_failed() {
             fixture.write("models.txt", MODELS);
             assert_eq!(fixture.run().await.unwrap().text, "fixture-ok");
             fixture.assert_counts(2, 2, 2);
+            fixture.req.route.model = "model-a".into();
+            fixture.run().await.unwrap();
+            fixture.assert_counts(2, 2, 3);
         } else {
             let error = fixture.run().await.unwrap_err();
             assert_eq!(error.class, ErrorClass::RouteUnavailable);
@@ -549,6 +552,102 @@ async fn in_place_executable_stamp_change_refreshes_probes_for_the_same_route() 
     fixture.assert_counts(2, 2, 2);
     fixture.run().await.unwrap();
     fixture.assert_counts(2, 2, 3);
+}
+
+#[tokio::test]
+async fn adc_credential_stamp_change_refreshes_probes_for_the_same_route() {
+    for explicit in [false, true] {
+        let mut fixture = ProbeFixture::setup_with(|sys| {
+            sys.set("AGY_ADC_AUTH", "true");
+            let home = sys.home.to_string_lossy().into_owned();
+            sys.set("APPDATA", home.clone());
+            sys.set("HOME", home);
+            if explicit {
+                sys.set("GOOGLE_APPLICATION_CREDENTIALS", "adc.json");
+            }
+        });
+        fixture.req.route.provider = "adc".into();
+        let credentials = fixture.dir.path().join(if explicit {
+            "adc.json"
+        } else if cfg!(windows) {
+            "gcloud/application_default_credentials.json"
+        } else {
+            ".config/gcloud/application_default_credentials.json"
+        });
+        std::fs::create_dir_all(credentials.parent().unwrap()).unwrap();
+        std::fs::write(&credentials, "{}").unwrap();
+        fixture.run().await.unwrap();
+        fixture.assert_counts(1, 1, 1);
+
+        std::fs::write(&credentials, r#"{"fixture":2}"#).unwrap();
+        fixture.run().await.unwrap();
+        fixture.assert_counts(2, 2, 2);
+        fixture.run().await.unwrap();
+        fixture.assert_counts(2, 2, 3);
+    }
+}
+
+#[tokio::test]
+async fn google_account_file_change_refreshes_probes_for_the_same_route() {
+    let fixture = ProbeFixture::setup();
+    let account = fixture.dir.path().join(".gemini").join("google_accounts.json");
+    std::fs::create_dir_all(account.parent().unwrap()).unwrap();
+    std::fs::write(&account, r#"{"active":"a@example.com"}"#).unwrap();
+    fixture.run().await.unwrap();
+    fixture.assert_counts(1, 1, 1);
+
+    std::fs::write(&account, r#"{"active":"someone.else@example.com"}"#).unwrap();
+    fixture.run().await.unwrap();
+    fixture.assert_counts(2, 2, 2);
+    fixture.run().await.unwrap();
+    fixture.assert_counts(2, 2, 3);
+}
+
+#[tokio::test]
+async fn refresh_during_a_failed_run_survives_its_cache_eviction() {
+    let fixture = ProbeFixture::setup_with(|sys| sys.set("FAKE_AGY_RUN_GATE", "release-run"));
+    let refresh = || {
+        fixture
+            .adapter
+            .catalog_for_route(fixture.req.route.clone())
+            .unwrap()
+    };
+    refresh().await.unwrap();
+    fixture.assert_counts(1, 1, 0);
+
+    let mut request = fixture.req.clone();
+    request.session_id = Some("another-session".into());
+    let (events, mut receive) = tokio::sync::mpsc::unbounded_channel();
+    let mut run = fixture.adapter.run(
+        request,
+        Arc::new(DenyHost(Arc::new(AtomicUsize::new(0)))),
+        events,
+        CancellationToken::new(),
+    );
+    tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::select! {
+            () = async {
+                while let Some(event) = receive.recv().await {
+                    if matches!(event, AdapterEvent::Journal {kind, data}
+                        if kind == "native" && data["event"] == "init")
+                    {
+                        return;
+                    }
+                }
+                panic!("native run did not start");
+            } => {},
+            _ = &mut run => panic!("native run ended before the concurrent refresh"),
+        }
+        refresh().await.unwrap();
+        fixture.assert_counts(2, 2, 1);
+        fixture.write("release-run", "");
+        assert_eq!(run.await.unwrap_err().class, ErrorClass::SessionMismatch);
+    })
+    .await
+    .unwrap();
+
+    fixture.run().await.unwrap();
+    fixture.assert_counts(2, 2, 2);
 }
 
 #[tokio::test]
