@@ -142,6 +142,7 @@ pub struct App {
     pub host_error: Option<String>,
     /// Recovery options when the startup error is a [`sa_store::journal::JournalError`].
     pub(crate) recovery: Option<crate::recovery_ui::RecoveryPanel>,
+    pub(crate) recovery_probe: Option<crate::ops::Pending<Option<crate::recovery_ui::RecoveryPanel>>>,
     pub composer: Composer,
     pub models: Option<crate::models::ModelDialog>,
     pub diff: DiffState,
@@ -255,6 +256,7 @@ impl App {
             ctx: cc.egui_ctx.clone(),
             host_error: host.as_ref().err().cloned(),
             recovery: None,
+            recovery_probe: None,
             host: host.ok(),
             worker,
             opts,

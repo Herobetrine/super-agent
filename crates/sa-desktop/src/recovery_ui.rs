@@ -6,13 +6,13 @@
 //! as a modal over the read-only window. Every filesystem or process action
 //! runs on a background thread.
 
-use crate::{app::App, host::Host, ops::Pending, theme, theme::Palette, widgets};
+use crate::{app::App, host::Host, ops::Pending, theme, theme::Palette, widgets, worker::Cmd};
 use anyhow::{Context, Result};
 use egui::{RichText, TextFormat, Ui, ViewportCommand, text::LayoutJob};
-use sa_store::journal::JournalError;
+use sa_store::journal::{JournalError, RestoreIdentity, RestoreOutcome};
 use std::{
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, mpsc},
     time::SystemTime,
 };
 
@@ -20,11 +20,15 @@ use std::{
 type Restart = Arc<dyn Fn() -> Result<()> + Send + Sync>;
 /// Opens a folder in the system file manager.
 type OpenFolder = Arc<dyn Fn(&Path) -> Result<()> + Send + Sync>;
+type Restore = Arc<dyn Fn(&Path, &Path, &RestoreIdentity) -> Result<RestoreOutcome> + Send + Sync>;
+type Cleanup = Arc<dyn Fn(&Path) -> Result<RestoreOutcome> + Send + Sync>;
 
 #[derive(Clone)]
 pub(crate) struct Hooks {
     pub restart: Restart,
     pub open_folder: OpenFolder,
+    pub restore: Restore,
+    pub cleanup: Cleanup,
 }
 
 impl Default for Hooks {
@@ -32,16 +36,17 @@ impl Default for Hooks {
         Self {
             restart: Arc::new(restart_self),
             open_folder: Arc::new(open_folder),
+            restore: Arc::new(Host::restore_snapshot),
+            cleanup: Arc::new(Host::retry_restore_cleanup),
         }
     }
 }
 
 fn restart_self() -> Result<()> {
     let exe = std::env::current_exe().context("无法确定程序路径")?;
-    std::process::Command::new(exe)
-        .args(std::env::args_os().skip(1))
-        .spawn()
-        .context("无法启动新的 Super Agent")?;
+    let mut command = std::process::Command::new(exe);
+    command.args(std::env::args_os().skip(1));
+    sa_engine::owner::spawn_detached(command).context("无法启动新的 Super Agent")?;
     Ok(())
 }
 
@@ -66,7 +71,19 @@ pub(crate) enum Kind {
     /// The marker of an unfinished migration was found (C2).
     Interrupted,
     /// SQLite refused to read the file (C3).
-    Corrupt { path: PathBuf, code: i32 },
+    Corrupt {
+        path: PathBuf,
+        code: i32,
+    },
+    RestoreInterrupted {
+        record: PathBuf,
+        installed: bool,
+        reason: String,
+    },
+    InvalidMigrationMarker {
+        path: PathBuf,
+        reason: String,
+    },
 }
 
 pub(crate) struct Snapshot {
@@ -77,7 +94,9 @@ pub(crate) struct Snapshot {
 
 pub(crate) enum Phase {
     Ready,
-    Restoring(Pending<()>),
+    Restoring(Pending<Result<RestoreOutcome>>),
+    Cleaning(Pending<Result<RestoreOutcome>>),
+    CleanupRequired(String),
     Restored,
     Restarting(Pending<()>),
     /// The new process is running; this window is closing.
@@ -100,6 +119,7 @@ pub(crate) struct RecoveryPanel {
     pub error: Option<String>,
     opening: Option<Pending<()>>,
     pub hooks: Hooks,
+    identity: Option<RestoreIdentity>,
 }
 
 fn readable(path: &Path) -> Option<SystemTime> {
@@ -115,9 +135,11 @@ fn stamp(time: SystemTime) -> String {
 }
 
 impl RecoveryPanel {
-    /// `None` unless the startup error carries a [`JournalError`].
-    pub fn from_error(error: &anyhow::Error, data_dir: &Path, observer: bool) -> Option<Self> {
-        let journal = error.downcast_ref::<JournalError>()?;
+    pub(crate) fn from_journal(
+        journal: &JournalError,
+        data_dir: &Path,
+        observer: bool,
+    ) -> Option<Self> {
         let (kind, snapshot, missing) = match journal {
             JournalError::MigrationInterrupted { snapshot, .. } => match readable(snapshot) {
                 Some(saved) => (
@@ -134,6 +156,7 @@ impl RecoveryPanel {
                 path,
                 code,
                 latest_snapshot,
+                ..
             } => (
                 Kind::Corrupt {
                     path: path.clone(),
@@ -149,6 +172,29 @@ impl RecoveryPanel {
                     }),
                 None,
             ),
+            JournalError::RestoreInterrupted {
+                record,
+                installed,
+                reason,
+                ..
+            } => (
+                Kind::RestoreInterrupted {
+                    record: record.clone(),
+                    installed: *installed,
+                    reason: reason.clone(),
+                },
+                None,
+                None,
+            ),
+            JournalError::InvalidMigrationMarker { path, reason } => (
+                Kind::InvalidMigrationMarker {
+                    path: path.clone(),
+                    reason: reason.clone(),
+                },
+                None,
+                None,
+            ),
+            JournalError::InvalidSnapshot { .. } | JournalError::RestoreCancelled => return None,
         };
         Some(Self {
             kind,
@@ -161,24 +207,46 @@ impl RecoveryPanel {
             error: None,
             opening: None,
             hooks: Hooks::default(),
+            identity: journal.restore_identity().cloned(),
         })
     }
 
     pub fn title(&self) -> &'static str {
+        if matches!(self.phase, Phase::CleanupRequired(_) | Phase::Cleaning(_)) {
+            return "上次恢复没有完成清理";
+        }
         match self.kind {
             Kind::Interrupted => "上次工单数据库升级没有完成",
             Kind::Corrupt { .. } => "工单数据库已损坏",
+            Kind::RestoreInterrupted {
+                installed: true, ..
+            } => "上次恢复没有完成清理",
+            Kind::RestoreInterrupted {
+                installed: false, ..
+            } => "上次恢复没有完成",
+            Kind::InvalidMigrationMarker { .. } => "升级标记无法识别",
         }
     }
 
     fn busy(&self) -> bool {
         matches!(
             self.phase,
-            Phase::Restoring(_) | Phase::Restarting(_) | Phase::Closing
+            Phase::Restoring(_) | Phase::Cleaning(_) | Phase::Restarting(_) | Phase::Closing
         )
     }
 
-    fn poll(&mut self, ctx: &egui::Context) {
+    fn can_cleanup(&self) -> bool {
+        matches!(self.phase, Phase::CleanupRequired(_) | Phase::Cleaning(_))
+            || matches!(
+                self.kind,
+                Kind::RestoreInterrupted {
+                    installed: true,
+                    ..
+                }
+            )
+    }
+
+    fn poll(&mut self, ctx: &egui::Context, reader: &mpsc::Sender<Cmd>) {
         if let Some(result) = self.opening.as_ref().and_then(Pending::poll) {
             self.opening = None;
             if let Err(error) = result {
@@ -186,16 +254,18 @@ impl RecoveryPanel {
             }
         }
         match &self.phase {
-            Phase::Restoring(pending) => {
+            Phase::Restoring(pending) | Phase::Cleaning(pending) => {
                 if let Some(result) = pending.poll() {
+                    let cleaning = matches!(self.phase, Phase::Cleaning(_));
                     match result {
-                        Ok(()) => {
-                            self.phase = Phase::Restored;
-                            self.error = None;
-                        }
+                        Ok(outcome) => self.finish_recovery(outcome, cleaning, reader),
+                        Err(error) if cleaning => self.phase = Phase::CleanupRequired(error),
                         Err(error) => {
                             self.phase = Phase::Ready;
-                            self.error = Some(format!("恢复失败：{error}。当前文件没有改动。"));
+                            self.identity = None;
+                            self.error = Some(format!(
+                                "恢复失败：{error}。请重新启动 Super Agent 后再看。"
+                            ));
                         }
                     }
                 }
@@ -209,28 +279,94 @@ impl RecoveryPanel {
                         }
                         Err(error) => {
                             self.phase = Phase::Restored;
-                            self.error =
-                                Some(format!("无法重新启动：{error}。请手动重新启动 Super Agent。"));
+                            self.error = Some(format!(
+                                "无法重新启动：{error}。请手动重新启动 Super Agent。"
+                            ));
                         }
                     }
                 }
             }
-            Phase::Ready | Phase::Restored | Phase::Closing => {}
+            Phase::Ready | Phase::CleanupRequired(_) | Phase::Restored | Phase::Closing => {}
         }
     }
 
-    fn restore(&mut self, ctx: &egui::Context) {
-        let Some(snapshot) = self.snapshot.as_ref().map(|s| s.path.clone()) else {
+    fn finish_recovery(
+        &mut self,
+        result: Result<RestoreOutcome>,
+        cleaning: bool,
+        reader: &mpsc::Sender<Cmd>,
+    ) {
+        self.error = None;
+        match result {
+            Ok(RestoreOutcome::Installed) => self.phase = Phase::Restored,
+            Ok(RestoreOutcome::InstalledMarkerNotRemoved(error)) => {
+                self.phase = Phase::CleanupRequired(format!("{error:#}"));
+            }
+            Err(error) => {
+                let journal = error.downcast_ref::<JournalError>();
+                if let Some(JournalError::RestoreInterrupted {
+                    record,
+                    installed,
+                    reason,
+                    ..
+                }) = journal
+                {
+                    self.kind = Kind::RestoreInterrupted {
+                        record: record.clone(),
+                        installed: *installed,
+                        reason: reason.clone(),
+                    };
+                    self.snapshot = None;
+                    self.identity = None;
+                    self.phase = Phase::Ready;
+                    return;
+                }
+                if cleaning {
+                    self.phase = Phase::CleanupRequired(format!("{error:#}"));
+                    return;
+                }
+                self.phase = Phase::Ready;
+                let _ = reader.send(Cmd::Resume);
+                self.error = Some(match journal {
+                    Some(JournalError::InvalidSnapshot { reason, .. }) => {
+                        format!("快照不完整，没有恢复：{reason}。当前文件没有改动。")
+                    }
+                    Some(JournalError::RestoreCancelled) => {
+                        self.identity = None;
+                        "工单数据库的状态已经变化，已取消这次恢复。请重新启动 Super Agent 后再看。".into()
+                    }
+                    _ if in_use(&error) => "恢复失败：工单数据库正被其他程序占用。请关闭其他 Super Agent 窗口后重试。当前文件没有改动。".into(),
+                    _ => format!("恢复失败：{error:#}。当前文件没有改动。"),
+                });
+            }
+        }
+    }
+
+    fn restore(&mut self, ctx: &egui::Context, reader: mpsc::Sender<Cmd>) {
+        let (Some(snapshot), Some(identity)) = (&self.snapshot, &self.identity) else {
             return;
         };
         if self.observer || self.busy() {
             return;
         }
         let dir = self.data_dir.clone();
+        let snapshot = snapshot.path.clone();
+        let identity = identity.clone();
+        let restore = self.hooks.restore.clone();
         self.error = None;
-        self.phase = Phase::Restoring(Pending::spawn(ctx, move || {
-            Host::restore_snapshot(&dir, &snapshot)
+        self.phase = Phase::Restoring(after_reader_closed(ctx, reader, move || {
+            restore(&dir, &snapshot, &identity)
         }));
+    }
+
+    fn cleanup(&mut self, ctx: &egui::Context, reader: mpsc::Sender<Cmd>) {
+        if self.observer || self.busy() || !self.can_cleanup() {
+            return;
+        }
+        let dir = self.data_dir.clone();
+        let cleanup = self.hooks.cleanup.clone();
+        self.error = None;
+        self.phase = Phase::Cleaning(after_reader_closed(ctx, reader, move || cleanup(&dir)));
     }
 
     fn open_data_folder(&mut self, ctx: &egui::Context) {
@@ -251,6 +387,35 @@ impl RecoveryPanel {
         self.error = None;
         self.phase = Phase::Restarting(Pending::spawn(ctx, move || restart()));
     }
+}
+
+fn after_reader_closed(
+    ctx: &egui::Context,
+    reader: mpsc::Sender<Cmd>,
+    action: impl FnOnce() -> Result<RestoreOutcome> + Send + 'static,
+) -> Pending<Result<RestoreOutcome>> {
+    // Keep typed backend errors inside Pending's text-error boundary.
+    Pending::spawn(ctx, move || {
+        Ok(close_reader(&reader).and_then(|()| action()))
+    })
+}
+
+fn close_reader(reader: &mpsc::Sender<Cmd>) -> Result<()> {
+    let (ack, closed) = mpsc::channel();
+    reader
+        .send(Cmd::Pause(ack))
+        .map_err(|_| anyhow::anyhow!("无法通知后台读取线程关闭工单数据库"))?;
+    closed.recv().context("后台读取线程没有确认关闭工单数据库")
+}
+
+fn in_use(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause.to_string() == sa_engine::owner::BUSY
+            || cause.downcast_ref::<std::io::Error>().is_some_and(|io| {
+                io.kind() == std::io::ErrorKind::PermissionDenied
+                    || (cfg!(windows) && matches!(io.raw_os_error(), Some(32 | 33)))
+            })
+    })
 }
 
 enum Seg<'a> {
@@ -305,6 +470,7 @@ const DAMAGED: &str = "hub-damaged-<时间戳>.sqlite3";
 #[derive(Default)]
 struct Pressed {
     restore: bool,
+    cleanup: bool,
     open: bool,
     dismiss: bool,
     restart: bool,
@@ -390,38 +556,79 @@ fn body(ui: &mut Ui, pal: &Palette, panel: &RecoveryPanel) {
                     ui,
                     pal,
                     &[Seg::Text(
-                        "可以退出 Super Agent，先把这个文件复制到别处保存，再用 sqlite3 的 .recover 命令尝试抢救。",
+                        "可以退出所有 Super Agent 窗口，把 hub.sqlite3 和同一目录下存在的 hub.sqlite3-wal、hub.sqlite3-shm、hub.sqlite3-journal 一起复制到别处保存，再对副本用 sqlite3 的 .recover 命令尝试抢救。",
                     )],
                 );
                 paragraph(
                     ui,
                     pal,
                     &[Seg::Text(
-                        "如果不需要旧数据，可以退出后把这个文件移走或改名，再次打开 Super Agent 会新建空的工单数据库。",
+                        "如果不需要旧数据，可以退出后把这些文件一起移走或改名，再次打开 Super Agent 会新建空的工单数据库。",
                     )],
                 );
             }
+        }
+        Kind::RestoreInterrupted {
+            record,
+            installed,
+            reason,
+        } => {
+            if *installed {
+                paragraph(
+                    ui,
+                    pal,
+                    &[Seg::Text(&format!(
+                        "快照已经装好，但升级标记还没清理：{reason}。"
+                    ))],
+                );
+            } else {
+                paragraph(
+                    ui,
+                    pal,
+                    &[
+                        Seg::Text(&format!(
+                            "上次从快照恢复时中断，Super Agent 无法自动完成：{reason}。恢复记录在 "
+                        )),
+                        Seg::Path(record),
+                        Seg::Text("。为避免数据丢失，没有创建新的工单数据库。"),
+                    ],
+                );
+            }
+        }
+        Kind::InvalidMigrationMarker { path, reason } => {
+            paragraph(
+                ui,
+                pal,
+                &[
+                    Seg::Path(path),
+                    Seg::Text(&format!("：{reason}。为安全起见，没有继续升级。")),
+                ],
+            );
         }
     }
 }
 
 impl App {
-    /// Keep what the recovery panel needs from a failed `Host::start`.
-    pub(crate) fn set_start_error(&mut self, error: &anyhow::Error) {
-        let dir = self
-            .opts
-            .data
-            .clone()
-            .unwrap_or_else(sa_store::default_data_dir);
-        self.recovery = RecoveryPanel::from_error(error, &dir, self.opts.observe || self.opts.demo);
+    pub(crate) fn inspect_recovery(&mut self, ctx: &egui::Context, dir: PathBuf) {
+        self.recovery_probe = Some(Pending::spawn(ctx, move || {
+            Ok(sa_store::journal::inspect(&dir)
+                .and_then(|error| RecoveryPanel::from_journal(&error, &dir, true)))
+        }));
     }
 
     pub fn recovery_dialog(&mut self, ctx: &egui::Context) {
+        if let Some(result) = self.recovery_probe.as_ref().and_then(Pending::poll) {
+            self.recovery_probe = None;
+            if let Ok(panel) = result {
+                self.recovery = panel;
+            }
+        }
         let pal = self.pal.clone();
+        let reader = &self.worker.tx;
         let Some(panel) = self.recovery.as_mut().filter(|panel| !panel.dismissed) else {
             return;
         };
-        panel.poll(ctx);
+        panel.poll(ctx, reader);
         let mut pressed = Pressed::default();
         let modal = egui::Modal::new(egui::Id::new("sa-recovery"))
             .frame(widgets::modal_frame(&pal))
@@ -435,6 +642,7 @@ impl App {
                     Phase::Restored | Phase::Restarting(_) | Phase::Closing
                 );
                 let restoring = matches!(panel.phase, Phase::Restoring(_));
+                let cleaning = matches!(panel.phase, Phase::Cleaning(_));
                 if restored {
                     ui.add(
                         egui::Label::new(
@@ -444,14 +652,26 @@ impl App {
                         )
                         .wrap(),
                     );
-                } else {
+                } else if let Phase::CleanupRequired(reason) = &panel.phase {
+                    paragraph(
+                        ui,
+                        &pal,
+                        &[Seg::Text(&format!(
+                            "已从快照恢复，但没能清理升级标记：{reason}。"
+                        ))],
+                    );
+                } else if !cleaning {
                     body(ui, &pal, panel);
                 }
-                if restoring {
+                if restoring || cleaning {
                     ui.add_space(10.0);
                     ui.horizontal(|ui| {
                         widgets::spinner(ui);
-                        ui.label("正在从快照恢复…");
+                        ui.label(if cleaning {
+                            "正在清理升级标记…"
+                        } else {
+                            "正在从快照恢复…"
+                        });
                     });
                 }
                 if let Some(error) = &panel.error {
@@ -463,34 +683,45 @@ impl App {
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 8.0;
                     if restored {
-                        let launching = matches!(panel.phase, Phase::Restarting(_) | Phase::Closing);
+                        let launching =
+                            matches!(panel.phase, Phase::Restarting(_) | Phase::Closing);
                         pressed.restart =
                             widgets::primary_button(ui, "", "立即重启", &pal, !launching).clicked();
                         return;
                     }
-                    let can_restore = panel.snapshot.is_some();
-                    if can_restore {
+                    let can_cleanup = panel.can_cleanup();
+                    if can_cleanup {
+                        pressed.cleanup = widgets::primary_button(
+                            ui,
+                            "",
+                            "重试清理",
+                            &pal,
+                            !busy && !panel.observer,
+                        )
+                        .clicked();
+                    } else if panel.snapshot.is_some() {
                         pressed.restore = widgets::primary_button(
                             ui,
                             "",
                             "从快照恢复",
                             &pal,
-                            !busy && !panel.observer,
+                            !busy && !panel.observer && panel.identity.is_some(),
                         )
                         .clicked();
                     }
                     ui.add_enabled_ui(!busy, |ui| {
                         pressed.open =
                             widgets::outline_button(ui, "", "打开数据文件夹", &pal).clicked();
-                        // C3 without a snapshot offers the folder only.
-                        let folder_only = matches!(panel.kind, Kind::Corrupt { .. }) && !can_restore;
-                        if !folder_only {
+                        let can_defer = matches!(panel.kind, Kind::Interrupted)
+                            || (matches!(panel.kind, Kind::Corrupt { .. })
+                                && panel.snapshot.is_some());
+                        if can_defer && !can_cleanup {
                             pressed.dismiss |=
                                 widgets::quiet_button(ui, "", "暂不恢复", &pal, false).clicked();
                         }
                     });
                 });
-                if panel.snapshot.is_some() && panel.observer && !restored {
+                if panel.observer && !restored {
                     ui.add_space(6.0);
                     ui.label(
                         RichText::new("请在主窗口处理。")
@@ -503,7 +734,10 @@ impl App {
             pressed.dismiss = true;
         }
         if pressed.restore {
-            panel.restore(ctx);
+            panel.restore(ctx, reader.clone());
+        }
+        if pressed.cleanup {
+            panel.cleanup(ctx, reader.clone());
         }
         if pressed.open {
             panel.open_data_folder(ctx);
