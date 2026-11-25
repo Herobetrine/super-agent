@@ -12,7 +12,7 @@ use egui_kittest::{
     Harness,
     kittest::{NodeT, Queryable},
 };
-use sa_store::{TicketSummary, notify::Settings};
+use sa_store::notify::Settings;
 use std::{
     io::{Read, Write},
     net::TcpListener,
@@ -303,6 +303,97 @@ fn failed_save_keeps_the_draft() {
 }
 
 #[test]
+fn rejected_save_submission_restores_controls_and_preserves_the_draft() {
+    let data = tempfile::tempdir().unwrap();
+    let mut h = harness(data.path(), false, false);
+    open(&mut h);
+    edit(&mut h, |settings| *settings = enabled());
+    let want = draft(&h);
+    h.state_mut().host.as_mut().unwrap().shutdown();
+    h.get_by_role_and_label(Role::Button, "保存").click();
+    wait(&mut h, "rejected submission", |app| {
+        app.notify.as_ref().is_some_and(|d| d.error.is_some() && !d.saving)
+    });
+    assert_eq!(draft(&h), want);
+    assert!(shown(&h, "无法保存设置。调度线程已退出，请重新打开窗口"));
+    assert!(!disabled(&h, Role::Button, "保存"));
+    assert!(!disabled(&h, Role::Button, "取消"));
+    h.get_by_role_and_label(Role::Button, "关闭对话框").click();
+    h.run_steps(3);
+    assert!(h.state().notify.is_none());
+}
+
+#[test]
+fn retry_repairs_the_host_cache_and_restores_automatic_pushes() {
+    let data = tempfile::tempdir().unwrap();
+    let owner = Host::start_with(data.path().into(), fakes, || {}).unwrap();
+    owner.engine().db().with(|q| {
+        q.run("INSERT INTO studio_notify(singleton,settings) VALUES(1,'{')", &[])
+    }).unwrap();
+    drop(owner);
+
+    let mut h = harness(data.path(), false, false);
+    let app = h.state_mut();
+    assert!(app.host.as_ref().unwrap().notify_settings().is_err());
+    app.test_focus = Some(false);
+    app.push_event(Event::Question { ticket: 7 });
+    assert!(app.pushed.is_empty());
+    app.open_notify();
+    h.run_steps(6);
+    assert!(shown(&h, "手机推送：无法读取设置"));
+    let saved = enabled();
+    h.state().host.as_ref().unwrap().engine().db()
+        .with(|q| sa_store::notify::save(q.conn(), &saved)).unwrap();
+    assert!(h.state().host.as_ref().unwrap().notify_settings().is_err());
+    let retry = h.get_by_role_and_label(Role::Button, "重试");
+    assert!(!retry.accesskit_node().is_disabled());
+    // Exercise the button's action without depending on the modal's pointer
+    // geometry. The assertions below still require the real asynchronous reread.
+    retry.click_accesskit();
+    h.step();
+    assert!(h.state().notify.is_some(), "retry closed the settings dialog");
+    wait(&mut h, "recovered host settings", |app| {
+        app.host.as_ref().unwrap().notify_settings() == Ok(saved.clone())
+    });
+    assert_eq!(draft(&h), saved);
+    assert!(shown(&h, "手机推送：已开启，发往 https://ntfy.sh"));
+    let app = h.state_mut();
+    app.push_event(Event::Question { ticket: 7 });
+    assert_eq!(app.pushed[0].message, "工单 #7 需要你回答问题");
+}
+
+#[test]
+fn new_conversation_shortcut_is_blocked_while_notify_is_open() {
+    let data = tempfile::tempdir().unwrap();
+    let mut h = harness(data.path(), false, false);
+    h.state_mut().select(Some(7));
+    open(&mut h);
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::N);
+    h.run_steps(3);
+    assert_eq!(h.state().view.as_ref().map(|view| view.id), Some(7));
+    assert!(h.state().notify.is_some());
+    h.get_by_role_and_label(Role::Button, "取消").click();
+    h.run_steps(3);
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::N);
+    h.run_steps(3);
+    assert!(h.state().view.is_none());
+}
+
+#[test]
+fn server_path_explains_the_root_rule_and_blocks_save_and_test() {
+    let data = tempfile::tempdir().unwrap();
+    let mut h = harness(data.path(), false, false);
+    open(&mut h);
+    edit(&mut h, |settings| {
+        *settings = enabled();
+        settings.server = "https://ntfy.sh/team".into();
+    });
+    assert!(shown(&h, push::ROOT_SERVER_ONLY));
+    assert!(disabled(&h, Role::Button, "保存"));
+    assert!(disabled(&h, Role::Button, "发送测试推送"));
+}
+
+#[test]
 fn observer_is_read_only_but_can_copy() {
     let data = tempfile::tempdir().unwrap();
     let saved = Settings {
@@ -488,21 +579,6 @@ fn test_push_to_a_closed_port_reports_a_connection_failure() {
     assert!(shown(&h, "发送失败：无法连接服务器"));
 }
 
-fn row(id: i64, state: &str) -> TicketSummary {
-    TicketSummary {
-        id,
-        goal: "g".into(),
-        cwd: String::new(),
-        lead: "claude".into(),
-        created: 0.0,
-        state: state.into(),
-        title: None,
-        pinned: false,
-        archived: false,
-        attention: None,
-    }
-}
-
 fn save_settings(h: &mut Harness<'_, App>, settings: Settings) {
     h.state_mut().submit(Action::SaveNotify(settings.clone()));
     wait(h, "settings", |app| app.host.as_ref().unwrap().notify_settings() == Ok(settings.clone()));
@@ -515,23 +591,53 @@ fn enabled() -> Settings {
 #[test]
 fn finished_tickets_push_only_while_unfocused_and_cancelled_never() {
     let data = tempfile::tempdir().unwrap();
+    let owner = Host::start_with(data.path().into(), fakes, || {}).unwrap();
+    owner.engine().db().with(|q| {
+        q.conn().execute_batch(
+            "WITH RECURSIVE ids(id) AS (VALUES(1) UNION ALL SELECT id+1 FROM ids WHERE id<155)
+             INSERT INTO tickets(id,goal,cwd,writes,lead,created)
+             SELECT id,'seed ticket','',0,'claude',0 FROM ids;
+             INSERT INTO jobs(id,ticket,agent,body,writing,depth,state)
+             SELECT id,id,'claude','seed',0,0,'done' FROM tickets;"
+        )?;
+        sa_store::notify::save(q.conn(), &enabled())
+    }).unwrap();
+    drop(owner);
     let mut h = harness(data.path(), false, false);
-    h.run_steps(3);
-    save_settings(&mut h, enabled());
-    let app = h.state_mut();
-    app.test_focus = Some(false);
-    // First sight of a ticket is a baseline, never a push.
-    app.notice_transitions(&[row(901, "running"), row(902, "running"), row(903, "running"), row(904, "running")]);
-    assert!(app.pushed.is_empty());
-    app.notice_transitions(&[row(901, "done"), row(902, "cancelled"), row(903, "failed")]);
-    let messages: Vec<_> = app.pushed.iter().map(|p| p.message.as_str()).collect();
-    assert_eq!(messages, ["工单 #901 已完成", "工单 #903 失败"]);
+    h.state_mut().test_focus = Some(false);
+    h.state_mut().set_search("no matching sidebar tickets".into());
+    wait(&mut h, "startup baseline", |app| app.completion_watch.has_state(1, "done"));
+    assert!(h.state().pushed.is_empty());
+    update_root_states(&h, "UPDATE jobs SET state='running',turn=2 WHERE id BETWEEN 1 AND 4");
+    wait(&mut h, "running roots", |app| app.completion_watch.has_state(4, "running"));
+    update_root_states(&h,
+        "UPDATE jobs SET state='done' WHERE id=1;
+         UPDATE jobs SET state='cancelled' WHERE id=2;
+         UPDATE jobs SET state='failed' WHERE id=3;");
+    wait(&mut h, "terminal roots", |app| app.completion_watch.has_state(3, "failed"));
+    let messages: Vec<_> = h.state().pushed.iter().map(|p| p.message.as_str()).collect();
+    assert_eq!(messages, ["工单 #1 已完成", "工单 #3 失败"]);
 
-    // The same transition in a focused window stays silent.
-    app.pushed.clear();
-    app.test_focus = Some(true);
-    app.notice_transitions(&[row(904, "done")]);
-    assert!(app.pushed.is_empty());
+    // The remaining root finishes while focused. Previously observed results
+    // remain deduplicated when a subsequent turn finishes between polls.
+    h.state_mut().pushed.clear();
+    h.state_mut().test_focus = Some(true);
+    update_root_states(&h, "UPDATE jobs SET state='done' WHERE id=4");
+    wait(&mut h, "focused completion", |app| app.completion_watch.has_state(4, "done"));
+    assert!(h.state().pushed.is_empty());
+    h.state_mut().test_focus = Some(false);
+    update_root_states(&h, "UPDATE jobs SET state='partial',turn=3 WHERE id=1");
+    wait(&mut h, "second turn completion", |app| app.completion_watch.has_state(1, "partial"));
+    let messages: Vec<_> = h.state().pushed.iter().map(|p| p.message.as_str()).collect();
+    assert_eq!(messages, ["工单 #1 部分完成"]);
+    assert_eq!(h.state().search, "no matching sidebar tickets");
+}
+
+fn update_root_states(h: &Harness<'_, App>, sql: &str) {
+    h.state().host.as_ref().unwrap().engine().db().tx(|q| {
+        q.conn().execute_batch(sql)?;
+        Ok(())
+    }).unwrap();
 }
 
 #[test]
@@ -571,20 +677,7 @@ fn nothing_is_pushed_when_the_switch_is_off_or_there_is_no_scheduler() {
 }
 
 #[test]
-fn forward_gate_and_event_mapping() {
-    let on = Ok(enabled());
-    let seen = std::cell::RefCell::new(Vec::new());
-    let sink = |event: Event, _: &Settings| {
-        seen.borrow_mut().push(push::push_for(&event, &enabled()).map(|p| p.message));
-    };
-    super::notify_ui::forward(true, Event::Approval { ticket: 1 }, Some(&on), sink);
-    assert!(seen.borrow().is_empty());
-    let err = Err("读取手机推送设置失败".to_string());
-    super::notify_ui::forward(false, Event::Approval { ticket: 1 }, Some(&err), sink);
-    super::notify_ui::forward(false, Event::Approval { ticket: 1 }, None, sink);
-    assert!(seen.borrow().is_empty());
-    super::notify_ui::forward(false, Event::Finished { ticket: 2, state: "cancelled".into() }, Some(&on), sink);
-    assert_eq!(*seen.borrow(), [None]);
+fn unfinished_mapping_and_invalid_address() {
     assert_eq!(
         push::push_for(&Event::Finished { ticket: 2, state: "partial".into() }, &enabled()).unwrap().message,
         "工单 #2 部分完成"

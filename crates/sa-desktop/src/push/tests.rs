@@ -104,14 +104,14 @@ fn stub<T: Send + 'static>(
         stream.set_write_timeout(Some(TIMEOUT)).unwrap();
         respond(stream)
     });
-    (format!("http://{address}/ntfy"), worker)
+    (format!("http://{address}"), worker)
 }
 
 fn read_publish(stream: &mut TcpStream) -> Value {
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
     reader.read_line(&mut line).unwrap();
-    assert_eq!(line, "POST /ntfy HTTP/1.1\r\n");
+    assert_eq!(line, "POST / HTTP/1.1\r\n");
     let mut length = None;
     let mut content_type = None;
     loop {
@@ -143,7 +143,7 @@ fn reply(stream: &mut TcpStream, status: &str) {
 }
 
 #[test]
-fn send_posts_exact_json_to_the_selected_endpoint() {
+fn send_posts_exact_json_to_the_server_root() {
     let (server, worker) = stub(|mut stream| {
         let body = read_publish(&mut stream);
         reply(&mut stream, "200 OK");
@@ -161,6 +161,25 @@ fn send_posts_exact_json_to_the_selected_endpoint() {
             "tags": ["question"],
         })
     );
+}
+
+#[test]
+fn send_rejects_a_non_root_endpoint_before_opening_a_connection() {
+    let server = TcpListener::bind("127.0.0.1:0").unwrap();
+    server.set_nonblocking(true).unwrap();
+    let address = server.local_addr().unwrap();
+    for suffix in ["/team", "/?topic=team", "/#team"] {
+        assert_eq!(
+            send(
+                &format!("http://{address}{suffix}"),
+                TOPIC,
+                &test_push(),
+                TIMEOUT
+            ),
+            Err(SendError::Other(ROOT_SERVER_ONLY.into()))
+        );
+    }
+    assert_eq!(server.accept().unwrap_err().kind(), ErrorKind::WouldBlock);
 }
 
 #[test]
@@ -256,7 +275,9 @@ fn last_tracks_auto_failure_and_success_but_ignores_test_pushes() {
         topic: TOPIC.into(),
         ..selected()
     };
-    pusher.notify(finished("partial"), &settings);
+    let saved = Arc::new(NotifySettings::default());
+    saved.publish(Ok(settings.clone()));
+    pusher.notify(&finished("partial"), &saved);
     let failed = wait_last(&pusher, Err(SendError::Status(403)));
     worker.join().unwrap();
 
@@ -276,7 +297,63 @@ fn last_tracks_auto_failure_and_success_but_ignores_test_pushes() {
         body
     });
     settings.server = success;
-    pusher.notify(finished("done"), &settings);
+    saved.publish(Ok(settings));
+    pusher.notify(&finished("done"), &saved);
     wait_last(&pusher, Ok(()));
     assert_eq!(worker.join().unwrap()["message"], "工单 #42 已完成");
+}
+
+#[test]
+fn saved_changes_drop_the_backlog_and_allow_an_in_flight_push_to_finish() {
+    for enabled in [true, false] {
+        let (sent_tx, sent_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (pusher, worker) = Pusher::start(move |_, topic, push, _| {
+            sent_tx
+                .send((topic.to_owned(), push.message.clone()))
+                .unwrap();
+            if push.message.starts_with("工单 #1 ") {
+                release_rx.recv_timeout(TIMEOUT).unwrap();
+            }
+            Ok(())
+        });
+        let settings = Arc::new(NotifySettings::default());
+        let original = Settings {
+            topic: TOPIC.into(),
+            ..selected()
+        };
+        settings.publish(Ok(original.clone()));
+        for ticket in 1..=4 {
+            pusher.notify(&Event::Question { ticket }, &settings);
+        }
+        assert_eq!(
+            sent_rx.recv_timeout(TIMEOUT).unwrap(),
+            (TOPIC.into(), "工单 #1 需要你回答问题".into())
+        );
+        let mut changed = original;
+        if enabled {
+            changed.topic = "new-private-topic".into();
+        } else {
+            changed.enabled = false;
+        }
+        settings.publish(Ok(changed));
+        release_tx.send(()).unwrap();
+        drop(pusher);
+        worker.join().unwrap();
+        let unexpected: Vec<_> = sent_rx.into_iter().collect();
+        assert!(unexpected.is_empty(), "{unexpected:?}");
+    }
+}
+
+#[test]
+fn recovered_settings_do_not_replace_a_newly_saved_value() {
+    let settings = NotifySettings::default();
+    settings.publish(Err("fixture read error".into()));
+    let saved = Settings {
+        topic: TOPIC.into(),
+        ..selected()
+    };
+    settings.publish(Ok(saved.clone()));
+    settings.recover(Settings::default());
+    assert_eq!(settings.get(), Ok(saved));
 }

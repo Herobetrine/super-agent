@@ -2,12 +2,13 @@
 
 use sa_store::notify::{self, ServerProblem, Settings, TopicProblem};
 use std::io::ErrorKind;
-use std::sync::{Arc, LazyLock, Mutex, mpsc};
+use std::sync::{Arc, LazyLock, Mutex, RwLock, mpsc};
 use std::time::{Duration, SystemTime};
 use ureq::Error;
 use url::Url;
 
 const AUTO_TIMEOUT: Duration = Duration::from_secs(10);
+pub const ROOT_SERVER_ONLY: &str = "服务器地址只填到域名和端口为止，主题请填在下面的“主题”里";
 
 pub enum Event {
     Question { ticket: i64 },
@@ -94,6 +95,7 @@ pub fn send(server: &str, topic: &str, push: &Push, timeout: Duration) -> Result
             Some("请使用 https 地址；只有本机或局域网地址可以用 http")
         }
         (Some(ServerProblem::Invalid), _) => Some("服务器地址格式不对"),
+        (Some(ServerProblem::HasPath), _) => Some(ROOT_SERVER_ONLY),
         (_, Some(TopicProblem::Empty)) => Some("请填写主题"),
         (_, Some(TopicProblem::Invalid)) => Some("主题只能包含字母、数字、- 和 _，最多 64 个字符"),
         (None, None) => None,
@@ -101,8 +103,9 @@ pub fn send(server: &str, topic: &str, push: &Push, timeout: Duration) -> Result
     if let Some(problem) = problem {
         return Err(SendError::Other(problem.into()));
     }
-    let target =
+    let mut target =
         Url::parse(server.trim()).map_err(|_| SendError::Other("服务器地址格式不对".into()))?;
+    target.set_path("/");
     let body = serde_json::json!({
         "topic": topic,
         "title": push.title,
@@ -160,8 +163,50 @@ fn send_error(error: &Error, tls: bool) -> SendError {
     }
 }
 
+/// Settings and their in-process version are published together after a save.
+pub(crate) struct NotifySettings {
+    current: RwLock<(u64, Result<Settings, String>)>,
+}
+
+impl Default for NotifySettings {
+    fn default() -> Self {
+        Self {
+            current: RwLock::new((0, Ok(Settings::default()))),
+        }
+    }
+}
+
+impl NotifySettings {
+    pub(crate) fn get(&self) -> Result<Settings, String> {
+        self.current
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .1
+            .clone()
+    }
+
+    pub(crate) fn publish(&self, settings: Result<Settings, String>) {
+        let mut current = self.current.write().unwrap_or_else(|p| p.into_inner());
+        *current = (current.0 + 1, settings);
+    }
+
+    pub(crate) fn recover(&self, settings: Settings) {
+        let mut current = self.current.write().unwrap_or_else(|p| p.into_inner());
+        // A save committed while the read was in progress takes precedence.
+        if current.1.is_err() {
+            *current = (current.0 + 1, Ok(settings));
+        }
+    }
+}
+
+struct Queued {
+    settings: Arc<NotifySettings>,
+    version: u64,
+    push: Push,
+}
+
 pub struct Pusher {
-    queue: mpsc::Sender<(String, String, Push)>,
+    queue: mpsc::Sender<Queued>,
     last: Arc<Mutex<Option<LastPush>>>,
 }
 
@@ -173,26 +218,51 @@ pub struct LastPush {
 
 impl Pusher {
     pub fn new() -> Self {
-        let (queue, receiver) = mpsc::channel::<(String, String, Push)>();
+        Self::start(send).0
+    }
+
+    fn start(
+        send_push: impl Fn(&str, &str, &Push, Duration) -> Result<(), SendError> + Send + 'static,
+    ) -> (Self, std::thread::JoinHandle<()>) {
+        let (queue, receiver) = mpsc::channel::<Queued>();
         let last = Arc::new(Mutex::new(None));
         let worker_last = Arc::clone(&last);
-        std::thread::spawn(move || {
-            while let Ok((server, topic, push)) = receiver.recv() {
-                let result = send(&server, &topic, &push, AUTO_TIMEOUT);
+        let worker = std::thread::spawn(move || {
+            while let Ok(item) = receiver.recv() {
+                let destination = {
+                    let current = item
+                        .settings
+                        .current
+                        .read()
+                        .unwrap_or_else(|p| p.into_inner());
+                    match &*current {
+                        (version, Ok(s)) if *version == item.version => {
+                            Some((s.server.clone(), s.topic.clone()))
+                        }
+                        _ => None,
+                    }
+                };
+                let Some((server, topic)) = destination else {
+                    continue;
+                };
+                let result = send_push(&server, &topic, &item.push, AUTO_TIMEOUT);
                 *worker_last.lock().unwrap_or_else(|p| p.into_inner()) = Some(LastPush {
                     at: SystemTime::now(),
                     result,
                 });
             }
         });
-        Self { queue, last }
+        (Self { queue, last }, worker)
     }
 
-    pub fn notify(&self, event: Event, settings: &Settings) {
-        if let Some(push) = push_for(&event, settings) {
-            let _ = self
-                .queue
-                .send((settings.server.clone(), settings.topic.clone(), push));
+    pub(crate) fn notify(&self, event: &Event, settings: &Arc<NotifySettings>) {
+        let current = settings.current.read().unwrap_or_else(|p| p.into_inner());
+        if let Some(push) = current.1.as_ref().ok().and_then(|s| push_for(event, s)) {
+            let _ = self.queue.send(Queued {
+                settings: Arc::clone(settings),
+                version: current.0,
+                push,
+            });
         }
     }
 
