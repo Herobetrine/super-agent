@@ -156,6 +156,7 @@ pub enum Action {
     ImportT3Projects(Vec<sa_store::t3_import::T3Project>),
     /// Persist that the T3 archive contains at least one completed conversation.
     RecordT3Export,
+    SaveNotify(sa_store::notify::Settings),
     /// `saveRoutes` (ST:239-290): routes of a stopped ticket.
     SaveRoutes {
         ticket: i64,
@@ -276,6 +277,7 @@ impl Action {
             Action::SaveEfficiency { .. } => ActionKind::Efficiency,
             Action::ImportT3Projects(_) => ActionKind::T3Import,
             Action::RecordT3Export => ActionKind::Meta,
+            Action::SaveNotify(_) => ActionKind::Notify,
             Action::KnowledgeAdd { .. } | Action::KnowledgeArchive { .. } => ActionKind::Knowledge,
             Action::ProviderSave { .. }
             | Action::ProviderRemove { .. }
@@ -330,6 +332,7 @@ pub enum ActionKind {
     Routes,
     Efficiency,
     T3Import,
+    Notify,
     Knowledge,
     Providers,
     Meta,
@@ -451,6 +454,7 @@ pub struct Shared {
     pub registry: Registry,
     pub rotation: Arc<RwLock<Rotation>>,
     pub efficiency: sa_store::efficiency::Shared,
+    notify: Arc<RwLock<Result<sa_store::notify::Settings, String>>>,
 }
 
 impl Shared {
@@ -459,6 +463,7 @@ impl Shared {
             registry: sa_adapters::registry(vec![]),
             rotation: Arc::default(),
             efficiency: sa_store::efficiency::shared(Default::default()),
+            notify: Arc::new(RwLock::new(Ok(sa_store::notify::Settings::default()))),
         }
     }
 
@@ -644,6 +649,10 @@ impl Host {
 
     pub fn efficiency_settings(&self) -> sa_store::efficiency::Settings {
         self.shared.efficiency.read().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    pub fn notify_settings(&self) -> Result<sa_store::notify::Settings, String> {
+        self.shared.notify.read().unwrap_or_else(|p| p.into_inner()).clone()
     }
 
     /// Probe one harness catalog concurrently with the action queue (probes
@@ -919,11 +928,15 @@ fn open_engine(
             q.conn().execute_batch(sa_store::STUDIO_PLAN)?;
             sa_store::efficiency::init(q.conn())?;
             sa_store::projects::init(q.conn())?;
+            sa_store::notify::init(q.conn())?;
             q.conn().execute_batch("CREATE TABLE IF NOT EXISTS studio_model_policy(singleton INTEGER PRIMARY KEY CHECK(singleton=1),allow_lead_routing INTEGER NOT NULL CHECK(allow_lead_routing IN (0,1)))")?;
             Ok(q.conn().execute_batch(sa_store::TICKET_META)?)
         })?;
     // Providers and rotation must be loaded before the first admission.
     shared.reload(&engine)?;
+    let notify = engine.db().with(|q| sa_store::notify::load(q.conn()));
+    *shared.notify.write().unwrap_or_else(|p| p.into_inner()) =
+        notify.map_err(|error| error.to_string());
     engine.start()?;
     Ok(engine)
 }
@@ -1145,6 +1158,11 @@ async fn execute(engine: &Engine, shared: &Shared, action: Action) -> Result<Opt
                 .db()
                 .with(|q| sa_store::t3_import::import_projects(q.conn(), &chosen))?;
             Ok(Some(i64::try_from(added)?))
+        }
+        Action::SaveNotify(settings) => {
+            engine.db().tx(|q| sa_store::notify::save(q.conn(), &settings))?;
+            *shared.notify.write().unwrap_or_else(|p| p.into_inner()) = Ok(settings);
+            Ok(None)
         }
         Action::SaveRoutes {
             ticket,

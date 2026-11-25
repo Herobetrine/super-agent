@@ -12,6 +12,7 @@ pub mod ledger;
 pub mod model;
 pub mod prices;
 mod native_activity;
+pub mod notify;
 mod progress;
 pub mod projects;
 pub mod providers;
