@@ -24,7 +24,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use tokio_util::sync::CancellationToken;
 
 static MODEL_ID: LazyLock<Regex> =
@@ -69,33 +69,53 @@ struct ProbeKey {
     exe: PathBuf,
     source: String,
     overrides: String,
+    settings_fingerprint: String,
+    exe_stamp: Option<(u64, SystemTime)>,
 }
 
-impl ProbeKey {
-    fn new(exe: &Path, source: &str, overrides: Value) -> Self {
+struct DiscoveryInputs {
+    exe: Option<PathBuf>,
+    exe_stamp: Option<(u64, SystemTime)>,
+    settings: Value,
+    settings_fingerprint: String,
+}
+
+impl DiscoveryInputs {
+    fn read(sys: &Sys) -> Self {
+        let exe = executable(sys);
+        let exe_stamp = exe.as_ref().and_then(|path| {
+            let metadata = std::fs::metadata(path).ok()?;
+            Some((metadata.len(), metadata.modified().ok()?))
+        });
+        let settings = native_settings(sys);
+        let settings_fingerprint = fingerprint("agy-settings-", std::slice::from_ref(&settings));
         Self {
+            exe,
+            exe_stamp,
+            settings,
+            settings_fingerprint,
+        }
+    }
+
+    fn probe_key(&self, exe: &Path, source: &str, overrides: Value) -> ProbeKey {
+        ProbeKey {
             exe: exe.to_path_buf(),
             source: source.into(),
             overrides: overrides.to_string(),
+            settings_fingerprint: self.settings_fingerprint.clone(),
+            exe_stamp: self.exe_stamp,
         }
     }
 }
 
 struct Fetched<T> {
     value: T,
-    at: Instant,
+    started: Instant,
 }
 
 impl<T> Fetched<T> {
-    fn new(value: T) -> Self {
-        Self {
-            value,
-            at: Instant::now(),
-        }
-    }
-
     fn fresh(&self, window: Duration) -> Option<&T> {
-        (self.at.elapsed() < window).then_some(&self.value)
+        (self.started.elapsed() < window).then_some(&self.value)
     }
 }
 
@@ -133,6 +153,62 @@ impl ProbeCache {
             .get(model)?
             .fresh(self.freshness)
             .cloned()
+    }
+
+    fn record_models(
+        &mut self,
+        key: &ProbeKey,
+        started: Instant,
+        models: Option<Arc<Vec<Value>>>,
+    ) {
+        if self
+            .sources
+            .get(key)
+            .and_then(|source| source.models.as_ref())
+            .is_some_and(|cached| cached.started > started)
+        {
+            return;
+        }
+        if let Some(models) = models {
+            let listed: HashSet<_> = models.iter().filter_map(|m| m["id"].as_str()).collect();
+            let source = self.sources.entry(key.clone()).or_default();
+            source.efforts.retain(|id, effort| {
+                effort.started > started || id == "@native" || listed.contains(id.as_str())
+            });
+            source.models = Some(Fetched { value: models, started });
+        } else if let Some(source) = self.sources.get_mut(key) {
+            source.models = None;
+            source.efforts.retain(|_, effort| effort.started > started);
+            if source.efforts.is_empty() {
+                self.sources.remove(key);
+            }
+        }
+    }
+
+    fn record_effort(
+        &mut self,
+        key: &ProbeKey,
+        model: &str,
+        started: Instant,
+        effort: Option<Effort>,
+    ) {
+        let Some(source) = self.sources.get_mut(key) else {
+            return;
+        };
+        if source
+            .efforts
+            .get(model)
+            .is_some_and(|cached| cached.started > started)
+        {
+            return;
+        }
+        if let Some(effort) = effort {
+            source
+                .efforts
+                .insert(model.into(), Fetched { value: effort, started });
+        } else {
+            source.efforts.remove(model);
+        }
     }
 }
 
@@ -344,27 +420,35 @@ async fn probe_effort(
     if !data.is_object() {
         return None;
     }
-    Some(if data["adjustable"] == true {
-        Effort::Adjustable {
-            available: data["available"].clone(),
-            current: data["current"].clone(),
-        }
-    } else {
-        Effort::Fixed
+    if !data["adjustable"].as_bool()? {
+        return Some(Effort::Fixed);
+    }
+    let available = &data["available"];
+    let current = &data["current"];
+    if !available
+        .as_array()
+        .is_some_and(|values| !values.is_empty() && values.iter().all(Value::is_string))
+        || !current.is_string()
+    {
+        return None;
+    }
+    Some(Effort::Adjustable {
+        available: available.clone(),
+        current: current.clone(),
     })
 }
 
 /// `discover(signal)` (AG:105-150).
 async fn discover(
     adapter: &Antigravity,
-    exe: Option<&Path>,
+    inputs: &DiscoveryInputs,
     cancel: &CancellationToken,
     route: Option<&Route>,
     read_cache: bool,
 ) -> Result<Discovery, AdapterError> {
     let sys = &adapter.sys;
     let probes = &adapter.probes;
-    let settings = native_settings(sys);
+    let settings = &inputs.settings;
     let mut rows = configured(sys);
     let mut ids = vec!["google"];
     if adc(sys) {
@@ -381,9 +465,9 @@ async fn discover(
     for id in ids {
         let mut models: Vec<Value> = vec![];
         let mut catalog_error = None;
-        if let Some(cli) = exe {
+        if let Some(cli) = &inputs.exe {
             let (env, overrides) = environment(sys, id, None, false)?;
-            let key = ProbeKey::new(cli, id, overrides);
+            let key = inputs.probe_key(cli, id, overrides);
             let cached_models = read_cache
                 .then(|| probes.lock().unwrap().models(&key))
                 .flatten();
@@ -391,7 +475,8 @@ async fn discover(
             let found = if let Some(found) = cached_models {
                 Some(found)
             } else {
-                match capture(
+                let started = Instant::now();
+                let found = match capture(
                     cli,
                     &["--settings".into(), key.overrides.clone(), "models".into()],
                     &sys.temp,
@@ -403,20 +488,7 @@ async fn discover(
                 .await
                 {
                     Ok(out) => match native_models(&out) {
-                        Ok(found) => {
-                            let found = Arc::new(found);
-                            if !cancel.is_cancelled() {
-                                let listed: HashSet<_> =
-                                    found.iter().filter_map(|m| m["id"].as_str()).collect();
-                                let mut cache = probes.lock().unwrap();
-                                let entry = cache.sources.entry(key.clone()).or_default();
-                                entry.models = Some(Fetched::new(Arc::clone(&found)));
-                                entry
-                                    .efforts
-                                    .retain(|id, _| id == "@native" || listed.contains(id.as_str()));
-                            }
-                            Some(found)
-                        }
+                        Ok(found) => Some(Arc::new(found)),
                         Err(error) => {
                             catalog_error = Some(error);
                             Some(Arc::new(Vec::new()))
@@ -427,12 +499,14 @@ async fn discover(
                         catalog_error = Some(format!("原生模型目录读取失败：{}", error.message));
                         None
                     }
+                };
+                if !cancel.is_cancelled() {
+                    let cacheable = found.clone().filter(|_| catalog_error.is_none());
+                    probes.lock().unwrap().record_models(&key, started, cacheable);
                 }
+                found
             };
             let complete = catalog_error.is_none();
-            if !complete && !cancel.is_cancelled() {
-                probes.lock().unwrap().sources.remove(&key);
-            }
             if let Some(found) = found {
                 models.push(json!({"id": "@native", "label": "跟随 agy 原生默认模型"}));
                 models.extend(found.iter().cloned());
@@ -452,19 +526,13 @@ async fn discover(
                         let effort = if let Some(effort) = cached {
                             Some(effort)
                         } else {
+                            let started = Instant::now();
                             let effort = probe_effort(key, env, cancel, id).await;
-                            if complete
-                                && !cancel.is_cancelled()
-                                && let Some(entry) = probes.lock().unwrap().sources.get_mut(key)
-                            {
-                                match &effort {
-                                    Some(effort) => {
-                                        entry.efforts.insert(id.into(), Fetched::new(effort.clone()));
-                                    }
-                                    None => {
-                                        entry.efforts.remove(id);
-                                    }
-                                }
+                            if complete && !cancel.is_cancelled() {
+                                probes
+                                    .lock()
+                                    .unwrap()
+                                    .record_effort(key, id, started, effort.clone());
                             }
                             effort
                         };
@@ -581,7 +649,7 @@ async fn discover(
         .unwrap_or_default();
     let catalog = json!({
         "providers": providers,
-        "modes": modes("Antigravity CLI", exe.is_some()),
+        "modes": modes("Antigravity CLI", inputs.exe.is_some()),
         "default": {
             "mode": "cli",
             "provider": selected.as_ref().and_then(|s| s["id"].as_str()).unwrap_or_default(),
@@ -629,8 +697,8 @@ impl Adapter for Antigravity {
     fn catalog(&self) -> BoxFuture<'static, anyhow::Result<Catalog>> {
         let adapter = self.clone_for_future();
         Box::pin(async move {
-            let exe = executable(&adapter.sys);
-            let d = discover(&adapter, exe.as_deref(), &CancellationToken::new(), None, false)
+            let inputs = DiscoveryInputs::read(&adapter.sys);
+            let d = discover(&adapter, &inputs, &CancellationToken::new(), None, false)
                 .await
                 .map_err(|e| anyhow::anyhow!(e.message))?;
             Ok(Catalog { value: d.catalog })
@@ -643,10 +711,10 @@ impl Adapter for Antigravity {
     ) -> Option<BoxFuture<'static, anyhow::Result<Catalog>>> {
         let adapter = self.clone_for_future();
         Some(Box::pin(async move {
-            let exe = executable(&adapter.sys);
+            let inputs = DiscoveryInputs::read(&adapter.sys);
             let d = discover(
                 &adapter,
-                exe.as_deref(),
+                &inputs,
                 &CancellationToken::new(),
                 Some(&route),
                 false,
@@ -666,15 +734,15 @@ impl Adapter for Antigravity {
     ) -> BoxFuture<'static, Result<RunOutcome, AdapterError>> {
         let adapter = self.clone_for_future();
         Box::pin(async move {
-            let exe = executable(&adapter.sys);
+            let inputs = DiscoveryInputs::read(&adapter.sys);
             let source = request.route.provider.clone();
-            let result = run(&adapter, exe.as_deref(), request, host, Emit(events), cancel).await;
+            let result = run(&adapter, &inputs, request, host, Emit(events), cancel).await;
             if result.as_ref().is_err_and(|e| e.class != ErrorClass::Cancelled)
                 && matches!(source.as_str(), "google" | "adc")
-                && let Some(cli) = exe.as_deref()
+                && let Some(cli) = &inputs.exe
                 && let Ok((_, overrides)) = environment(&adapter.sys, &source, None, false)
             {
-                let key = ProbeKey::new(cli, &source, overrides);
+                let key = inputs.probe_key(cli, &source, overrides);
                 adapter.probes.lock().unwrap().sources.remove(&key);
             }
             result
@@ -694,7 +762,7 @@ fn tool_key(step: &Value) -> Option<String> {
 /// `run(o)` (AG:151-205).
 async fn run(
     adapter: &Antigravity,
-    exe: Option<&Path>,
+    inputs: &DiscoveryInputs,
     req: RunRequest,
     host: Arc<dyn TurnHost>,
     emit: Emit,
@@ -705,7 +773,7 @@ async fn run(
     let boundary = scope("antigravity", &req, &host, &cancel, false).await?;
     let mut read_cache = true;
     let (d, s) = loop {
-        let d = discover(adapter, exe, &cancel, Some(&req.route), read_cache)
+        let d = discover(adapter, inputs, &cancel, Some(&req.route), read_cache)
             .await
             .map_err(|e| {
                 if e.class == ErrorClass::Cancelled {
@@ -737,7 +805,10 @@ async fn run(
     }
     let r = d.rows.iter().find(|v| v.id == s.provider);
     let (env, overrides) = environment(sys, &s.provider, r, !high)?;
-    let exe = exe.ok_or_else(|| route_gone("本机未安装所选原生执行端"))?;
+    let exe = inputs
+        .exe
+        .as_deref()
+        .ok_or_else(|| route_gone("本机未安装所选原生执行端"))?;
     // `--settings` rejects `mcpServers`; only ACP `session/new` mounts a server
     // for one session. The ACP path is wired for the Google account source.
     let bus = high
@@ -996,6 +1067,49 @@ mod tests {
             vec![]
         }
         fn accept_notes(&self, _: &[i64]) {}
+    }
+
+    #[test]
+    fn older_probe_results_cannot_overwrite_or_remove_newer_results() {
+        let key = ProbeKey {
+            exe: "agy".into(),
+            source: "google".into(),
+            overrides: "{}".into(),
+            settings_fingerprint: "settings".into(),
+            exe_stamp: None,
+        };
+        let mut cache = ProbeCache {
+            sources: HashMap::new(),
+            freshness: PROBE_FRESHNESS,
+        };
+        let newer = Instant::now();
+        let older = newer - Duration::from_secs(1);
+        let old_models = Arc::new(vec![json!({"id": "model-old"})]);
+        let new_models = Arc::new(vec![json!({"id": "model-new"})]);
+
+        cache.record_models(&key, newer, Some(Arc::clone(&new_models)));
+        cache.record_effort(&key, "model-new", newer, Some(Effort::Fixed));
+        cache.record_models(&key, older, Some(old_models));
+        cache.record_models(&key, older, None);
+        assert_eq!(cache.models(&key).unwrap(), new_models);
+
+        cache.record_effort(
+            &key,
+            "model-new",
+            older,
+            Some(Effort::Adjustable {
+                available: json!(["low"]),
+                current: json!("low"),
+            }),
+        );
+        assert!(matches!(cache.effort(&key, "model-new"), Some(Effort::Fixed)));
+        cache.record_effort(&key, "model-new", older, None);
+        assert!(matches!(cache.effort(&key, "model-new"), Some(Effort::Fixed)));
+
+        cache.record_effort(&key, "model-new", newer, None);
+        cache.record_models(&key, newer, None);
+        assert!(cache.effort(&key, "model-new").is_none());
+        assert!(cache.models(&key).is_none());
     }
 
     fn fake_cli() -> &'static Path {
