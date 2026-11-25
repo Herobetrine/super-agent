@@ -223,6 +223,8 @@ pub(crate) struct Entry {
     // belongs in the feed; visible originals already have an SQL row.
     feed_seqs: Vec<i64>,
     feed_by_job: HashMap<Option<i64>, Vec<i64>>,
+    #[cfg(test)]
+    pub(crate) feed_turn_checks: std::cell::Cell<usize>,
 }
 
 /// Raw row fetched by the progress scan.
@@ -287,7 +289,7 @@ impl Entry {
         }
         let mut ids = Vec::new();
         let before = fold.resumed.saturating_sub(1);
-        let mut append = |seqs: &[i64], low: i64, high: i64, check_turn: bool| {
+        let append = |ids: &mut Vec<i64>, seqs: &[i64], low: i64, high: i64, check_turn: bool| {
             if low >= high {
                 return;
             }
@@ -295,6 +297,8 @@ impl Entry {
                 &seqs[seqs.partition_point(|s| *s <= low)..seqs.partition_point(|s| *s <= high)];
             let keep = |seq: &&i64| {
                 !check_turn || {
+                    #[cfg(test)]
+                    self.feed_turn_checks.set(self.feed_turn_checks.get() + 1);
                     let r = &self.rows[*seq];
                     fold.shown("activity", **seq, r.job, r.turn)
                 }
@@ -305,16 +309,16 @@ impl Entry {
                 ids.extend(seqs.iter().filter(keep).take(PAGE).copied());
             }
         };
-        append(&self.feed_seqs, after.max(before), end, false);
-        if after < before {
+        append(&mut ids, &self.feed_seqs, after.max(before), end, false);
+        if after < before && (after != 0 || ids.len() < PAGE) {
             if let Some(nulls) = self.feed_by_job.get(&None) {
-                append(nulls, after, before, false);
+                append(&mut ids, nulls, after, before, false);
             }
             for (job, round) in &fold.open {
                 if round.on_ticket && Some(*job) != fold.root
                     && let Some(seqs) = self.feed_by_job.get(&Some(*job))
                 {
-                    append(seqs, after, before, true);
+                    append(&mut ids, seqs, after, before, true);
                 }
             }
         }
