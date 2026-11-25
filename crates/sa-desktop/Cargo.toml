@@ -25,6 +25,7 @@ rusqlite.workspace = true
 sha2.workspace = true
 url = "2"
 webbrowser = "1"
+ureq = { version = "3.5", default-features = false, features = ["rustls", "platform-verifier"] }
 # Project file index for @ mentions (respects .gitignore).
 ignore = "0.4"
 # Clipboard images pasted into the composer.
