@@ -170,8 +170,7 @@ fn enabled(h: &Harness<'_, App>, role: Role, label: &str) -> bool {
 fn click_in_view(h: &mut Harness<'_, App>, role: Role, label: &str) {
     h.get_by_role_and_label(role, label).scroll_to_me();
     h.run_steps(3);
-    // The scroll or async dialog layout can move the widget. Reacquire its
-    // coordinates before sending the pointer events.
+    // ScrollIntoView can move the widget. Query its post-scroll coordinates.
     h.get_by_role_and_label(role, label).click();
     h.run_steps(3);
 }
@@ -384,7 +383,7 @@ fn selection_step_can_switch_folders_and_resets_both_selections() {
     let data = tempfile::tempdir().unwrap();
     let mut h = writable(data.path(), &first, listed_beta(&first));
     open_dialog(&mut h);
-    until(&mut h, "first folder", |a| a.t3.step_name() == "select");
+    until(&mut h, "first folder's selection laid out", |a| a.t3.select_settled());
     assert!(contains_visible(&h, &first.folder.to_string_lossy()));
     click_in_view(&mut h, Role::Button, "全不选");
     assert_eq!(h.state().t3.picked(), [false; 3]);
@@ -393,7 +392,7 @@ fn selection_step_can_switch_folders_and_resets_both_selections() {
 
     h.state_mut().t3.next_picked_folder = Some(second.folder.clone());
     h.get_by_role_and_label(Role::Button, "选择文件夹…").click();
-    until(&mut h, "new folder's selections", |a| a.t3.picked() == [true, true, false]);
+    until(&mut h, "new folder's selections", |a| a.t3.select_settled() && a.t3.picked() == [true, true, false]);
     assert!(contains_visible(&h, &second.folder.to_string_lossy()));
     assert_eq!(
         h.get_by_role_and_label(Role::CheckBox, "把对话导出为本地归档（仅供查阅）")
@@ -605,7 +604,7 @@ fn export_only_import_persists_first_import_and_leaves_the_link_available() {
     let data = tempfile::tempdir().unwrap();
     let mut h = writable(data.path(), &fx, listed_beta(&fx));
     open_dialog(&mut h);
-    until(&mut h, "select", |a| a.t3.step_name() == "select");
+    until(&mut h, "selection laid out", |a| a.t3.select_settled());
     click_in_view(&mut h, Role::Button, "全不选");
     assert_eq!(h.state().t3.picked(), [false; 3]);
     h.get_by_role_and_label(Role::Button, "开始导入").click();
@@ -634,7 +633,7 @@ fn export_only_with_all_threads_failed_shows_failure_and_retry() {
     let data = tempfile::tempdir().unwrap();
     let mut h = writable(data.path(), &fx, listed_beta(&fx));
     open_dialog(&mut h);
-    until(&mut h, "select", |a| a.t3.step_name() == "select");
+    until(&mut h, "selection laid out", |a| a.t3.select_settled());
     click_in_view(&mut h, Role::Button, "全不选");
     assert_eq!(h.state().t3.picked(), [false; 3]);
     h.get_by_role_and_label(Role::Button, "开始导入").click();

@@ -167,6 +167,14 @@ impl T3State {
         }
     }
 
+    /// The selection has been laid out for interaction and has no folder pick in flight.
+    #[cfg(test)]
+    pub fn select_settled(&self) -> bool {
+        self.dialog.as_ref().is_some_and(|dialog| {
+            dialog.picking.is_none() && matches!(&dialog.step, Step::Select(sel) if sel.laid_out)
+        })
+    }
+
     /// Selection flags of the open step 2, for tests.
     #[cfg(test)]
     pub fn picked(&self) -> Vec<bool> {
@@ -233,13 +241,21 @@ struct Select {
     scan: Scan,
     picked: Vec<bool>,
     export: bool,
+    #[cfg(test)]
+    laid_out: bool,
 }
 
 impl Select {
     fn new(scan: Scan) -> Self {
         let picked = scan.projects.iter().map(|p| p.exists && !p.already_listed).collect();
         let export = scan.threads > 0;
-        Self { scan, picked, export }
+        Self {
+            scan,
+            picked,
+            export,
+            #[cfg(test)]
+            laid_out: false,
+        }
     }
 
     fn new_projects(&self) -> usize {
@@ -783,6 +799,7 @@ impl App {
 
     pub fn t3_import_dialog(&mut self, ctx: &egui::Context) {
         let Some(mut dialog) = self.t3.dialog.take() else { return };
+        let was_selecting = matches!(dialog.step, Step::Select(_));
         self.t3_poll_dialog(&mut dialog);
         if dialog.auto && matches!(dialog.step, Step::Select(_)) {
             dialog.auto = false;
@@ -791,11 +808,24 @@ impl App {
         let pal = self.pal.clone();
         let data = self.t3_data_dir();
         let running = matches!(dialog.step, Step::Run(_));
+        let selecting = matches!(dialog.step, Step::Select(_));
+        let entering_selection = selecting && !was_selecting;
         let mut intent = None;
-        let modal = egui::Modal::new(egui::Id::new("sa-t3-import"))
+        let id = egui::Id::new("sa-t3-import");
+        if entering_selection {
+            // Measure the selection before showing it at the modal's new center.
+            ctx.request_discard("size the T3 import selection");
+        }
+        let modal = egui::Modal::new(id)
+            .area(egui::Modal::default_area(id).sizing_pass(entering_selection))
             .frame(widgets::modal_frame(&pal))
             .show(ctx, |ui| {
                 ui.set_width(560.0);
+                if selecting {
+                    // The scroll area should use its viewport-based cap, even when
+                    // the centered modal was much shorter on the previous pass.
+                    ui.set_max_height(ctx.content_rect().height());
+                }
                 let title = match &dialog.step {
                     Step::Done(outcome) => outcome.title(),
                     _ => "从 T3 Code 导入",
@@ -814,6 +844,10 @@ impl App {
                         let can_pick = dialog.picking.is_none();
                         folder_row(ui, dialog.folder.as_deref(), can_pick, &pal, &mut intent);
                         select_ui(ui, sel, &data, max_height, can_pick, &pal, &mut intent);
+                        #[cfg(test)]
+                        {
+                            sel.laid_out = !ui.is_sizing_pass() && !ctx.will_discard();
+                        }
                     }
                     Step::Run(run) => run_ui(ui, run, &pal, &mut intent),
                     Step::Done(outcome) => done_ui(ui, outcome, &pal, &mut intent),
