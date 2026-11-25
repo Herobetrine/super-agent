@@ -805,7 +805,7 @@ impl App {
                                     continue;
                                 };
                                 if url.starts_with("https://") {
-                                    ui.hyperlink_to(label, url);
+                                    crate::ops::browser_link(ui, label, url);
                                 }
                             }
                             if widgets::quiet_button(

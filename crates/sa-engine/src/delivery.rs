@@ -160,6 +160,7 @@ fn repair_existing_object(data_dir: &Path, file: &DeliveryFile, correct: &[u8]) 
 
 impl Engine {
     pub fn delivery_summary(&self, ticket: i64) -> Result<DeliverySummary> {
+        let _power = self.track_work();
         delivery::read_summary(self.data_dir(), ticket)
     }
 
@@ -237,6 +238,7 @@ impl Engine {
         expected_policy_revision: i64,
         before_commit: impl FnOnce() -> Result<()>,
     ) -> Result<DeliveryAssessment> {
+        let _power = self.track_work();
         let (requirements, manifest_sha256, behavior_basis) = self.db().with(|q| {
             ticket_project(q, ticket)?;
             let gate = delivery::gate_metadata(q.conn(), ticket)?;
@@ -360,6 +362,7 @@ impl Engine {
         expected_contract_revision: i64,
         paths: Vec<String>,
     ) -> Result<DeliverySnapshot> {
+        let _power = self.track_work();
         self.capture_inner(ticket, expected_contract_revision, paths, None, None)
     }
 

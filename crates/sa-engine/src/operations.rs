@@ -795,9 +795,10 @@ fn with_reconciled(mut detail: Value) -> Value {
 /// Classify every operation left open by a previous process, then sweep
 /// legacy rows that predate receipts. Call before jobs are requeued or
 /// admitted. Git inspection runs outside journal transactions.
-pub(crate) fn reconcile(db: &Db, hub: &Hub) -> Result<()> {
+pub(crate) fn reconcile(db: &Db, hub: &Hub, power: &crate::power::Power) -> Result<()> {
     let open = db.with(|q| q.all(
         "SELECT * FROM operations WHERE state IN ('planned','started','cancel_requested') ORDER BY id", &[]))?;
+    let _power = (!open.is_empty()).then(|| power.track());
     for row in open {
         let op = Operation::from_row(&row)?;
         if hub.is_live(op.id) {
@@ -822,8 +823,8 @@ pub(crate) fn reconcile(db: &Db, hub: &Hub) -> Result<()> {
             Ok(())
         })?;
     }
-    legacy_workspaces(db, hub)?;
-    mcp_receipts(db)?;
+    legacy_workspaces(db, hub, power)?;
+    mcp_receipts(db, power)?;
     Ok(())
 }
 
@@ -911,8 +912,9 @@ fn behavior_verdict(q: &Q, op: &Operation) -> Result<(&'static str, Value)> {
 }
 
 /// Legacy validate/integrate rows without a live operation.
-fn legacy_workspaces(db: &Db, hub: &Hub) -> Result<()> {
+fn legacy_workspaces(db: &Db, hub: &Hub, power: &crate::power::Power) -> Result<()> {
     let rows = db.with(|q| q.all("SELECT job FROM job_workspaces WHERE state IN ('validating','integrating') ORDER BY job", &[]))?;
+    let _power = (!rows.is_empty()).then(|| power.track());
     for row in rows {
         let job = int_of(&row, "job");
         if hub.live_job(job) {
@@ -945,13 +947,14 @@ fn legacy_workspaces(db: &Db, hub: &Hub) -> Result<()> {
 
 /// `SA_TOOL` receipts still `pending` were issued (or about to be) by a dead
 /// process. They become `uncertain` and are never re-issued.
-fn mcp_receipts(db: &Db) -> Result<()> {
+fn mcp_receipts(db: &Db, power: &crate::power::Power) -> Result<()> {
     db.tx(|q| {
         if !q.exists("SELECT 1 FROM sqlite_master WHERE type='table' AND name='studio_tool_receipts'", &[])? {
             return Ok(());
         }
         let rows = q.all("SELECT r.job,r.logical,r.key,r.request,j.ticket,j.turn,j.id FROM studio_tool_receipts r
             JOIN jobs j ON j.id=r.job WHERE r.state='pending' ORDER BY r.rowid", &[])?;
+        let _power = (!rows.is_empty()).then(|| power.track());
         for row in rows {
             let (job, logical, key) = (int_of(&row, "job"), int_of(&row, "logical"), str_of(&row, "key"));
             let request: Value = serde_json::from_str(str_of(&row, "request")).unwrap_or(Value::Null);

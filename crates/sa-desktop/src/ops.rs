@@ -16,6 +16,27 @@ use std::time::{Duration, Instant};
 const GIT_CAP: usize = 256 * 1024;
 const GIT_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// Keep egui's link widget and tooltip while opening the URL off the UI thread.
+pub(crate) fn browser_link(ui: &mut egui::Ui, label: &str, url: &str) {
+    let response = ui.link(label);
+    if response.clicked() || response.middle_clicked() {
+        let url = url.to_owned();
+        if let Err(error) = std::thread::Builder::new()
+            .name("sa-open-url".into())
+            .spawn(move || {
+                if let Err(error) = webbrowser::open(&url) {
+                    eprintln!("无法打开浏览器链接：{error}");
+                }
+            })
+        {
+            eprintln!("无法启动浏览器后台线程：{error}");
+        }
+    }
+    if ui.style().url_in_tooltip {
+        response.on_hover_text(url);
+    }
+}
+
 /// A background result polled once per frame.
 pub struct Pending<T> {
     rx: mpsc::Receiver<Result<T, String>>,

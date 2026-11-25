@@ -24,6 +24,7 @@ tempfile.workspace = true
 rusqlite.workspace = true
 sha2.workspace = true
 url = "2"
+webbrowser = "1"
 # Project file index for @ mentions (respects .gitignore).
 ignore = "0.4"
 # Clipboard images pasted into the composer.

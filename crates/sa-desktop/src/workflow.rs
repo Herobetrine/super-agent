@@ -724,7 +724,7 @@ impl WorkflowState {
                                 );
                             });
                             if let Some(url) = row["url"].as_str() {
-                                ui.hyperlink(url);
+                                crate::ops::browser_link(ui, url, url);
                             }
                             if let Some(summary) = row["latest"].get("summary") {
                                 ui.label(

@@ -23,6 +23,7 @@ use crate::guides;
 use crate::job::{JobCtx, envelope};
 use crate::knowledge;
 use crate::pause::{self, PauseStatus};
+use crate::power::{BusyGuard, Power};
 use crate::protocol::{self as p, END_SQL, digest, stringify};
 use crate::resilience::{Health, HealthTransition, Recovery, ResilienceConfig, TurnLedger, TurnResult, classify};
 use crate::runner::{NoRotation, ResilientRunner, RotationSource, TurnRunner};
@@ -197,6 +198,7 @@ struct Slot {
     cancel: CancellationToken,
     task: Option<JoinHandle<()>>,
     turn: Arc<Turn>,
+    _power: BusyGuard,
 }
 
 #[derive(Default)]
@@ -216,6 +218,7 @@ pub(crate) struct Inner {
     adapters: HashMap<String, Arc<dyn Adapter>>,
     opts: EngineOptions,
     sched: Mutex<Sched>,
+    power: Power,
     catalogs: Mutex<HashMap<CatalogKey, CatalogFuture>>,
     project_preparations: Mutex<HashMap<String, ProjectPreparation>>,
     started: AtomicBool,
@@ -238,10 +241,22 @@ pub(crate) struct Inner {
     pub(crate) operations: crate::operations::Hub,
 }
 
-struct IntegrationLease(Arc<Inner>, Vec<String>);
+struct IntegrationLease {
+    inner: Arc<Inner>,
+    keys: Vec<String>,
+    _power: BusyGuard,
+}
+
+impl IntegrationLease {
+    fn new(inner: Arc<Inner>, keys: Vec<String>) -> Self {
+        let power = inner.power.track();
+        Self { inner, keys, _power: power }
+    }
+}
+
 impl Drop for IntegrationLease {
     fn drop(&mut self) {
-        lock(&self.0.sched).maintenance.retain(|key| !self.1.contains(key));
+        lock(&self.inner.sched).maintenance.retain(|key| !self.keys.contains(key));
     }
 }
 
@@ -386,6 +401,7 @@ impl Engine {
                 cache_clocks: Mutex::default(),
                 opts,
                 sched: Mutex::new(Sched::default()),
+                power: Power::default(),
                 catalogs: Mutex::new(HashMap::new()),
                 project_preparations: Mutex::default(),
                 started: AtomicBool::new(false),
@@ -406,6 +422,10 @@ impl Engine {
 
     pub fn data_dir(&self) -> &Path {
         &self.inner.data_dir
+    }
+
+    pub(crate) fn track_work(&self) -> BusyGuard {
+        self.inner.power.track()
     }
 
     pub(crate) fn is_stopping(&self) -> bool {
@@ -468,7 +488,7 @@ impl Engine {
         }
         // Classify receipts of operations a previous process left open before
         // anything is requeued or admitted. Never re-runs an effect.
-        crate::operations::reconcile(&inner.db, &inner.operations)?;
+        crate::operations::reconcile(&inner.db, &inner.operations, &inner.power)?;
         inner.db.tx(crate::integration_queue::recover)?;
         ensure!(!inner.opts.tick.is_zero(), "调度间隔必须大于零");
         inner.db.tx(|q| q.recover())?;
@@ -496,6 +516,7 @@ impl Engine {
                     loop {
                         let pass = inner.clone();
                         let admitted = tokio::task::spawn_blocking(move || {
+                            pass.power.refresh();
                             let admitted = pass.step();
                             pass.keepalive_pass();
                             admitted
@@ -537,6 +558,8 @@ impl Engine {
 
     /// `close()` (E:40-54): abort running turns, wait for them, close the DB.
     pub async fn close(&self) {
+        self.inner.stopping.store(true, Ordering::SeqCst);
+        self.inner.power.close();
         self.quiesce().await;
         self.inner.db.close();
     }
@@ -668,6 +691,7 @@ impl Engine {
             let r=q.one("SELECT b.url,t.cwd FROM scm_bindings b JOIN jobs j ON j.id=b.job JOIN tickets t ON t.id=j.ticket WHERE b.job=?",&[&job])?.ok_or_else(||anyhow!("任务尚未绑定 PR"))?;
             Ok((str_of(&r,"url").to_string(),PathBuf::from(str_of(&r,"cwd"))))
         })?;
+        let _power = self.track_work();
         let observation=crate::scm::fetch(&url,&cwd).await?;
         self.inner.db.tx(|q|crate::scm::apply(q,job,&observation))
     }
@@ -802,7 +826,7 @@ impl Engine {
             sched.maintenance.extend(keys.clone());
             let owner = inner.clone();
             let task = tokio::task::spawn_blocking(move || {
-                let _lease = IntegrationLease(owner.clone(), keys);
+                let _lease = IntegrationLease::new(owner.clone(), keys);
                 let _ = send.send(owner.publish_confirmed(&item, &w));
             });
             sched.integration_tasks.push(task);
@@ -821,9 +845,7 @@ impl Engine {
                 sched.maintenance.extend(keys.clone());
                 (w,keys)
             };
-            struct Lease(Arc<Inner>, Vec<String>);
-            impl Drop for Lease { fn drop(&mut self) { lock(&self.0.sched).maintenance.retain(|k| !self.1.contains(k)); } }
-            let _lease = Lease(inner.clone(), keys);
+            let _lease = IntegrationLease::new(inner.clone(), keys);
             let hydration = inner.db.with(|q| crate::workspaces::hydrate::paths(q, &project_key(&workspace.source)))?;
             // Invalidate the previous receipt before a new attempt, including
             // spawn failures/timeouts and process crashes during validation.
@@ -900,6 +922,7 @@ impl Engine {
         if params.extensions.is_some() && inner.opts.extensions.is_none() {
             bail!("当前未配置项目扩展服务");
         }
+        let _power = self.track_work();
         let extensions = match &inner.opts.extensions {
             Some(x) => Some(x.prepare(params.extensions.clone(), &dir).await?),
             None => None,
@@ -1009,11 +1032,16 @@ impl Engine {
                 .map(|row| str_of(&row, "cwd").to_string())
                 .ok_or_else(|| anyhow::anyhow!("工单不存在"))
         })?;
+        let _power = self.track_work();
         let manifest = self.inner.snapshot(&cwd, files).await?;
         let validation = Value::Array(manifest.clone());
         let directory = self.inner.data_dir.join("objects");
-        let _ = tokio::task::spawn_blocking(move || crate::images::from_manifest(&validation, &directory))
-            .await??;
+        let image_power = self.track_work();
+        let _ = tokio::task::spawn_blocking(move || {
+            let _power = image_power;
+            crate::images::from_manifest(&validation, &directory)
+        })
+        .await??;
         self.follow_snapshot(ticket, body, resume, &manifest)
     }
 
@@ -1503,6 +1531,7 @@ impl Inner {
         let inner = self.clone();
         // `git init` and the initial commit run under operation receipts.
         let (repository, ids) = tokio::task::spawn_blocking(move || {
+            let _power = inner.power.track();
             let scope = inner.scope(owner);
             let result = crate::project_git::ensure_observed(&directory, &||
                 cancel.is_cancelled() || inner.stopping.load(Ordering::SeqCst), &scope);
@@ -1728,7 +1757,7 @@ impl Inner {
             sched.maintenance.extend(keys.clone());
             let owner = self.clone();
             let task = tokio::task::spawn_blocking(move || {
-                let _lease = IntegrationLease(owner.clone(), keys);
+                let _lease = IntegrationLease::new(owner.clone(), keys);
                 let _ = owner.publish_confirmed(&item, &w);
             });
             sched.integration_tasks.push(task);
@@ -1766,7 +1795,7 @@ impl Inner {
             sched.maintenance.extend(keys.clone());
             let owner = self.clone();
             let task = tokio::task::spawn_blocking(move || {
-                let _lease = IntegrationLease(owner.clone(), keys);
+                let _lease = IntegrationLease::new(owner.clone(), keys);
                 // Candidate preparation never changes the source branch. Its
                 // receipt lets a restart list candidates left behind.
                 use crate::operations::{self as ops, kind};
@@ -2095,6 +2124,7 @@ impl Inner {
             let t = turn.clone();
             // The task's cleanup waits for the scheduler lock held here, so
             // the slot is always registered before it can be removed.
+            let power = self.power.track();
             let task = tokio::spawn(async move {
                 if let Err(e) = inner.execute(&t).await {
                     inner.scheduler_failed("journal_error", format!("无法保存任务状态：{e}"));
@@ -2109,6 +2139,7 @@ impl Inner {
                     cancel: turn.cancel.clone(),
                     task: Some(task),
                     turn: turn.clone(),
+                    _power: power,
                 },
             );
         }
@@ -4037,6 +4068,7 @@ impl Inner {
         {
             return;
         }
+        let _power = self.power.track();
         let job = request.job;
         let who = Who { ticket: request.ticket, id: job, turn: request.turn };
         // The bus contributes tool definitions; the fork must list the same tools.
@@ -4251,6 +4283,7 @@ impl Engine {
         };
         let mut usage_lost = false;
         let started = std::time::Instant::now();
+        let _power = self.track_work();
         let outcome = {
             let run = adapter.run(request, Arc::new(AdviceHost), tx, cancel.clone());
             let timeout = tokio::time::sleep(limit);

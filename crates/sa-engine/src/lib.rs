@@ -30,6 +30,7 @@ pub mod job;
 pub mod knowledge;
 pub mod owner;
 pub mod pause;
+mod power;
 pub mod protocol;
 pub mod operations;
 pub mod project_git;
