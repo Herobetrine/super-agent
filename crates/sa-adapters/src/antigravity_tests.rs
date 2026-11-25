@@ -1,5 +1,5 @@
 use super::*;
-use crate::antigravity::{Antigravity, fixture_sys};
+use crate::antigravity::{Antigravity, SETTINGS_REL, executable, fixture_sys};
 use sa_engine::{
     adapter::{AdapterEvent, Route},
     images::ImageInput,
@@ -251,8 +251,13 @@ struct ProbeFixture {
 
 impl ProbeFixture {
     fn setup() -> Self {
+        Self::setup_with(|_| {})
+    }
+
+    fn setup_with(configure: impl FnOnce(&mut Sys)) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let mut sys = fixture_sys(dir.path());
+        configure(&mut sys);
         sys.set("FAKE_AGY_MODELS_FILE", "models.txt");
         sys.set("FAKE_AGY_EFFORT_FILE", "effort.json");
         sys.set("FAKE_AGY_LOG_ARGS", "1");
@@ -471,6 +476,79 @@ async fn effort_reply_without_command_data_is_not_cached() {
     // The error reply was not cached as a fixed effort, so the run probes the
     // effort again and needs no fresh catalog retry.
     fixture.assert_counts(1, 2, 1);
+}
+
+#[tokio::test]
+async fn incomplete_effort_capabilities_are_not_cached() {
+    for reply in [
+        r#"{"command":{"data":{}}}"#,
+        r#"{"command":{"data":{"adjustable":"false"}}}"#,
+        r#"{"command":{"data":{"adjustable":true}}}"#,
+        r#"{"command":{"data":{"adjustable":true,"available":[]}}}"#,
+        r#"{"command":{"data":{"adjustable":true,"available":[],"current":"low"}}}"#,
+        r#"{"command":{"data":{"adjustable":true,"available":["low",1],"current":"low"}}}"#,
+        r#"{"command":{"data":{"adjustable":true,"available":["low"],"current":1}}}"#,
+    ] {
+        let fixture = ProbeFixture::setup();
+        fixture.write("effort.json", reply);
+        let catalog = fixture
+            .adapter
+            .catalog_for_route(fixture.req.route.clone())
+            .unwrap()
+            .await
+            .unwrap();
+        let model = &catalog.value["providers"][0]["models"][2];
+        assert_eq!(model["id"], "model-b");
+        assert!(model.get("reasoningEfforts").is_none(), "{reply}");
+        assert!(model.get("defaultReasoningEffort").is_none(), "{reply}");
+        fixture.assert_counts(1, 1, 0);
+
+        fixture.write("effort.json", EFFORT);
+        fixture.run().await.unwrap();
+        fixture.assert_counts(1, 2, 1);
+    }
+}
+
+#[tokio::test]
+async fn native_settings_change_refreshes_probes_for_the_same_route() {
+    let mut fixture = ProbeFixture::setup();
+    fixture.req.route.model = "@native".into();
+    let settings = fixture.dir.path().join(SETTINGS_REL);
+    std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+    std::fs::write(&settings, r#"{"model":"model-a"}"#).unwrap();
+    fixture.run().await.unwrap();
+    fixture.assert_counts(1, 1, 1);
+
+    std::fs::write(settings, r#"{"model":"model-b"}"#).unwrap();
+    fixture.run().await.unwrap();
+    fixture.assert_counts(2, 2, 2);
+    fixture.run().await.unwrap();
+    fixture.assert_counts(2, 2, 3);
+}
+
+#[tokio::test]
+async fn in_place_executable_stamp_change_refreshes_probes_for_the_same_route() {
+    let fixture = ProbeFixture::setup_with(|sys| {
+        let shared = executable(sys).unwrap();
+        std::fs::copy(&shared, sys.home.join(shared.file_name().unwrap())).unwrap();
+        sys.set("PATH", sys.home.to_string_lossy().into_owned());
+    });
+    let exe = fixture.dir.path().join(if cfg!(windows) { "agy.exe" } else { "agy" });
+    fixture.run().await.unwrap();
+    fixture.assert_counts(1, 1, 1);
+
+    let before = std::fs::metadata(&exe).unwrap().modified().unwrap();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&exe)
+        .unwrap()
+        .set_modified(before - Duration::from_secs(60))
+        .unwrap();
+    assert_ne!(std::fs::metadata(exe).unwrap().modified().unwrap(), before);
+    fixture.run().await.unwrap();
+    fixture.assert_counts(2, 2, 2);
+    fixture.run().await.unwrap();
+    fixture.assert_counts(2, 2, 3);
 }
 
 #[tokio::test]
