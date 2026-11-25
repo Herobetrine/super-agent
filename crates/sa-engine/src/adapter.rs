@@ -168,6 +168,17 @@ pub struct Catalog {
 pub trait Adapter: Send + Sync {
     fn agent(&self) -> &'static str;
     fn catalog(&self) -> BoxFuture<'static, anyhow::Result<Catalog>>;
+    /// Subprocess-free description of locally configured defaults.
+    fn local_catalog(&self) -> Value {
+        Value::Null
+    }
+    fn catalog_revision(&self) -> String {
+        self.agent().to_owned()
+    }
+    /// Public CLI metadata, queried only during full refresh.
+    fn cli_info(&self) -> BoxFuture<'static, Value> {
+        Box::pin(async { serde_json::json!({"version":null,"compatibility":"unverified"}) })
+    }
     /// Refresh capabilities for an already selected execution route. Adapters
     /// may narrow discovery while preserving live source and model validation.
     /// `None` preserves the engine's shared full-catalog fallback. Complete

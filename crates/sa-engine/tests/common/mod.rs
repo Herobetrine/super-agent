@@ -143,6 +143,8 @@ impl Shared {
 }
 
 struct Fake {
+    local: Value,
+    original: CatalogFn,
     name: &'static str,
     shared: Arc<Shared>,
 }
@@ -150,6 +152,13 @@ struct Fake {
 impl Adapter for Fake {
     fn agent(&self) -> &'static str {
         self.name
+    }
+    fn local_catalog(&self) -> Value {
+        if Arc::ptr_eq(&self.original, &self.shared.catalog.lock().unwrap()) {
+            self.local.clone()
+        } else {
+            Value::Null
+        }
     }
     fn catalog(&self) -> BoxFuture<'static, anyhow::Result<Catalog>> {
         let f = self.shared.catalog.lock().unwrap().clone();
@@ -211,10 +220,17 @@ impl Adapter for Fake {
 }
 
 pub fn adapters(shared: &Arc<Shared>) -> Vec<Arc<dyn Adapter>> {
+    adapters_with_local(shared, &t1_catalog())
+}
+
+fn adapters_with_local(shared: &Arc<Shared>, local: &Value) -> Vec<Arc<dyn Adapter>> {
+    let original = shared.catalog.lock().unwrap().clone();
     AGENTS
         .iter()
         .map(|name| {
             Arc::new(Fake {
+                local: local.clone(),
+                original: original.clone(),
                 name,
                 shared: shared.clone(),
             }) as Arc<dyn Adapter>
@@ -232,6 +248,7 @@ pub fn quiet() -> EngineOptions {
 }
 
 pub struct Fx {
+    local: Value,
     pub engine: Engine,
     pub dir: TempDir,
     pub project: PathBuf,
@@ -254,12 +271,13 @@ impl Fx {
         std::fs::create_dir_all(&project).unwrap();
         let shared = Arc::new(Shared {
             script: Mutex::new(s),
-            catalog: Mutex::new(catalog_of(catalog)),
+            catalog: Mutex::new(catalog_of(catalog.clone())),
             calls: Mutex::new(vec![]),
             panics: Mutex::new(vec![]),
         });
-        let engine = Engine::open(&data, adapters(&shared), opts).unwrap();
+        let engine = Engine::open(&data, adapters_with_local(&shared, &catalog), opts).unwrap();
         Self {
+            local: catalog,
             engine,
             dir,
             project,
@@ -271,7 +289,7 @@ impl Fx {
     /// Close and reopen the same journal (a restart).
     pub async fn restart(&mut self, opts: EngineOptions) {
         self.engine.close().await;
-        self.engine = Engine::open(&self.data, adapters(&self.shared), opts).unwrap();
+        self.engine = Engine::open(&self.data, adapters_with_local(&self.shared, &self.local), opts).unwrap();
     }
 
     pub async fn create(&self, params: CreateParams) -> i64 {

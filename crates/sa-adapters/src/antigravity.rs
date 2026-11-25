@@ -323,6 +323,7 @@ async fn discover(
             "label": if id == "adc" { "Google Cloud ADC" } else { "Google · Antigravity 登录账号" },
             "available": !models.is_empty(),
             "catalog_complete": catalog_error.is_none() && !models.is_empty(),
+            "catalogError": catalog_error.is_some(),
             "detail": catalog_error.as_deref().unwrap_or("agy 原生在线模型目录"),
             "models": models,
         }));
@@ -419,6 +420,31 @@ async fn discover(
 impl Adapter for Antigravity {
     fn agent(&self) -> &'static str {
         "antigravity"
+    }
+
+    fn catalog_revision(&self) -> String {
+        crate::catalog_revision(&self.sys, self.agent())
+    }
+    fn cli_info(&self) -> BoxFuture<'static, Value> {
+        crate::compatibility::detect(self.agent(), self.sys.clone(), executable(&self.sys))
+    }
+
+    fn local_catalog(&self) -> Value {
+        let settings = native_settings(&self.sys);
+        if settings["modelProvider"] == "gemini" {
+            if let Some(row) = configured(&self.sys).first() {
+                return crate::compatibility::local(json!({"provider":row.id,"model":row.model,"mode":"cli"}),
+                    executable(&self.sys).is_some() && row.public["available"] == true);
+            }
+            return Value::Null;
+        }
+        let model = self.sys.var("SUPERAGENT_AGY_MODEL").or_else(|| settings["model"].as_str()).unwrap_or("@native");
+        // Display labels need live ID resolution before binding a model.
+        if model != "@native" && !MODEL_ID.is_match(model) {
+            return Value::Null;
+        }
+        let provider = if adc(&self.sys) { "adc" } else { "google" };
+        crate::compatibility::local(json!({"provider":provider,"model":model,"mode":"cli"}), executable(&self.sys).is_some())
     }
 
     fn catalog(&self) -> BoxFuture<'static, anyhow::Result<Catalog>> {

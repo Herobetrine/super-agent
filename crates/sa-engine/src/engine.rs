@@ -30,7 +30,8 @@ use crate::runner::{NoRotation, ResilientRunner, RotationSource, TurnRunner};
 use crate::services::{Extensions, FsSnapshotter, Snapshotter, realpath};
 use anyhow::{Result, anyhow, bail, ensure};
 use futures::FutureExt;
-use futures::future::{BoxFuture, Shared, join_all};
+use futures::future::{BoxFuture, Shared};
+use sa_store::catalog_cache::{self, Entry};
 use regex::Regex;
 use serde_json::{Map, Value, json};
 use serde::Serialize;
@@ -189,7 +190,7 @@ type CatalogFuture = Shared<BoxFuture<'static, Result<Value, String>>>;
 
 #[derive(Clone, PartialEq, Eq, Hash)]
 enum CatalogKey {
-    Full(String),
+    Full(String, String),
     Selected(String, Route),
 }
 
@@ -219,6 +220,8 @@ pub(crate) struct Inner {
     sched: Mutex<Sched>,
     power: Power,
     catalogs: Mutex<HashMap<CatalogKey, CatalogFuture>>,
+    catalog_cache: Mutex<HashMap<String, Entry>>,
+    catalog_shutdown: CancellationToken,
     project_preparations: Mutex<HashMap<String, ProjectPreparation>>,
     started: AtomicBool,
     stopping: AtomicBool,
@@ -386,6 +389,7 @@ impl Engine {
     pub fn open(dir: impl AsRef<Path>, adapters: Vec<Arc<dyn Adapter>>, opts: EngineOptions) -> Result<Self> {
         let data_dir = std::path::absolute(dir.as_ref())?;
         let db = Db::open(&data_dir)?;
+        let catalog_cache = db.with(|q| catalog_cache::load(q.conn()))?;
         let adapters = adapters.into_iter().map(|a| (a.agent().to_string(), a)).collect();
         let limits = opts.runner.stall_limits();
         let operations = crate::operations::Hub::new(opts.failpoints.clone());
@@ -402,6 +406,8 @@ impl Engine {
                 sched: Mutex::new(Sched::default()),
                 power: Power::default(),
                 catalogs: Mutex::new(HashMap::new()),
+                catalog_cache: Mutex::new(catalog_cache),
+                catalog_shutdown: CancellationToken::new(),
                 project_preparations: Mutex::default(),
                 started: AtomicBool::new(false),
                 stopping: AtomicBool::new(false),
@@ -413,6 +419,16 @@ impl Engine {
                 scheduler_origin: Instant::now(),
             }),
         })
+    }
+
+    /// Normal desktop requests show the snapshot and update it in the background.
+    /// Forced requests await the shared live refresh, including its errors.
+    pub async fn request_catalog(&self, agent: &str, force: bool) -> Result<Value, String> {
+        let (cached, refresh) = self.inner.catalog_snapshot(agent, true);
+        if !force && let Some(value) = cached {
+            return Ok(value);
+        }
+        refresh.expect("forced snapshot always starts a refresh").await
     }
 
     pub fn db(&self) -> &Db {
@@ -568,6 +584,7 @@ impl Engine {
     pub async fn quiesce(&self) {
         let inner = &self.inner;
         inner.stopping.store(true, Ordering::SeqCst);
+        inner.catalog_shutdown.cancel();
         inner.scheduler_state.store(SCHEDULER_STOPPED, Ordering::SeqCst);
         let tasks: Vec<JoinHandle<()>> = {
             let mut s = lock(&inner.sched);
@@ -2159,6 +2176,7 @@ impl Inner {
                 continue;
             }
             let Ok(route) = p::route(Some(value)) else { continue };
+            if self.cached_route(agent, value).is_some() { continue; }
             let Ok(cat) = self.catalog_request(agent, Some(route.clone())).await else { continue };
             match p::options(Some(&cat), Some(value)) {
                 Ok(Some(_)) => {}
@@ -2172,30 +2190,117 @@ impl Inner {
         Ok(())
     }
 
-    /// `catalogRequest(name)` (E:207-215): one in-flight probe per harness.
+    /// Hold the flights lock across freshness check and registration. The
+    /// finisher publishes the new entry before removing its flight.
+    fn catalog_snapshot(self: &Arc<Self>, name: &str, force: bool) -> (Option<Value>, Option<CatalogFuture>) {
+        let Some(adapter) = self.adapters.get(name).cloned() else {
+            return (None, Some(futures::future::ready(Err("执行端不可用".into())).boxed().shared()));
+        };
+        let revision = adapter.catalog_revision();
+        let mut flights = lock(&self.catalogs);
+        let cache = lock(&self.catalog_cache);
+        let entry = cache.get(name);
+        let same_revision = entry.filter(|e|
+            e.fingerprint == stringify(&json!([revision, e.value["cli"]["version"]])));
+        let stale = same_revision.is_none_or(|e| now() - e.fetched_at >= 20.0 * 60.0);
+        let value = entry.map(|e| e.value.clone());
+        let previous_version = same_revision.filter(|e| e.value["cli"]["version"].is_string())
+            .map(|e| e.value["cli"].clone());
+        drop(cache);
+        if !force && !stale {
+            return (value, None);
+        }
+        let key = CatalogKey::Full(name.into(), revision.clone());
+        if let Some(flight) = flights.get(&key) {
+            return (value, Some(flight.clone()));
+        }
+        // A provider edit can race a refresh from the old configuration.
+        // Serialize discovery, then recheck freshness for the new revision.
+        if let Some(previous) = flights.iter().find_map(|(key, flight)| {
+            matches!(key, CatalogKey::Full(agent, _) if agent == name).then(|| flight.clone())
+        }) {
+            let inner = Arc::clone(self);
+            let name = name.to_owned();
+            let next = async move {
+                let _ = previous.await;
+                let (cached, refresh) = inner.catalog_snapshot(&name, false);
+                match refresh {
+                    Some(future) => future.await,
+                    None => cached.ok_or_else(|| "执行端不可用".into()),
+                }
+            }.boxed().shared();
+            tokio::spawn(next.clone());
+            return (value, Some(next));
+        }
+        let inner = Arc::downgrade(self);
+        let name = name.to_owned();
+        let flight_key = key.clone();
+        let shutdown = self.catalog_shutdown.clone();
+        let future = async move {
+            let result = async {
+                let (catalog, info) = tokio::select! {
+                    biased;
+                    _ = shutdown.cancelled() => return Err("调度台已关闭".to_string()),
+                    pair = async { tokio::join!(adapter.catalog(), adapter.cli_info()) } => pair,
+                };
+                let mut catalog = catalog.map_err(|e| e.to_string())?.value;
+                if !catalog.is_object() {
+                    return Err("执行端模型目录无效".to_string());
+                }
+                catalog["cli"] = if info["version"].is_null() {
+                    previous_version.unwrap_or(info)
+                } else {
+                    info
+                };
+                Ok(catalog)
+            }.await;
+            if let Some(inner) = inner.upgrade() {
+                let keep_previous = result.as_ref().is_ok_and(|value| {
+                    lock(&inner.catalog_cache).get(&name).is_some_and(|e| e.loses_good_source(value))
+                });
+                if let Ok(value) = &result && !keep_previous {
+                    let entry = Entry { fingerprint: stringify(&json!([revision, value["cli"]["version"]])),
+                        fetched_at: now(), value: value.clone() };
+                    if let Err(error) = inner.db.with(|q| catalog_cache::save(q.conn(), &name, &entry)) {
+                        lock(&inner.catalogs).remove(&key);
+                        return Err(error.to_string());
+                    }
+                    lock(&inner.catalog_cache).insert(name, entry);
+                }
+                lock(&inner.catalogs).remove(&key);
+            }
+            result
+        }.boxed().shared();
+        flights.insert(flight_key, future.clone());
+        tokio::spawn(future.clone());
+        (value, Some(future))
+    }
+
+    fn cached_route(&self, name: &str, route: &Value) -> Option<Value> {
+        lock(&self.catalog_cache).get(name)
+            .filter(|e| matches!(p::options(Some(&e.value), Some(route)), Ok(Some(_))))
+            .map(|e| e.value.clone())
+    }
+
+    /// One in-flight probe per harness and scope.
     fn catalog(self: &Arc<Self>, name: &str) -> CatalogFuture {
-        self.catalog_request(name, None)
+        self.catalog_snapshot(name, true).1.expect("forced snapshot starts a refresh")
     }
 
     fn catalog_request(self: &Arc<Self>, name: &str, route: Option<Route>) -> CatalogFuture {
-        let key = match &route {
-            Some(route) => CatalogKey::Selected(name.into(), route.clone()),
-            None => CatalogKey::Full(name.into()),
-        };
+        let Some(route) = route else { return self.catalog(name) };
+        let key = CatalogKey::Selected(name.into(), route.clone());
         let mut map = lock(&self.catalogs);
         if let Some(f) = map.get(&key) {
             return f.clone();
         }
         let probe = match self.adapters.get(name) {
-            Some(adapter) => match route {
-                Some(route) => match adapter.catalog_for_route(route) {
-                    Some(probe) => Some(probe),
-                    None => {
-                        drop(map);
-                        return self.catalog(name);
-                    }
-                },
-                None => Some(adapter.catalog()),
+            Some(adapter) => match adapter.catalog_for_route(route) {
+                Some(probe) => Some(probe),
+                None => {
+                    drop(map);
+                    return self.catalog(name);
+                }
             },
             None => None,
         };
@@ -2779,37 +2884,38 @@ impl Inner {
                 cat.get("default").cloned()
             }
         };
-        let mut memo: HashMap<String, Result<Value, String>> = HashMap::new();
         let full_menus = job.is_root() || job.primary();
+        let mut own = None;
+        let mut own_refresh = None;
+        let mut own_is_local = false;
         if full_menus {
-            let probes = AGENTS.iter().map(|name| {
-                let f = self.catalog(name);
-                async move { (*name, f.await) }
-            });
             let mut menus = Map::new();
-            for (name, r) in join_all(probes).await {
-                match &r {
-                    Ok(cat) => match p::options(Some(cat), pick(name, Some(cat)).as_ref()) {
-                        Ok(Some(menu)) => {
-                            menus.insert(name.into(), menu);
-                        }
-                        Ok(None) => {
-                            // Name the missing route so the lead can report why it cannot delegate.
-                            let mut entry = json!({"available": false, "reason": "unavailable"});
-                            if let Some(route) = pick(name, Some(cat)).and_then(|v| p::route(Some(&v)).ok()) {
-                                entry["reason"] = json!("route_not_in_catalog");
-                                entry["route"] = json!({"provider": route.provider, "model": route.model, "mode": route.mode});
-                            }
-                            menus.insert(name.into(), entry);
-                        }
-                        // An unavailable local provider cannot grant delegation rights.
-                        Err(_) => {}
-                    },
-                    Err(_) => {
-                        menus.insert(name.into(), json!({"available": false, "reason": "probe_failed"}));
-                    }
+            for name in AGENTS {
+                let (cached, refresh) = self.catalog_snapshot(name, false);
+                let provisional = cached.is_none();
+                let catalog = cached.unwrap_or_else(|| self.adapters.get(name)
+                    .map(|a| a.local_catalog()).unwrap_or_default());
+                if name == job.agent {
+                    own = Some(catalog.clone());
+                    own_refresh = refresh;
+                    own_is_local = provisional;
                 }
-                memo.insert(name.to_string(), r);
+                let picked = pick(name, Some(&catalog));
+                let mut menu = match p::options(Some(&catalog), picked.as_ref()) {
+                    Ok(Some(menu)) => menu,
+                    Ok(None) => {
+                        let mut entry = json!({"available":false,"reason":"unavailable"});
+                        if !provisional && let Some(route) = picked.and_then(|v| p::route(Some(&v)).ok()) {
+                            entry["reason"] = json!("route_not_in_catalog");
+                            entry["route"] = json!({"provider":route.provider,"model":route.model,"mode":route.mode});
+                        }
+                        entry
+                    }
+                    Err(_) if provisional => json!({"available":false,"reason":"unavailable"}),
+                    Err(_) => continue,
+                };
+                if provisional { menu["partial"] = json!(true); }
+                menus.insert(name.into(), menu);
             }
             *turn.menus() = menus;
         }
@@ -2822,34 +2928,45 @@ impl Inner {
         };
         let bound = parse(job.bound_route.as_deref());
         let fresh = !p::truthy_value(&bound);
-        // A collaborator with a complete fixed route needs live validation of
-        // that route. Defaults still require full discovery to resolve them.
-        let fixed_route = if full_menus {
-            None
-        } else if !fresh {
-            Some(bound.clone())
+        let fixed = if !fresh {
+            Some(bound)
         } else if p::truthy_value(&selected_execution) {
-            Some(selected_execution.clone())
+            Some(selected_execution)
         } else {
             pick(&job.agent, None)
         };
-        let selected_probe = fixed_route.as_ref().and_then(|value| p::route(Some(value)).ok());
-        let cat = match (memo.remove(&job.agent), selected_probe) {
-            (Some(r), _) => r,
-            (None, Some(route)) => self.catalog_request(&job.agent, Some(route)).await,
-            (None, None) => self.catalog(&job.agent).await,
-        }
-        .map_err(|e| route_error(crate::resilience::CODE_ROUTE_PROBE_FAILED, e))?;
-        let picked = if fresh {
-            if p::truthy_value(&selected_execution) {
-                Some(selected_execution)
-            } else {
-                pick(&job.agent, Some(&cat))
-            }
+        let probe_error = |message| route_error(crate::resilience::CODE_ROUTE_PROBE_FAILED, message);
+        let from_default_snapshot = own.is_some() && fixed.is_none() && !own_is_local;
+        let (mut cat, picked) = if let Some(value) = fixed {
+            let route = p::route(Some(&value)).map_err(|e| TurnError::Engine(anyhow!(e)))?;
+            let cat = match self.cached_route(&job.agent, &value) {
+                Some(cat) => cat,
+                None if own_is_local && own.as_ref().is_some_and(|cat|
+                    matches!(p::options(Some(cat), Some(&value)), Ok(Some(_)))) =>
+                    own.expect("local catalog matched"),
+                None => self.catalog_request(&job.agent, Some(route)).await.map_err(probe_error)?,
+            };
+            (cat, Some(value))
         } else {
-            Some(bound)
+            let mut cat = match own {
+                Some(cat) => cat,
+                None => self.catalog(&job.agent).await.map_err(probe_error)?,
+            };
+            let mut picked = pick(&job.agent, Some(&cat));
+            if own_is_local && p::route(picked.as_ref()).is_err()
+                && let Some(future) = own_refresh
+            {
+                cat = future.await.map_err(probe_error)?;
+                picked = pick(&job.agent, Some(&cat));
+            }
+            (cat, picked)
         };
         let selected = p::route(picked.as_ref()).map_err(|e| TurnError::Engine(anyhow!(e)))?;
+        if from_default_snapshot
+            && !matches!(p::options(Some(&cat), picked.as_ref()), Ok(Some(_)))
+        {
+            cat = self.catalog_request(&job.agent, Some(selected.clone())).await.map_err(probe_error)?;
+        }
         // Existing native conversations stay on their bound route. A missing
         // model requires an explicit choice; never substitute an upstream.
         // A route the ticket configured (or this job already bound) was valid
@@ -4454,11 +4571,11 @@ mod catalog_tests {
             let mut other = route.clone();
             other.reasoning_effort = Some("high".into());
             let third = engine.inner.catalog_request("antigravity", Some(other));
+            let (first, second, third) = tokio::join!(first, second, third);
             assert_eq!(
                 adapter.calls.load(Ordering::SeqCst),
                 if selected { 2 } else { 1 }
             );
-            let (first, second, third) = tokio::join!(first, second, third);
             assert_eq!(first.as_ref().unwrap(), second.as_ref().unwrap());
             if selected {
                 assert_ne!(first.unwrap(), third.unwrap());

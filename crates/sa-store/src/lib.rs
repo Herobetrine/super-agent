@@ -1,6 +1,7 @@
 //! Super Agent ticket journal (SQLite) access.
 
 mod activity;
+pub mod catalog_cache;
 mod feed;
 pub mod efficiency;
 pub mod delivery;

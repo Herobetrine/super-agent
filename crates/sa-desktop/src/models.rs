@@ -510,10 +510,10 @@ impl App {
             advisor_pick: advisor.map(|(_, r)| r).unwrap_or_else(|| json!({})),
             advisor_dirty: false,
         });
-        self.load_catalog(&agent);
+        self.load_catalog(&agent, false);
     }
 
-    fn load_catalog(&mut self, agent: &str) {
+    fn load_catalog(&mut self, agent: &str, force: bool) {
         let (Some(host), Some(d)) = (&self.host, self.models.as_mut()) else {
             return;
         };
@@ -521,7 +521,7 @@ impl App {
             return;
         }
         d.catalogs.insert(agent.to_string(), Probe::Loading);
-        let request_id = host.request_catalog(agent);
+        let request_id = host.request_catalog_with(agent, force);
         d.pending_requests.insert(agent.to_string(), request_id);
     }
 
@@ -532,7 +532,7 @@ impl App {
         dialog.catalogs.clear();
         dialog.pending_requests.clear();
         let agent = dialog.agent.clone();
-        self.load_catalog(&agent);
+        self.load_catalog(&agent, true);
     }
 
     /// Short summary of the explicit routes, for button tooltips.
@@ -898,7 +898,7 @@ impl App {
                 self.models.as_ref().and_then(|d| d.catalogs.get(&a)),
                 Some(Probe::Ready(_))
             ) {
-                self.load_catalog(&a);
+                self.load_catalog(&a, false);
             }
         }
         if let Some(a) = switch_catalog
@@ -907,7 +907,7 @@ impl App {
                 Some(Probe::Ready(_))
             )
         {
-            self.load_catalog(&a);
+            self.load_catalog(&a, false);
         }
         if refresh {
             let a = self
@@ -919,7 +919,7 @@ impl App {
                 d.catalogs.remove(&a);
                 d.pending_requests.remove(&a);
             }
-            self.load_catalog(&a);
+            self.load_catalog(&a, true);
         }
         if save {
             self.save_models();

@@ -153,6 +153,38 @@ fn visible(data: &Value) -> Vec<Value> {
         .collect()
 }
 
+fn file_models(path: &Path) -> Result<Vec<Value>> {
+    if std::fs::metadata(path)?.len() > 32 * 1024 * 1024 {
+        bail!("too large");
+    }
+    Ok(visible(&read_json(path, json!({}))?))
+}
+
+pub(crate) fn local_catalog(sys: &Sys) -> Result<Value> {
+    let Settings {config, dir, ..} = settings(sys)?;
+    let provider = match config.get("model_provider") {
+        None => "openai",
+        Some(value) => value.as_str().filter(|id| PROVIDER_ID.is_match(id))
+            .ok_or_else(|| anyhow!("当前 Codex 配置含有无效的供应商 ID"))?,
+    };
+    if !config["model"].is_null() && !id_ok(&config["model"]) {
+        bail!("当前 Codex 配置含有无效的模型 ID");
+    }
+    let mut models = config["model_catalog_json"].as_str()
+        .and_then(|p| file_models(&resolve(&dir, p)).ok()).unwrap_or_default();
+    let configured = config["model"].as_str();
+    let default = configured.or_else(|| models.first()?.get("id")?.as_str());
+    let route = json!({"mode":"cli","provider":provider,"model":default});
+    let mut local = crate::compatibility::local(route, executable(sys).is_some());
+    if !models.is_empty() {
+        if let Some(id) = configured && !models.iter().any(|r| r["id"] == id) {
+            models.push(json!({"id":id}));
+        }
+        local["providers"][0]["models"] = Value::Array(models);
+    }
+    Ok(local)
+}
+
 /// `customModels(cfg)` (CXC:71-86).
 async fn custom_models(sys: &Sys, cfg: &Value, cancel: &CancellationToken) -> Result<Vec<Value>> {
     let origin = endpoint(cfg["base_url"].as_str().unwrap_or_default())?;
@@ -278,10 +310,7 @@ pub async fn discover(sys: &Sys, cancel: &CancellationToken) -> Result<Discovery
             let mut detail = "没有该来源的模型目录".to_string();
             let attempt: Result<()> = async {
                 if let (Some(fc), true) = (file_catalog, name == def) {
-                    if std::fs::metadata(fc)?.len() > 32 * 1024 * 1024 {
-                        bail!("too large");
-                    }
-                    models = visible(&read_json(fc, json!({}))?);
+                    models = file_models(fc)?;
                     detail = "本机 model_catalog_json".into();
                 } else if let Some(c) = cfg.as_ref().filter(|c| c["base_url"].as_str().is_some()) {
                     models = custom_models(sys, c, cancel).await?;
@@ -304,7 +333,8 @@ pub async fn discover(sys: &Sys, cancel: &CancellationToken) -> Result<Discovery
                 Ok(())
             }
             .await;
-            let complete = attempt.is_ok() && !models.is_empty();
+            let failed = attempt.is_err();
+            let complete = !failed && !models.is_empty();
             if let Err(error) = attempt {
                 detail = format!("在线模型目录获取失败：{error}；以下仅为已保存型号");
             }
@@ -330,7 +360,7 @@ pub async fn discover(sys: &Sys, cancel: &CancellationToken) -> Result<Discovery
                 .unwrap_or(name)
                 .to_string();
             let available = !by_id.is_empty();
-            json!({"id": name, "label": label, "models": by_id, "detail": detail, "available": available, "catalog_complete":complete})
+            json!({"id": name, "label": label, "models": by_id, "detail": detail, "available": available, "catalog_complete":complete, "catalogError":failed})
         }
     });
     let providers: Vec<Value> = join_all(probes).await;

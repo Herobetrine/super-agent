@@ -203,6 +203,17 @@ impl Adapter for Codex {
         "codex"
     }
 
+    fn catalog_revision(&self) -> String {
+        crate::catalog_revision_with(&self.sys, self.agent(), &self.registry)
+    }
+    fn cli_info(&self) -> BoxFuture<'static, Value> {
+        crate::compatibility::detect(self.agent(), self.sys.clone(), crate::codex_config::executable(&self.sys))
+    }
+
+    fn local_catalog(&self) -> Value {
+        crate::codex_config::local_catalog(&self.sys).unwrap_or_default()
+    }
+
     fn catalog(&self) -> BoxFuture<'static, anyhow::Result<Catalog>> {
         let sys = self.sys.clone();
         let customs = custom::snapshot(&self.registry, "codex");

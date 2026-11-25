@@ -147,6 +147,18 @@ impl Adapter for Acp {
     fn agent(&self) -> &'static str {
         "acp"
     }
+    fn catalog_revision(&self) -> String {
+        let mut paths = vec![config_path(&self.sys)];
+        if let Ok(cfg) = load(&self.sys) {
+            paths.extend(cfg.servers.iter().filter_map(|s| executable(&self.sys, s)));
+        }
+        crate::revision::fingerprint(&paths)
+    }
+
+    fn local_catalog(&self) -> Value {
+        load(&self.sys).map(|cfg| catalog(&self.sys, &cfg)).unwrap_or_default()
+    }
+
     fn catalog(&self) -> BoxFuture<'static, anyhow::Result<Catalog>> {
         let sys = self.sys.clone();
         Box::pin(async move {

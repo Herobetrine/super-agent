@@ -242,6 +242,10 @@ async fn engine_replay_reduces_bytes_and_survives_restart_with_verified_full_arc
     let extensions = Arc::new(TestExtensions(Mutex::new(json!({"skills":["retained skill\n".repeat(30_000)],"mcp":[]}))));
     let options = || sa_engine::EngineOptions { extensions:Some(extensions.clone()), ..quiet() };
     let mut fx = Fx::with(script(|_| async { Ok("successful reply".into()) }), t1_catalog(), options());
+    // This replay checks omission of unchanged menus across restart.
+    for agent in sa_engine::adapter::AGENTS {
+        fx.engine.request_catalog(agent, true).await.unwrap();
+    }
     for id in 1..=3 {
         fx.engine.add_knowledge(fx.project.to_str().unwrap(), "memory", &format!("stable {id} {}", "x".repeat(700)), None).unwrap();
     }
