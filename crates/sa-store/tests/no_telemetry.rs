@@ -1,8 +1,9 @@
 use proc_macro2::{Delimiter, TokenStream, TokenTree};
 use regex::Regex;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use syn::parse::{Parse, ParseStream, Parser};
 use toml_edit::{Document, Item, TableLike};
 use url::Url;
 
@@ -222,12 +223,7 @@ fn workspace_member_manifests(root: &Path, workspace: &dyn TableLike) -> Vec<Pat
     manifests
 }
 
-fn check_manifest_file(
-    doc: &Document<&str>,
-    text: &str,
-    path: &Path,
-    findings: &mut Vec<String>,
-) {
+fn check_manifest_file(doc: &Document<&str>, text: &str, path: &Path, findings: &mut Vec<String>) {
     check_manifest(doc.as_table(), text, path, findings);
     let name = doc
         .get("package")
@@ -238,7 +234,7 @@ fn check_manifest_file(
     }
 }
 
-fn check_manifests(root: &Path, findings: &mut Vec<String>) {
+fn check_manifests(root: &Path, findings: &mut Vec<String>) -> Vec<PathBuf> {
     let lock = root.join("Cargo.lock");
     let text = read(&lock);
     let doc = Document::parse(text.as_str()).expect("parse Cargo.lock");
@@ -257,7 +253,6 @@ fn check_manifests(root: &Path, findings: &mut Vec<String>) {
         );
     }
 
-    let root = root.canonicalize().unwrap();
     let text = read(&root.join("Cargo.toml"));
     let doc = Document::parse(text.as_str()).expect("parse root Cargo.toml");
     check_manifest_file(&doc, &text, Path::new("Cargo.toml"), findings);
@@ -265,13 +260,22 @@ fn check_manifests(root: &Path, findings: &mut Vec<String>) {
         .get("workspace")
         .and_then(Item::as_table_like)
         .expect("root workspace table");
-    for path in workspace_member_manifests(&root, workspace) {
-        let display_path = path.strip_prefix(&root).unwrap_or(&path);
-        let text = read(&path);
+    let members = workspace_member_manifests(root, workspace);
+    for path in &members {
+        let display_path = path.strip_prefix(root).unwrap_or(path);
+        let text = read(path);
         let doc = Document::parse(text.as_str())
             .unwrap_or_else(|err| panic!("{}: {err}", display_path.display()));
         check_manifest_file(&doc, &text, display_path, findings);
     }
+    let mut source_members: Vec<_> = members
+        .iter()
+        .map(|path| path.parent().unwrap().to_path_buf())
+        .collect();
+    if doc.get("package").is_some() {
+        source_members.push(root.to_path_buf());
+    }
+    source_members
 }
 
 fn read(path: &Path) -> String {
@@ -415,29 +419,6 @@ fn path_attribute(attribute: &proc_macro2::Group) -> Option<PathBuf> {
     }
 }
 
-#[derive(Default)]
-struct ModuleFiles {
-    test_only: HashSet<PathBuf>,
-    possibly_production: HashSet<PathBuf>,
-}
-
-impl ModuleFiles {
-    fn record(&mut self, path: &Path, test_only: bool) {
-        if let Ok(path) = path.canonicalize() {
-            if test_only {
-                self.test_only.insert(path);
-            } else {
-                self.possibly_production.insert(path);
-            }
-        }
-    }
-
-    fn is_test_only(&self, path: &Path) -> bool {
-        let path = path.canonicalize().unwrap();
-        self.test_only.contains(&path) && !self.possibly_production.contains(&path)
-    }
-}
-
 struct Module<'a> {
     attributes: &'a [TokenTree],
     name: &'a proc_macro2::Ident,
@@ -445,6 +426,27 @@ struct Module<'a> {
     after: &'a [TokenTree],
     test_only: bool,
     explicit_path: Option<PathBuf>,
+}
+
+struct ModuleLink {
+    inline_dir: Option<PathBuf>,
+    name: String,
+    explicit_path: Option<PathBuf>,
+    test_only: bool,
+}
+
+#[derive(Default)]
+struct SourceScan {
+    urls: Vec<(usize, String)>,
+    modules: Vec<ModuleLink>,
+}
+
+fn is_test_attribute(attribute: &proc_macro2::Group) -> bool {
+    cfg_test(attribute)
+        || matches!(
+            attribute.stream().into_iter().collect::<Vec<_>>().as_slice(),
+            [name] if ident(name, "test")
+        )
 }
 
 // Keep attributes, visibility and the module item together so a cfg applies
@@ -495,78 +497,145 @@ fn module_declaration(tokens: &[TokenTree]) -> Option<Module<'_>> {
     })
 }
 
-fn module_dir(path: &Path) -> PathBuf {
-    let parent = path.parent().unwrap();
-    match path.file_name().and_then(|name| name.to_str()) {
-        Some("lib.rs" | "main.rs" | "mod.rs") => parent.to_path_buf(),
-        _ => parent.join(path.file_stem().unwrap()),
+fn test_item_len(tokens: &[TokenTree]) -> Option<usize> {
+    let mut rest = tokens;
+    let mut test_only = false;
+    while let [
+        TokenTree::Punct(hash),
+        TokenTree::Group(attribute),
+        tail @ ..,
+    ] = rest
+    {
+        if hash.as_char() != '#' || attribute.delimiter() != Delimiter::Bracket {
+            break;
+        }
+        test_only |= is_test_attribute(attribute);
+        rest = tail;
+    }
+    if !test_only {
+        return None;
+    }
+    fn consumed<T: Parse>(tokens: &[TokenTree]) -> Option<usize> {
+        let parse_one = |input: ParseStream<'_>| {
+            input.parse::<T>()?;
+            input.parse::<TokenStream>()
+        };
+        let remaining = parse_one.parse2(tokens.iter().cloned().collect()).ok()?;
+        let consumed = tokens.len() - remaining.into_iter().count();
+        (consumed > 0).then_some(consumed)
+    }
+    let item = consumed::<syn::Item>(rest)
+        .or_else(|| consumed::<syn::ImplItem>(rest))
+        .or_else(|| consumed::<syn::TraitItem>(rest))
+        .or_else(|| consumed::<syn::ForeignItem>(rest))?;
+    Some(tokens.len() - rest.len() + item)
+}
+
+fn concat_call(tokens: &[TokenTree]) -> Option<(&proc_macro2::Group, &[TokenTree])> {
+    match tokens {
+        [
+            name,
+            TokenTree::Punct(bang),
+            TokenTree::Group(args),
+            tail @ ..,
+        ] if ident(name, "concat") && bang.as_char() == '!' => Some((args, tail)),
+        _ => None,
     }
 }
 
-fn url_literals(
-    stream: TokenStream,
-    path_base: &Path,
-    module_dir: &Path,
-    module_files: &mut ModuleFiles,
+fn concat_literal(args: &proc_macro2::Group) -> Option<String> {
+    let tokens: Vec<_> = args.stream().into_iter().collect();
+    let comma =
+        |token: &TokenTree| matches!(token, TokenTree::Punct(mark) if mark.as_char() == ',');
+    let args = match tokens.as_slice() {
+        [args @ .., last] if comma(last) => args,
+        args => args,
+    };
+    let mut result = String::new();
+    if args.is_empty() {
+        return Some(result);
+    }
+    for arg in args.split(comma) {
+        if let Some((nested, [])) = concat_call(arg) {
+            result.push_str(&concat_literal(nested)?);
+        } else {
+            let literal = syn::parse2(arg.iter().cloned().collect()).ok()?;
+            let value = match literal {
+                syn::Lit::Str(value) => value.value(),
+                syn::Lit::Char(value) => value.value().to_string(),
+                syn::Lit::Bool(value) => value.value.to_string(),
+                syn::Lit::Int(value) => value.base10_digits().to_owned(),
+                syn::Lit::Float(value) => {
+                    value.to_string().strip_suffix(value.suffix())?.to_owned()
+                }
+                _ => return None,
+            };
+            result.push_str(&value);
+        }
+    }
+    Some(result)
+}
+
+fn scan_tokens(
+    tokens: &[TokenTree],
+    inline_dir: Option<&Path>,
     test_only: bool,
+    modules: &mut Vec<ModuleLink>,
     visit: &mut impl FnMut(usize, &str),
 ) {
-    let tokens: Vec<_> = stream.into_iter().collect();
-    let mut rest = tokens.as_slice();
+    let mut rest = tokens;
     while let [first, tail @ ..] = rest {
         if let Some(module) = module_declaration(rest) {
             let name = module.name.to_string();
             let name = name.strip_prefix("r#").unwrap_or(&name);
             let test_only = test_only || module.test_only;
-            if !test_only && !module.attributes.is_empty() {
-                url_literals(
-                    module.attributes.iter().cloned().collect(),
-                    path_base,
-                    module_dir,
-                    module_files,
-                    false,
-                    visit,
-                );
+            if !test_only {
+                scan_tokens(module.attributes, inline_dir, false, modules, visit);
             }
             match module.end {
                 TokenTree::Group(body) if body.delimiter() == Delimiter::Brace => {
-                    let nested = module
-                        .explicit_path
-                        .map_or_else(|| module_dir.join(name), |path| module_dir.join(path));
-                    url_literals(
-                        body.stream(),
-                        &nested,
-                        &nested,
-                        module_files,
-                        test_only,
-                        visit,
+                    let nested = inline_dir.unwrap_or_else(|| Path::new("")).join(
+                        module
+                            .explicit_path
+                            .as_deref()
+                            .unwrap_or_else(|| Path::new(name)),
                     );
+                    let body: Vec<_> = body.stream().into_iter().collect();
+                    scan_tokens(&body, Some(&nested), test_only, modules, visit);
                     rest = module.after;
                     continue;
                 }
                 TokenTree::Punct(end) if end.as_char() == ';' => {
-                    if let Some(path) = module.explicit_path {
-                        module_files.record(&path_base.join(path), test_only);
-                    } else {
-                        module_files.record(&module_dir.join(format!("{name}.rs")), test_only);
-                        module_files.record(&module_dir.join(name).join("mod.rs"), test_only);
-                    }
+                    modules.push(ModuleLink {
+                        inline_dir: inline_dir.map(Path::to_path_buf),
+                        name: name.to_owned(),
+                        explicit_path: module.explicit_path,
+                        test_only,
+                    });
                     rest = module.after;
                     continue;
                 }
                 _ => {}
             }
         }
+        if matches!(first, TokenTree::Punct(hash) if hash.as_char() == '#')
+            && let Some(len) = test_item_len(rest)
+        {
+            rest = &rest[len..];
+            continue;
+        }
+        if !test_only
+            && let Some((args, after)) = concat_call(rest)
+            && let Some(value) = concat_literal(args)
+        {
+            visit(first.span().start().line, &value);
+            rest = after;
+            continue;
+        }
         match first {
             TokenTree::Group(group) => {
-                url_literals(
-                    group.stream(),
-                    path_base,
-                    module_dir,
-                    module_files,
-                    test_only,
-                    visit,
-                );
+                let nested: Vec<_> = group.stream().into_iter().collect();
+                scan_tokens(&nested, inline_dir, test_only, modules, visit);
             }
             TokenTree::Literal(literal) if !test_only => {
                 let span = literal.span();
@@ -600,10 +669,16 @@ fn url_literals(
 #[test]
 fn workspace_has_no_telemetry_dependencies_hosts_or_unreviewed_urls() {
     let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let root = crate_dir.parent().unwrap().parent().unwrap();
+    let root = crate_dir
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .canonicalize()
+        .unwrap();
     let mut findings = Vec::new();
-    check_manifests(root, &mut findings);
-    check_sources(root, &allowlist(), &mut findings);
+    let members = check_manifests(&root, &mut findings);
+    check_sources(&root, &members, &allowlist(), &mut findings);
     findings.sort_unstable();
     findings.dedup();
     assert!(
@@ -613,24 +688,96 @@ fn workspace_has_no_telemetry_dependencies_hosts_or_unreviewed_urls() {
     );
 }
 
-fn check_sources(root: &Path, allowlist: &[AllowedUrl<'_>], findings: &mut Vec<String>) {
+fn crate_entry_point(relative: &Path) -> bool {
+    let parts: Vec<_> = relative.iter().collect();
+    match parts.as_slice() {
+        [name] => *name == "lib.rs" || *name == "main.rs",
+        [bin, _] => *bin == "bin",
+        [bin, _, name] => *bin == "bin" && *name == "main.rs",
+        _ => false,
+    }
+}
+
+// A file may be entered from several crates or under more than one module
+// path. Traverse each context while retaining any production reachability.
+fn module_reachability(
+    roots: Vec<PathBuf>,
+    sources: &HashMap<PathBuf, SourceScan>,
+) -> HashMap<PathBuf, bool> {
+    let mut pending: Vec<_> = roots
+        .into_iter()
+        .map(|path| {
+            let dir = path.parent().unwrap().to_path_buf();
+            (path, dir, false)
+        })
+        .collect();
+    let mut visited = HashSet::new();
+    let mut test_only_files = HashMap::new();
+    while let Some((file, module_dir, test_only)) = pending.pop() {
+        if !visited.insert((file.clone(), module_dir.clone(), test_only)) {
+            continue;
+        }
+        let Some(source) = sources.get(&file) else {
+            continue;
+        };
+        test_only_files
+            .entry(file.clone())
+            .and_modify(|flag| *flag &= test_only)
+            .or_insert(test_only);
+        for link in &source.modules {
+            let inherited = test_only || link.test_only;
+            let base = link
+                .inline_dir
+                .as_ref()
+                .map_or_else(|| module_dir.clone(), |inline| module_dir.join(inline));
+            if let Some(path) = &link.explicit_path {
+                let path_base = if link.inline_dir.is_some() {
+                    &base
+                } else {
+                    file.parent().unwrap()
+                };
+                if let Ok(path) = path_base.join(path).canonicalize() {
+                    let child_dir = path.parent().unwrap().to_path_buf();
+                    pending.push((path, child_dir, inherited));
+                }
+            } else {
+                let child_dir = base.join(&link.name);
+                for path in [
+                    base.join(format!("{}.rs", link.name)),
+                    child_dir.join("mod.rs"),
+                ] {
+                    if let Ok(path) = path.canonicalize() {
+                        pending.push((path, child_dir.clone(), inherited));
+                    }
+                }
+            }
+        }
+    }
+    test_only_files
+}
+
+fn check_sources(
+    root: &Path,
+    members: &[PathBuf],
+    allowlist: &[AllowedUrl<'_>],
+    findings: &mut Vec<String>,
+) {
     let hosts: Vec<_> = FORBIDDEN_HOST_LABELS
         .iter()
         .map(|(host, tld)| format!("{host}.{tld}"))
         .chain(std::iter::once(["datadog", "hq"].concat()))
         .collect();
     let url = Regex::new(r#"(?i)https?://[^\s"'<>]*"#).unwrap();
-    let mut module_files = ModuleFiles::default();
-    let mut unapproved_urls = Vec::new();
-    for crate_entry in fs::read_dir(root.join("crates")).unwrap() {
-        let crate_dir = crate_entry.unwrap().path();
+    let mut roots = Vec::new();
+    let mut sources = HashMap::new();
+    for crate_dir in members {
         for area in ["src", "tests"] {
             let dir = crate_dir.join(area);
             if !dir.is_dir() {
                 continue;
             }
             visit_files(&dir, &mut |path| {
-                let relative = path.strip_prefix(root).unwrap();
+                let relative = path.strip_prefix(root).unwrap_or(path);
                 let raw =
                     fs::read(path).unwrap_or_else(|err| panic!("{}: {err}", relative.display()));
                 let text = String::from_utf8_lossy(&raw);
@@ -647,44 +794,41 @@ fn check_sources(root: &Path, allowlist: &[AllowedUrl<'_>], findings: &mut Vec<S
                     }
                 }
                 if area == "src" && path.extension().is_some_and(|extension| extension == "rs") {
-                    if path.parent() == Some(dir.as_path())
-                        && path
-                            .file_name()
-                            .is_some_and(|name| name == "lib.rs" || name == "main.rs")
-                        || path
-                            .parent()
-                            .is_some_and(|parent| parent == dir.join("bin"))
-                    {
-                        module_files.record(path, false);
+                    let source_path = path.canonicalize().unwrap();
+                    if crate_entry_point(path.strip_prefix(&dir).unwrap()) {
+                        roots.push(source_path.clone());
                     }
                     let tokens = text
                         .parse::<TokenStream>()
                         .unwrap_or_else(|err| panic!("{}: {err}", relative.display()));
-                    url_literals(
-                        tokens,
-                        path.parent().unwrap(),
-                        &module_dir(path),
-                        &mut module_files,
+                    let tokens: Vec<_> = tokens.into_iter().collect();
+                    let mut source = SourceScan::default();
+                    scan_tokens(
+                        &tokens,
+                        None,
                         false,
+                        &mut source.modules,
                         &mut |line, literal| {
                             for candidate in url.find_iter(literal).map(|url| url.as_str()) {
                                 if !allowlist.iter().any(|rule| rule.allows(candidate)) {
-                                    unapproved_urls.push((
-                                        path.to_path_buf(),
-                                        line,
-                                        candidate.to_owned(),
-                                    ));
+                                    source.urls.push((line, candidate.to_owned()));
                                 }
                             }
                         },
                     );
+                    sources.insert(source_path, source);
                 }
             });
         }
     }
-    for (path, line, candidate) in unapproved_urls {
-        if !module_files.is_test_only(&path) {
-            let relative = path.strip_prefix(root).unwrap();
+    let reachability = module_reachability(roots, &sources);
+    for (path, source) in sources {
+        // Keep scanning orphan files unless a test-only path is proven.
+        if reachability.get(&path) == Some(&true) {
+            continue;
+        }
+        let relative = path.strip_prefix(root).unwrap_or(&path);
+        for (line, candidate) in source.urls {
             findings.push(format!(
                 "{}:{line}: URL needs review: {candidate}",
                 relative.display()
@@ -725,6 +869,30 @@ fn workspace_member_resolution_uses_declared_globs_paths_and_excludes() {
             root.join("tools/explicit/Cargo.toml"),
         ],
     );
+    fs::write(root.join("Cargo.toml"), manifest).unwrap();
+    fs::write(root.join("Cargo.lock"), "[[package]]\nname = 'fixture'\n").unwrap();
+    for member in [
+        "tools/explicit",
+        "crates/excluded",
+        "workspaces/another-project",
+    ] {
+        let src = root.join(member).join("src");
+        fs::create_dir(&src).unwrap();
+        fs::write(
+            src.join("lib.rs"),
+            r#"const URL: &str = "https://example.org/unapproved";"#,
+        )
+        .unwrap();
+    }
+    let mut findings = Vec::new();
+    let members = check_manifests(&root, &mut findings);
+    check_sources(&root, &members, &[], &mut findings);
+    assert_eq!(findings.len(), 1, "{findings:?}");
+    let expected = Path::new("tools")
+        .join("explicit")
+        .join("src")
+        .join("lib.rs");
+    assert!(findings[0].starts_with(&format!("{}:1:", expected.display())));
 }
 
 #[test]
@@ -769,7 +937,9 @@ fn url_prefix_is_confined_to_one_origin_and_a_path() {
 #[test]
 fn production_contests_file_is_scanned_even_when_referenced_by_tests() {
     let dir = tempfile::tempdir().unwrap();
-    let src = dir.path().join("crates/example/src");
+    let root = dir.path().canonicalize().unwrap();
+    let member = root.join("crates/example");
+    let src = member.join("src");
     fs::create_dir_all(&src).unwrap();
     fs::write(
         src.join("lib.rs"),
@@ -787,7 +957,86 @@ fn production_contests_file_is_scanned_even_when_referenced_by_tests() {
     fs::write(src.join("contests.rs"), fixture_source).unwrap();
     fs::write(src.join("fixtures.rs"), fixture_source).unwrap();
     let mut findings = Vec::new();
-    check_sources(dir.path(), &[], &mut findings);
+    check_sources(&root, &[member], &[], &mut findings);
     assert_eq!(findings.len(), 1, "{findings:?}");
     assert!(findings[0].contains("contests.rs:1: URL needs review"));
+}
+
+#[test]
+fn concat_checks_the_assembled_url_and_keeps_the_scheme_literal_valid() {
+    let source = r#"
+        const SCHEME: &str = "https://";
+        const BLOCKED: &str = concat!("https://", "example.org/api");
+        const APPROVED: &str = concat!("https://", concat!(r"example.org", "/allowed"));
+        const WITH_PORT: &str = concat!("http", 's', "://example.org:", 0x20FB, "/numbers/", -2);
+    "#;
+    let allowed = [
+        AllowedUrl::Exact("https://"),
+        AllowedUrl::Exact("https://example.org/allowed"),
+        AllowedUrl::Exact("https://example.org:8443/numbers/-2"),
+    ];
+    let findings = check_source_fixture(&[("lib.rs", source)], &allowed);
+    assert_eq!(findings.len(), 1, "{findings:?}");
+    assert!(findings[0].contains("lib.rs:3: URL needs review: https://example.org/api"));
+}
+
+#[test]
+fn test_only_paths_propagate_to_children_but_production_paths_win() {
+    let test_only = r#"const URL: &str = "https://example.org/test-fixture";"#;
+    let shared = r#"const URL: &str = "https://example.org/shared-fixture";"#;
+    let findings = check_source_fixture(
+        &[
+            ("lib.rs", "#[cfg(test)]\nmod tests;"),
+            ("tests.rs", "mod fixtures;\nmod shared;"),
+            ("tests/fixtures.rs", test_only),
+            ("tests/shared.rs", shared),
+            (
+                "bin/tool/main.rs",
+                "#[path = \"../../tests/shared.rs\"]\nmod shared;\nfn main() {}",
+            ),
+        ],
+        &[],
+    );
+    assert_eq!(findings.len(), 1, "{findings:?}");
+    assert!(
+        findings[0].contains("shared.rs:1: URL needs review: https://example.org/shared-fixture")
+    );
+}
+
+#[test]
+fn test_attributes_skip_only_the_items_they_decorate() {
+    let source = r#"
+        #[test]
+        fn test_endpoint() { let _ = "https://example.org/test"; }
+        fn production_endpoint() -> &'static str { "https://example.org/production" }
+        #[cfg(test)]
+        const TEST_URL: &str = { "https://example.org/cfg-test" };
+        const PRODUCTION_URL: &str = "https://example.org/another-production";
+        struct Sample;
+        impl Sample {
+            #[cfg(all(test, windows))]
+            fn fixture(&self) -> &'static str { "https://example.org/method-fixture" }
+        }
+    "#;
+    let findings = check_source_fixture(&[("lib.rs", source)], &[]);
+    assert_eq!(findings.len(), 2, "{findings:?}");
+    assert!(findings[0].contains("lib.rs:4: URL needs review: https://example.org/production"));
+    assert!(
+        findings[1].contains("lib.rs:7: URL needs review: https://example.org/another-production")
+    );
+}
+
+fn check_source_fixture(files: &[(&str, &str)], allowlist: &[AllowedUrl<'_>]) -> Vec<String> {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let member = root.join("tools/example");
+    for (file, source) in files {
+        let path = member.join("src").join(file);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, source).unwrap();
+    }
+    let mut findings = Vec::new();
+    check_sources(&root, &[member], allowlist, &mut findings);
+    findings.sort_unstable();
+    findings
 }
