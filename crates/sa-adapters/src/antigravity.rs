@@ -340,19 +340,27 @@ async fn discover(
         } else {
             format!("{base}/v1beta/models?pageSize=1000")
         };
-        match crate::catalog::fetch(&target, &[("x-goog-api-key".into(), token.clone())], cancel)
+        match crate::catalog::fetch_with_status(&target, &[("x-goog-api-key".into(), token.clone())], cancel)
             .await
         {
-            Ok(mut models) => {
+            Ok((mut models, error)) => {
                 models.retain(|m| {
                     m["supportedGenerationMethods"]
                         .as_array()
                         .is_none_or(|methods| methods.iter().any(|s| s == "generateContent"))
                 });
-                row.public["available"] = json!(!models.is_empty());
-                row.public["models"] = json!(models);
-                row.public["detail"] = json!("Gemini API 在线模型目录");
-                row.public["catalog_complete"] = json!(true);
+                row.public["catalog_complete"] = json!(error.is_none());
+                if let Some(error) = error {
+                    let saved = row.public["models"].as_array_mut().expect("configured Gemini models");
+                    sa_store::catalog_cache::supplement_models(saved, &models);
+                    row.public["catalogError"] = json!(true);
+                    row.public["cachedModels"] = json!(true);
+                    row.public["detail"] = json!(format!("在线目录获取失败：{error}；已保留已保存型号和上次目录"));
+                } else {
+                    row.public["available"] = json!(!models.is_empty());
+                    row.public["models"] = json!(models);
+                    row.public["detail"] = json!("Gemini API 在线模型目录");
+                }
             }
             Err(error) => {
                 row.public["catalogError"] = json!(true);
@@ -380,7 +388,7 @@ async fn discover(
         .as_ref()
         .and_then(|s| {
             let models = s["models"].as_array()?;
-            if s["catalogError"] == true {
+            if s["catalogError"] == true && matches!(s["id"].as_str(), Some("google" | "adc")) {
                 return models.iter().any(|m| m["id"] == "@native").then(|| "@native".to_string());
             }
             let hit = configured_model.as_deref().and_then(|c| {
@@ -975,6 +983,51 @@ int main(int argc, char **argv) {
         assert!(calls(root.path()).is_empty());
         let catalog = adapter.catalog().await.unwrap().value;
         assert_eq!(catalog["default"]["model"], "@native");
+    }
+
+    #[tokio::test]
+    async fn failed_gemini_api_models_request_binds_saved_model_on_new_ticket() {
+        use sa_engine::{CreateParams, Engine};
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let root = tempfile::tempdir().unwrap();
+        let mut sys = fixture_sys(root.path());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        std::fs::create_dir_all(root.path().join(".gemini/antigravity-cli")).unwrap();
+        std::fs::write(root.path().join(SETTINGS_REL),
+            r#"{"modelProvider":"gemini","model":"saved-model"}"#).unwrap();
+        sys.set("GEMINI_API_KEY", "fixture-token");
+        sys.set("GOOGLE_GEMINI_BASE_URL", base);
+        let provider = configured(&sys)[0].id.clone();
+        let engine = Engine::open(root.path().join("journal"),
+            vec![Arc::new(Antigravity::new(sys))], Default::default()).unwrap();
+        let project = root.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        let ticket = engine.create(CreateParams::new("fixture", project).lead("antigravity")).await.unwrap();
+        engine.start().unwrap();
+        let (mut socket, _) = tokio::time::timeout(Duration::from_secs(20), listener.accept()).await.unwrap().unwrap();
+        let mut request = BufReader::new(&mut socket).lines();
+        assert!(request.next_line().await.unwrap().unwrap().starts_with("GET /v1beta/models?"));
+        while request.next_line().await.unwrap().is_some_and(|line| !line.is_empty()) {}
+        socket.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+        drop(socket);
+        drop(listener);
+        let binding = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let row = engine.db().with(|q| q.one(
+                    "SELECT r.route FROM native_routes r JOIN jobs j ON j.id=r.job WHERE j.ticket=?",
+                    &[&ticket],
+                )).unwrap();
+                if let Some(row) = row {
+                    break serde_json::from_str::<Value>(row["route"].as_str().unwrap()).unwrap();
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }).await.expect("Gemini API route was not bound");
+        assert_eq!(binding["provider"], provider);
+        assert_eq!(binding["model"], "saved-model");
+        engine.close().await;
     }
 
     #[tokio::test]

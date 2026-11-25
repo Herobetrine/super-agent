@@ -191,7 +191,7 @@ pub type CatalogFuture = Shared<BoxFuture<'static, Result<Value, String>>>;
 #[derive(Clone, PartialEq, Eq, Hash)]
 enum CatalogKey {
     Full(String, String),
-    Selected(String, Route),
+    Selected(String, String, Route),
 }
 
 struct Slot {
@@ -359,6 +359,22 @@ fn route_error(class_code: &str, message: String) -> TurnError {
 
 fn class_name(class: ErrorClass) -> Value {
     serde_json::to_value(class).unwrap_or(Value::Null)
+}
+
+fn catalog_fingerprint(revision: &str, catalog: &Value) -> String {
+    stringify(&json!([revision, catalog["cli"]["version"]]))
+}
+
+fn catalog_selection(job: &JobCtx, assigned: &Value, name: &str, cat: Option<&Value>) -> Option<Value> {
+    if let Some(route) = assigned.get(name).filter(|v| p::truthy_value(v)) {
+        return Some(route.clone());
+    }
+    let cat = cat?;
+    if name == "claude" && job.follow_config != 1 {
+        cat.get("legacy_defaults")?.get(&job.claude_route).cloned()
+    } else {
+        cat.get("default").cloned()
+    }
 }
 
 fn route_json(r: &Route) -> Value {
@@ -2186,11 +2202,12 @@ impl Inner {
             let Ok(cat) = self.catalog_request(agent, Some(route.clone())).await else { continue };
             match p::options(Some(&cat), Some(value)) {
                 Ok(Some(_)) => {}
+                Ok(None) if p::model_listing_failed(&cat, &route) => continue,
                 Ok(None) => bail!(
                     "{agent} 的所选路由不在当前模型目录中（{} / {}），请刷新模型目录或重新选择",
                     route.provider, route.model
                 ),
-                Err(message) => bail!("{agent} 的所选路由无效：{message}"),
+                Err(message) => bail!("{agent} 的所选路由无效（{} / {}）：{message}", route.provider, route.model),
             }
         }
         Ok(())
@@ -2206,8 +2223,7 @@ impl Inner {
         let mut flights = lock(&self.catalogs);
         let cache = lock(&self.catalog_cache);
         let entry = cache.get(name);
-        let same_revision = entry.filter(|e|
-            e.fingerprint == stringify(&json!([revision, e.value["cli"]["version"]])));
+        let same_revision = entry.filter(|e| e.fingerprint == catalog_fingerprint(&revision, &e.value));
         let stale = same_revision.is_none_or(|e| now() - e.fetched_at >= 20.0 * 60.0);
         let value = entry.map(|e| e.value.clone());
         let previous_version = same_revision.filter(|e| e.value["cli"]["version"].is_string())
@@ -2262,12 +2278,11 @@ impl Inner {
             }.await;
             if let Some(inner) = inner.upgrade() {
                 if let Ok(value) = &mut result {
+                    let fingerprint = catalog_fingerprint(&revision, value);
                     if let Some(previous) = lock(&inner.catalog_cache).get(&name) {
-                        let unchanged = previous.fingerprint
-                            == stringify(&json!([revision, previous.value["cli"]["version"]]));
-                        previous.merge_failed_sources(value, unchanged);
+                        previous.merge_failed_sources(value, previous.fingerprint == fingerprint);
                     }
-                    let entry = Entry { fingerprint: stringify(&json!([revision, value["cli"]["version"]])),
+                    let entry = Entry { fingerprint,
                         fetched_at: now(), value: value.clone() };
                     if let Err(error) = inner.db.with(|q| catalog_cache::save(q.conn(), &name, &entry)) {
                         lock(&inner.catalogs).remove(&key);
@@ -2285,7 +2300,9 @@ impl Inner {
     }
 
     fn cached_route(&self, name: &str, route: &Value) -> Option<Value> {
+        let revision = self.adapters.get(name)?.catalog_revision();
         lock(&self.catalog_cache).get(name)
+            .filter(|e| e.fingerprint == catalog_fingerprint(&revision, &e.value))
             .filter(|e| matches!(p::options(Some(&e.value), Some(route)), Ok(Some(_))))
             .map(|e| e.value.clone())
     }
@@ -2297,7 +2314,8 @@ impl Inner {
 
     fn catalog_request(self: &Arc<Self>, name: &str, route: Option<Route>) -> CatalogFuture {
         let Some(route) = route else { return self.catalog(name) };
-        let key = CatalogKey::Selected(name.into(), route.clone());
+        let revision = self.adapters.get(name).map(|a| a.catalog_revision()).unwrap_or_default();
+        let key = CatalogKey::Selected(name.into(), revision, route.clone());
         let mut map = lock(&self.catalogs);
         if let Some(f) = map.get(&key) {
             return f.clone();
@@ -2881,17 +2899,7 @@ impl Inner {
     async fn execution_route(self: &Arc<Self>, turn: &Arc<Turn>) -> Result<(Route, bool), TurnError> {
         let job = &turn.job;
         let assigned = parse(Some(&job.agent_routes));
-        let pick = |name: &str, cat: Option<&Value>| -> Option<Value> {
-            if let Some(a) = assigned.get(name).filter(|v| p::truthy_value(v)) {
-                return Some(a.clone());
-            }
-            let cat = cat?;
-            if name == "claude" && job.follow_config != 1 {
-                cat.get("legacy_defaults").and_then(|d| d.get(&job.claude_route)).cloned()
-            } else {
-                cat.get("default").cloned()
-            }
-        };
+        let pick = |name: &str, cat: Option<&Value>| catalog_selection(job, &assigned, name, cat);
         let full_menus = job.is_root() || job.primary();
         let mut own = None;
         let mut own_refresh = None;
@@ -2953,11 +2961,9 @@ impl Inner {
             let resolved = matches!(p::options(local.as_ref(), local_pick.as_ref()), Ok(Some(_)));
             if resolved || own_refresh.is_some() || cached_default {
                 own = local;
-                own_is_local = true;
             }
         }
-        let from_default_snapshot = own.is_some() && fixed.is_none() && !own_is_local;
-        let (mut cat, picked) = if let Some(value) = fixed {
+        let (cat, picked) = if let Some(value) = fixed {
             let route = p::route(Some(&value)).map_err(|e| TurnError::Engine(anyhow!(e)))?;
             let cat = match self.cached_route(&job.agent, &value) {
                 Some(cat) => cat,
@@ -2968,27 +2974,27 @@ impl Inner {
             };
             (cat, Some(value))
         } else {
-            let mut cat = match own {
-                Some(cat) => cat,
-                None => self.catalog(&job.agent).await.map_err(probe_error)?,
+            // A successful but incomplete catalog may have no usable default.
+            // Refresh once even within the TTL, without waiting on peer menus.
+            let resolved = own.and_then(|cat| {
+                let picked = pick(&job.agent, Some(&cat));
+                matches!(p::options(Some(&cat), picked.as_ref()), Ok(Some(_))).then_some((cat, picked))
+            });
+            let (cat, picked) = match resolved {
+                Some(pair) => pair,
+                None => {
+                    let future = own_refresh.unwrap_or_else(|| self.catalog(&job.agent));
+                    let cat = future.await.map_err(probe_error)?;
+                    let picked = pick(&job.agent, Some(&cat));
+                    (cat, picked)
+                }
             };
-            let mut picked = pick(&job.agent, Some(&cat));
-            if own_is_local && !matches!(p::options(Some(&cat), picked.as_ref()), Ok(Some(_))) {
-                let future = own_refresh.unwrap_or_else(|| self.catalog(&job.agent));
-                cat = future.await.map_err(probe_error)?;
-                picked = pick(&job.agent, Some(&cat));
-            }
             if cat["cachedDefault"] == true && !(job.agent == "claude" && job.follow_config != 1) {
                 return Err(probe_error(UNAVAILABLE.into()));
             }
             (cat, picked)
         };
         let selected = p::route(picked.as_ref()).map_err(|e| TurnError::Engine(anyhow!(e)))?;
-        if from_default_snapshot
-            && !matches!(p::options(Some(&cat), picked.as_ref()), Ok(Some(_)))
-        {
-            cat = self.catalog_request(&job.agent, Some(selected.clone())).await.map_err(probe_error)?;
-        }
         // Existing native conversations stay on their bound route. A missing
         // model requires an explicit choice; never substitute an upstream.
         // A route the ticket configured (or this job already bound) was valid
@@ -3546,8 +3552,9 @@ impl Inner {
     /// Optional automatic failover of a read-only child (spec §9.2 F), for
     /// tickets with `ticket_failover`. Creates a sibling with the same body
     /// on the first other harness, in `AGENTS` order, that the parent's
-    /// latest `delegate_models` lists as available (any configured harness
-    /// when the parent has no delegate menu) and whose route is not
+    /// latest `delegate_models` lists as available, including a provisional
+    /// entry since resolved by discovery (any configured harness when the
+    /// parent has no delegate menu), and whose route is not
     /// circuit-open, skipping harnesses already tried in this failover
     /// chain. Logs `send {…, failover_of, reason}` on the parent and cancels
     /// the original and its subtree. Writers and roots never fail over.
@@ -3599,6 +3606,7 @@ impl Inner {
                     && route.is_none_or(|x| x.provider == r.provider && x.model == r.model && x.mode == r.mode)
             })
         };
+        let assigned = parse(Some(&job.agent_routes));
         let target = AGENTS.into_iter().find(|agent| {
             if tried.iter().any(|t| t == agent)
                 || !self.adapters.contains_key(*agent)
@@ -3608,8 +3616,15 @@ impl Inner {
             }
             let Some(menus) = &menus else { return !blocked(agent, None) };
             let Some(menu) = menus.get(*agent) else { return false };
-            if menu.get("available") == Some(&Value::Bool(false)) {
-                return false;
+            if menu["available"] == false {
+                if menu["partial"] != true { return false; }
+                // Admission did not know this harness's menu yet. Use only a
+                // completed refresh; never run discovery in the journal transaction.
+                let cache = lock(&self.catalog_cache);
+                let Some(entry) = cache.get(*agent) else { return false };
+                let picked = catalog_selection(job, &assigned, agent, Some(&entry.value));
+                return matches!(p::options(Some(&entry.value), picked.as_ref()), Ok(Some(_)))
+                    && p::route(picked.as_ref()).is_ok_and(|r| !blocked(agent, Some(&r)));
             }
             let model = menu
                 .get("models")

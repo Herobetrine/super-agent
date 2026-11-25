@@ -205,17 +205,27 @@ pub async fn fetch(
     headers: &[(String, String)],
     cancel: &CancellationToken,
 ) -> Result<Vec<Value>> {
+    Ok(fetch_with_status(url, headers, cancel).await?.0)
+}
+
+/// Callers with a configured fallback need to know whether the rows came from
+/// this request or from the endpoint's last successful response.
+pub(crate) async fn fetch_with_status(
+    url: &str,
+    headers: &[(String, String)],
+    cancel: &CancellationToken,
+) -> Result<(Vec<Value>, Option<String>)> {
     let key = cache_key(url, headers);
     match fetch_online(url, headers, cancel).await {
         Ok(rows) => {
             LAST_GOOD.lock().unwrap_or_else(|e| e.into_inner()).insert(key, (Instant::now(), rows.clone()));
-            Ok(rows)
+            Ok((rows, None))
         }
         Err(error) if !cancel.is_cancelled() => {
             let cached = LAST_GOOD.lock().unwrap_or_else(|e| e.into_inner()).get(&key)
                 .filter(|(at, _)| at.elapsed() <= LAST_GOOD_TTL)
                 .map(|(_, rows)| rows.clone());
-            cached.ok_or(error)
+            cached.map(|rows| (rows, Some(error.to_string()))).ok_or(error)
         }
         Err(error) => Err(error),
     }
