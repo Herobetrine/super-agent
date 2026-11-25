@@ -13,6 +13,7 @@ const DB: &str = "statev2.sqlite";
 const NEWEST: &str = "a1b2c3d4-main";
 const ARCHIVED: &str = "b2c3d4e5-old";
 const BROKEN: &str = "c3d4e5f6-broken";
+const EMPTY: &str = "d4e5f6a7-empty";
 const OUTPUT: &str = "COMMAND_STDOUT_MUST_NOT_LEAK";
 const DIFF: &str = "DIFF_BODY_MUST_NOT_LEAK";
 const TOOL_OUTPUT: &str = "DYNAMIC_RESULT_MUST_NOT_LEAK";
@@ -95,7 +96,7 @@ impl Fixture {
                 None,
             ),
             (BROKEN, "p2", "Breakable", "2024-03-05", None, None),
-            ("d4e5f6a7-empty", "p3", "  .  ", "2024-03-03", None, None),
+            (EMPTY, "p3", "  .  ", "2024-03-03", None, None),
             (
                 "deleted-thread",
                 "p1",
@@ -135,7 +136,7 @@ impl Fixture {
             (
                 "a1",
                 "assistant",
-                "2024-03-02T01:05:00.000Z",
+                "2024-03-02T01:00:00.000Z",
                 json!({"text": "answer", "attachments": []}),
             ),
             (
@@ -264,6 +265,26 @@ fn archive_files(root: &Path) -> Vec<PathBuf> {
         }
     }
     files
+}
+
+fn id_digest(id: &str) -> String {
+    format!("{:x}", Sha256::digest(id.as_bytes()))[..16].to_owned()
+}
+
+fn thread_files(folder: &Path, id: &str) -> (PathBuf, PathBuf) {
+    let suffix = format!("-{}.md", id_digest(id));
+    let md = archive_files(folder)
+        .into_iter()
+        .find(|path| {
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .ends_with(&suffix)
+        })
+        .unwrap_or_else(|| panic!("no archive file for {id}"));
+    let jsonl = md.with_extension("jsonl");
+    assert!(jsonl.is_file());
+    (md, jsonl)
 }
 
 fn fingerprint(path: &Path) -> (Vec<u8>, SystemTime) {
@@ -418,10 +439,8 @@ fn export_layout_interleaving_and_redaction_preserve_source() {
     assert_eq!(name.as_bytes()[8], b'-');
     let files = archive_files(&report.folder);
     assert_eq!(files.len(), 10);
-    let newest = files
-        .iter()
-        .find(|path| path.ends_with("2024-03-02-CON- a-b---a1b2c3d4.md"))
-        .unwrap();
+    let (newest, jsonl) = thread_files(&report.folder, NEWEST);
+    assert!(newest.ends_with(format!("2024-03-02-CON- a-b---{}.md", id_digest(NEWEST))));
     let project_dir = newest
         .parent()
         .unwrap()
@@ -430,8 +449,8 @@ fn export_layout_interleaving_and_redaction_preserve_source() {
         .to_str()
         .unwrap();
     assert!(!project_dir.eq_ignore_ascii_case("NUL"));
-    let md = fs::read_to_string(newest).unwrap();
-    let jl = fs::read_to_string(newest.with_extension("jsonl")).unwrap();
+    let md = fs::read_to_string(&newest).unwrap();
+    let jl = fs::read_to_string(jsonl).unwrap();
     for forbidden in [
         OUTPUT,
         DIFF,
@@ -456,6 +475,7 @@ fn export_layout_interleaving_and_redaction_preserve_source() {
     assert!(md.contains("### 系统 · 2024-03-02T01:06:00.000Z"));
     assert!(md.find("question").unwrap() < md.find("工具：命令").unwrap());
     assert!(md.find("工具：命令").unwrap() < md.find("### 助手").unwrap());
+    assert!(md.contains("### 助手 · 2024-03-02T01:00:00.000Z"));
     let records: Vec<Value> = jl
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())
@@ -477,18 +497,23 @@ fn export_layout_interleaving_and_redaction_preserve_source() {
     assert_eq!(tools.len(), 23);
     assert!(tools.windows(2).all(|pair| pair[0]["ordinal"].as_i64().unwrap() < pair[1]["ordinal"].as_i64().unwrap()));
     let index = fs::read_to_string(report.folder.join("index.md")).unwrap();
-    assert!(index.contains("CON-%20a-b---a1b2c3d4.md"));
-    assert!(index.find("a1b2c3d4.md").unwrap() < index.find("b2c3d4e5.md").unwrap());
+    assert!(index.contains(&format!("CON-%20a-b---{}.md", id_digest(NEWEST))));
+    assert!(index.find(&id_digest(NEWEST)).unwrap() < index.find(&id_digest(ARCHIVED)).unwrap());
     assert!(index.contains("已归档"));
     assert!(!index.contains("Deleted project") && !index.contains("Deleted thread"));
     assert!(
         files
             .iter()
-            .any(|path| path.ends_with("2024-03-02-untitled-d4e5f6a7.md"))
+            .any(|path| path.ends_with(format!("2024-03-02-untitled-{}.md", id_digest(EMPTY))))
     );
     let archived = files
         .iter()
-        .find(|path| path.ends_with("2024-03-02-Archive example-b2c3d4e5.md"))
+        .find(|path| {
+            path.ends_with(format!(
+                "2024-03-02-Archive example-{}.md",
+                id_digest(ARCHIVED)
+            ))
+        })
         .unwrap();
     assert!(fs::read_to_string(archived).unwrap().contains("已归档：是"));
     let stored: Value =
@@ -556,9 +581,186 @@ fn stop_and_thread_failure_preserve_complete_pairs() {
     assert!(
         !files
             .iter()
-            .any(|path| path.to_string_lossy().contains("c3d4e5f6"))
+            .any(|path| path.to_string_lossy().contains(&id_digest(BROKEN)))
     );
     assert_eq!(archive_files(&report.folder).len(), 4);
+}
+
+fn insert_thread(db: &Connection, id: &str, title: &str, header: Value) {
+    db.execute(
+        "INSERT INTO orchestration_v2_projection_threads
+         VALUES (?1,'p1',?2,'fixture','2024-03-09T01:00:00.000Z','2024-03-10',NULL,NULL,?3)",
+        params![id, title, header.to_string()],
+    )
+    .unwrap();
+}
+
+#[test]
+fn same_day_same_title_subagents_have_distinct_archive_pairs_and_links() {
+    let fixture = Fixture::new();
+    let db = Connection::open(fixture.folder.join(DB)).unwrap();
+    let ids = ["thread:subagent:fixture-1", "thread:subagent:fixture-2"];
+    for id in ids {
+        insert_thread(
+            &db,
+            id,
+            "Worker",
+            json!({"lineage": {"relationshipToParent": "subagent"}}),
+        );
+    }
+    db.close().unwrap();
+    let report = fixture.export();
+    assert_eq!(report.exported, 6);
+    assert!(report.failed.is_empty());
+    let index = fs::read_to_string(report.folder.join("index.md")).unwrap();
+    for id in ids {
+        let (md, jsonl) = thread_files(&report.folder, id);
+        assert!(index.contains(md.file_name().unwrap().to_str().unwrap()));
+        assert!(index.contains(jsonl.file_name().unwrap().to_str().unwrap()));
+        let header: Value =
+            serde_json::from_str(fs::read_to_string(jsonl).unwrap().lines().next().unwrap())
+                .unwrap();
+        assert_eq!(header["id"], id);
+    }
+}
+
+fn fork_header(parent: &str, run: &str, side_chat: bool) -> Value {
+    json!({
+        "forkedFrom": {"type": "run", "threadId": parent, "runId": run},
+        "lineage": {"relationshipToParent": "fork", "sideChat": side_chat},
+    })
+}
+
+#[test]
+fn run_fork_contains_only_inherited_history_through_cutoff_and_side_chat_stays_local() {
+    let fixture = Fixture::new();
+    let db = Connection::open(fixture.folder.join(DB)).unwrap();
+    db.execute_batch(
+        "
+        CREATE TABLE orchestration_v2_projection_runs (
+            run_id TEXT PRIMARY KEY, thread_id TEXT, ordinal INTEGER, status TEXT, completed_at TEXT
+        );
+        CREATE TABLE orchestration_v2_projection_run_attempts (
+            attempt_id TEXT PRIMARY KEY, thread_id TEXT, run_id TEXT, root_node_id TEXT, status TEXT
+        );",
+    )
+    .unwrap();
+    insert_thread(&db, "parent", "Parent", json!({}));
+    insert_thread(
+        &db,
+        "fork",
+        "Fork",
+        fork_header("parent", "at-cutoff", false),
+    );
+    insert_thread(
+        &db,
+        "side-chat",
+        "SideChat",
+        fork_header("parent", "at-cutoff", true),
+    );
+    for (run, ordinal, status, date) in [
+        (
+            "before-rewind",
+            0,
+            "rolled_back",
+            "2024-03-07T00:00:00.000Z",
+        ),
+        ("prior", 1, "completed", "2024-03-07T00:00:01.000Z"),
+        ("queued", 2, "cancelled", "2024-03-07T00:00:02.000Z"),
+        ("at-cutoff", 3, "rolled_back", "2024-03-10T00:00:00.000Z"),
+        ("past-cutoff", 4, "completed", "2024-03-10T00:00:01.000Z"),
+    ] {
+        db.execute(
+            "INSERT INTO orchestration_v2_projection_runs VALUES (?1,'parent',?2,?3,?4)",
+            params![run, ordinal, status, date],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO orchestration_v2_projection_messages VALUES
+             (?1,'parent',?1,'user','2024-03-08T01:00:00.000Z',?2,'')",
+            params![run, json!({"text": format!("body {run}")}).to_string()],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO orchestration_v2_projection_turn_items VALUES
+             (?1,'parent',?1,?2,'user_message','completed','2024-03-08',?3)",
+            params![run, ordinal * 2, json!({
+                "messageId": run, "inputIntent": if run == "queued" { "queued_turn" } else { "started_turn" },
+            }).to_string()],
+        ).unwrap();
+    }
+    db.execute_batch(
+        r#"INSERT INTO orchestration_v2_projection_turn_items VALUES (
+           'tool-at-cutoff','parent','at-cutoff',7,'command_execution','completed',
+           '2024-03-08','{"input":"fixture-cutoff-tool","output":"PRIVATE_RESULT"}');
+           INSERT INTO orchestration_v2_projection_messages VALUES (
+           'side-only','side-chat',NULL,'user','2024-03-09','{"text":"side-only"}','');"#,
+    )
+    .unwrap();
+    db.close().unwrap();
+
+    let report = fixture.export();
+    assert!(report.failed.is_empty(), "{:?}", report.failed);
+    let (md, jl) = thread_files(&report.folder, "fork");
+    let md = fs::read_to_string(md).unwrap();
+    assert!(md.contains("已包含继承记录") && md.contains(" · 继承"));
+    let records: Vec<Value> = fs::read_to_string(jl)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(records[0]["forked_from"]["history"], "expanded");
+    assert_eq!(records[0]["forked_from"]["cutoff_ordinal"], 3);
+    assert_eq!(records.len(), 4);
+    assert_eq!(records[1]["text"], "body prior");
+    assert_eq!(records[2]["text"], "body at-cutoff");
+    assert_eq!(records[3]["details"]["input"], "fixture-cutoff-tool");
+    for record in &records[1..] {
+        assert_eq!(record["inherited_from"], "parent");
+    }
+    for text in [
+        "body before-rewind",
+        "body past-cutoff",
+        "body queued",
+        "PRIVATE_RESULT",
+    ] {
+        assert!(!md.contains(text));
+    }
+    let (md, jl) = thread_files(&report.folder, "side-chat");
+    assert!(fs::read_to_string(md).unwrap().contains("side-only"));
+    let jl = fs::read_to_string(jl).unwrap();
+    assert!(!jl.contains("forked_from") && !jl.contains("body prior"));
+}
+
+#[test]
+fn unresolved_fork_cutoff_references_the_exact_parent_archive_and_run() {
+    let fixture = Fixture::new();
+    let db = Connection::open(fixture.folder.join(DB)).unwrap();
+    insert_thread(&db, "parent", "Parent", json!({}));
+    insert_thread(
+        &db,
+        "unknown",
+        "Unresolved",
+        fork_header("parent", "missing-run", false),
+    );
+    db.close().unwrap();
+    let report = fixture.export();
+    assert!(report.failed.is_empty());
+    let (parent, _) = thread_files(&report.folder, "parent");
+    let (md, jl) = thread_files(&report.folder, "unknown");
+    let contents = fs::read_to_string(jl).unwrap();
+    let record: Value = serde_json::from_str(contents.lines().next().unwrap()).unwrap();
+    assert_eq!(contents.lines().count(), 1);
+    let point = &record["forked_from"];
+    assert_eq!(point["history"], "reference");
+    assert_eq!(point["thread_id"], "parent");
+    assert_eq!(point["run_id"], "missing-run");
+    assert!(point["cutoff_ordinal"].is_null());
+    let link = point["archive_path"].as_str().unwrap();
+    assert_eq!(report.folder.join(link), parent);
+    let md = fs::read_to_string(md).unwrap();
+    assert!(md.contains(&format!("[parent](../../{link}) · 运行 missing-run")));
+    assert!(md.contains("无法确定完整继承范围，请参阅父对话及分叉点"));
 }
 
 #[test]
@@ -660,4 +862,71 @@ fn projects_deduplicate_and_recent_order_respects_cap() {
     assert_eq!(recent[3].name.as_deref(), Some("Pinned"));
     assert_eq!(recent[4].name.as_deref(), Some("New"));
     assert!(projects::recent(&cwds, &imported, 0).is_empty());
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_project_keys_preserve_distinct_ntfs_directories_and_merge_aliases() {
+    let parent = tempfile::tempdir().unwrap();
+    let conn = Connection::open_in_memory().unwrap();
+    projects::init(&conn).unwrap();
+    let ordinary = parent.path().join("Ordinary");
+    fs::create_dir(&ordinary).unwrap();
+    let spelling = ordinary.to_string_lossy();
+    let alias = format!("{}/", spelling.replace('\\', "/"));
+    assert_eq!(
+        projects::add(
+            &conn,
+            &[
+                project(&spelling, "Ordinary", false, "2024-03-01"),
+                project(&alias, "Alias", false, "2024-03-01"),
+            ]
+        )
+        .unwrap(),
+        1
+    );
+
+    let missing_a = parent.path().join("Missing");
+    let missing_b = parent.path().join("missing");
+    assert_eq!(
+        projects::add(
+            &conn,
+            &[
+                project(&missing_a.to_string_lossy(), "Missing", false, "2024-03-01"),
+                project(&missing_b.to_string_lossy(), "missing", false, "2024-03-01"),
+            ]
+        )
+        .unwrap(),
+        1
+    );
+    let sensitive = parent.path().join("sensitive");
+    fs::create_dir(&sensitive).unwrap();
+    let output = std::process::Command::new("fsutil.exe")
+        .args(["file", "setCaseSensitiveInfo"])
+        .arg(&sensitive)
+        .arg("enable")
+        .output()
+        .unwrap();
+    if !output.status.success() {
+        eprintln!(
+            "case-sensitive NTFS fixture unavailable: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        return;
+    }
+    let upper = sensitive.join("Repo");
+    let lower = sensitive.join("repo");
+    fs::create_dir(&upper).unwrap();
+    fs::create_dir(&lower).unwrap();
+    assert_eq!(
+        projects::add(
+            &conn,
+            &[
+                project(&upper.to_string_lossy(), "Upper", false, "2024-03-01"),
+                project(&lower.to_string_lossy(), "Lower", false, "2024-03-01"),
+            ]
+        )
+        .unwrap(),
+        2
+    );
 }

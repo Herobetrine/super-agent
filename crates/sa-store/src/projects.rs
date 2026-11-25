@@ -3,6 +3,7 @@
 use anyhow::Result;
 use rusqlite::{Connection, Transaction, TransactionBehavior, params};
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Project {
@@ -102,7 +103,10 @@ pub fn recent(
             return result;
         }
         let key = path_key(path);
-        if !path.is_empty() && !key.contains("super-agent-project-") && seen.insert(key.clone()) {
+        if !path.is_empty()
+            && !normalized_path(path).contains("super-agent-project-")
+            && seen.insert(key.clone())
+        {
             result.push(Recent {
                 path: path.clone(),
                 name: names.get(&key).map(|name| (*name).clone()),
@@ -130,7 +134,24 @@ pub fn recent(
     result
 }
 
-pub(crate) fn path_key(path: &str) -> String {
+pub(crate) fn path_key(path: &str) -> PathBuf {
+    if cfg!(windows) {
+        // Same approach as sa-ext::directory (which depends on sa-store via
+        // sa-engine). Keep the stored case in an existing directory's real path.
+        match Path::new(path).canonicalize() {
+            Ok(real) => return real,
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                return PathBuf::from(path);
+            }
+            _ => {}
+        }
+        // Keep a failed lookup separate from a resolved (verbatim) path.
+        return PathBuf::from(normalized_path(path));
+    }
+    PathBuf::from(path)
+}
+
+pub(crate) fn normalized_path(path: &str) -> String {
     if cfg!(windows) {
         use std::path::Component;
         std::path::Path::new(path)
@@ -150,7 +171,7 @@ pub(crate) fn path_key(path: &str) -> String {
     }
 }
 
-pub(crate) fn path_keys(conn: &Connection, sql: &str) -> Result<HashSet<String>> {
+pub(crate) fn path_keys(conn: &Connection, sql: &str) -> Result<HashSet<PathBuf>> {
     let mut stmt = conn.prepare(sql)?;
     Ok(stmt
         .query_map([], |row| Ok(path_key(row.get_ref(0)?.as_str()?)))?
