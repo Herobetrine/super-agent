@@ -339,6 +339,7 @@ pub struct Outcome {
 #[derive(Debug)]
 pub struct CatalogReply {
     pub request_id: u64,
+    pub final_reply: bool,
     pub agent: String,
     pub result: Result<Value, String>,
 }
@@ -655,13 +656,17 @@ impl Host {
             agent.to_string(),
         );
         self.runtime.spawn(async move {
-            let result = engine.request_catalog(&agent, force).await;
-            let _ = tx.send(CatalogReply {
-                agent,
-                request_id,
-                result,
-            });
-            notify();
+            let (snapshot, refresh) = engine.catalog_updates(&agent, force);
+            let publish = |result, final_reply| {
+                let _ = tx.send(CatalogReply { agent: agent.clone(), request_id, result, final_reply });
+                notify();
+            };
+            if let Some(value) = snapshot {
+                publish(Ok(value), refresh.is_none());
+            }
+            if let Some(refresh) = refresh {
+                publish(refresh.await, true);
+            }
         });
         request_id
     }
@@ -1418,6 +1423,53 @@ pub(crate) mod tests {
                 })
             })
         }
+    }
+
+    #[test]
+    fn catalog_reopen_uses_fresh_snapshot_and_stale_request_delivers_both_replies() {
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        struct Counted {
+            revision: AtomicUsize,
+            probes: AtomicUsize,
+            gate: Arc<tokio::sync::Semaphore>,
+        }
+        impl Adapter for Counted {
+            fn agent(&self) -> &'static str { "codex" }
+            fn catalog_revision(&self) -> String { self.revision.load(SeqCst).to_string() }
+            fn catalog(&self) -> Boxed<anyhow::Result<Catalog>> {
+                let call = self.probes.fetch_add(1, SeqCst);
+                let gate = self.gate.clone();
+                Box::pin(async move {
+                    if call == 1 { gate.acquire().await.unwrap().forget(); }
+                    Ok(Catalog { value: json!({"generation":call}) })
+                })
+            }
+            fn run(&self, _: RunRequest, _: Arc<dyn TurnHost>, _: EventSink, _: CancellationToken)
+                -> Boxed<Result<RunOutcome, AdapterError>> { unreachable!() }
+        }
+        let data = tempfile::tempdir().unwrap();
+        let adapter = Arc::new(Counted {
+            revision: 0.into(), probes: 0.into(), gate: Arc::new(tokio::sync::Semaphore::new(0)),
+        });
+        let instance = adapter.clone();
+        let host = Host::start_with(data.path().into(), move |_| vec![instance], || {}).unwrap();
+        let receive = |id, terminal, generation: usize| {
+            let r = host.catalogs.recv_timeout(Duration::from_secs(3)).unwrap();
+            assert_eq!(r.agent, "codex");
+            assert_eq!(r.request_id, id);
+            assert_eq!(r.final_reply, terminal);
+            assert_eq!(r.result.unwrap()["generation"], generation);
+        };
+        receive(host.request_catalog("codex"), true, 0);
+        receive(host.request_catalog("codex"), true, 0);
+        assert_eq!(adapter.probes.load(SeqCst), 1);
+        adapter.revision.store(1, SeqCst);
+        let id = host.request_catalog("codex");
+        receive(id, false, 0);
+        adapter.gate.add_permits(1);
+        receive(id, true, 1);
+        receive(host.request_catalog_with("codex", true), true, 2);
+        assert_eq!(adapter.probes.load(SeqCst), 3);
     }
 
     pub(crate) fn fakes(_: &Shared) -> Vec<Arc<dyn Adapter>> {

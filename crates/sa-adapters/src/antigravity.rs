@@ -380,6 +380,9 @@ async fn discover(
         .as_ref()
         .and_then(|s| {
             let models = s["models"].as_array()?;
+            if s["catalogError"] == true {
+                return models.iter().any(|m| m["id"] == "@native").then(|| "@native".to_string());
+            }
             let hit = configured_model.as_deref().and_then(|c| {
                 models
                     .iter()
@@ -389,7 +392,7 @@ async fn discover(
                 .or_else(|| {
                     s["defaultModel"]
                         .as_str()
-                        .filter(|d| !d.is_empty())
+                        .filter(|d| models.iter().any(|m| m["id"].as_str() == Some(*d)))
                         .map(str::to_string)
                 })
                 .or_else(|| {
@@ -423,7 +426,9 @@ impl Adapter for Antigravity {
     }
 
     fn catalog_revision(&self) -> String {
-        crate::catalog_revision(&self.sys, self.agent())
+        fingerprint("agy-", &[json!(crate::catalog_revision(&self.sys, self.agent())),
+            json!(self.sys.var("SUPERAGENT_AGY_MODEL")), json!(self.sys.var("GEMINI_MODEL")),
+            json!(self.sys.var("GOOGLE_GEMINI_BASE_URL")), json!(adc(&self.sys))])
     }
     fn cli_info(&self) -> BoxFuture<'static, Value> {
         crate::compatibility::detect(self.agent(), self.sys.clone(), executable(&self.sys))
@@ -431,20 +436,14 @@ impl Adapter for Antigravity {
 
     fn local_catalog(&self) -> Value {
         let settings = native_settings(&self.sys);
-        if settings["modelProvider"] == "gemini" {
-            if let Some(row) = configured(&self.sys).first() {
-                return crate::compatibility::local(json!({"provider":row.id,"model":row.model,"mode":"cli"}),
-                    executable(&self.sys).is_some() && row.public["available"] == true);
-            }
-            return Value::Null;
-        }
-        let model = self.sys.var("SUPERAGENT_AGY_MODEL").or_else(|| settings["model"].as_str()).unwrap_or("@native");
-        // Display labels need live ID resolution before binding a model.
-        if model != "@native" && !MODEL_ID.is_match(model) {
+        // Only the native sentinel can be resolved without consulting the
+        // directory. Configured IDs and display labels can both disappear.
+        let configured = self.sys.var("SUPERAGENT_AGY_MODEL").or_else(|| settings["model"].as_str());
+        if settings["modelProvider"] == "gemini" || configured.is_some_and(|m| m != "@native") {
             return Value::Null;
         }
         let provider = if adc(&self.sys) { "adc" } else { "google" };
-        crate::compatibility::local(json!({"provider":provider,"model":model,"mode":"cli"}), executable(&self.sys).is_some())
+        crate::compatibility::local(json!({"provider":provider,"model":"@native","mode":"cli"}), executable(&self.sys).is_some())
     }
 
     fn catalog(&self) -> BoxFuture<'static, anyhow::Result<Catalog>> {
@@ -964,6 +963,18 @@ int main(int argc, char **argv) {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn removed_configured_model_requires_discovery_and_resolves_to_native() {
+        let root = tempfile::tempdir().unwrap();
+        let mut sys = fixture_sys(root.path());
+        sys.set("SUPERAGENT_AGY_MODEL", "model-that-was-removed");
+        let adapter = Antigravity::new(sys);
+        assert!(adapter.local_catalog()["default"].is_null());
+        assert!(calls(root.path()).is_empty());
+        let catalog = adapter.catalog().await.unwrap().value;
+        assert_eq!(catalog["default"]["model"], "@native");
     }
 
     #[tokio::test]

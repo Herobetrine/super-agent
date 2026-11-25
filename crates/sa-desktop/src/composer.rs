@@ -334,10 +334,10 @@ impl App {
         let probes: Vec<_> = host.probes.try_iter().collect();
         for c in catalogs {
             if let Some(d) = self.models.as_mut() {
-                d.answer_for(&c.agent, c.request_id, c.result.clone());
+                d.answer_for(&c.agent, c.request_id, c.final_reply, c.result.clone());
             }
             if let Some(d) = self.providers.as_mut() {
-                d.answer_for(&c.agent, c.request_id, c.result);
+                d.answer_for(&c.agent, c.request_id, c.final_reply, c.result);
             }
         }
         if let Some(d) = self.providers.as_mut() {

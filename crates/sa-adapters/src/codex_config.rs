@@ -360,7 +360,14 @@ pub async fn discover(sys: &Sys, cancel: &CancellationToken) -> Result<Discovery
                 .unwrap_or(name)
                 .to_string();
             let available = !by_id.is_empty();
-            json!({"id": name, "label": label, "models": by_id, "detail": detail, "available": available, "catalog_complete":complete, "catalogError":failed})
+            let source = cfg.as_ref().unwrap_or(&Value::Null);
+            let identity = crate::common::fingerprint("src-", &[
+                source["base_url"].clone(), source["model_catalog_url"].clone(),
+                source["env_key"].clone(), source["requires_openai_auth"].clone(),
+                source["env_http_headers"].clone(), source["http_headers"].clone(),
+                json!(file_catalog.as_ref().filter(|_| name == def)),
+            ]);
+            json!({"id": name, "sourceIdentity":identity, "label": label, "models": by_id, "detail": detail, "available": available, "catalog_complete":complete, "catalogError":failed})
         }
     });
     let providers: Vec<Value> = join_all(probes).await;

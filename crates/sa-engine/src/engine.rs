@@ -186,7 +186,7 @@ impl CreateParams {
     }
 }
 
-type CatalogFuture = Shared<BoxFuture<'static, Result<Value, String>>>;
+pub type CatalogFuture = Shared<BoxFuture<'static, Result<Value, String>>>;
 
 #[derive(Clone, PartialEq, Eq, Hash)]
 enum CatalogKey {
@@ -424,11 +424,17 @@ impl Engine {
     /// Normal desktop requests show the snapshot and update it in the background.
     /// Forced requests await the shared live refresh, including its errors.
     pub async fn request_catalog(&self, agent: &str, force: bool) -> Result<Value, String> {
-        let (cached, refresh) = self.inner.catalog_snapshot(agent, true);
-        if !force && let Some(value) = cached {
+        let (cached, refresh) = self.catalog_updates(agent, force);
+        if let Some(value) = cached {
             return Ok(value);
         }
-        refresh.expect("forced snapshot always starts a refresh").await
+        refresh.expect("cold or forced lookup starts a refresh").await
+    }
+
+    /// Snapshot to display now and, when due, the shared live result.
+    pub fn catalog_updates(&self, agent: &str, force: bool) -> (Option<Value>, Option<CatalogFuture>) {
+        let (cached, refresh) = self.inner.catalog_snapshot(agent, force);
+        (if force { None } else { cached }, refresh)
     }
 
     pub fn db(&self) -> &Db {
@@ -2237,7 +2243,7 @@ impl Inner {
         let flight_key = key.clone();
         let shutdown = self.catalog_shutdown.clone();
         let future = async move {
-            let result = async {
+            let mut result = async {
                 let (catalog, info) = tokio::select! {
                     biased;
                     _ = shutdown.cancelled() => return Err("调度台已关闭".to_string()),
@@ -2255,10 +2261,12 @@ impl Inner {
                 Ok(catalog)
             }.await;
             if let Some(inner) = inner.upgrade() {
-                let keep_previous = result.as_ref().is_ok_and(|value| {
-                    lock(&inner.catalog_cache).get(&name).is_some_and(|e| e.loses_good_source(value))
-                });
-                if let Ok(value) = &result && !keep_previous {
+                if let Ok(value) = &mut result {
+                    if let Some(previous) = lock(&inner.catalog_cache).get(&name) {
+                        let unchanged = previous.fingerprint
+                            == stringify(&json!([revision, previous.value["cli"]["version"]]));
+                        previous.merge_failed_sources(value, unchanged);
+                    }
                     let entry = Entry { fingerprint: stringify(&json!([revision, value["cli"]["version"]])),
                         fetched_at: now(), value: value.clone() };
                     if let Err(error) = inner.db.with(|q| catalog_cache::save(q.conn(), &name, &entry)) {
@@ -2936,6 +2944,18 @@ impl Inner {
             pick(&job.agent, None)
         };
         let probe_error = |message| route_error(crate::resilience::CODE_ROUTE_PROBE_FAILED, message);
+        // A stale menu can still be displayed, but only current configuration
+        // (or this adapter's in-flight discovery) can choose a new binding.
+        let cached_default = own.as_ref().is_some_and(|cat| cat["cachedDefault"] == true);
+        if full_menus && fixed.is_none() && !own_is_local {
+            let local = self.adapters.get(&job.agent).map(|adapter| adapter.local_catalog());
+            let local_pick = pick(&job.agent, local.as_ref());
+            let resolved = matches!(p::options(local.as_ref(), local_pick.as_ref()), Ok(Some(_)));
+            if resolved || own_refresh.is_some() || cached_default {
+                own = local;
+                own_is_local = true;
+            }
+        }
         let from_default_snapshot = own.is_some() && fixed.is_none() && !own_is_local;
         let (mut cat, picked) = if let Some(value) = fixed {
             let route = p::route(Some(&value)).map_err(|e| TurnError::Engine(anyhow!(e)))?;
@@ -2953,11 +2973,13 @@ impl Inner {
                 None => self.catalog(&job.agent).await.map_err(probe_error)?,
             };
             let mut picked = pick(&job.agent, Some(&cat));
-            if own_is_local && p::route(picked.as_ref()).is_err()
-                && let Some(future) = own_refresh
-            {
+            if own_is_local && !matches!(p::options(Some(&cat), picked.as_ref()), Ok(Some(_))) {
+                let future = own_refresh.unwrap_or_else(|| self.catalog(&job.agent));
                 cat = future.await.map_err(probe_error)?;
                 picked = pick(&job.agent, Some(&cat));
+            }
+            if cat["cachedDefault"] == true && !(job.agent == "claude" && job.follow_config != 1) {
+                return Err(probe_error(UNAVAILABLE.into()));
             }
             (cat, picked)
         };

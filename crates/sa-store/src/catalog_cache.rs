@@ -15,27 +15,54 @@ pub struct Entry {
 }
 
 impl Entry {
-    /// Some adapters return a diagnostic catalog on a provider probe error.
-    /// Keep a previously discovered directory until that source responds again.
-    pub fn loses_good_source(&self, live: &Value) -> bool {
-        live["providers"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter(|row| row["catalogError"] == true)
-            .any(|failed| {
-                self.value["providers"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .any(|old| {
-                        old["id"] == failed["id"]
-                            && old["catalogError"] != true
-                            && old["models"]
-                                .as_array()
-                                .is_some_and(|models| !models.is_empty())
-                    })
-            })
+    /// Iterate the new directory so removed sources stay removed. An adapter
+    /// whose route ID survives endpoint edits also supplies a source identity.
+    pub fn merge_failed_sources(&self, live: &mut Value, unchanged_revision: bool) {
+        let Some(previous) = self.value["providers"].as_array() else {
+            return;
+        };
+        let mut default = live["default"].clone();
+        let mut restored_default = false;
+        let Some(rows) = live["providers"].as_array_mut() else {
+            return;
+        };
+        for row in rows.iter_mut().filter(|row| row["catalogError"] == true) {
+            let Some(old) = previous.iter().find(|old| {
+                old["id"].is_string()
+                    && old["id"] == row["id"]
+                    && (old["sourceIdentity"] == row["sourceIdentity"]
+                        || (unchanged_revision && old.get("sourceIdentity").is_none()))
+                    && (old["catalogError"] != true || old["cachedModels"] == true)
+                    && old["models"]
+                        .as_array()
+                        .is_some_and(|models| !models.is_empty())
+            }) else {
+                continue;
+            };
+            row["models"] = old["models"].clone();
+            row["cachedModels"] = Value::Bool(true);
+            if row.get("unavailable_reason").is_none() {
+                row["available"] = Value::Bool(old["available"] != false);
+            }
+            if row["defaultModel"].as_str().is_none_or(str::is_empty)
+                && let Some(model) = old.get("defaultModel")
+            {
+                row["defaultModel"] = model.clone();
+            }
+            let old_default = &self.value["default"];
+            if default["provider"] == row["id"]
+                && default["provider"] == old_default["provider"]
+                && default["mode"] == old_default["mode"]
+                && default["model"].as_str().is_none_or(str::is_empty)
+            {
+                default["model"] = old_default["model"].clone();
+                restored_default = true;
+            }
+        }
+        if restored_default {
+            live["default"] = default;
+            live["cachedDefault"] = Value::Bool(true);
+        }
     }
 }
 

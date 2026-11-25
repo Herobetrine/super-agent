@@ -83,18 +83,12 @@ impl ProvidersDialog {
     pub fn needs(&self, agent: &str) -> bool {
         matches!(self.catalogs.get(agent), Some(None))
     }
-
-    pub fn answer(&mut self, agent: &str, result: Result<Value, String>) {
-        if self.needs(agent) {
+    pub fn answer_for(&mut self, agent: &str, request_id: u64, final_reply: bool, result: Result<Value, String>) {
+        if self.pending_requests.get(agent) != Some(&request_id) { return; }
+        if result.is_ok() || self.needs(agent) {
             self.catalogs.insert(agent.to_string(), Some(result));
-            self.pending_requests.remove(agent);
         }
-    }
-
-    pub fn answer_for(&mut self, agent: &str, request_id: u64, result: Result<Value, String>) {
-        if self.pending_requests.get(agent) == Some(&request_id) && self.needs(agent) {
-            self.answer(agent, result);
-        }
+        if final_reply { self.pending_requests.remove(agent); }
     }
 
     pub fn probed(&mut self, result: Result<Vec<String>, String>) {
@@ -683,12 +677,17 @@ mod tests {
             message: None,
             preferred_agent: "codex".into(),
         };
-        dialog.answer_for("codex", 1, Err("old failure".into()));
+        dialog.answer_for("codex", 1, true, Err("old failure".into()));
         assert!(dialog.needs("codex"));
-        dialog.answer_for("codex", 2, Ok(serde_json::json!({"revision":"new"})));
+        dialog.answer_for("codex", 2, false, Ok(serde_json::json!({"revision":"snapshot"})));
+        assert!(!dialog.needs("codex"));
+        assert_eq!(dialog.pending_requests.get("codex"), Some(&2));
+        dialog.answer_for("codex", 1, true, Err("superseded".into()));
+        assert_eq!(dialog.pending_requests.get("codex"), Some(&2));
+        dialog.answer_for("codex", 2, true, Ok(serde_json::json!({"revision":"new"})));
         assert!(!dialog.needs("codex"));
         assert!(dialog.pending_requests.is_empty());
-        dialog.answer_for("codex", 1, Ok(serde_json::json!({"revision":"old"})));
+        dialog.answer_for("codex", 1, true, Ok(serde_json::json!({"revision":"old"})));
         assert!(matches!(dialog.catalogs.get("codex"), Some(Some(Ok(value))) if value["revision"] == "new"));
     }
 }
