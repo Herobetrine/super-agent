@@ -302,6 +302,10 @@ impl App {
             self.composer.pending += 1;
             self.composer.message = None;
         } else {
+            if kind == ActionKind::Notify {
+                self.notify_saved(Err("调度线程已退出，请重新打开窗口".into()));
+                return;
+            }
             if let ActionKind::ProjectChecks { request } = kind {
                 self.workflow.checks_result(request, Err("调度线程已退出，请重新打开窗口".into()));
             }

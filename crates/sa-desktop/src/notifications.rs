@@ -94,6 +94,69 @@ impl QuestionWatch {
     }
 }
 
+type RootStates = std::collections::BTreeMap<i64, (i64, String)>;
+
+/// Observe root jobs independently of the sidebar's filtering and pagination.
+#[derive(Default)]
+pub struct CompletionWatch {
+    pending: Option<crate::ops::Pending<RootStates>>,
+    last: Option<std::time::Instant>,
+    seen: Option<RootStates>,
+}
+
+impl CompletionWatch {
+    pub fn poll(&mut self, ctx: &egui::Context, data: &std::path::Path) -> Vec<(i64, String)> {
+        let mut finished = Vec::new();
+        if let Some(result) = self.pending.as_ref().and_then(crate::ops::Pending::poll) {
+            self.pending = None;
+            if let Ok(rows) = result {
+                if let Some(seen) = &self.seen {
+                    for (&ticket, (turn, state)) in &rows {
+                        // A new ticket or turn can run to completion between polls.
+                        if matches!(state.as_str(), "done" | "failed" | "partial" | "interrupted")
+                            && seen.get(&ticket).is_none_or(|(old_turn, old_state)| {
+                                turn > old_turn || crate::labels::is_active(old_state)
+                            })
+                        {
+                            finished.push((ticket, state.clone()));
+                        }
+                    }
+                }
+                self.seen = Some(rows);
+            }
+        }
+        if self.pending.is_none()
+            && self
+                .last
+                .is_none_or(|last| last.elapsed() >= std::time::Duration::from_secs(1))
+        {
+            let path = data.join(sa_store::DB_FILE);
+            self.pending = Some(crate::ops::Pending::spawn(ctx, move || {
+                let conn = rusqlite::Connection::open_with_flags(
+                    path,
+                    rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+                )?;
+                conn.busy_timeout(std::time::Duration::from_secs(1))?;
+                let mut stmt =
+                    conn.prepare("SELECT ticket, turn, state FROM jobs WHERE parent IS NULL")?;
+                let rows = stmt.query_map([], |r| Ok((r.get(0)?, (r.get(1)?, r.get(2)?))))?;
+                Ok(rows.collect::<rusqlite::Result<RootStates>>()?)
+            }));
+            self.last = Some(std::time::Instant::now());
+        }
+        ctx.request_repaint_after(std::time::Duration::from_secs(1));
+        finished
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_state(&self, ticket: i64, state: &str) -> bool {
+        self.seen
+            .as_ref()
+            .and_then(|rows| rows.get(&ticket))
+            .is_some_and(|(_, seen)| seen == state)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NoticeKind {
     Approval,

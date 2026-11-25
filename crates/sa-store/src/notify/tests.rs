@@ -47,8 +47,14 @@ fn server_policy() {
     };
     for (server, expected) in [
         ("https://ntfy.sh", None),
-        ("https://example.com:8443/base", None),
-        ("http://localhost:8080/base", None),
+        ("https://ntfy.sh/", None),
+        ("https://ntfy.example.com:8443", None),
+        ("https://ntfy.sh/team", Some(HasPath)),
+        ("https://ntfy.sh/team/..", Some(HasPath)),
+        ("https://ntfy.sh/%2e", Some(HasPath)),
+        ("https://ntfy.sh/?", Some(HasPath)),
+        ("https://ntfy.sh/#", Some(HasPath)),
+        ("http://localhost:8080/base", Some(HasPath)),
         ("http://127.0.0.1", None),
         ("http://127.255.255.254", None),
         ("http://[::1]", None),

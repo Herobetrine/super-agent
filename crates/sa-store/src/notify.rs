@@ -72,6 +72,7 @@ pub enum ServerProblem {
     Empty,
     NeedsHttps,
     Invalid,
+    HasPath,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -99,6 +100,15 @@ pub fn check(s: &Settings) -> Check {
     } else {
         match Url::parse(address) {
             Err(_) => Some(ServerProblem::Invalid),
+            Ok(url)
+                if matches!(url.scheme(), "http" | "https")
+                    && (url.path() != "/"
+                        || has_non_root_path(address)
+                        || url.query().is_some()
+                        || url.fragment().is_some()) =>
+            {
+                Some(ServerProblem::HasPath)
+            }
             Ok(url) if url.scheme() == "https" => None,
             Ok(url) if url.scheme() == "http" && url.host().is_some_and(local_host) => None,
             Ok(_) => Some(ServerProblem::NeedsHttps),
@@ -124,6 +134,22 @@ pub fn check(s: &Settings) -> Check {
         short_topic: s.topic.chars().count() < 12,
         nothing_selected: !(s.needs_you || s.done || s.unfinished),
     }
+}
+
+fn has_non_root_path(address: &str) -> bool {
+    // URL parsing normalizes dot segments. Inspect the supplied path too so
+    // a path such as /team/.. cannot silently turn into a valid server setting.
+    let Some((_, authority_and_path)) = address.split_once(':') else {
+        return false;
+    };
+    let authority_and_path = authority_and_path.trim_start_matches(['/', '\\']);
+    let before_suffix = authority_and_path
+        .split(['?', '#'])
+        .next()
+        .unwrap_or_default();
+    before_suffix
+        .find(['/', '\\'])
+        .is_some_and(|at| &before_suffix[at..] != "/")
 }
 
 fn local_host(host: Host<&str>) -> bool {

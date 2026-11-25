@@ -58,7 +58,7 @@ impl App {
     /// Global shortcuts; called once per frame before the panels.
     pub fn shortcuts(&mut self, ctx: &egui::Context) {
         let pressed = |s: &KeyboardShortcut| ctx.input_mut(|i| i.consume_shortcut(s));
-        if pressed(&PALETTE) {
+        if self.notify.is_none() && pressed(&PALETTE) {
             self.palette = match self.palette {
                 Some(_) => None,
                 None => Some(PaletteState::default()),
@@ -68,6 +68,7 @@ impl App {
             || self.models.is_some()
             || self.providers.is_some()
             || self.extensions.is_some()
+            || self.notify.is_some()
             || self.composer.confirm.is_some();
         if modal_open {
             return;

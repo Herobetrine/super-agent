@@ -89,22 +89,6 @@ fn copy_button(ui: &mut Ui, key: &'static str, idle: &str, text: &str, pal: &the
     clicked
 }
 
-/// Gate for automatic pushes: only while the window is in the background and
-/// the saved settings could be read. Independent of the system-toast toggle.
-pub(crate) fn forward(
-    focused: bool,
-    event: Event,
-    settings: Option<&Saved>,
-    sink: impl FnOnce(Event, &Settings),
-) {
-    if focused {
-        return;
-    }
-    if let Some(Ok(settings)) = settings {
-        sink(event, settings);
-    }
-}
-
 impl App {
     pub fn open_notify(&mut self) {
         if self.notify.is_some() {
@@ -169,8 +153,6 @@ impl App {
         let writable = self.writable();
         let demo = self.opts.demo;
         let data = self.data_dir();
-        // What is in effect now, not what the form holds.
-        let live: Option<Saved> = self.host.as_ref().map(|host| host.notify_settings());
         let last_push = self.pusher.last();
         let pal = self.pal.clone();
         let Some(dialog) = self.notify.as_mut() else {
@@ -180,6 +162,12 @@ impl App {
             dialog.loading = None;
             match result {
                 Ok(settings) => {
+                    let settings = if let Some(host) = &self.host {
+                        host.notify_settings_cache().recover(settings.clone());
+                        host.notify_settings().unwrap_or(settings)
+                    } else {
+                        settings
+                    };
                     dialog.draft = settings.clone();
                     dialog.loaded = Some(Ok(settings));
                     dialog.load_error = None;
@@ -199,7 +187,11 @@ impl App {
         if dialog.test.is_some() && key != dialog.test_key {
             dialog.test = None;
         }
-        let saved = live.clone().or_else(|| dialog.loaded.clone());
+        let saved = self
+            .host
+            .as_ref()
+            .map(|host| host.notify_settings())
+            .or_else(|| dialog.loaded.clone());
         let busy = dialog.saving || dialog.testing.is_some();
         let editable = (writable || demo) && dialog.ready && !busy;
         let on = editable && dialog.draft.enabled;
@@ -286,6 +278,7 @@ impl App {
                                     "请使用 https 地址；只有本机或局域网地址可以用 http"
                                 }
                                 ServerProblem::Invalid => "服务器地址格式不对",
+                                ServerProblem::HasPath => push::ROOT_SERVER_ONLY,
                             },
                             pal.fail.fg,
                         );
@@ -559,19 +552,19 @@ impl App {
     /// Queue a phone push for `event` while the window is in the background.
     /// Never blocks: the network call runs on the pusher's worker thread.
     pub(crate) fn push_event(&mut self, event: Event) {
-        if !self.writable() || self.opts.demo || self.shot_active() {
+        let Some(host) = &self.host else {
+            return;
+        };
+        if self.opts.demo || self.shot_active() || self.window_focused() {
             return;
         }
-        let focused = self.window_focused();
-        let settings = self.host.as_ref().map(|host| host.notify_settings());
         #[cfg(test)]
-        let sink = |event: Event, settings: &Settings| {
-            if let Some(push) = push::push_for(&event, settings) {
-                self.pushed.push(push);
-            }
-        };
+        if let Ok(settings) = host.notify_settings()
+            && let Some(push) = push::push_for(&event, &settings)
+        {
+            self.pushed.push(push);
+        }
         #[cfg(not(test))]
-        let sink = |event: Event, settings: &Settings| self.pusher.notify(event, settings);
-        forward(focused, event, settings.as_ref(), sink);
+        self.pusher.notify(&event, host.notify_settings_cache());
     }
 }

@@ -177,6 +177,7 @@ pub struct App {
     notifications_enabled: bool,
     approval_watch: crate::notifications::ApprovalWatch,
     question_watch: crate::notifications::QuestionWatch,
+    pub(crate) completion_watch: crate::notifications::CompletionWatch,
     pub extensions: Option<crate::extensions::ExtDialog>,
     /// For background work started outside `update`.
     pub ctx: egui::Context,
@@ -270,6 +271,7 @@ impl App {
             notifications_enabled: cfg!(windows) && get("notifications").as_deref() != Some("0"),
             approval_watch: Default::default(),
             question_watch: Default::default(),
+            completion_watch: Default::default(),
             extensions: None,
             ctx: cc.egui_ctx.clone(),
             host_error: host.as_ref().err().cloned(),
@@ -768,10 +770,6 @@ impl App {
                     kind: crate::notifications::NoticeKind::Completion,
                     status: labels::job_state(&r.state).to_string(),
                 });
-                self.push_event(crate::push::Event::Finished {
-                    ticket: r.id,
-                    state: r.state.clone(),
-                });
                 done = Some(format!(
                     "工单 #{} {}：{}",
                     r.id,
@@ -878,6 +876,9 @@ impl App {
                     crate::notifications::NoticeKind::Completion => {}
                 }
                 self.post_notice(notice);
+            }
+            for (ticket, state) in self.completion_watch.poll(&self.ctx, &data) {
+                self.push_event(crate::push::Event::Finished { ticket, state });
             }
         }
         if let Some(r) = self.export.as_ref().and_then(Pending::poll) {

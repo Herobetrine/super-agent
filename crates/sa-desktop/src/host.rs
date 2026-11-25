@@ -454,7 +454,7 @@ pub struct Shared {
     pub registry: Registry,
     pub rotation: Arc<RwLock<Rotation>>,
     pub efficiency: sa_store::efficiency::Shared,
-    notify: Arc<RwLock<Result<sa_store::notify::Settings, String>>>,
+    notify: Arc<crate::push::NotifySettings>,
 }
 
 impl Shared {
@@ -463,7 +463,7 @@ impl Shared {
             registry: sa_adapters::registry(vec![]),
             rotation: Arc::default(),
             efficiency: sa_store::efficiency::shared(Default::default()),
-            notify: Arc::new(RwLock::new(Ok(sa_store::notify::Settings::default()))),
+            notify: Arc::default(),
         }
     }
 
@@ -652,7 +652,11 @@ impl Host {
     }
 
     pub fn notify_settings(&self) -> Result<sa_store::notify::Settings, String> {
-        self.shared.notify.read().unwrap_or_else(|p| p.into_inner()).clone()
+        self.shared.notify.get()
+    }
+
+    pub(crate) fn notify_settings_cache(&self) -> &Arc<crate::push::NotifySettings> {
+        &self.shared.notify
     }
 
     /// Probe one harness catalog concurrently with the action queue (probes
@@ -935,8 +939,7 @@ fn open_engine(
     // Providers and rotation must be loaded before the first admission.
     shared.reload(&engine)?;
     let notify = engine.db().with(|q| sa_store::notify::load(q.conn()));
-    *shared.notify.write().unwrap_or_else(|p| p.into_inner()) =
-        notify.map_err(|error| error.to_string());
+    shared.notify.publish(notify.map_err(|error| error.to_string()));
     engine.start()?;
     Ok(engine)
 }
@@ -1161,7 +1164,7 @@ async fn execute(engine: &Engine, shared: &Shared, action: Action) -> Result<Opt
         }
         Action::SaveNotify(settings) => {
             engine.db().tx(|q| sa_store::notify::save(q.conn(), &settings))?;
-            *shared.notify.write().unwrap_or_else(|p| p.into_inner()) = Ok(settings);
+            shared.notify.publish(Ok(settings));
             Ok(None)
         }
         Action::SaveRoutes {
