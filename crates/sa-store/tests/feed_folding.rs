@@ -348,3 +348,45 @@ fn full_and_incremental_snapshots_match_full_scan_with_and_without_writer_index(
         assert_eq!(check_page(&mut store, &conn, lead, end), end);
     }
 }
+
+#[test]
+fn snapshot_keeps_unadmitted_legacy_attempt_and_admitted_retry() {
+    for indexed in [true, false] {
+        for prior_admission in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            drop(Store::open(dir.path()).unwrap());
+            let conn = writer(dir.path());
+            if !indexed {
+                conn.execute_batch("DROP INDEX events_ticket_job_kind")
+                    .unwrap();
+            }
+            let lead = create_ticket(&conn, ".", "legacy retry", "claude");
+            if prior_admission {
+                log(&conn, lead, "turn.admitted", &json!({}));
+            }
+            log(&conn, lead, "delta", &json!("older turn"));
+            let lead = Job { turn: 2, ..lead };
+            conn.execute(
+                "UPDATE jobs SET turn=2,state='running' WHERE id=?",
+                [lead.id],
+            )
+            .unwrap();
+            let first = log(&conn, lead, "delta", &json!("legacy attempt"));
+            log(&conn, lead, "retry", &json!({}));
+            log(&conn, lead, "turn.admitted", &json!({}));
+            let second = log(&conn, lead, "delta", &json!("admitted retry"));
+            let mut store = Store::open_read_only(dir.path()).unwrap();
+            for (after, expected) in [(0, vec![first, second]), (first, vec![second])] {
+                let snap = store.snapshot(lead.ticket, after).unwrap();
+                assert_eq!(snap.cursor, second);
+                let deltas: Vec<_> = snap
+                    .events
+                    .iter()
+                    .filter(|e| e.kind == "delta")
+                    .map(|e| e.seq)
+                    .collect();
+                assert_eq!(deltas, expected);
+            }
+        }
+    }
+}
