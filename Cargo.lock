@@ -3454,12 +3454,15 @@ name = "sa-store"
 version = "0.3.0"
 dependencies = [
  "anyhow",
+ "proc-macro2",
  "regex",
  "rusqlite",
  "serde",
  "serde_json",
  "sha2",
+ "syn 2.0.119",
  "tempfile",
+ "toml_edit",
  "url",
  "windows-sys 0.61.2",
 ]
