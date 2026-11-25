@@ -394,6 +394,53 @@ fn server_path_explains_the_root_rule_and_blocks_save_and_test() {
 }
 
 #[test]
+fn legacy_credentials_are_redacted_in_the_server_field_and_privacy_status() {
+    let data = tempfile::tempdir().unwrap();
+    let owner = Host::start_with(data.path().into(), fakes, || {}).unwrap();
+    let legacy = Settings {
+        server: "https://fixture-user:fixture-password@ntfy.example.org:8443/".into(),
+        ..enabled()
+    };
+    owner.engine().db().with(|q| {
+        q.conn().execute("INSERT INTO studio_notify VALUES(1,?1)", [serde_json::to_string(&legacy)?])?;
+        Ok(())
+    }).unwrap();
+    drop(owner);
+
+    let mut h = harness(data.path(), false, false);
+    open(&mut h);
+    let server = h.get_by_role_and_label(Role::TextInput, "服务器");
+    assert_eq!(
+        server.accesskit_node().value().as_deref(),
+        Some("https://ntfy.example.org:8443/")
+    );
+    assert!(shown(&h, "手机推送：已开启，发往 https://ntfy.example.org:8443/"));
+    assert!(shown(&h, sa_store::notify::SERVER_CREDENTIALS_ERROR));
+    assert!(!shown(&h, &format!("手机推送：已开启，发往 {}", legacy.server)));
+    assert!(disabled(&h, Role::Button, "保存"));
+    assert!(disabled(&h, Role::Button, "发送测试推送"));
+}
+
+#[test]
+fn entering_credentials_never_places_them_in_the_server_field() {
+    let data = tempfile::tempdir().unwrap();
+    let mut h = harness(data.path(), false, false);
+    open(&mut h);
+    edit(&mut h, |s| {
+        *s = enabled();
+        s.server.clear();
+    });
+    let server = h.get_by_role_and_label(Role::TextInput, "服务器");
+    server.focus();
+    server.type_text("https://fixture-user:fixture-password@ntfy.sh/");
+    h.run_steps(3);
+    assert!(draft(&h).server.is_empty());
+    assert!(shown(&h, sa_store::notify::SERVER_CREDENTIALS_ERROR));
+    assert!(disabled(&h, Role::Button, "保存"));
+    assert!(disabled(&h, Role::Button, "发送测试推送"));
+}
+
+#[test]
 fn observer_is_read_only_but_can_copy() {
     let data = tempfile::tempdir().unwrap();
     let saved = Settings {
@@ -424,6 +471,10 @@ fn observer_is_read_only_but_can_copy() {
     assert!(disabled(&h, Role::CheckBox, "向手机推送提醒"));
     assert!(!disabled(&h, Role::Button, "复制"));
     assert!(!disabled(&h, Role::Button, "复制路径"));
+    assert!(shown(&h, "· 工作台刷新模型目录时（向对应供应商查询可用模型）；"));
+    assert!(shown(&h, "· 你在工作台里刷新已绑定的 PR 时（通过本机已登录的 gh 向 GitHub 查询该 PR）；"));
+    assert!(shown(&h, "· 你在工作台里打开网页链接时（由默认浏览器访问）；"));
+    assert!(shown(&h, "· 工作台运行你配置的项目检查命令时（是否联网取决于命令本身）；"));
     h.get_by_role_and_label(Role::Button, "复制路径").click();
     h.run_steps(3);
     assert!(h.query_by_role_and_label(Role::Button, "已复制").is_some());
@@ -431,6 +482,34 @@ fn observer_is_read_only_but_can_copy() {
     h.run_steps(3);
     assert!(h.state().notify.is_none());
     assert_eq!(owner.engine().db().with(|q| sa_store::notify::load(q.conn())).unwrap(), saved);
+}
+
+#[test]
+fn open_observer_refreshes_status_and_the_copied_topic_after_a_main_window_save() {
+    let data = tempfile::tempdir().unwrap();
+    let mut main = harness(data.path(), false, false);
+    save_settings(&mut main, enabled());
+    let mut observer = harness(data.path(), true, false);
+    open(&mut observer);
+    wait(&mut observer, "initial saved topic", |app| {
+        app.notify.as_ref().is_some_and(|d| d.draft.topic == TOPIC)
+    });
+
+    let changed = Settings {
+        server: "https://ntfy.example.org".into(),
+        topic: "sa-new-private-topic".into(),
+        ..enabled()
+    };
+    save_settings(&mut main, changed.clone());
+    wait(&mut observer, "observer settings refresh", |app| {
+        app.notify.as_ref().is_some_and(|d| d.draft == changed)
+    });
+    assert!(shown(&observer, "手机推送：已开启，发往 https://ntfy.example.org"));
+    observer.get_by_role_and_label(Role::Button, "复制").click_accesskit();
+    observer.step();
+    assert!(observer.output().platform_output.commands.iter().any(|cmd| {
+        matches!(cmd, egui::OutputCommand::CopyText(text) if text == &changed.topic)
+    }));
 }
 
 #[test]
@@ -592,7 +671,7 @@ fn enabled() -> Settings {
 fn finished_tickets_push_only_while_unfocused_and_cancelled_never() {
     let data = tempfile::tempdir().unwrap();
     let owner = Host::start_with(data.path().into(), fakes, || {}).unwrap();
-    owner.engine().db().with(|q| {
+    let baseline_seq = owner.engine().db().with(|q| {
         q.conn().execute_batch(
             "WITH RECURSIVE ids(id) AS (VALUES(1) UNION ALL SELECT id+1 FROM ids WHERE id<155)
              INSERT INTO tickets(id,goal,cwd,writes,lead,created)
@@ -600,21 +679,25 @@ fn finished_tickets_push_only_while_unfocused_and_cancelled_never() {
              INSERT INTO jobs(id,ticket,agent,body,writing,depth,state)
              SELECT id,id,'claude','seed',0,0,'done' FROM tickets;"
         )?;
-        sa_store::notify::save(q.conn(), &enabled())
+        q.conn().execute(
+            "INSERT INTO events(ts,ticket,job,turn,kind,payload,sha256)
+             VALUES (0,1,1,1,'reply','{\"state\":\"done\"}','fixture')", [])?;
+        let seq = q.conn().last_insert_rowid();
+        sa_store::notify::save(q.conn(), &enabled())?;
+        Ok(seq)
     }).unwrap();
     drop(owner);
     let mut h = harness(data.path(), false, false);
     h.state_mut().test_focus = Some(false);
     h.state_mut().set_search("no matching sidebar tickets".into());
-    wait(&mut h, "startup baseline", |app| app.completion_watch.has_state(1, "done"));
+    wait_for_completion(&mut h, baseline_seq);
     assert!(h.state().pushed.is_empty());
-    update_root_states(&h, "UPDATE jobs SET state='running',turn=2 WHERE id BETWEEN 1 AND 4");
-    wait(&mut h, "running roots", |app| app.completion_watch.has_state(4, "running"));
-    update_root_states(&h,
-        "UPDATE jobs SET state='done' WHERE id=1;
-         UPDATE jobs SET state='cancelled' WHERE id=2;
-         UPDATE jobs SET state='failed' WHERE id=3;");
-    wait(&mut h, "terminal roots", |app| app.completion_watch.has_state(3, "failed"));
+    let seq = record_completion_events(&h, &[
+        (1, "done", "reply", r#"{"state":"done"}"#),
+        (2, "cancelled", "cancelled", "null"),
+        (3, "failed", "failed", "null"),
+    ]);
+    wait_for_completion(&mut h, seq);
     let messages: Vec<_> = h.state().pushed.iter().map(|p| p.message.as_str()).collect();
     assert_eq!(messages, ["工单 #1 已完成", "工单 #3 失败"]);
 
@@ -622,22 +705,74 @@ fn finished_tickets_push_only_while_unfocused_and_cancelled_never() {
     // remain deduplicated when a subsequent turn finishes between polls.
     h.state_mut().pushed.clear();
     h.state_mut().test_focus = Some(true);
-    update_root_states(&h, "UPDATE jobs SET state='done' WHERE id=4");
-    wait(&mut h, "focused completion", |app| app.completion_watch.has_state(4, "done"));
+    let seq = record_completion_events(&h, &[(4, "done", "reply", r#"{"state":"done"}"#)]);
+    wait_for_completion(&mut h, seq);
     assert!(h.state().pushed.is_empty());
     h.state_mut().test_focus = Some(false);
-    update_root_states(&h, "UPDATE jobs SET state='partial',turn=3 WHERE id=1");
-    wait(&mut h, "second turn completion", |app| app.completion_watch.has_state(1, "partial"));
+    let seq = record_completion_events(&h, &[
+        (1, "failed", "failed", "null"),
+        (1, "queued", "retry", "null"),
+        (1, "done", "reply", r#"{"state":"done"}"#),
+        (3, "queued", "retry", "null"),
+        (3, "failed", "turn.pause_failure", r#"{"state":"failed"}"#),
+    ]);
+    wait_for_completion(&mut h, seq);
     let messages: Vec<_> = h.state().pushed.iter().map(|p| p.message.as_str()).collect();
-    assert_eq!(messages, ["工单 #1 部分完成"]);
+    assert_eq!(messages, ["工单 #1 失败", "工单 #1 已完成", "工单 #3 失败"]);
     assert_eq!(h.state().search, "no matching sidebar tickets");
 }
 
-fn update_root_states(h: &Harness<'_, App>, sql: &str) {
+fn record_completion_events(h: &Harness<'_, App>, events: &[(i64, &str, &str, &str)]) -> i64 {
     h.state().host.as_ref().unwrap().engine().db().tx(|q| {
-        q.conn().execute_batch(sql)?;
+        for &(ticket, state, kind, payload) in events {
+            q.conn().execute("UPDATE jobs SET state=?1 WHERE id=?2", rusqlite::params![state, ticket])?;
+            q.conn().execute(
+                "INSERT INTO events(ts,ticket,job,turn,kind,payload,sha256)
+                 VALUES (0,?1,?1,1,?2,?3,'fixture')",
+                rusqlite::params![ticket, kind, payload],
+            )?;
+        }
+        Ok(q.conn().last_insert_rowid())
+    }).unwrap()
+}
+
+fn wait_for_completion(h: &mut Harness<'_, App>, seq: i64) {
+    wait(h, "completion watcher cursor", |app| {
+        app.completion_watch.cursor().is_some_and(|cursor| cursor >= seq)
+    });
+}
+
+#[test]
+fn completion_watcher_stops_while_disabled_and_rebaselines_on_enable() {
+    let data = tempfile::tempdir().unwrap();
+    let mut h = harness(data.path(), false, false);
+    h.state_mut().test_focus = Some(false);
+    h.state().host.as_ref().unwrap().engine().db().with(|q| {
+        q.conn().execute_batch(
+            "INSERT INTO tickets(id,goal,cwd,writes,lead,created) VALUES (1,'fixture','',0,'claude',0);
+             INSERT INTO jobs(id,ticket,agent,body,writing,depth,state)
+             VALUES (1,1,'claude','fixture',0,0,'done');"
+        )?;
         Ok(())
     }).unwrap();
+    let seq = record_completion_events(&h, &[(1, "failed", "failed", "null")]);
+    h.run_steps(3);
+    assert!(!h.state().completion_watch.is_polling());
+    save_settings(&mut h, enabled());
+    wait_for_completion(&mut h, seq);
+    assert!(h.state().pushed.is_empty());
+
+    save_settings(&mut h, Settings { done: false, unfinished: false, ..enabled() });
+    let seq = record_completion_events(&h, &[(1, "done", "reply", r#"{"state":"done"}"#)]);
+    h.run_steps(3);
+    assert!(!h.state().completion_watch.is_polling());
+    assert!(h.state().completion_watch.cursor().is_none());
+    save_settings(&mut h, enabled());
+    wait_for_completion(&mut h, seq);
+    assert!(h.state().pushed.is_empty());
+    let seq = record_completion_events(&h, &[(1, "interrupted", "interrupted", "null")]);
+    wait_for_completion(&mut h, seq);
+    assert_eq!(h.state().pushed[0].message, "工单 #1 已中断");
 }
 
 #[test]

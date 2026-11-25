@@ -860,6 +860,10 @@ impl App {
     }
 
     fn poll_ops(&mut self) {
+        let completion_epoch = self.host.as_ref()
+            .filter(|_| !self.opts.demo && self.shot.is_none())
+            .and_then(|host| host.notify_settings_cache().completion_epoch());
+        self.completion_watch.set_epoch(completion_epoch);
         if self.writable() && !self.opts.demo && self.shot.is_none() {
             let data = self.opts.data.clone().unwrap_or_else(sa_store::default_data_dir);
             let notices = self.approval_watch.poll(&self.ctx, &data).into_iter()
@@ -877,8 +881,10 @@ impl App {
                 }
                 self.post_notice(notice);
             }
-            for (ticket, state) in self.completion_watch.poll(&self.ctx, &data) {
-                self.push_event(crate::push::Event::Finished { ticket, state });
+            if completion_epoch.is_some() {
+                for (ticket, state) in self.completion_watch.poll(&self.ctx, &data) {
+                    self.push_event(crate::push::Event::Finished { ticket, state });
+                }
             }
         }
         if let Some(r) = self.export.as_ref().and_then(Pending::poll) {

@@ -94,35 +94,31 @@ impl QuestionWatch {
     }
 }
 
-type RootStates = std::collections::BTreeMap<i64, (i64, String)>;
+type CompletionBatch = (i64, Vec<(i64, String)>);
 
 /// Observe root jobs independently of the sidebar's filtering and pagination.
 #[derive(Default)]
 pub struct CompletionWatch {
-    pending: Option<crate::ops::Pending<RootStates>>,
+    epoch: Option<u64>,
+    pending: Option<crate::ops::Pending<CompletionBatch>>,
     last: Option<std::time::Instant>,
-    seen: Option<RootStates>,
+    cursor: Option<i64>,
 }
 
 impl CompletionWatch {
+    pub fn set_epoch(&mut self, epoch: Option<u64>) {
+        if self.epoch != epoch {
+            *self = Self { epoch, ..Self::default() };
+        }
+    }
+
     pub fn poll(&mut self, ctx: &egui::Context, data: &std::path::Path) -> Vec<(i64, String)> {
         let mut finished = Vec::new();
         if let Some(result) = self.pending.as_ref().and_then(crate::ops::Pending::poll) {
             self.pending = None;
-            if let Ok(rows) = result {
-                if let Some(seen) = &self.seen {
-                    for (&ticket, (turn, state)) in &rows {
-                        // A new ticket or turn can run to completion between polls.
-                        if matches!(state.as_str(), "done" | "failed" | "partial" | "interrupted")
-                            && seen.get(&ticket).is_none_or(|(old_turn, old_state)| {
-                                turn > old_turn || crate::labels::is_active(old_state)
-                            })
-                        {
-                            finished.push((ticket, state.clone()));
-                        }
-                    }
-                }
-                self.seen = Some(rows);
+            if let Ok((head, endings)) = result {
+                self.cursor = Some(head);
+                finished = endings;
             }
         }
         if self.pending.is_none()
@@ -131,16 +127,9 @@ impl CompletionWatch {
                 .is_none_or(|last| last.elapsed() >= std::time::Duration::from_secs(1))
         {
             let path = data.join(sa_store::DB_FILE);
+            let cursor = self.cursor;
             self.pending = Some(crate::ops::Pending::spawn(ctx, move || {
-                let conn = rusqlite::Connection::open_with_flags(
-                    path,
-                    rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-                )?;
-                conn.busy_timeout(std::time::Duration::from_secs(1))?;
-                let mut stmt =
-                    conn.prepare("SELECT ticket, turn, state FROM jobs WHERE parent IS NULL")?;
-                let rows = stmt.query_map([], |r| Ok((r.get(0)?, (r.get(1)?, r.get(2)?))))?;
-                Ok(rows.collect::<rusqlite::Result<RootStates>>()?)
+                read_completions(&path, cursor)
             }));
             self.last = Some(std::time::Instant::now());
         }
@@ -149,12 +138,43 @@ impl CompletionWatch {
     }
 
     #[cfg(test)]
-    pub(crate) fn has_state(&self, ticket: i64, state: &str) -> bool {
-        self.seen
-            .as_ref()
-            .and_then(|rows| rows.get(&ticket))
-            .is_some_and(|(_, seen)| seen == state)
+    pub(crate) fn cursor(&self) -> Option<i64> {
+        self.cursor
     }
+
+    #[cfg(test)]
+    pub(crate) fn is_polling(&self) -> bool {
+        self.last.is_some()
+    }
+}
+
+fn read_completions(path: &std::path::Path, cursor: Option<i64>) -> anyhow::Result<CompletionBatch> {
+    let mut conn = rusqlite::Connection::open_with_flags(
+        path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )?;
+    conn.busy_timeout(std::time::Duration::from_secs(1))?;
+    let tx = conn.transaction()?;
+    let head = tx.query_row("SELECT coalesce(max(seq), 0) FROM events", [], |r| r.get(0))?;
+    let Some(after) = cursor.filter(|&after| after < head) else {
+        return Ok((head, Vec::new()));
+    };
+    // A reply or pause failure carries its resulting state in the payload.
+    // Dedicated failure/interruption events encode the state in their kind.
+    // CROSS JOIN keeps SQLite on the new event rowid range before root lookup.
+    let mut stmt = tx.prepare(
+        "SELECT ticket, state FROM (
+           SELECT e.seq, e.ticket, CASE
+             WHEN e.kind IN ('reply', 'turn.pause_failure') THEN
+               CASE WHEN json_valid(e.payload) THEN json_extract(e.payload, '$.state') END
+             ELSE e.kind END AS state
+           FROM events e CROSS JOIN jobs j ON j.id=e.job AND j.ticket=e.ticket
+           WHERE e.seq>?1 AND e.seq<=?2 AND j.parent IS NULL
+             AND e.kind IN ('reply', 'turn.pause_failure', 'done', 'failed', 'partial', 'interrupted')
+         ) WHERE state IN ('done', 'failed', 'partial', 'interrupted') ORDER BY seq",
+    )?;
+    let rows = stmt.query_map([after, head], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    Ok((head, rows.collect::<rusqlite::Result<_>>()?))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

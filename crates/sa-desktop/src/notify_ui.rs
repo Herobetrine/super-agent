@@ -9,11 +9,12 @@ use crate::{
     push::{self, Event, SendError},
     theme, widgets,
 };
-use egui::{Align, Color32, Layout, RichText, Ui};
+use egui::{Align, Color32, Layout, RichText, TextBuffer, Ui};
 use sa_store::notify::{self, ServerProblem, Settings, TopicProblem};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(10);
+const OBSERVER_REFRESH: Duration = Duration::from_secs(2);
 const COPIED_FOR: f64 = 1.5;
 
 type Saved = Result<Settings, String>;
@@ -25,12 +26,94 @@ pub struct NotifyDialog {
     /// Saved settings read by this dialog (windows without a scheduler, retries).
     loaded: Option<Saved>,
     loading: Option<Pending<Settings>>,
+    last_read: Instant,
     load_error: Option<String>,
+    server_credentials: bool,
     ready: bool,
     testing: Option<Pending<Result<(), SendError>>>,
     /// Outcome of the last test push; cleared when the server or topic changes.
     pub test: Option<Result<(), SendError>>,
     test_key: (String, String),
+}
+
+impl NotifyDialog {
+    fn show_saved(&mut self, settings: Settings) {
+        self.draft = settings.clone();
+        self.loaded = Some(Ok(settings));
+        self.redact_draft_server();
+        self.load_error = None;
+        self.ready = true;
+    }
+
+    fn redact_draft_server(&mut self) {
+        if let Some(redacted) = notify::redact_server_credentials(&self.draft.server) {
+            self.draft.server = redacted;
+            self.server_credentials = true;
+        }
+    }
+}
+
+/// Reject credential-bearing edits before egui can render or expose their text.
+struct ServerText<'a> {
+    text: &'a mut String,
+    rejected: &'a mut bool,
+}
+
+impl TextBuffer for ServerText<'_> {
+    fn type_id(&self) -> std::any::TypeId {
+        std::any::TypeId::of::<ServerText<'static>>()
+    }
+
+    fn is_mutable(&self) -> bool {
+        true
+    }
+
+    fn as_str(&self) -> &str {
+        self.text
+    }
+
+    fn insert_text(&mut self, text: &str, at: usize) -> usize {
+        let mut candidate = self.text.clone();
+        let inserted = candidate.insert_text(text, at);
+        if notify::redact_server_credentials(&candidate).is_some() {
+            // The old buffer can contain the userinfo prefix if the last
+            // character typed was the authority's @ separator.
+            self.text.clear();
+            *self.rejected = true;
+            return 0;
+        }
+        *self.text = candidate;
+        if inserted != 0 {
+            *self.rejected = false;
+        }
+        inserted
+    }
+
+    fn delete_char_range(&mut self, range: std::ops::Range<usize>) {
+        let mut candidate = self.text.clone();
+        candidate.delete_char_range(range);
+        if notify::redact_server_credentials(&candidate).is_some() {
+            self.text.clear();
+            *self.rejected = true;
+            return;
+        }
+        if candidate != *self.text {
+            *self.text = candidate;
+            *self.rejected = false;
+        }
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn server_editor_clears_userinfo_typed_before_the_separator() {
+    let mut text = "https://fixture-user:fixture-password".to_string();
+    let mut rejected = false;
+    let at = text.len();
+    let mut field = ServerText { text: &mut text, rejected: &mut rejected };
+    assert_eq!(field.insert_text("@ntfy.sh", at), 0);
+    assert!(field.as_str().is_empty());
+    assert!(rejected);
 }
 
 fn read_settings(ctx: &egui::Context, data: std::path::PathBuf) -> Pending<Settings> {
@@ -100,7 +183,9 @@ impl App {
             error: None,
             loaded: None,
             loading: None,
+            last_read: Instant::now(),
             load_error: None,
+            server_credentials: false,
             ready: true,
             testing: None,
             test: None,
@@ -109,8 +194,7 @@ impl App {
         if let Some(host) = &self.host {
             match host.notify_settings() {
                 Ok(settings) => {
-                    dialog.draft = settings.clone();
-                    dialog.loaded = Some(Ok(settings));
+                    dialog.show_saved(settings);
                 }
                 Err(error) => {
                     dialog.ready = false;
@@ -168,17 +252,17 @@ impl App {
                     } else {
                         settings
                     };
-                    dialog.draft = settings.clone();
-                    dialog.loaded = Some(Ok(settings));
-                    dialog.load_error = None;
-                    dialog.ready = true;
+                    dialog.server_credentials = false;
+                    dialog.show_saved(settings);
                 }
                 Err(error) => {
                     dialog.loaded = Some(Err(error.clone()));
                     dialog.load_error = Some(error);
+                    dialog.ready = false;
                 }
             }
         }
+        dialog.redact_draft_server();
         if let Some(result) = dialog.testing.as_ref().and_then(Pending::poll) {
             dialog.testing = None;
             dialog.test = Some(result.unwrap_or_else(|error| Err(SendError::Other(error))));
@@ -196,7 +280,9 @@ impl App {
         let editable = (writable || demo) && dialog.ready && !busy;
         let on = editable && dialog.draft.enabled;
         let check = notify::check(&dialog.draft);
-        let problem = check.server.is_some() || check.topic.is_some();
+        let problem = check.server.is_some()
+            || check.topic.is_some()
+            || (dialog.draft.enabled && dialog.server_credentials);
         let can_test = writable && on && !problem;
         let failed_load = dialog.load_error.is_some() && dialog.loading.is_none();
         let mut close = false;
@@ -221,7 +307,7 @@ impl App {
                     note(ui, "只读观察窗口。请在正在调度的主窗口保存设置。", pal.mute);
                     ui.add_space(10.0);
                 }
-                if dialog.loading.is_some() {
+                if !dialog.ready && dialog.loading.is_some() {
                     ui.horizontal(|ui| {
                         widgets::spinner(ui);
                         ui.label("正在读取已保存设置…");
@@ -253,9 +339,13 @@ impl App {
 
                     field_label(ui, "服务器", &pal);
                     ui.add_space(4.0);
+                    let mut server = ServerText {
+                        text: &mut dialog.draft.server,
+                        rejected: &mut dialog.server_credentials,
+                    };
                     let r = ui.add_enabled(
                         on,
-                        egui::TextEdit::singleline(&mut dialog.draft.server)
+                        egui::TextEdit::singleline(&mut server)
                             .margin(egui::Margin::symmetric(8, 5))
                             .hint_text(widgets::hint(ui, "https://ntfy.sh"))
                             .desired_width(ui.available_width()),
@@ -268,7 +358,12 @@ impl App {
                         "可以改成自建的 ntfy 服务器。使用 ntfy.sh 时，推送会经过 ntfy.sh 的服务器。",
                         pal.mute,
                     );
-                    if let Some(problem) = check.server {
+                    let server_problem = if dialog.draft.enabled && dialog.server_credentials {
+                        Some(ServerProblem::HasCredentials)
+                    } else {
+                        check.server
+                    };
+                    if let Some(problem) = server_problem {
                         ui.add_space(2.0);
                         note(
                             ui,
@@ -279,6 +374,7 @@ impl App {
                                 }
                                 ServerProblem::Invalid => "服务器地址格式不对",
                                 ServerProblem::HasPath => push::ROOT_SERVER_ONLY,
+                                ServerProblem::HasCredentials => notify::SERVER_CREDENTIALS_ERROR,
                             },
                             pal.fail.fg,
                         );
@@ -292,6 +388,7 @@ impl App {
                             ui.add_enabled_ui(
                                 !dialog.draft.topic.is_empty()
                                     && !busy
+                                    && dialog.ready
                                     && (dialog.draft.enabled || !(writable || demo)),
                                 |ui| {
                                     copy_button(ui, "sa-notify-copy-topic", "复制", &dialog.draft.topic, &pal);
@@ -457,6 +554,10 @@ impl App {
                     for line in [
                         "执行端（Codex、Claude、Gemini、DeepSeek 等）与各自的服务通信；",
                         "你配置的自定义供应商和 MCP 服务器；",
+                        "工作台刷新模型目录时（向对应供应商查询可用模型）；",
+                        "你在工作台里刷新已绑定的 PR 时（通过本机已登录的 gh 向 GitHub 查询该 PR）；",
+                        "你在工作台里打开网页链接时（由默认浏览器访问）；",
+                        "工作台运行你配置的项目检查命令时（是否联网取决于命令本身）；",
                         "你开启的手机推送。",
                     ] {
                         ui.horizontal_top(|ui| {
@@ -467,7 +568,13 @@ impl App {
                     ui.add_space(8.0);
                     match &saved {
                         Some(Ok(s)) if s.enabled => {
-                            note(ui, &format!("手机推送：已开启，发往 {}", s.server.trim()), pal.ink)
+                            let redacted = notify::redact_server_credentials(&s.server);
+                            let server = redacted.as_deref().unwrap_or_else(|| s.server.trim());
+                            if server.is_empty() && redacted.is_some() {
+                                note(ui, "手机推送：无法读取设置", pal.ink);
+                            } else {
+                                note(ui, &format!("手机推送：已开启，发往 {server}"), pal.ink);
+                            }
                         }
                         Some(Ok(_)) => note(ui, "手机推送：未开启", pal.ink),
                         Some(Err(_)) => note(ui, "手机推送：无法读取设置", pal.ink),
@@ -494,6 +601,7 @@ impl App {
                     ui.add_enabled_ui(editable, |ui| {
                         if widgets::quiet_button(ui, "", "恢复默认", &pal, false).clicked() {
                             dialog.draft = Settings::default();
+                            dialog.server_credentials = false;
                             dialog.error = None;
                         }
                     });
@@ -518,12 +626,21 @@ impl App {
             self.notify = None;
             return;
         }
-        if retry {
+        let observer_refresh = if !writable && !demo && dialog.loading.is_none() {
+            let remaining = OBSERVER_REFRESH.saturating_sub(dialog.last_read.elapsed());
+            ctx.request_repaint_after(remaining);
+            remaining.is_zero()
+        } else {
+            false
+        };
+        if retry || observer_refresh {
             dialog.load_error = None;
+            dialog.last_read = Instant::now();
             dialog.loading = Some(read_settings(ctx, data));
             return;
         }
-        if test {
+        let credential_free = !dialog.draft.enabled || !dialog.server_credentials;
+        if test && credential_free {
             let (server, topic) = (dialog.draft.server.clone(), dialog.draft.topic.clone());
             dialog.test = None;
             dialog.test_key = (server.clone(), topic.clone());
@@ -531,7 +648,7 @@ impl App {
                 Ok(push::send(&server, &topic, &push::test_push(), TEST_TIMEOUT))
             }));
         }
-        if save {
+        if save && credential_free {
             dialog.saving = true;
             dialog.error = None;
             let mut settings = dialog.draft.clone();

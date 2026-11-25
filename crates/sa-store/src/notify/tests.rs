@@ -49,6 +49,9 @@ fn server_policy() {
         ("https://ntfy.sh", None),
         ("https://ntfy.sh/", None),
         ("https://ntfy.example.com:8443", None),
+        ("https://user:password@ntfy.sh/", Some(HasCredentials)),
+        ("https://user@ntfy.sh/", Some(HasCredentials)),
+        ("http://:password@localhost:8443/", Some(HasCredentials)),
         ("https://ntfy.sh/team", Some(HasPath)),
         ("https://ntfy.sh/team/..", Some(HasPath)),
         ("https://ntfy.sh/%2e", Some(HasPath)),
@@ -87,6 +90,35 @@ fn server_policy() {
         s.server = server.into();
         assert_eq!(check(&s).server, expected, "{server}");
     }
+}
+
+#[test]
+fn credentials_cannot_be_saved_and_read_errors_do_not_print_them() {
+    let conn = Connection::open_in_memory().unwrap();
+    init(&conn).unwrap();
+    let server = "https://fixture-user:fixture-password@ntfy.sh/";
+    let settings = Settings {
+        server: server.into(),
+        ..Settings::default()
+    };
+    assert_eq!(
+        save(&conn, &settings).unwrap_err().to_string(),
+        SERVER_CREDENTIALS_ERROR
+    );
+    assert_eq!(load(&conn).unwrap(), Settings::default());
+    assert_eq!(
+        redact_server_credentials(server).as_deref(),
+        Some("https://ntfy.sh/")
+    );
+
+    let malformed = serde_json::json!({"enabled": server});
+    conn.execute(
+        "INSERT INTO studio_notify VALUES(1,?1)",
+        [malformed.to_string()],
+    )
+    .unwrap();
+    let error = format!("{:#}", load(&conn).unwrap_err());
+    assert!(!error.contains("fixture-user") && !error.contains("fixture-password"));
 }
 
 #[test]

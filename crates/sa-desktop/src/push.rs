@@ -96,6 +96,7 @@ pub fn send(server: &str, topic: &str, push: &Push, timeout: Duration) -> Result
         }
         (Some(ServerProblem::Invalid), _) => Some("服务器地址格式不对"),
         (Some(ServerProblem::HasPath), _) => Some(ROOT_SERVER_ONLY),
+        (Some(ServerProblem::HasCredentials), _) => Some(notify::SERVER_CREDENTIALS_ERROR),
         (_, Some(TopicProblem::Empty)) => Some("请填写主题"),
         (_, Some(TopicProblem::Invalid)) => Some("主题只能包含字母、数字、- 和 _，最多 64 个字符"),
         (None, None) => None,
@@ -165,13 +166,39 @@ fn send_error(error: &Error, tls: bool) -> SendError {
 
 /// Settings and their in-process version are published together after a save.
 pub(crate) struct NotifySettings {
-    current: RwLock<(u64, Result<Settings, String>)>,
+    current: RwLock<NotifySnapshot>,
+}
+
+struct NotifySnapshot {
+    version: u64,
+    completion_epoch: u64,
+    value: Result<Settings, String>,
+}
+
+impl NotifySnapshot {
+    fn watches_completions(&self) -> bool {
+        self.value
+            .as_ref()
+            .is_ok_and(|s| s.enabled && (s.done || s.unfinished))
+    }
+
+    fn publish(&mut self, value: Result<Settings, String>) {
+        self.version += 1;
+        self.value = value;
+        if !self.watches_completions() {
+            self.completion_epoch = self.version;
+        }
+    }
 }
 
 impl Default for NotifySettings {
     fn default() -> Self {
         Self {
-            current: RwLock::new((0, Ok(Settings::default()))),
+            current: RwLock::new(NotifySnapshot {
+                version: 0,
+                completion_epoch: 0,
+                value: Ok(Settings::default()),
+            }),
         }
     }
 }
@@ -181,20 +208,29 @@ impl NotifySettings {
         self.current
             .read()
             .unwrap_or_else(|p| p.into_inner())
-            .1
+            .value
             .clone()
     }
 
+    pub(crate) fn completion_epoch(&self) -> Option<u64> {
+        let current = self.current.read().unwrap_or_else(|p| p.into_inner());
+        current
+            .watches_completions()
+            .then_some(current.completion_epoch)
+    }
+
     pub(crate) fn publish(&self, settings: Result<Settings, String>) {
-        let mut current = self.current.write().unwrap_or_else(|p| p.into_inner());
-        *current = (current.0 + 1, settings);
+        self.current
+            .write()
+            .unwrap_or_else(|p| p.into_inner())
+            .publish(settings);
     }
 
     pub(crate) fn recover(&self, settings: Settings) {
         let mut current = self.current.write().unwrap_or_else(|p| p.into_inner());
         // A save committed while the read was in progress takes precedence.
-        if current.1.is_err() {
-            *current = (current.0 + 1, Ok(settings));
+        if current.value.is_err() {
+            current.publish(Ok(settings));
         }
     }
 }
@@ -235,12 +271,12 @@ impl Pusher {
                         .current
                         .read()
                         .unwrap_or_else(|p| p.into_inner());
-                    match &*current {
-                        (version, Ok(s)) if *version == item.version => {
-                            Some((s.server.clone(), s.topic.clone()))
-                        }
-                        _ => None,
-                    }
+                    current
+                        .value
+                        .as_ref()
+                        .ok()
+                        .filter(|_| current.version == item.version)
+                        .map(|s| (s.server.clone(), s.topic.clone()))
                 };
                 let Some((server, topic)) = destination else {
                     continue;
@@ -257,10 +293,10 @@ impl Pusher {
 
     pub(crate) fn notify(&self, event: &Event, settings: &Arc<NotifySettings>) {
         let current = settings.current.read().unwrap_or_else(|p| p.into_inner());
-        if let Some(push) = current.1.as_ref().ok().and_then(|s| push_for(event, s)) {
+        if let Some(push) = current.value.as_ref().ok().and_then(|s| push_for(event, s)) {
             let _ = self.queue.send(Queued {
                 settings: Arc::clone(settings),
-                version: current.0,
+                version: current.version,
                 push,
             });
         }
