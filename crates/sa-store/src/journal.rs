@@ -10,15 +10,13 @@ use rusqlite::{Connection, OpenFlags, TransactionBehavior};
 use std::{
     collections::HashSet,
     fmt,
+    fs::{self, OpenOptions},
     path::{Path, PathBuf},
     time::{Duration, SystemTime},
 };
 
 #[path = "journal_backup.rs"]
 mod backup;
-#[path = "journal_restore.rs"]
-mod restore;
-pub use restore::{RestoreOutcome, restore_snapshot, retry_restore_cleanup};
 
 #[cfg(test)]
 #[path = "../tests/journal_migrations/mod.rs"]
@@ -30,65 +28,22 @@ pub enum JournalError {
         snapshot: PathBuf,
         from: u32,
         to: u32,
-        identity: RestoreIdentity,
     },
     Corrupt {
         path: PathBuf,
         code: i32,
         latest_snapshot: Option<(PathBuf, SystemTime)>,
-        identity: Option<RestoreIdentity>,
     },
-    RestoreInterrupted {
-        record: PathBuf,
-        snapshot_name: Option<PathBuf>,
-        installed: bool,
-        reason: String,
-    },
-    InvalidSnapshot {
-        path: PathBuf,
-        reason: String,
-    },
-    RestoreCancelled,
     InvalidMigrationMarker {
         path: PathBuf,
         reason: String,
     },
 }
 
-/// Opaque identity captured when the diagnostic was produced.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RestoreIdentity(FailureIdentity);
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum FailureIdentity {
-    Migration([u8; 32]),
-    Corrupt { size: u64, modified: SystemTime },
-}
-
-fn file_identity(path: &Path) -> std::io::Result<RestoreIdentity> {
-    let metadata = std::fs::metadata(path)?;
-    Ok(RestoreIdentity(FailureIdentity::Corrupt {
-        size: metadata.len(),
-        modified: metadata.modified()?,
-    }))
-}
-
-impl JournalError {
-    pub fn restore_identity(&self) -> Option<&RestoreIdentity> {
-        match self {
-            Self::MigrationInterrupted { identity, .. } => Some(identity),
-            Self::Corrupt { identity, .. } => identity.as_ref(),
-            _ => None,
-        }
-    }
-}
-
 impl fmt::Display for JournalError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::MigrationInterrupted {
-                snapshot, from, to, ..
-            } => {
+            Self::MigrationInterrupted { snapshot, from, to } => {
                 write!(
                     f,
                     "工单库迁移中断（{from} → {to}），可恢复的快照位于 {}",
@@ -99,7 +54,6 @@ impl fmt::Display for JournalError {
                 path,
                 code,
                 latest_snapshot,
-                ..
             } => {
                 write!(f, "工单库损坏（SQLite {code}）：{}", path.display())?;
                 if let Some((snapshot, _)) = latest_snapshot {
@@ -107,13 +61,6 @@ impl fmt::Display for JournalError {
                 }
                 Ok(())
             }
-            Self::RestoreInterrupted { record, reason, .. } => {
-                write!(f, "工单库恢复中断（{}）：{reason}", record.display())
-            }
-            Self::InvalidSnapshot { path, reason } => {
-                write!(f, "快照不完整（{}）：{reason}", path.display())
-            }
-            Self::RestoreCancelled => write!(f, "工单库状态已变化，请重新检查"),
             Self::InvalidMigrationMarker { path, reason } => {
                 write!(f, "无法读取迁移标记（{}）：{reason}", path.display())
             }
@@ -146,19 +93,15 @@ fn corruption_code(error: &rusqlite::Error) -> Option<i32> {
 fn corrupt_error(dir: &Path, code: i32) -> JournalError {
     let path = dir.join(DB_FILE);
     JournalError::Corrupt {
-        identity: file_identity(&path).ok(),
         path,
         code,
         latest_snapshot: backup::latest_snapshot(dir),
     }
 }
 
-/// Observe recovery records and probe the main database header without taking
+/// Observe the migration marker and probe the main database header without taking
 /// locks or creating SQLite sidecars. This probe ignores WAL content.
 pub fn inspect(data_dir: &Path) -> Option<JournalError> {
-    if let Some(error) = restore::inspect_record(data_dir) {
-        return Some(error);
-    }
     if let Some(error) = backup::inspect_marker(data_dir) {
         return Some(error);
     }
@@ -217,8 +160,15 @@ const MIGRATIONS: &[Migration] = &[Migration {
 }];
 
 fn open_with_migrations(dir: &Path, migrations: &[Migration]) -> Result<Connection> {
-    let _lock = restore::lock(dir)?;
-    restore::resume(dir)?;
+    fs::create_dir_all(dir)?;
+    // Serialize the marker lifecycle, which extends past the SQLite commit.
+    let migration_lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(dir.join(".journal-migration.lock"))?;
+    migration_lock.lock()?;
     backup::check_marker(dir)?;
     let path = dir.join(DB_FILE);
     let mut conn = Connection::open(&path).with_context(|| format!("open {}", path.display()))?;
@@ -252,6 +202,9 @@ fn open_with_migrations(dir: &Path, migrations: &[Migration]) -> Result<Connecti
         if empty && page_count(&tx)? == 0 {
             tx.pragma_update(None, "auto_vacuum", "INCREMENTAL")?;
         }
+        // The migration writer owns this directory until the marker lifecycle
+        // is complete. Clean up abandoned copies before every migration step.
+        backup::clean_pending_snapshots(dir)?;
         if step.needs_snapshot {
             ensure!(!empty, "需要快照的迁移必须在初始建表之后运行");
             backup::prepare_migration(dir, &path, from, step.to)?;

@@ -1,8 +1,7 @@
-use super::{FailureIdentity, JournalError, RestoreIdentity};
+use super::JournalError;
 use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, MAIN_DB, OpenFlags, backup::NO_PROGRESS};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::{
     ffi::OsString,
     fs::{self, File, OpenOptions},
@@ -35,7 +34,6 @@ pub(super) fn inspect_marker(dir: &Path) -> Option<JournalError> {
             snapshot: dir.join("backups").join(name),
             from: marker.from,
             to: marker.to,
-            identity: RestoreIdentity(FailureIdentity::Migration(marker_digest(&contents))),
         }))
     };
     read().unwrap_or_else(|error| {
@@ -53,11 +51,7 @@ pub(super) fn check_marker(dir: &Path) -> Result<()> {
     }
 }
 
-pub(super) fn marker_digest(contents: &[u8]) -> [u8; 32] {
-    Sha256::digest(contents).into()
-}
-
-pub(super) fn read_optional(path: &Path) -> io::Result<Option<Vec<u8>>> {
+fn read_optional(path: &Path) -> io::Result<Option<Vec<u8>>> {
     match fs::read(path) {
         Ok(bytes) => Ok(Some(bytes)),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
@@ -67,7 +61,7 @@ pub(super) fn read_optional(path: &Path) -> io::Result<Option<Vec<u8>>> {
 
 // Return a basename even for legacy absolute paths, including Windows paths
 // read on a different platform.
-pub(super) fn local_name(path: &Path) -> Result<&str> {
+fn local_name(path: &Path) -> Result<&str> {
     let text = path.to_str().context("快照文件名无法解码")?;
     let name = text.rsplit(['/', '\\']).next().unwrap_or_default();
     ensure!(
@@ -78,11 +72,38 @@ pub(super) fn local_name(path: &Path) -> Result<&str> {
 }
 
 pub(super) fn remove_marker(dir: &Path) -> Result<()> {
-    let path = marker_path(dir);
-    remove_file(&path).with_context(|| format!("移除迁移标记 {}", path.display()))
+    remove_marker_with_sync(dir, sync_directory)
 }
 
-pub(super) fn remove_file(path: &Path) -> io::Result<()> {
+pub(super) fn remove_marker_with_sync(
+    dir: &Path,
+    sync: impl FnOnce(&Path) -> io::Result<()>,
+) -> Result<()> {
+    let path = marker_path(dir);
+    retire_marker(&path).with_context(|| format!("移除迁移标记 {}", path.display()))?;
+    let backups = dir.join("backups");
+    sync(&backups).with_context(|| format!("同步迁移备份目录 {}", backups.display()))
+}
+
+#[cfg(not(windows))]
+fn retire_marker(path: &Path) -> Result<()> {
+    Ok(remove_file(path)?)
+}
+
+#[cfg(windows)]
+fn retire_marker(path: &Path) -> Result<()> {
+    // Use a write-through rename to remove the active name. Windows does not
+    // expose the same directory-fsync contract as Unix.
+    let stamp = timestamp(SystemTime::now())?;
+    let retired = with_suffix(path, &format!("-{stamp}.pending"));
+    match durable_rename(path, &retired, false) {
+        Ok(()) => Ok(remove_file(&retired)?),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn remove_file(path: &Path) -> io::Result<()> {
     match fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
@@ -91,34 +112,46 @@ pub(super) fn remove_file(path: &Path) -> io::Result<()> {
 }
 
 // Fixed-width Unix time in UTC, in nanoseconds.
-pub(super) fn timestamp(time: SystemTime) -> Result<String> {
+fn timestamp(time: SystemTime) -> Result<String> {
     Ok(format!(
         "{:020}",
         time.duration_since(UNIX_EPOCH)?.as_nanos()
     ))
 }
 
+fn is_snapshot_name(name: &std::ffi::OsStr, suffix: &str) -> bool {
+    name.to_str()
+        .and_then(|name| name.strip_prefix("hub-"))
+        .and_then(|name| name.strip_suffix(suffix))
+        .is_some_and(|stamp| stamp.len() == 20 && stamp.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
 fn snapshots(dir: &Path) -> io::Result<Vec<(PathBuf, SystemTime)>> {
     let mut snapshots = Vec::new();
     for entry in fs::read_dir(dir.join("backups"))? {
         let entry = entry?;
-        let name = entry.file_name();
-        let Some(stamp) = name
-            .to_str()
-            .and_then(|name| name.strip_prefix("hub-"))
-            .and_then(|name| name.strip_suffix(".sqlite3"))
-        else {
-            continue;
-        };
-        if stamp.len() == 20
-            && stamp.bytes().all(|byte| byte.is_ascii_digit())
-            && entry.file_type()?.is_file()
-        {
+        if is_snapshot_name(&entry.file_name(), ".sqlite3") && entry.file_type()?.is_file() {
             snapshots.push((entry.path(), entry.metadata()?.modified()?));
         }
     }
     snapshots.sort_unstable_by(|left, right| right.0.cmp(&left.0));
     Ok(snapshots)
+}
+
+pub(super) fn clean_pending_snapshots(dir: &Path) -> io::Result<()> {
+    let entries = match fs::read_dir(dir.join("backups")) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    for entry in entries {
+        let entry = entry?;
+        if is_snapshot_name(&entry.file_name(), ".sqlite3.pending") && entry.file_type()?.is_file()
+        {
+            remove_file(&entry.path())?;
+        }
+    }
+    Ok(())
 }
 
 pub(super) fn latest_snapshot(dir: &Path) -> Option<(PathBuf, SystemTime)> {
@@ -174,21 +207,21 @@ pub(super) fn publish_snapshot(
     Ok(())
 }
 
-pub(super) fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
+fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
     let mut name = OsString::from(path);
     name.push(suffix);
     name.into()
 }
 
-pub(super) struct PendingFile<'a>(Option<&'a Path>);
+struct PendingFile<'a>(Option<&'a Path>);
 
 impl<'a> PendingFile<'a> {
-    pub(super) fn create(path: &'a Path) -> io::Result<Self> {
+    fn create(path: &'a Path) -> io::Result<Self> {
         File::create_new(path)?;
         Ok(Self(Some(path)))
     }
 
-    pub(super) fn disarm(&mut self) {
+    fn disarm(&mut self) {
         self.0 = None;
     }
 }
@@ -201,8 +234,8 @@ impl Drop for PendingFile<'_> {
     }
 }
 
-pub(super) fn write_record(path: &Path, record: &impl Serialize) -> Result<()> {
-    let directory = path.parent().context("恢复记录缺少目录")?;
+fn write_record(path: &Path, record: &impl Serialize) -> Result<()> {
+    let directory = path.parent().context("迁移标记缺少目录")?;
     fs::create_dir_all(directory)?;
     // Persist the backups directory itself before publishing a record in it.
     sync_directory(directory.parent().context("缺少工单库目录")?)?;
@@ -220,7 +253,7 @@ pub(super) fn write_record(path: &Path, record: &impl Serialize) -> Result<()> {
 }
 
 #[cfg(windows)]
-pub(super) fn durable_rename(from: &Path, to: &Path, replace: bool) -> io::Result<()> {
+fn durable_rename(from: &Path, to: &Path, replace: bool) -> io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Storage::FileSystem::{
         MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
@@ -254,7 +287,7 @@ pub(super) fn durable_rename(from: &Path, to: &Path, replace: bool) -> io::Resul
 }
 
 #[cfg(not(windows))]
-pub(super) fn durable_rename(from: &Path, to: &Path, replace: bool) -> io::Result<()> {
+fn durable_rename(from: &Path, to: &Path, replace: bool) -> io::Result<()> {
     if !replace && to.try_exists()? {
         return Err(io::Error::new(
             io::ErrorKind::AlreadyExists,
@@ -270,12 +303,12 @@ pub(super) fn durable_rename(from: &Path, to: &Path, replace: bool) -> io::Resul
 }
 
 #[cfg(windows)]
-pub(super) fn sync_directory(_dir: &Path) -> io::Result<()> {
-    // The Windows rename itself requests write-through.
+fn sync_directory(_dir: &Path) -> io::Result<()> {
+    // Marker publication and removal both use write-through renames.
     Ok(())
 }
 
 #[cfg(not(windows))]
-pub(super) fn sync_directory(dir: &Path) -> io::Result<()> {
+fn sync_directory(dir: &Path) -> io::Result<()> {
     File::open(dir)?.sync_all()
 }

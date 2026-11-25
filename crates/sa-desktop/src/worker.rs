@@ -45,12 +45,6 @@ pub enum Cmd {
         before: Option<i64>,
         epoch: u64,
     },
-    /// Drop the journal connection, send the acknowledgement once it is
-    /// closed, and stay disconnected until [`Cmd::Resume`]. A restore needs
-    /// this: Windows will not rename a file another connection holds open.
-    Pause(Sender<()>),
-    /// Reconnect after a [`Cmd::Pause`].
-    Resume,
 }
 
 pub enum Msg {
@@ -117,8 +111,6 @@ struct Reader {
     busy: bool,
     /// A `loading` snapshot of the selected ticket was already shown.
     loading_sent: bool,
-    /// Disconnected on request; the connection is not reopened.
-    paused: bool,
 }
 
 fn message(e: &anyhow::Error) -> String {
@@ -143,7 +135,6 @@ impl Reader {
             history_at: None,
             busy: false,
             loading_sent: false,
-            paused: false,
         }
     }
 
@@ -217,18 +208,6 @@ impl Reader {
                 true
             }
             Cmd::Refresh => true,
-            Cmd::Pause(ack) => {
-                self.paused = true;
-                self.disconnect();
-                // The connection is closed before the caller is released.
-                let _ = ack.send(());
-                false
-            }
-            Cmd::Resume => {
-                self.paused = false;
-                self.next_open = Instant::now();
-                true
-            }
             Cmd::JobsPage {
                 ticket,
                 before,
@@ -257,8 +236,8 @@ impl Reader {
         }
     }
 
-    /// Drop the connection and everything derived from it.
-    fn disconnect(&mut self) {
+    fn fail(&mut self, error: String) {
+        // Drop the connection so a replaced or repaired database is reopened.
         self.source = None;
         self.next_open = Instant::now() + REOPEN;
         self.last_history = None;
@@ -268,11 +247,6 @@ impl Reader {
         self.last_meta = None;
         self.busy = false;
         self.loading_sent = false;
-    }
-
-    fn fail(&mut self, error: String) {
-        // Drop the connection so a replaced or repaired database is reopened.
-        self.disconnect();
         if self.last_error.as_deref() != Some(error.as_str()) {
             self.last_error = Some(error.clone());
             self.send(Msg::SourceError(error));
@@ -282,9 +256,6 @@ impl Reader {
     /// One load. `urgent` (the UI asked) also reloads the session list at
     /// once. Returns false when the UI has gone away.
     fn poll(&mut self, urgent: bool) -> bool {
-        if self.paused {
-            return true;
-        }
         if self.source.is_none() {
             if Instant::now() < self.next_open {
                 return true;
@@ -410,33 +381,6 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
-
-    #[test]
-    fn pause_acknowledges_a_closed_source_and_blocks_reopen_until_resume() {
-        let dir = tempfile::tempdir().unwrap();
-        drop(sa_store::journal::open_journal(dir.path()).unwrap());
-        let (messages, _receiver) = mpsc::channel();
-        let mut reader = Reader::new(
-            crate::data::StoreSource::opener(dir.path().to_path_buf()),
-            messages,
-            egui::Context::default(),
-        );
-        assert!(reader.poll(true));
-        assert!(reader.source.is_some());
-
-        let (ack, closed) = mpsc::channel();
-        assert!(!reader.handle(Cmd::Pause(ack)));
-        closed.try_recv().unwrap();
-        assert!(reader.source.is_none());
-
-        reader.next_open = Instant::now();
-        assert!(reader.handle(Cmd::Refresh));
-        assert!(reader.poll(true));
-        assert!(reader.source.is_none());
-        assert!(reader.handle(Cmd::Resume));
-        assert!(reader.poll(true));
-        assert!(reader.source.is_some());
-    }
 
     /// A source whose history is one ticket titled with the current version.
     struct Counted {
