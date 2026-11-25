@@ -152,6 +152,8 @@ pub struct App {
     pub providers: Option<crate::providers::ProvidersDialog>,
     pub efficiency: Option<crate::efficiency::EfficiencyDialog>,
     pub observer_efficiency: crate::efficiency::ObserverEfficiency,
+    /// "从 T3 Code 导入": welcome card, imported projects and the dialog.
+    pub t3: crate::t3_import_ui::T3State,
     pub palette: Option<crate::palette::PaletteState>,
     /// Focus the sidebar search on the next frame.
     pub focus_search: bool,
@@ -242,6 +244,7 @@ impl App {
             providers: None,
             efficiency: None,
             observer_efficiency: Default::default(),
+            t3: crate::t3_import_ui::T3State::new(get(crate::t3_import_ui::DISMISS_KEY).as_deref() == Some("1")),
             palette: None,
             focus_search: false,
             show_archived: false,
@@ -275,6 +278,8 @@ impl App {
             }
             Some("providers") => app.open_providers(),
             Some("efficiency") => app.open_efficiency(),
+            Some("t3import") => app.open_t3_import(),
+            Some("t3import-run") => app.open_t3_import_auto(),
             Some("extensions") => app.open_extensions(crate::extensions::ExtScope::Defaults),
             Some("palette") => app.palette = Some(Default::default()),
             Some("rotation") => {
@@ -655,6 +660,7 @@ impl eframe::App for App {
         self.providers_dialog(ctx);
         self.efficiency_dialog(ctx);
         self.recovery_dialog(ctx);
+        self.t3_import_dialog(ctx);
         self.extensions_dialog(ctx);
         self.palette_ui(ctx);
         self.rename_dialog(ctx);
@@ -673,6 +679,7 @@ impl eframe::App for App {
         storage.set_string("tab", self.tab.key().into());
         storage.set_string("lead", self.composer.lead.clone());
         storage.set_string("notifications", if self.notifications_enabled { "1" } else { "0" }.into());
+        storage.set_string(crate::t3_import_ui::DISMISS_KEY, if self.t3.dismissed() { "1" } else { "0" }.into());
         if let Some(p) = &self.composer.project {
             storage.set_string("project", p.to_string_lossy().into_owned());
         }

@@ -302,7 +302,8 @@ impl App {
         let pal = self.pal.clone();
         let h = ui.available_height();
         // Sit a little above the middle of the free space.
-        ui.add_space(((h - 330.0) * 0.4).max(16.0));
+        let extra = if self.t3_card_showing() { 120.0 } else { 0.0 };
+        ui.add_space(((h - 330.0 - extra - 40.0) * 0.4).max(16.0));
         let mut pick_draft: Option<String> = None;
         let mut pick_project: Option<std::path::PathBuf> = None;
         centered(ui, COLUMN, 20.0, |ui| {
@@ -332,15 +333,8 @@ impl App {
                     pick_draft = Some(prompt.to_string());
                 }
             }
-            let mut recent: Vec<&str> = Vec::new();
-            for t in &self.history {
-                if !t.cwd.is_empty() && !t.cwd.contains("super-agent-project-") && !recent.contains(&t.cwd.as_str()) {
-                    recent.push(&t.cwd);
-                }
-                if recent.len() == 5 {
-                    break;
-                }
-            }
+            // Projects with tickets first, then imported ones (T3 names).
+            let recent = self.t3_recent();
             if !recent.is_empty() {
                 ui.add_space(22.0);
                 ui.horizontal_wrapped(|ui| {
@@ -348,9 +342,11 @@ impl App {
                     ui.add_space(indent);
                     ui.label(RichText::new("最近的项目").font(theme::body(theme::SMALL)).color(pal.faint));
                     ui.add_space(4.0);
-                    for cwd in recent {
+                    for entry in &recent {
+                        let cwd = entry.path.as_str();
+                        let name = entry.name.clone().unwrap_or_else(|| labels::basename(cwd));
                         let active = self.composer.project.as_ref().is_some_and(|p| p.to_string_lossy() == cwd);
-                        if widgets::quiet_button(ui, icon::FOLDER_SIMPLE, &labels::basename(cwd), &pal, active)
+                        if widgets::quiet_button(ui, icon::FOLDER_SIMPLE, &name, &pal, active)
                             .on_hover_text(cwd)
                             .clicked()
                         {
@@ -359,6 +355,7 @@ impl App {
                     }
                 });
             }
+            self.t3_welcome(ui, indent);
         });
         if let Some(d) = pick_draft {
             self.composer.draft = d;

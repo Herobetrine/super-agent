@@ -31,6 +31,9 @@ mod recovery_ui;
 mod recovery_ui_tests;
 mod review;
 mod sidebar;
+mod t3_import_ui;
+#[cfg(test)]
+mod t3_import_ui_tests;
 mod theme;
 mod usage;
 #[cfg(test)]
