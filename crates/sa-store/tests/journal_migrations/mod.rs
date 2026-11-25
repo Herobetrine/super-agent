@@ -1,7 +1,4 @@
-use super::{
-    JournalError, Migration, RestoreOutcome, backup, inspect, open_journal, open_with_migrations,
-    restore_snapshot,
-};
+use super::{JournalError, Migration, backup, inspect, open_journal, open_with_migrations};
 use crate::DB_FILE;
 use anyhow::Result;
 use rusqlite::Connection;
@@ -67,7 +64,7 @@ fn snapshot_migrations_keep_only_the_last_two_pre_step_states() {
 }
 
 #[test]
-fn failed_step_leaves_marker_and_can_restore_the_pre_step_state() {
+fn failed_step_rolls_back_and_leaves_the_pre_step_snapshot_and_marker() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join(DB_FILE);
     drop(fixture(dir.path()));
@@ -81,14 +78,13 @@ fn failed_step_leaves_marker_and_can_restore_the_pre_step_state() {
     )
     .unwrap_err();
     assert!(error.downcast_ref::<rusqlite::Error>().is_some());
-    let marker = dir.path().join("backups/migration.json");
-    assert!(marker.is_file());
+    let marker = backup::marker_path(dir.path());
+    let marker_bytes = fs::read(&marker).unwrap();
     let error = open_journal(dir.path()).unwrap_err();
     let Some(JournalError::MigrationInterrupted {
         snapshot,
         from: 1,
         to: 2,
-        identity,
     }) = error.downcast_ref::<JournalError>()
     else {
         panic!("{error:#}");
@@ -101,37 +97,68 @@ fn failed_step_leaves_marker_and_can_restore_the_pre_step_state() {
             .unwrap(),
         1
     );
-    raw.execute_batch("UPDATE recovery_fixture SET value=100")
-        .unwrap();
-    drop(raw);
-    let damaged_bytes = fs::read(&path).unwrap();
-    fs::write(dir.path().join("hub.sqlite3-wal"), b"wal fixture").unwrap();
-    fs::write(dir.path().join("hub.sqlite3-shm"), b"shm fixture").unwrap();
+    let saved =
+        Connection::open_with_flags(snapshot, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+    assert_eq!(value(&saved), 42);
+    assert_eq!(
+        saved
+            .pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
+            .unwrap(),
+        1
+    );
+    assert_eq!(fs::read(&marker).unwrap(), marker_bytes);
+}
 
-    assert!(matches!(
-        restore_snapshot(dir.path(), snapshot, identity).unwrap(),
-        RestoreOutcome::Installed
-    ));
-    assert!(!marker.exists());
-    assert!(snapshot.is_file());
-    let damaged = fs::read_dir(dir.path())
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
-        .find(|path| {
-            path.file_name()
-                .unwrap()
-                .to_string_lossy()
-                .starts_with("hub-damaged-")
-                && path.extension().is_some_and(|ext| ext == "sqlite3")
-        })
-        .unwrap();
-    assert_eq!(fs::read(&damaged).unwrap(), damaged_bytes);
-    for (suffix, bytes) in [("-wal", b"wal fixture"), ("-shm", b"shm fixture")] {
-        let mut sidecar = damaged.as_os_str().to_owned();
-        sidecar.push(suffix);
-        assert_eq!(fs::read(sidecar).unwrap().as_slice(), bytes.as_slice());
+#[test]
+fn marker_removal_syncs_backups_after_removing_the_active_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let marker = backup::marker_path(dir.path());
+    let backups = marker.parent().unwrap();
+    fs::create_dir(backups).unwrap();
+    fs::write(&marker, b"marker").unwrap();
+    let error = backup::remove_marker_with_sync(dir.path(), |directory| {
+        assert_eq!(directory, backups);
+        assert!(!marker.exists());
+        assert_eq!(fs::read_dir(directory).unwrap().count(), 0);
+        Err(std::io::Error::other("injected directory sync failure"))
+    })
+    .unwrap_err();
+    assert_eq!(
+        error.root_cause().to_string(),
+        "injected directory sync failure"
+    );
+}
+
+#[test]
+fn next_snapshot_migration_cleans_only_private_pending_snapshot_files() {
+    let dir = tempfile::tempdir().unwrap();
+    drop(fixture(dir.path()));
+    let backups = dir.path().join("backups");
+    fs::create_dir(&backups).unwrap();
+    let stale = backups.join("hub-00000000000000000001.sqlite3.pending");
+    let unrelated = backups.join("hub-not-a-timestamp.sqlite3.pending");
+    let marker_temp = backups.join("migration.json-00000000000000000001.pending");
+    let directory = backups.join("hub-00000000000000000002.sqlite3.pending");
+    for path in [&stale, &unrelated, &marker_temp] {
+        fs::write(path, b"leftover").unwrap();
     }
-    assert_eq!(value(&open_journal(dir.path()).unwrap()), 42);
+    fs::create_dir(&directory).unwrap();
+
+    drop(open_journal(dir.path()).unwrap());
+    assert!(
+        stale.is_file(),
+        "opening a current journal does not clean backups"
+    );
+    let conn = open_with_migrations(dir.path(), &[migration(2, increment)]).unwrap();
+    assert!(!stale.exists());
+    assert_eq!(fs::read(unrelated).unwrap().as_slice(), b"leftover");
+    assert_eq!(fs::read(marker_temp).unwrap().as_slice(), b"leftover");
+    assert!(directory.is_dir());
+    assert_eq!(value(&conn), 43);
+    assert_eq!(
+        value(&Connection::open(backup::latest_snapshot(dir.path()).unwrap().0).unwrap()),
+        42
+    );
 }
 
 #[test]

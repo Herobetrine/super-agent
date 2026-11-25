@@ -141,7 +141,7 @@ fn create_app(
     } else {
         host_error
             .and_then(|error| error.downcast_ref::<sa_store::journal::JournalError>())
-            .and_then(|error| recovery_ui::RecoveryPanel::from_journal(error, &dir, false))
+            .map(|error| recovery_ui::RecoveryPanel::from_journal(error, &dir, false))
     };
     let worker = worker::spawn(opener, cc.egui_ctx.clone());
     let mut app = app::App::new(

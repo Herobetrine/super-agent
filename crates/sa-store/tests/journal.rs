@@ -1,7 +1,7 @@
 use rusqlite::Connection;
 use sa_store::{
     DB_FILE,
-    journal::{JournalError, inspect, open_journal, restore_snapshot},
+    journal::{JournalError, inspect, open_journal},
 };
 use std::fs;
 use tempfile::tempdir;
@@ -75,7 +75,7 @@ fn unrecognized_file_is_classified_without_changing_its_bytes() {
     files.sort_unstable();
     assert_eq!(
         files,
-        [".journal-restore.lock", DB_FILE].map(std::ffi::OsString::from)
+        [".journal-migration.lock", DB_FILE].map(std::ffi::OsString::from)
     );
 }
 
@@ -96,37 +96,11 @@ fn observer_probe_reports_corrupt_header_with_snapshot() {
     fs::write(&path, &bytes).unwrap();
     assert!(matches!(
         inspect(dir.path()),
-        Some(JournalError::Corrupt { code: 11, identity: Some(_), latest_snapshot: Some((found, _)), .. })
+        Some(JournalError::Corrupt { code: 11, latest_snapshot: Some((found, _)), .. })
             if found == snapshot
     ));
     assert_eq!(fs::read(&path).unwrap(), bytes);
     assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 2);
-}
-
-#[test]
-fn invalid_restore_snapshot_keeps_journal_and_cleans_pending_file() {
-    let dir = tempdir().unwrap();
-    let path = dir.path().join(DB_FILE);
-    let original = [0xaa; 4096];
-    fs::write(&path, original).unwrap();
-    let failure = inspect(dir.path()).unwrap();
-    let snapshot = dir.path().join("invalid-snapshot.sqlite3");
-    fs::write(&snapshot, [0xcd; 4096]).unwrap();
-
-    let error =
-        restore_snapshot(dir.path(), &snapshot, failure.restore_identity().unwrap()).unwrap_err();
-    assert!(matches!(
-        error.downcast_ref::<JournalError>(),
-        Some(JournalError::InvalidSnapshot { path, .. }) if *path == snapshot
-    ));
-    assert_eq!(fs::read(&path).unwrap(), original);
-    assert!(fs::read_dir(dir.path()).unwrap().all(|entry| {
-        entry
-            .unwrap()
-            .path()
-            .extension()
-            .is_none_or(|ext| ext != "pending")
-    }));
 }
 
 #[test]

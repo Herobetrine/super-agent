@@ -140,7 +140,7 @@ pub struct App {
     pub host: Option<Host>,
     /// Why the window is an observer (another workbench owns the journal, …).
     pub host_error: Option<String>,
-    /// Recovery options when the startup error is a [`sa_store::journal::JournalError`].
+    /// Journal diagnostics and manual recovery instructions.
     pub(crate) recovery: Option<crate::recovery_ui::RecoveryPanel>,
     pub(crate) recovery_probe: Option<crate::ops::Pending<Option<crate::recovery_ui::RecoveryPanel>>>,
     pub composer: Composer,
