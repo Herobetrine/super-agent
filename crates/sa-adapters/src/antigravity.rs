@@ -20,11 +20,11 @@ use sa_engine::adapter::{
 };
 use sa_engine::resilience::classify::{classified, classify_text, from_http_status};
 use serde_json::{Value, json};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, LazyLock};
-use std::time::Duration;
+use std::sync::{Arc, LazyLock, Mutex};
+use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
 static MODEL_ID: LazyLock<Regex> =
@@ -32,14 +32,107 @@ static MODEL_ID: LazyLock<Regex> =
 
 pub(crate) const SETTINGS_REL: &str = ".gemini/antigravity-cli/settings.json";
 const FAILED: &str = "Antigravity 未返回匹配会话的成功终态";
+// Matches the 20-minute freshness check in sa_engine::engine::Inner::catalog_snapshot.
+const PROBE_FRESHNESS: Duration = Duration::from_secs(20 * 60);
 
 pub struct Antigravity {
     sys: Sys,
+    probes: Arc<Mutex<ProbeCache>>,
 }
 
 impl Antigravity {
     pub fn new(sys: Sys) -> Self {
-        Self { sys }
+        Self {
+            sys,
+            probes: Arc::new(Mutex::new(ProbeCache {
+                sources: HashMap::new(),
+                freshness: PROBE_FRESHNESS,
+            })),
+        }
+    }
+
+    fn clone_for_future(&self) -> Self {
+        Self {
+            sys: self.sys.clone(),
+            probes: Arc::clone(&self.probes),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_probe_freshness(&self, freshness: Duration) {
+        self.probes.lock().unwrap().freshness = freshness;
+    }
+}
+
+#[derive(Clone, Eq, Hash, PartialEq)]
+struct ProbeKey {
+    exe: PathBuf,
+    source: String,
+    overrides: String,
+}
+
+impl ProbeKey {
+    fn new(exe: &Path, source: &str, overrides: Value) -> Self {
+        Self {
+            exe: exe.to_path_buf(),
+            source: source.into(),
+            overrides: overrides.to_string(),
+        }
+    }
+}
+
+struct Fetched<T> {
+    value: T,
+    at: Instant,
+}
+
+impl<T> Fetched<T> {
+    fn new(value: T) -> Self {
+        Self {
+            value,
+            at: Instant::now(),
+        }
+    }
+
+    fn fresh(&self, window: Duration) -> Option<&T> {
+        (self.at.elapsed() < window).then_some(&self.value)
+    }
+}
+
+#[derive(Clone)]
+enum Effort {
+    Fixed,
+    Adjustable { available: Value, current: Value },
+}
+
+#[derive(Default)]
+struct SourceProbes {
+    models: Option<Fetched<Arc<Vec<Value>>>>,
+    efforts: HashMap<String, Fetched<Effort>>,
+}
+
+struct ProbeCache {
+    sources: HashMap<ProbeKey, SourceProbes>,
+    freshness: Duration,
+}
+
+impl ProbeCache {
+    fn models(&self, key: &ProbeKey) -> Option<Arc<Vec<Value>>> {
+        self.sources
+            .get(key)?
+            .models
+            .as_ref()?
+            .fresh(self.freshness)
+            .cloned()
+    }
+
+    fn effort(&self, key: &ProbeKey, model: &str) -> Option<Effort> {
+        self.sources
+            .get(key)?
+            .efforts
+            .get(model)?
+            .fresh(self.freshness)
+            .cloned()
     }
 }
 
@@ -195,9 +288,9 @@ fn environment(
 }
 
 struct Discovery {
-    exe: Option<PathBuf>,
     rows: Vec<Row>,
     catalog: Value,
+    cached_key: Option<ProbeKey>,
 }
 
 fn native_models(output: &str) -> Result<Vec<Value>, String> {
@@ -216,106 +309,181 @@ fn native_models(output: &str) -> Result<Vec<Value>, String> {
     }
 }
 
+async fn probe_effort(
+    key: &ProbeKey,
+    env: &Sys,
+    cancel: &CancellationToken,
+    model: &str,
+) -> Option<Effort> {
+    let mut args = vec![
+        "--settings".into(),
+        key.overrides.clone(),
+        "-p".into(),
+        "/effort".into(),
+        "--output-format".into(),
+        "json".into(),
+    ];
+    if model != "@native" {
+        args.extend(["--model".into(), model.into()]);
+    }
+    let out = capture(
+        &key.exe,
+        &args,
+        &env.temp,
+        env,
+        "",
+        Duration::from_secs(15),
+        cancel,
+    )
+    .await
+    .ok()?;
+    let info = serde_json::from_str::<Value>(&out).ok()?;
+    let data = &info["command"]["data"];
+    // A reply without command data (an error or an unexpected shape) is a
+    // failed probe, not a fixed effort, and must not be cached.
+    if !data.is_object() {
+        return None;
+    }
+    Some(if data["adjustable"] == true {
+        Effort::Adjustable {
+            available: data["available"].clone(),
+            current: data["current"].clone(),
+        }
+    } else {
+        Effort::Fixed
+    })
+}
+
 /// `discover(signal)` (AG:105-150).
 async fn discover(
-    sys: &Sys,
+    adapter: &Antigravity,
+    exe: Option<&Path>,
     cancel: &CancellationToken,
     route: Option<&Route>,
+    read_cache: bool,
 ) -> Result<Discovery, AdapterError> {
-    let exe = executable(sys);
+    let sys = &adapter.sys;
+    let probes = &adapter.probes;
     let settings = native_settings(sys);
     let mut rows = configured(sys);
     let mut ids = vec!["google"];
     if adc(sys) {
         ids.push("adc");
     }
-    // Execution admission refreshes only its selected source. The model picker
+    // Selected-route discovery only checks its source. The model picker
     // still obtains every source and every model's effort capabilities.
     if let Some(route) = route {
         ids.retain(|id| *id == route.provider);
         rows.retain(|row| row.id == route.provider);
     }
     let mut providers: Vec<Value> = vec![];
+    let mut cached_key = None;
     for id in ids {
         let mut models: Vec<Value> = vec![];
         let mut catalog_error = None;
-        if let Some(cli) = &exe {
+        if let Some(cli) = exe {
             let (env, overrides) = environment(sys, id, None, false)?;
-            match capture(
-                cli,
-                &[
-                    "--settings".into(),
-                    overrides.to_string(),
-                    "models".to_string(),
-                ],
-                &sys.temp,
-                &env,
-                "",
-                Duration::from_secs(15),
-                cancel,
-            )
-            .await
-            {
-                Ok(out) => {
-                    match native_models(&out) {
-                        Ok(found) => models = found,
-                        Err(error) => catalog_error = Some(error),
+            let key = ProbeKey::new(cli, id, overrides);
+            let cached_models = read_cache
+                .then(|| probes.lock().unwrap().models(&key))
+                .flatten();
+            let mut used_cache = cached_models.is_some();
+            let found = if let Some(found) = cached_models {
+                Some(found)
+            } else {
+                match capture(
+                    cli,
+                    &["--settings".into(), key.overrides.clone(), "models".into()],
+                    &sys.temp,
+                    &env,
+                    "",
+                    Duration::from_secs(15),
+                    cancel,
+                )
+                .await
+                {
+                    Ok(out) => match native_models(&out) {
+                        Ok(found) => {
+                            let found = Arc::new(found);
+                            if !cancel.is_cancelled() {
+                                let listed: HashSet<_> =
+                                    found.iter().filter_map(|m| m["id"].as_str()).collect();
+                                let mut cache = probes.lock().unwrap();
+                                let entry = cache.sources.entry(key.clone()).or_default();
+                                entry.models = Some(Fetched::new(Arc::clone(&found)));
+                                entry
+                                    .efforts
+                                    .retain(|id, _| id == "@native" || listed.contains(id.as_str()));
+                            }
+                            Some(found)
+                        }
+                        Err(error) => {
+                            catalog_error = Some(error);
+                            Some(Arc::new(Vec::new()))
+                        }
+                    },
+                    Err(e) if e.class == ErrorClass::Cancelled => return Err(e),
+                    Err(error) => {
+                        catalog_error = Some(format!("原生模型目录读取失败：{}", error.message));
+                        None
                     }
-                    models.insert(
-                        0,
-                        json!({"id": "@native", "label": "跟随 agy 原生默认模型"}),
-                    );
-                    models = stream::iter(models.into_iter().map(|mut model| {
-                        let (env, overrides) = (&env, &overrides);
-                        async move {
-                            if route.is_some_and(|route| {
-                                route.reasoning_effort.is_none() || model["id"] != route.model
-                            }) {
-                                return model;
-                            }
-                            let mut args = vec![
-                                "--settings".into(),
-                                overrides.to_string(),
-                                "-p".into(),
-                                "/effort".into(),
-                                "--output-format".into(),
-                                "json".into(),
-                            ];
-                            if model["id"] != "@native" {
-                                args.extend([
-                                    "--model".into(),
-                                    model["id"].as_str().unwrap_or_default().to_string(),
-                                ]);
-                            }
-                            if let Ok(out) = capture(
-                                cli,
-                                &args,
-                                &sys.temp,
-                                env,
-                                "",
-                                Duration::from_secs(15),
-                                cancel,
-                            )
-                            .await
-                                && let Ok(info) = serde_json::from_str::<Value>(&out)
+                }
+            };
+            let complete = catalog_error.is_none();
+            if !complete && !cancel.is_cancelled() {
+                probes.lock().unwrap().sources.remove(&key);
+            }
+            if let Some(found) = found {
+                models.push(json!({"id": "@native", "label": "跟随 agy 原生默认模型"}));
+                models.extend(found.iter().cloned());
+                let mut enriched = stream::iter(models.into_iter().map(|mut model| {
+                    let (env, key) = (&env, &key);
+                    async move {
+                        if route.is_some_and(|route| {
+                            route.reasoning_effort.is_none() || model["id"] != route.model
+                        }) {
+                            return (model, false);
+                        }
+                        let id = model["id"].as_str().expect("native model id");
+                        let cached = (read_cache && complete)
+                            .then(|| probes.lock().unwrap().effort(key, id))
+                            .flatten();
+                        let hit = cached.is_some();
+                        let effort = if let Some(effort) = cached {
+                            Some(effort)
+                        } else {
+                            let effort = probe_effort(key, env, cancel, id).await;
+                            if complete
+                                && !cancel.is_cancelled()
+                                && let Some(entry) = probes.lock().unwrap().sources.get_mut(key)
                             {
-                                let data = &info["command"]["data"];
-                                if data["adjustable"] == true {
-                                    model["reasoningEfforts"] = data["available"].clone();
-                                    model["defaultReasoningEffort"] = data["current"].clone();
+                                match &effort {
+                                    Some(effort) => {
+                                        entry.efforts.insert(id.into(), Fetched::new(effort.clone()));
+                                    }
+                                    None => {
+                                        entry.efforts.remove(id);
+                                    }
                                 }
                             }
-                            model
+                            effort
+                        };
+                        if let Some(Effort::Adjustable { available, current }) = effort {
+                            model["reasoningEfforts"] = available;
+                            model["defaultReasoningEffort"] = current;
                         }
-                    }))
-                    .buffered(4)
-                    .collect()
-                    .await;
+                        (model, hit)
+                    }
+                }))
+                .buffered(4);
+                models = Vec::new();
+                while let Some((model, hit)) = enriched.next().await {
+                    models.push(model);
+                    used_cache |= hit;
                 }
-                Err(e) if e.class == ErrorClass::Cancelled => return Err(e),
-                Err(error) => {
-                    catalog_error = Some(format!("原生模型目录读取失败：{}", error.message))
-                }
+            }
+            if used_cache {
+                cached_key = Some(key);
             }
         }
         providers.push(json!({
@@ -425,7 +593,11 @@ async fn discover(
             {"label": "Antigravity 桌面版", "url": "https://antigravity.google/download"},
         ],
     });
-    Ok(Discovery { exe, rows, catalog })
+    Ok(Discovery {
+        rows,
+        catalog,
+        cached_key,
+    })
 }
 
 impl Adapter for Antigravity {
@@ -455,9 +627,10 @@ impl Adapter for Antigravity {
     }
 
     fn catalog(&self) -> BoxFuture<'static, anyhow::Result<Catalog>> {
-        let sys = self.sys.clone();
+        let adapter = self.clone_for_future();
         Box::pin(async move {
-            let d = discover(&sys, &CancellationToken::new(), None)
+            let exe = executable(&adapter.sys);
+            let d = discover(&adapter, exe.as_deref(), &CancellationToken::new(), None, false)
                 .await
                 .map_err(|e| anyhow::anyhow!(e.message))?;
             Ok(Catalog { value: d.catalog })
@@ -468,11 +641,18 @@ impl Adapter for Antigravity {
         &self,
         route: Route,
     ) -> Option<BoxFuture<'static, anyhow::Result<Catalog>>> {
-        let sys = self.sys.clone();
+        let adapter = self.clone_for_future();
         Some(Box::pin(async move {
-            let d = discover(&sys, &CancellationToken::new(), Some(&route))
-                .await
-                .map_err(|e| anyhow::anyhow!(e.message))?;
+            let exe = executable(&adapter.sys);
+            let d = discover(
+                &adapter,
+                exe.as_deref(),
+                &CancellationToken::new(),
+                Some(&route),
+                false,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!(e.message))?;
             Ok(Catalog { value: d.catalog })
         }))
     }
@@ -484,8 +664,21 @@ impl Adapter for Antigravity {
         events: EventSink,
         cancel: CancellationToken,
     ) -> BoxFuture<'static, Result<RunOutcome, AdapterError>> {
-        let sys = self.sys.clone();
-        Box::pin(async move { run(sys, request, host, Emit(events), cancel).await })
+        let adapter = self.clone_for_future();
+        Box::pin(async move {
+            let exe = executable(&adapter.sys);
+            let source = request.route.provider.clone();
+            let result = run(&adapter, exe.as_deref(), request, host, Emit(events), cancel).await;
+            if result.as_ref().is_err_and(|e| e.class != ErrorClass::Cancelled)
+                && matches!(source.as_str(), "google" | "adc")
+                && let Some(cli) = exe.as_deref()
+                && let Ok((_, overrides)) = environment(&adapter.sys, &source, None, false)
+            {
+                let key = ProbeKey::new(cli, &source, overrides);
+                adapter.probes.lock().unwrap().sources.remove(&key);
+            }
+            result
+        })
     }
 }
 
@@ -500,43 +693,57 @@ fn tool_key(step: &Value) -> Option<String> {
 
 /// `run(o)` (AG:151-205).
 async fn run(
-    sys: Sys,
+    adapter: &Antigravity,
+    exe: Option<&Path>,
     req: RunRequest,
     host: Arc<dyn TurnHost>,
     emit: Emit,
     cancel: CancellationToken,
 ) -> Result<RunOutcome, AdapterError> {
+    let sys = &adapter.sys;
     crate::images::check(&req)?;
     let boundary = scope("antigravity", &req, &host, &cancel, false).await?;
-    let d = discover(&sys, &cancel, Some(&req.route))
-        .await
-        .map_err(|e| {
-            if e.class == ErrorClass::Cancelled {
-                e
-            } else {
-                probe_failed(&e.message)
+    let mut read_cache = true;
+    let (d, s) = loop {
+        let d = discover(adapter, exe, &cancel, Some(&req.route), read_cache)
+            .await
+            .map_err(|e| {
+                if e.class == ErrorClass::Cancelled {
+                    e
+                } else {
+                    probe_failed(&e.message)
+                }
+            })?;
+        if cancel.is_cancelled() {
+            return Err(crate::proc::cancelled());
+        }
+        match select(&d.catalog, &req.route) {
+            Ok(s) => break (d, s),
+            Err(error) => {
+                let Some(key) = d.cached_key else {
+                    return Err(error);
+                };
+                adapter.probes.lock().unwrap().sources.remove(&key);
+                read_cache = false;
             }
-        })?;
-    let s = select(&d.catalog, &req.route)?;
+        }
+    };
     let high = boundary == "danger-full-access";
     if !req.images.is_empty() {
         image_provider(&s.provider)?;
         if high {
-            image_account_settings(&native_settings(&sys))?;
+            image_account_settings(&native_settings(sys))?;
         }
     }
     let r = d.rows.iter().find(|v| v.id == s.provider);
-    let (env, overrides) = environment(&sys, &s.provider, r, !high)?;
-    let exe = d
-        .exe
-        .clone()
-        .ok_or_else(|| route_gone("本机未安装所选原生执行端"))?;
+    let (env, overrides) = environment(sys, &s.provider, r, !high)?;
+    let exe = exe.ok_or_else(|| route_gone("本机未安装所选原生执行端"))?;
     // `--settings` rejects `mcpServers`; only ACP `session/new` mounts a server
     // for one session. The ACP path is wired for the Google account source.
     let bus = high
         && req.bus.is_some()
         && s.provider == "google"
-        && image_account_settings(&native_settings(&sys)).is_ok();
+        && image_account_settings(&native_settings(sys)).is_ok();
     if !req.images.is_empty() || bus {
         // ACP reads permissions from its actual settings file. Root
         // --settings overrides are not propagated into the ACP server.
@@ -610,7 +817,7 @@ async fn run(
         "{}\n",
         json!({"event": "user", "message": {"content": req.prompt}})
     );
-    let mut proc = start(&exe, &args, &req.cwd, &env)?;
+    let mut proc = start(exe, &args, &req.cwd, &env)?;
     let mut last: Option<Value> = None;
     let mut session = req.session_id.clone();
     let mut open_tools: HashSet<String> = HashSet::new();
@@ -773,6 +980,9 @@ pub(crate) fn native_failure(text: &str) -> AdapterError {
 }
 
 #[cfg(test)]
+pub(crate) use tests::fixture_sys;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -808,6 +1018,20 @@ mod tests {
 #include <fcntl.h>
 #include <unistd.h>
 #endif
+static int probe_output(const char *file_var, const char *text_var) {
+    const char *path = getenv(file_var);
+    if (!path) {
+        puts(getenv(text_var));
+        return 0;
+    }
+    FILE *file = fopen(path, "r");
+    if (!file) return 8;
+    char line[1024];
+    while (fgets(line, sizeof(line), file)) fputs(line, stdout);
+    int failed = ferror(file);
+    fclose(file);
+    return failed ? 8 : 0;
+}
 int main(int argc, char **argv) {
     const char *model = "@native", *kind = "run";
     for (int i = 1; i < argc; i++) {
@@ -818,8 +1042,17 @@ int main(int argc, char **argv) {
             if (!strcmp(model, "@native")) return 5;
         }
     }
-    char line[1024];
-    int length = snprintf(line, sizeof(line), "%s\t%s\t%s\n", getenv("AGY_ADC_AUTH") ? "adc" : "google", kind, model);
+    char line[8192];
+    int length = snprintf(line, sizeof(line), "%s\t%s\t%s", getenv("AGY_ADC_AUTH") ? "adc" : "google", kind, model);
+    if (getenv("FAKE_AGY_LOG_ARGS")) {
+        for (int i = 1; i < argc; i++) {
+            int remaining = sizeof(line) - length;
+            int written = snprintf(line + length, remaining, "\t%s", argv[i]);
+            if (written < 0 || written >= remaining) return 2;
+            length += written;
+        }
+    }
+    line[length++] = '\n';
 #ifdef _WIN32
     HANDLE log = CreateFileA(getenv("FAKE_AGY_LOG"), FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (log == INVALID_HANDLE_VALUE) return 2;
@@ -832,8 +1065,8 @@ int main(int argc, char **argv) {
     write(log, line, length);
     close(log);
 #endif
-    if (!strcmp(kind, "models")) puts(getenv("FAKE_AGY_MODELS"));
-    else if (!strcmp(kind, "effort")) puts(getenv("FAKE_AGY_EFFORT"));
+    if (!strcmp(kind, "models")) return probe_output("FAKE_AGY_MODELS_FILE", "FAKE_AGY_MODELS");
+    else if (!strcmp(kind, "effort")) return probe_output("FAKE_AGY_EFFORT_FILE", "FAKE_AGY_EFFORT");
     else {
         const char *expected_settings = getenv("FAKE_AGY_EXPECT_SETTINGS");
         if (expected_settings) {
@@ -880,7 +1113,7 @@ int main(int argc, char **argv) {
             .1
     }
 
-    fn fixture_sys(root: &Path) -> Sys {
+    pub(crate) fn fixture_sys(root: &Path) -> Sys {
         let mut sys = Sys::new(vec![], root.to_path_buf(), root.to_path_buf());
         sys.set("PATH", fake_cli().parent().unwrap().to_string_lossy());
         if let Some(system_root) = std::env::var_os("SystemRoot") {

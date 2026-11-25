@@ -1,7 +1,9 @@
 use super::*;
+use crate::antigravity::{Antigravity, fixture_sys};
 use sa_engine::{
     adapter::{AdapterEvent, Route},
     images::ImageInput,
+    resilience::CODE_ROUTE_PROBE_FAILED,
 };
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -41,26 +43,31 @@ fn setup(scenario: &str) -> (tempfile::TempDir, Sys, Server, RunRequest) {
         permission_modes: [("readonly".into(), "default".into())].into(),
     };
     let png = STANDARD.decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=").unwrap();
-    let req = RunRequest {
+    let mut req = request(dir.path(), "gemini-fixture-low", "low");
+    req.images.push(ImageInput::from_bytes("图片.PNG".into(), png).unwrap());
+    (dir, sys, server, req)
+}
+
+fn request(cwd: &std::path::Path, model: &str, effort: &str) -> RunRequest {
+    RunRequest {
         ticket: 1,
         job: 1,
         turn: 1,
         agent: "antigravity".into(),
         prompt: "审阅图片".into(),
-        images: vec![ImageInput::from_bytes("图片.PNG".into(), png).unwrap()],
-        cwd: dir.path().into(),
+        images: vec![],
+        cwd: cwd.into(),
         route: Route {
             provider: "google".into(),
-            model: "gemini-fixture-low".into(),
+            model: model.into(),
             mode: "cli".into(),
-            reasoning_effort: Some("low".into()),
+            reasoning_effort: Some(effort.into()),
         },
         profile: "readonly".into(),
         writable: false,
         session_id: None,
         bus: None,
-    };
-    (dir, sys, server, req)
+    }
 }
 
 async fn execute(
@@ -69,19 +76,20 @@ async fn execute(
     req: RunRequest,
     cancel: CancellationToken,
 ) -> (Result<RunOutcome, AdapterError>, Vec<AdapterEvent>, usize) {
+    execute_with(|host, events| run_server(sys, req, host, Emit(events), cancel, server, true)).await
+}
+
+async fn execute_with<F>(
+    run: impl FnOnce(Arc<dyn TurnHost>, EventSink) -> F,
+) -> (Result<RunOutcome, AdapterError>, Vec<AdapterEvent>, usize)
+where
+    F: Future<Output = Result<RunOutcome, AdapterError>>,
+{
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let calls = Arc::new(AtomicUsize::new(0));
     let result = tokio::time::timeout(
         Duration::from_secs(10),
-        run_server(
-            sys,
-            req,
-            Arc::new(DenyHost(calls.clone())),
-            Emit(tx),
-            cancel,
-            server,
-            true,
-        ),
+        run(Arc::new(DenyHost(calls.clone())), tx),
     )
     .await
     .unwrap();
@@ -229,4 +237,248 @@ fn antigravity_retry_classification_does_not_change_generic_acp_errors() {
     assert_eq!(agy.class, ErrorClass::Overloaded);
     assert_eq!(agy.http_status, Some(503));
     assert!(agy.native_retry_exhausted());
+}
+
+const MODELS: &str = "model-a\tModel A\nmodel-b\tModel B\n";
+const EFFORT: &str =
+    r#"{"command":{"data":{"adjustable":true,"available":["low","high"],"current":"low"}}}"#;
+
+struct ProbeFixture {
+    dir: tempfile::TempDir,
+    adapter: Antigravity,
+    req: RunRequest,
+}
+
+impl ProbeFixture {
+    fn setup() -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let mut sys = fixture_sys(dir.path());
+        sys.set("FAKE_AGY_MODELS_FILE", "models.txt");
+        sys.set("FAKE_AGY_EFFORT_FILE", "effort.json");
+        sys.set("FAKE_AGY_LOG_ARGS", "1");
+        let fixture = Self {
+            adapter: Antigravity::new(sys),
+            req: request(dir.path(), "model-b", "high"),
+            dir,
+        };
+        fixture.write("models.txt", MODELS);
+        fixture.write("effort.json", EFFORT);
+        fixture
+    }
+
+    fn write(&self, name: &str, content: &str) {
+        std::fs::write(self.dir.path().join(name), content).unwrap();
+    }
+
+    async fn run(&self) -> Result<RunOutcome, AdapterError> {
+        self.execute(self.req.clone(), CancellationToken::new()).await
+    }
+
+    async fn execute(
+        &self,
+        req: RunRequest,
+        cancel: CancellationToken,
+    ) -> Result<RunOutcome, AdapterError> {
+        execute_with(|host, events| self.adapter.run(req, host, events, cancel))
+            .await
+            .0
+    }
+
+    fn args(&self, kind: &str) -> Vec<Vec<String>> {
+        std::fs::read_to_string(self.dir.path().join("calls.tsv"))
+            .unwrap()
+            .lines()
+            .filter_map(|line| {
+                let mut fields = line.split('\t');
+                assert_eq!(fields.next(), Some("google"));
+                let action = fields.next().unwrap();
+                fields.next().unwrap(); // Model column retained for the existing fixtures.
+                (action == kind).then(|| fields.map(str::to_owned).collect())
+            })
+            .collect()
+    }
+
+    fn assert_counts(&self, models: usize, efforts: usize, runs: usize) {
+        assert_eq!(self.args("models").len(), models);
+        assert_eq!(self.args("effort").len(), efforts);
+        assert_eq!(self.args("run").len(), runs);
+    }
+}
+
+#[tokio::test]
+async fn three_turns_reuse_probes_and_another_model_only_probes_its_effort() {
+    let mut fixture = ProbeFixture::setup();
+    for turn in 1..=3 {
+        fixture.req.turn = turn;
+        assert_eq!(fixture.run().await.unwrap().text, "fixture-ok");
+    }
+    fixture.assert_counts(1, 1, 3);
+    assert_eq!(
+        fixture.args("models"),
+        [["--settings", r#"{"modelProvider":""}"#, "models"]]
+    );
+    assert_eq!(
+        fixture.args("effort"),
+        [[
+            "--settings",
+            r#"{"modelProvider":""}"#,
+            "-p",
+            "/effort",
+            "--output-format",
+            "json",
+            "--model",
+            "model-b",
+        ]]
+    );
+
+    fixture.req.route.model = "model-a".into();
+    fixture.run().await.unwrap();
+    fixture.assert_counts(1, 2, 4);
+    assert_eq!(fixture.args("effort")[1].last().unwrap(), "model-a");
+}
+
+#[tokio::test]
+async fn cached_model_miss_refreshes_once_and_preserves_probe_failed() {
+    for restored in [true, false] {
+        let mut fixture = ProbeFixture::setup();
+        fixture.write("models.txt", "model-a\tModel A\n");
+        fixture.req.route.model = "model-a".into();
+        fixture.run().await.unwrap();
+        fixture.assert_counts(1, 1, 1);
+
+        fixture.req.route.model = "model-b".into();
+        if restored {
+            fixture.write("models.txt", MODELS);
+            assert_eq!(fixture.run().await.unwrap().text, "fixture-ok");
+            fixture.assert_counts(2, 2, 2);
+        } else {
+            let error = fixture.run().await.unwrap_err();
+            assert_eq!(error.class, ErrorClass::RouteUnavailable);
+            assert_eq!(error.code.as_deref(), Some(CODE_ROUTE_PROBE_FAILED));
+            fixture.assert_counts(2, 1, 1);
+        }
+    }
+}
+
+#[tokio::test]
+async fn failed_run_evicts_probes_but_cancelled_run_keeps_them() {
+    let fixture = ProbeFixture::setup();
+    fixture.run().await.unwrap();
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+    let error = fixture
+        .execute(fixture.req.clone(), cancel)
+        .await
+        .unwrap_err();
+    assert_eq!(error.class, ErrorClass::Cancelled);
+    fixture.run().await.unwrap();
+    fixture.assert_counts(1, 1, 2);
+
+    let mut req = fixture.req.clone();
+    req.session_id = Some("another-session".into());
+    let error = fixture
+        .execute(req, CancellationToken::new())
+        .await
+        .unwrap_err();
+    assert_eq!(error.class, ErrorClass::SessionMismatch);
+    fixture.assert_counts(1, 1, 3);
+    fixture.run().await.unwrap();
+    fixture.assert_counts(2, 2, 4);
+}
+
+#[tokio::test]
+async fn catalog_refreshes_always_probe_and_write_through() {
+    let mut fixture = ProbeFixture::setup();
+    for refresh in 1..=2 {
+        fixture.adapter.catalog().await.unwrap();
+        fixture.assert_counts(refresh, 3 * refresh, 0);
+    }
+    fixture.run().await.unwrap();
+    fixture.assert_counts(2, 6, 1);
+
+    fixture.write("models.txt", "model-c\tModel C\n");
+    fixture.req.route.model = "model-c".into();
+    for refresh in 1..=2 {
+        fixture
+            .adapter
+            .catalog_for_route(fixture.req.route.clone())
+            .unwrap()
+            .await
+            .unwrap();
+        fixture.assert_counts(2 + refresh, 6 + refresh, 1);
+    }
+    fixture.run().await.unwrap();
+    fixture.assert_counts(4, 8, 2);
+}
+
+#[tokio::test]
+async fn failed_models_probe_is_not_cached() {
+    let fixture = ProbeFixture::setup();
+    std::fs::remove_file(fixture.dir.path().join("models.txt")).unwrap();
+    let catalog = fixture
+        .adapter
+        .catalog_for_route(fixture.req.route.clone())
+        .unwrap()
+        .await
+        .unwrap();
+    assert_eq!(catalog.value["providers"][0]["catalogError"], true);
+    fixture.assert_counts(1, 0, 0);
+    let error = fixture.run().await.unwrap_err();
+    assert_eq!(error.code.as_deref(), Some(CODE_ROUTE_PROBE_FAILED));
+    fixture.assert_counts(2, 0, 0);
+    fixture.write("models.txt", MODELS);
+    fixture.run().await.unwrap();
+    fixture.assert_counts(3, 1, 1);
+}
+
+#[tokio::test]
+async fn malformed_models_and_effort_are_not_cached() {
+    let mut fixture = ProbeFixture::setup();
+    fixture.write("models.txt", "unrecognized format");
+    fixture.req.route.model = "@native".into();
+    fixture.run().await.unwrap();
+    fixture.run().await.unwrap();
+    fixture.assert_counts(2, 2, 2);
+
+    fixture.write("models.txt", MODELS);
+    fixture.write("effort.json", "invalid JSON");
+    fixture.req.route.model = "model-b".into();
+    fixture
+        .adapter
+        .catalog_for_route(fixture.req.route.clone())
+        .unwrap()
+        .await
+        .unwrap();
+    fixture.assert_counts(3, 3, 2);
+    fixture.write("effort.json", EFFORT);
+    fixture.run().await.unwrap();
+    fixture.assert_counts(3, 4, 3);
+}
+
+#[tokio::test]
+async fn effort_reply_without_command_data_is_not_cached() {
+    let fixture = ProbeFixture::setup();
+    fixture.write("effort.json", r#"{"status":"ERROR","response":"not signed in"}"#);
+    fixture
+        .adapter
+        .catalog_for_route(fixture.req.route.clone())
+        .unwrap()
+        .await
+        .unwrap();
+    fixture.assert_counts(1, 1, 0);
+    fixture.write("effort.json", EFFORT);
+    fixture.run().await.unwrap();
+    // The error reply was not cached as a fixed effort, so the run probes the
+    // effort again and needs no fresh catalog retry.
+    fixture.assert_counts(1, 2, 1);
+}
+
+#[tokio::test]
+async fn expired_probes_are_fetched_again() {
+    let fixture = ProbeFixture::setup();
+    fixture.run().await.unwrap();
+    fixture.assert_counts(1, 1, 1);
+    fixture.adapter.set_probe_freshness(Duration::ZERO);
+    fixture.run().await.unwrap();
+    fixture.assert_counts(2, 2, 2);
 }
