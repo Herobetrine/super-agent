@@ -35,6 +35,7 @@ impl Engine {
         status: &str,
         before_commit: impl FnOnce() -> Result<()>,
     ) -> Result<DeliverySummary> {
+        let _power = self.track_work();
         ensure!(
             ticket > 0 && assessment_id > 0 && matches!(status, "ready" | "partial"),
             "只能接受已核验的完整或部分交付"

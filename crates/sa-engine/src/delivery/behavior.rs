@@ -72,6 +72,7 @@ impl Engine {
         argv: Vec<String>,
         verifier_paths: Vec<String>,
     ) -> Result<DeliverySummary> {
+        let _power = self.track_work();
         workspaces::validate_command(&argv)?;
         let serialized = serde_json::to_string(&argv)?;
         ensure!(serialized.len() <= 16 * 1024, "行为检查命令超过 16 KiB");
@@ -138,6 +139,7 @@ impl Engine {
         cancel: &dyn Fn() -> bool,
         timeout: Duration,
     ) -> Result<BehaviorReceipt> {
+        let _power = self.track_work();
         // Reserve a new attempt before touching the filesystem or resolving
         // the command. A crash or slow new attempt immediately supersedes any pass.
         // Its operation receipt is written in the same transaction.
