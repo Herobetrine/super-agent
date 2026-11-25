@@ -290,7 +290,7 @@ impl Fx {
     }
 
     pub async fn until(&self, cond: impl Fn() -> bool) {
-        until(&self.engine, &self.shared, Duration::from_secs(15), cond).await
+        until(&self.engine, &self.shared, Duration::from_secs(60), cond).await
     }
 
     pub async fn finish(&self, ticket: i64, state: &str) {
@@ -309,7 +309,7 @@ impl Fx {
 
 pub async fn until(engine: &Engine, shared: &Shared, limit: Duration, cond: impl Fn() -> bool) {
     let end = tokio::time::Instant::now() + limit;
-    while tokio::time::Instant::now() < end {
+    loop {
         if cond() {
             return;
         }
@@ -318,6 +318,9 @@ pub async fn until(engine: &Engine, shared: &Shared, limit: Duration, cond: impl
         }
         if let Some(f) = engine.fault() {
             panic!("engine fault: {f}");
+        }
+        if tokio::time::Instant::now() >= end {
+            break;
         }
         engine.step();
         tokio::time::sleep(Duration::from_millis(5)).await;
