@@ -415,26 +415,35 @@ fn recommended_checks_require_one_explicit_adoption_and_preserve_existing() {
         }
         other => panic!("unexpected action {other:?}"),
     };
-    // Visit a different project, then read the original project's stored
-    // commands again while the adoption is still pending.
+    // Visit a different project, then start a read of the original project
+    // whose pre-save result will arrive only after the save is acknowledged.
     let other_project = tempfile::tempdir().unwrap();
     h.state_mut().checks_cwd = other_project.path().to_string_lossy().into_owned();
     h.run_steps(3);
+    let stale_read = h.state_mut().ui.hold_next_checks_read();
     h.state_mut().checks_cwd = cwd.clone();
-    wait_for_checks(&mut h, "original project's checks did not reload", |h| {
-        h.query_by_role_and_label(Role::Label, r#"["git","diff","--check"]"#)
-            .is_some()
-            && h.query_by_label("保存完成检查").is_some()
+    wait_for_checks(&mut h, "original project's editor did not reopen", |h| {
+        h.query_by_label("保存完成检查").is_some()
     });
     assert!(h.get_by_label("保存完成检查").accesskit_node().is_disabled());
     assert!(h.state().host.submit(action));
     let outcome = h.state().host.rx.recv_timeout(Duration::from_secs(60)).unwrap();
     assert!(outcome.result.is_ok(), "{:?}", outcome.result);
     h.state_mut().ui.checks_result(request, outcome.result.map(|_| ()));
+    // The acknowledgement should have dropped the receiver. If it hasn't,
+    // the next frame will poll this result and replace the adopted commands.
+    let _ = stale_read.send(Ok(original));
     wait_for_checks(&mut h, "recommendations did not reload", |h| {
         h.query_by_label("采用推荐检查").is_some()
     });
     assert_eq!(h.state().host.engine().project_checks(&cwd).unwrap(), expected);
+    // The recommendation list repeats some commands, so check the editor's
+    // own rows: a stale read that won would leave only the original command.
+    assert_eq!(
+        h.state().ui.checks_rows(),
+        expected.as_slice(),
+        "editor lost saved checks after the stale read"
+    );
     assert!(h.get_by_label("采用推荐检查").accesskit_node().is_disabled());
     assert!(h.state().actions.is_empty());
 }
