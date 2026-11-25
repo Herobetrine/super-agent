@@ -13,10 +13,12 @@ pub mod model;
 pub mod prices;
 mod native_activity;
 mod progress;
+pub mod projects;
 pub mod providers;
 pub mod quota;
 pub mod schema;
 pub mod store;
+pub mod t3_import;
 pub mod usage;
 pub mod evaluation;
 
