@@ -10,7 +10,7 @@
 use crate::activity::Activity;
 use crate::model::EventView;
 use crate::native_activity::{NativeRow, NativeState};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ops::Bound;
 
 /// Journal kinds shown verbatim by `Studio.snapshot` (`VISIBLE` in studio.cjs).
@@ -219,6 +219,10 @@ pub(crate) struct Entry {
     pub seq: i64,
     pub native: NativeState,
     pub rows: BTreeMap<i64, ProgressRow>,
+    // Absorbed in seq order by PROGRESS_SCAN. Only supplemental activity
+    // belongs in the feed; visible originals already have an SQL row.
+    feed_seqs: Vec<i64>,
+    feed_by_job: HashMap<Option<i64>, Vec<i64>>,
 }
 
 /// Raw row fetched by the progress scan.
@@ -256,6 +260,11 @@ impl Entry {
             })
         };
         if let Some(item) = item {
+            let visible_original = VISIBLE.contains(&row.kind.as_str());
+            if !visible_original {
+                self.feed_seqs.push(row.seq);
+                self.feed_by_job.entry(row.job).or_default().push(row.seq);
+            }
             self.rows.insert(
                 row.seq,
                 ProgressRow {
@@ -263,12 +272,57 @@ impl Entry {
                     job: row.job,
                     turn: row.turn,
                     agent: row.agent,
-                    visible_original: VISIBLE.contains(&row.kind.as_str()),
+                    visible_original,
                     item,
                 },
             );
         }
         self.seq = row.seq;
+    }
+
+    pub fn feed(&self, after: i64, end: i64, fold: &crate::feed::Fold) -> Vec<EventView> {
+        use crate::feed::PAGE;
+        if after >= end {
+            return Vec::new();
+        }
+        let mut ids = Vec::new();
+        let before = fold.resumed.saturating_sub(1);
+        let mut append = |seqs: &[i64], low: i64, high: i64, check_turn: bool| {
+            if low >= high {
+                return;
+            }
+            let seqs =
+                &seqs[seqs.partition_point(|s| *s <= low)..seqs.partition_point(|s| *s <= high)];
+            let keep = |seq: &&i64| {
+                !check_turn || {
+                    let r = &self.rows[*seq];
+                    fold.shown("activity", **seq, r.job, r.turn)
+                }
+            };
+            if after == 0 {
+                ids.extend(seqs.iter().rev().filter(keep).take(PAGE).copied());
+            } else {
+                ids.extend(seqs.iter().filter(keep).take(PAGE).copied());
+            }
+        };
+        append(&self.feed_seqs, after.max(before), end, false);
+        if after < before {
+            if let Some(nulls) = self.feed_by_job.get(&None) {
+                append(nulls, after, before, false);
+            }
+            for (job, round) in &fold.open {
+                if round.on_ticket && Some(*job) != fold.root
+                    && let Some(seqs) = self.feed_by_job.get(&Some(*job))
+                {
+                    append(seqs, after, before, true);
+                }
+            }
+        }
+        ids.sort_unstable();
+        crate::feed::page_slice(&ids, after)
+            .iter()
+            .map(|seq| self.rows[seq].view(*seq))
+            .collect()
     }
 
     /// `read(ticket, after, end, reverse, limit, except)` where `except` is
@@ -291,19 +345,25 @@ impl Entry {
         let keep = |(seq, r): &(&i64, &ProgressRow)| {
             !(except_visible && r.visible_original) && shown(**seq, r.job, r.turn)
         };
-        let view = |(seq, r): (&i64, &ProgressRow)| EventView {
-            seq: *seq,
-            kind: "activity".to_owned(),
-            ts: r.ts,
-            job: r.job,
-            turn: r.turn,
-            agent: r.agent.clone(),
-            payload: r.item.to_value(),
-        };
+        let view = |(seq, r): (&i64, &ProgressRow)| r.view(*seq);
         if reverse {
             range.rev().filter(keep).take(limit).map(view).collect()
         } else {
             range.filter(keep).take(limit).map(view).collect()
+        }
+    }
+}
+
+impl ProgressRow {
+    fn view(&self, seq: i64) -> EventView {
+        EventView {
+            seq,
+            kind: "activity".to_owned(),
+            ts: self.ts,
+            job: self.job,
+            turn: self.turn,
+            agent: self.agent.clone(),
+            payload: self.item.to_value(),
         }
     }
 }

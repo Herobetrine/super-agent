@@ -1,5 +1,5 @@
-//! Journal schema, copied verbatim from `runtime/engine-schema.cjs` and the
-//! `studio_plan` table created by `runtime/studio.cjs`.
+//! Journal schema from `runtime/engine-schema.cjs`, with the folded-feed
+//! index and the studio tables used by the Rust control room.
 
 pub(crate) const SCHEMA: &str = r#"CREATE TABLE IF NOT EXISTS tickets(
   id INTEGER PRIMARY KEY, goal TEXT NOT NULL, cwd TEXT NOT NULL,
@@ -41,7 +41,8 @@ CREATE TABLE IF NOT EXISTS continuous_runs(
   stalls INTEGER NOT NULL DEFAULT 0, last_signal TEXT NOT NULL DEFAULT '');
 CREATE INDEX IF NOT EXISTS jobs_ticket_id ON jobs(ticket,id);
 CREATE INDEX IF NOT EXISTS jobs_ticket_root ON jobs(ticket) WHERE parent IS NULL;
-CREATE INDEX IF NOT EXISTS events_ticket_kind ON events(ticket,kind,seq);"#;
+CREATE INDEX IF NOT EXISTS events_ticket_kind ON events(ticket,kind,seq);
+CREATE INDEX IF NOT EXISTS events_ticket_job_kind ON events(ticket,job,kind,seq) WHERE kind NOT IN ('delta','native');"#;
 
 /// Columns added to older databases, in the same order as `engine-schema.cjs`.
 pub(crate) const ADDITIONS: &[(&str, &[(&str, &str)])] = &[
