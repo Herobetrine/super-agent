@@ -2,7 +2,7 @@
 //! sequence before projecting payloads. Older journals use one ordered query.
 
 use crate::model::{DECISION_KINDS, EventView, OPEN_JOB_STATES, folded_from_feed};
-use crate::progress::VISIBLE;
+use crate::progress::{Entry, VISIBLE};
 use anyhow::Result;
 use rusqlite::{Connection, Row, ToSql, params};
 use std::collections::{HashMap, HashSet};
@@ -40,7 +40,7 @@ const COLUMNS: &str = "seq,kind,ts,job,turn,CASE
 pub(super) struct Indexes {
     kind: &'static str,
     owner: Option<&'static str>,
-    open_jobs: &'static str,
+    ticket_jobs: &'static str,
 }
 
 impl Indexes {
@@ -48,15 +48,16 @@ impl Indexes {
         let names = conn
             .prepare(
                 "SELECT name FROM sqlite_master WHERE type='index'
-             AND name IN ('events_ticket_job_kind','events_ticket_kind','jobs_queue','jobs_ticket_id')",
+             AND name IN ('events_ticket_job_kind','events_ticket_kind','events_ticket','jobs_ticket_id')",
             )?
             .query_map([], |r| r.get::<_, String>(0))?
             .collect::<rusqlite::Result<HashSet<_>>>()?;
         let kind = if names.contains("events_ticket_kind") {
             "INDEXED BY events_ticket_kind"
+        } else if names.contains("events_ticket") {
+            "INDEXED BY events_ticket"
         } else {
-            // A journal predating even the per-kind index still opens read-only.
-            "NOT INDEXED"
+            ""
         };
         let owner = names
             .contains("events_ticket_job_kind")
@@ -64,12 +65,10 @@ impl Indexes {
         Ok(Self {
             kind,
             owner,
-            open_jobs: if owner.is_some() && names.contains("jobs_queue") {
-                "INDEXED BY jobs_queue"
-            } else if owner.is_none() && names.contains("jobs_ticket_id") {
+            ticket_jobs: if names.contains("jobs_ticket_id") {
                 "INDEXED BY jobs_ticket_id"
             } else {
-                "NOT INDEXED"
+                ""
             },
         })
     }
@@ -78,22 +77,17 @@ impl Indexes {
 pub(super) struct Fold {
     pub root: Option<i64>,
     pub resumed: i64,
-    pub open: HashMap<i64, OpenRound>,
 }
 
-pub(super) struct OpenRound {
+struct OpenRound {
     state: String,
     turn: i64,
-    pub on_ticket: bool,
+    on_ticket: bool,
 }
 
 impl Fold {
-    pub fn shown(&self, kind: &str, seq: i64, job: Option<i64>, turn: Option<i64>) -> bool {
-        let round = job
-            .and_then(|j| self.open.get(&j))
-            .filter(|r| kind != "activity" || r.on_ticket)
-            .map(|r| (r.state.as_str(), r.turn));
-        !folded_from_feed(kind, seq, job, turn, self.root, self.resumed, round)
+    fn needs_history(&self, after: i64, newer_rows: usize) -> bool {
+        after < self.resumed.saturating_sub(1) && (after != 0 || newer_rows < PAGE)
     }
 }
 
@@ -155,28 +149,29 @@ impl<'a> Reader<'a> {
                 .copied()
                 .unwrap_or(0);
         }
-        let mut open = HashMap::new();
-        if self.after < resumed {
-            let states = sql_literals(OPEN_JOB_STATES);
-            let index = self.indexes.open_jobs;
-            // The old raw-event query resolved an owner by job id alone.
-            // Activity used this ticket's rounds. Preserve both behaviours
-            // even for an imported event referring to another ticket's job.
-            let referenced = if let Some(owner) = self.indexes.owner {
-                format!(
-                    "AND (j.ticket=?1 OR EXISTS (SELECT 1 FROM events {owner}
-                    WHERE ticket=?1 AND job=j.id AND {INCLUDED}))"
-                )
-            } else {
-                // The legacy SQL resolves raw owners itself. Only activity
-                // uses this map, and it uses this ticket's rounds.
-                "AND j.ticket=?1".to_owned()
-            };
-            let sql = format!(
-                "SELECT id,state,turn,j.ticket=?1 FROM jobs AS j {index}
-                WHERE state IN ({states}) {referenced}"
-            );
-            open.extend(self.read(&sql, params![self.ticket], |r| {
+        Ok(Fold { root, resumed })
+    }
+
+    fn open_rounds(&self, owner: &str) -> Result<HashMap<i64, OpenRound>> {
+        let tickets = self.indexes.ticket_jobs;
+        let states = sql_literals(OPEN_JOB_STATES);
+        // Each recursive seek jumps to the next distinct non-NULL job in this
+        // ticket's partial index. The anchor includes even the smallest job id.
+        let sql = format!(
+            "WITH RECURSIVE referenced(job) AS (
+            SELECT (SELECT job FROM events {owner} WHERE ticket=?1 AND {INCLUDED}
+                    AND job IS NOT NULL ORDER BY job LIMIT 1)
+            UNION ALL
+            SELECT (SELECT job FROM events {owner} WHERE ticket=?1 AND {INCLUDED}
+                    AND job>r.job ORDER BY job LIMIT 1) FROM referenced r WHERE r.job IS NOT NULL
+        ), candidates(id) AS (
+            SELECT id FROM jobs {tickets} WHERE ticket=?1
+            UNION SELECT job FROM referenced WHERE job IS NOT NULL
+        ) SELECT j.id,j.state,j.turn,j.ticket=?1 FROM candidates c
+          CROSS JOIN jobs j ON j.id=c.id WHERE j.state IN ({states})"
+        );
+        Ok(self
+            .read(&sql, params![self.ticket], |r| {
                 Ok((
                     r.get(0)?,
                     OpenRound {
@@ -185,24 +180,81 @@ impl<'a> Reader<'a> {
                         on_ticket: r.get(3)?,
                     },
                 ))
-            })?);
-        }
-        Ok(Fold {
-            root,
-            resumed,
-            open,
-        })
+            })?
+            .into_iter()
+            .collect())
     }
 
-    pub fn page(&self, fold: &Fold) -> Result<Vec<EventView>> {
+    pub fn page(&self, fold: &Fold, activity: Option<&Entry>) -> Result<Vec<EventView>> {
         if self.after >= self.end {
             return Ok(Vec::new());
         }
-        let kind = self.indexes.kind;
         let order = if self.after == 0 { "DESC" } else { "ASC" };
-        let Some(owner) = self.indexes.owner else {
-            return self.legacy_page(fold, order);
+        let mut activity_ids = activity.map_or_else(Vec::new, |e| {
+            e.newer_feed(self.after, self.end, fold.resumed).to_vec()
+        });
+        let mut open = HashMap::new();
+        let mut events = if let Some(owner) = self.indexes.owner {
+            self.indexed_page(fold, owner, order, activity_ids.len(), &mut open)?
+        } else {
+            self.legacy_page(fold, order)?
         };
+
+        if let Some(entry) = activity {
+            let newer =
+                events.iter().filter(|e| e.seq >= fold.resumed).count() + activity_ids.len();
+            if fold.needs_history(self.after, newer) {
+                entry.append_history(&mut activity_ids, self.after, fold, None, None);
+                let mut append = |job, state: &str, turn| {
+                    if Some(job) != fold.root {
+                        entry.append_history(
+                            &mut activity_ids,
+                            self.after,
+                            fold,
+                            Some(job),
+                            Some((state, turn)),
+                        );
+                    }
+                };
+                if self.indexes.owner.is_some() {
+                    for (job, round) in open {
+                        if round.on_ticket {
+                            append(job, &round.state, round.turn);
+                        }
+                    }
+                } else {
+                    // Raw ownership was resolved by legacy_page. Stream local
+                    // owners directly to the supplemental activity projection.
+                    let tickets = self.indexes.ticket_jobs;
+                    let states = sql_literals(OPEN_JOB_STATES);
+                    let sql = format!(
+                        "SELECT id,state,turn FROM jobs {tickets} WHERE ticket=? AND state IN ({states})"
+                    );
+                    self.read(&sql, params![self.ticket], |r| {
+                        append(r.get(0)?, r.get_ref(1)?.as_str()?, r.get(2)?);
+                        Ok(())
+                    })?;
+                }
+            }
+            activity_ids.sort_unstable();
+            events.extend(
+                page_slice(&activity_ids, self.after)
+                    .iter()
+                    .map(|s| entry.rows[s].view(*s)),
+            );
+        }
+        Ok(events)
+    }
+
+    fn indexed_page(
+        &self,
+        fold: &Fold,
+        owner: &str,
+        order: &str,
+        newer_activity: usize,
+        open: &mut HashMap<i64, OpenRound>,
+    ) -> Result<Vec<EventView>> {
+        let kind = self.indexes.kind;
         let slice = |index: &str, extra: &str| {
             format!(
                 "SELECT seq FROM events {index} WHERE ticket=?1 AND kind=?2 AND seq>?3 AND seq<=?4
@@ -221,7 +273,8 @@ impl<'a> Reader<'a> {
             )?);
         }
         // Only a latest-first page can be filled entirely by the newer range.
-        if self.after < before && (self.after != 0 || ids.len() < PAGE) {
+        if fold.needs_history(self.after, ids.len() + newer_activity) {
+            *open = self.open_rounds(owner)?;
             let owned = format!("AND {INCLUDED} AND job IS ?5");
             let by_owner = slice(owner, &owned);
             let by_round = slice(owner, &format!("{owned} AND (turn IS NULL OR turn>=?6)"));
@@ -241,7 +294,7 @@ impl<'a> Reader<'a> {
                         seq,
                     )?);
                 }
-                for (&job, round) in &fold.open {
+                for (&job, round) in open.iter() {
                     if Some(job) != fold.root {
                         ids.extend(self.read(
                             &by_round,
@@ -264,7 +317,21 @@ impl<'a> Reader<'a> {
             format!("SELECT {COLUMNS} FROM events WHERE seq IN ({placeholders}) ORDER BY seq");
         let args = ids.iter().map(|id| id as &dyn ToSql).collect::<Vec<_>>();
         let mut events = self.events(&sql, &args)?;
-        events.retain(|e| fold.shown(&e.kind, e.seq, e.job, e.turn));
+        events.retain(|e| {
+            let round = e
+                .job
+                .and_then(|j| open.get(&j))
+                .map(|r| (r.state.as_str(), r.turn));
+            !folded_from_feed(
+                &e.kind,
+                e.seq,
+                e.job,
+                e.turn,
+                fold.root,
+                fold.resumed,
+                round,
+            )
+        });
         Ok(events)
     }
 
@@ -309,32 +376,23 @@ impl<'a> Reader<'a> {
     }
 
     pub fn deltas(&self, job: i64, turn: i64, cursor: i64) -> Result<Vec<EventView>> {
-        // Admission commits before the adapter starts. A same-turn retry
-        // keeps the first attempt's deltas; old journals may lack admission.
         let kind = self.indexes.kind;
-        let admission = if let Some(owner) = self.indexes.owner {
-            // A job's turn advances monotonically; retries retain its turn.
-            // Seek backwards over the retries, then forwards from the preceding
-            // turn's admission to the first admission of this turn.
-            let range = format!(
-                "FROM events {owner} WHERE ticket=?1 AND job=?2 AND kind='turn.admitted'
-                AND {INCLUDED} AND seq<=?5"
-            );
+        // A legacy first attempt can precede this turn's first recorded
+        // admission. Only a lower turn's admission is a safe initial bound.
+        let lower = if self.after == 0 {
+            let owner = self.indexes.owner.unwrap_or(kind);
             format!(
-                "SELECT min(seq) {range} AND turn=?3 AND seq>=coalesce(
-                (SELECT seq {range} AND turn<>?3 ORDER BY seq DESC LIMIT 1),{first_seq})",
-                first_seq = i64::MIN
+                "max(?4,coalesce((SELECT seq FROM events {owner} WHERE ticket=?1 AND job=?2
+                AND kind='turn.admitted' AND {INCLUDED} AND turn<?3 AND seq<=?5
+                ORDER BY seq DESC LIMIT 1),?4))"
             )
         } else {
-            format!(
-                "SELECT min(seq) FROM events {kind}
-                WHERE ticket=?1 AND kind='turn.admitted' AND job=?2 AND turn=?3 AND seq<=?5"
-            )
+            "?4".to_owned()
         };
         let sql = format!(
             "SELECT {COLUMNS} FROM events {kind}
             WHERE ticket=?1 AND kind='delta' AND job=?2 AND turn=?3
-              AND seq>max(?4,coalesce(({admission}),?4))
+              AND seq>{lower}
               AND seq<=?5 ORDER BY seq"
         );
         self.events(&sql, params![self.ticket, job, turn, self.after, cursor])

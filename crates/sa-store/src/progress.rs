@@ -282,51 +282,55 @@ impl Entry {
         self.seq = row.seq;
     }
 
-    pub fn feed(&self, after: i64, end: i64, fold: &crate::feed::Fold) -> Vec<EventView> {
-        use crate::feed::PAGE;
-        if after >= end {
-            return Vec::new();
-        }
-        let mut ids = Vec::new();
-        let before = fold.resumed.saturating_sub(1);
-        let append = |ids: &mut Vec<i64>, seqs: &[i64], low: i64, high: i64, check_turn: bool| {
-            if low >= high {
-                return;
-            }
-            let seqs =
-                &seqs[seqs.partition_point(|s| *s <= low)..seqs.partition_point(|s| *s <= high)];
-            let keep = |seq: &&i64| {
-                !check_turn || {
-                    #[cfg(test)]
-                    self.feed_turn_checks.set(self.feed_turn_checks.get() + 1);
-                    let r = &self.rows[*seq];
-                    fold.shown("activity", **seq, r.job, r.turn)
-                }
-            };
-            if after == 0 {
-                ids.extend(seqs.iter().rev().filter(keep).take(PAGE).copied());
-            } else {
-                ids.extend(seqs.iter().filter(keep).take(PAGE).copied());
-            }
+    pub fn newer_feed(&self, after: i64, end: i64, resumed: i64) -> &[i64] {
+        let low = after.max(resumed.saturating_sub(1));
+        let seqs = &self.feed_seqs;
+        crate::feed::page_slice(
+            &seqs[seqs.partition_point(|s| *s <= low)..seqs.partition_point(|s| *s <= end)],
+            after,
+        )
+    }
+
+    pub fn append_history(
+        &self,
+        ids: &mut Vec<i64>,
+        after: i64,
+        fold: &crate::feed::Fold,
+        job: Option<i64>,
+        round: Option<(&str, i64)>,
+    ) {
+        let Some(seqs) = self.feed_by_job.get(&job) else {
+            return;
         };
-        append(&mut ids, &self.feed_seqs, after.max(before), end, false);
-        if after < before && (after != 0 || ids.len() < PAGE) {
-            if let Some(nulls) = self.feed_by_job.get(&None) {
-                append(&mut ids, nulls, after, before, false);
+        let seqs = &seqs
+            [seqs.partition_point(|s| *s <= after)..seqs.partition_point(|s| *s < fold.resumed)];
+        let shown = |s: &&i64| {
+            if job.is_none() {
+                return true;
             }
-            for (job, round) in &fold.open {
-                if round.on_ticket && Some(*job) != fold.root
-                    && let Some(seqs) = self.feed_by_job.get(&Some(*job))
-                {
-                    append(&mut ids, seqs, after, before, true);
-                }
-            }
+            #[cfg(test)]
+            self.feed_turn_checks.set(self.feed_turn_checks.get() + 1);
+            !crate::model::folded_from_feed(
+                "activity",
+                **s,
+                job,
+                self.rows[*s].turn,
+                fold.root,
+                fold.resumed,
+                round,
+            )
+        };
+        if after == 0 {
+            ids.extend(
+                seqs.iter()
+                    .rev()
+                    .filter(shown)
+                    .take(crate::feed::PAGE)
+                    .copied(),
+            );
+        } else {
+            ids.extend(seqs.iter().filter(shown).take(crate::feed::PAGE).copied());
         }
-        ids.sort_unstable();
-        crate::feed::page_slice(&ids, after)
-            .iter()
-            .map(|seq| self.rows[seq].view(*seq))
-            .collect()
     }
 
     /// `read(ticket, after, end, reverse, limit, except)` where `except` is
@@ -359,7 +363,7 @@ impl Entry {
 }
 
 impl ProgressRow {
-    fn view(&self, seq: i64) -> EventView {
+    pub(crate) fn view(&self, seq: i64) -> EventView {
         EventView {
             seq,
             kind: "activity".to_owned(),

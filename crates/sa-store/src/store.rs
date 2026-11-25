@@ -436,11 +436,8 @@ impl Store {
         let reader = feed::Reader::new(conn, self.feed_indexes, ticket, after, end);
         let fold = reader.fold(root.map(|j| j.id))?;
         let lead_resumed = fold.resumed;
-        let mut merged = reader.page(&fold)?;
         let entry = &self.progress[&ticket];
-        if !loading {
-            merged.extend(entry.feed(after, end, &fold));
-        }
+        let mut merged = reader.page(&fold, (!loading).then_some(entry))?;
         merged.sort_by_key(|e| e.seq);
         let mut events: Vec<EventView> = if after != 0 {
             merged.truncate(PAGE);
