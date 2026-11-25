@@ -500,6 +500,13 @@ impl Host {
         )
     }
 
+    /// Restore while the engine and any journal readers are closed. Claim the
+    /// scheduler lock so another desktop cannot start during the restore.
+    pub fn restore_snapshot(dir: &Path, snapshot: &Path) -> Result<()> {
+        let _owner = owner::claim(dir)?;
+        sa_store::journal::restore_snapshot(dir, snapshot)
+    }
+
     /// [`start`](Self::start) with explicit harness adapters (tests).
     pub fn start_with(
         dir: PathBuf,
@@ -515,7 +522,7 @@ impl Host {
         );
         let notify: Notify = Arc::new(notify);
         let wake = notify.clone();
-        let (ready_tx, ready_rx) = mpsc::channel::<Result<Ready, String>>();
+        let (ready_tx, ready_rx) = mpsc::channel::<Result<Ready>>();
         let (out_tx, out_rx) = mpsc::channel();
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Action>();
         let thread = std::thread::Builder::new()
@@ -529,7 +536,7 @@ impl Host {
                 {
                     Ok(r) => r,
                     Err(e) => {
-                        let _ = ready_tx.send(Err(format!("调度运行时启动失败：{e}")));
+                        let _ = ready_tx.send(Err(anyhow::Error::new(e).context("调度运行时启动失败")));
                         return;
                     }
                 };
@@ -537,7 +544,7 @@ impl Host {
                     let _owner = match owner::claim(&dir) {
                         Ok(o) => o,
                         Err(e) => {
-                            let _ = ready_tx.send(Err(e.to_string()));
+                            let _ = ready_tx.send(Err(e));
                             return;
                         }
                     };
@@ -545,7 +552,8 @@ impl Host {
                     let ext = match sa_ext::ProjectExtensions::open(&dir) {
                         Ok(x) => x,
                         Err(e) => {
-                            let _ = ready_tx.send(Err(format!("MCP 与技能服务无法打开：{e:#}")));
+                            let error = sa_store::journal::classify_open_error(&dir, e);
+                            let _ = ready_tx.send(Err(error.context("MCP 与技能服务无法打开")));
                             return;
                         }
                     };
@@ -558,7 +566,8 @@ impl Host {
                     let engine = match open_engine(&dir, adapters, &for_thread, &ext, bus.clone()) {
                         Ok(e) => e,
                         Err(e) => {
-                            let _ = ready_tx.send(Err(format!("{e:#}")));
+                            let error = sa_store::journal::classify_open_error(&dir, e);
+                            let _ = ready_tx.send(Err(error));
                             return;
                         }
                     };
@@ -568,7 +577,7 @@ impl Host {
                     let control = match crate::control::Server::open(&dir) {
                         Ok(server) => server,
                         Err(e) => {
-                            let _ = ready_tx.send(Err(format!("本地控制接口无法打开：{e:#}")));
+                            let _ = ready_tx.send(Err(e.context("本地控制接口无法打开")));
                             engine.close().await;
                             ext.close();
                             return;
@@ -620,7 +629,7 @@ impl Host {
             }
             Ok(Err(e)) => {
                 let _ = thread.join();
-                Err(anyhow!(e))
+                Err(e)
             }
             Err(_) => {
                 let _ = thread.join();
@@ -906,7 +915,7 @@ fn open_engine(
     let engine = Engine::open(dir, adapters, opts)?;
     engine
         .db()
-        .with(|q| {
+        .tx(|q| {
             q.conn().execute_batch(sa_store::STUDIO_PLAN)?;
             sa_store::efficiency::init(q.conn())?;
             q.conn().execute_batch("CREATE TABLE IF NOT EXISTS studio_model_policy(singleton INTEGER PRIMARY KEY CHECK(singleton=1),allow_lead_routing INTEGER NOT NULL CHECK(allow_lead_routing IN (0,1)))")?;

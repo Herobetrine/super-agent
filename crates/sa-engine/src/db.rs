@@ -79,20 +79,25 @@ pub struct Db {
 
 impl Db {
     pub fn open(dir: &Path) -> Result<Self> {
-        let conn = sa_store::journal::open_journal(dir)?;
-        // Additive Rust-port table; the Node engine ignores it.
-        conn.execute_batch(sa_store::knowledge::SCHEMA)?;
-        conn.execute_batch(SCHEMA)?;
-        conn.execute_batch(crate::pause::SCHEMA)?;
-        conn.execute_batch(crate::advice::SCHEMA)?;
-        conn.execute_batch(crate::workspaces::SCHEMA)?;
-        conn.execute_batch(crate::workspaces::hydrate::SCHEMA)?;
-        conn.execute_batch(crate::scm::SCHEMA)?;
-        conn.execute_batch(crate::checkpoints::SCHEMA)?;
-        conn.execute_batch(crate::execution_policy::SCHEMA)?;
-        conn.execute_batch(sa_store::delivery::SCHEMA)?;
-        conn.execute_batch(sa_store::catalog_cache::SCHEMA)?;
-        conn.execute_batch(crate::operations::SCHEMA)?;
+        let mut conn = sa_store::journal::open_journal(dir)?;
+        conn.transaction_with_behavior(TransactionBehavior::Immediate)
+            .and_then(|tx| {
+                // Additive Rust-port tables; the Node engine ignores them.
+                tx.execute_batch(sa_store::knowledge::SCHEMA)?;
+                tx.execute_batch(SCHEMA)?;
+                tx.execute_batch(crate::pause::SCHEMA)?;
+                tx.execute_batch(crate::advice::SCHEMA)?;
+                tx.execute_batch(crate::workspaces::SCHEMA)?;
+                tx.execute_batch(crate::workspaces::hydrate::SCHEMA)?;
+                tx.execute_batch(crate::scm::SCHEMA)?;
+                tx.execute_batch(crate::checkpoints::SCHEMA)?;
+                tx.execute_batch(crate::execution_policy::SCHEMA)?;
+                tx.execute_batch(sa_store::delivery::SCHEMA)?;
+                tx.execute_batch(sa_store::catalog_cache::SCHEMA)?;
+                tx.execute_batch(crate::operations::SCHEMA)?;
+                tx.commit()
+            })
+            .map_err(|error| sa_store::journal::classify_open_error(dir, error.into()))?;
         conn.set_prepared_statement_cache_capacity(256);
         Ok(Self {
             conn: Mutex::new(Some(conn)),
