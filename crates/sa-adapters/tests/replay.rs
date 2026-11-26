@@ -15,10 +15,17 @@ use std::{
     fs,
     io::ErrorKind,
     path::{Path, PathBuf},
+    process::Stdio,
     sync::Arc,
     time::Duration,
 };
-use tokio::{io::AsyncReadExt, net::TcpListener, sync::mpsc, time::timeout};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpListener,
+    process::Command,
+    sync::mpsc,
+    time::timeout,
+};
 use tokio_util::sync::CancellationToken;
 
 const PROMPT: &str = "Inspect fixture.txt.";
@@ -414,11 +421,93 @@ async fn antigravity_resume() {
     );
 }
 
+#[tokio::test]
+async fn replay_binds_named_response_and_rejects_notification_with_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let script = dir.path().join("notification.jsonl");
+    fs::write(
+        &script,
+        r#"{"expect":{"method":"session/prompt"}}
+{"expect":{"method":"session/prompt"}}
+{"expect":{"method":"session/load"}}
+{"expect":{"method":"session/cancel","notification":true}}
+{"respond":{"stopReason":"cancelled"},"to":"session/prompt"}
+"#,
+    )
+    .unwrap();
+
+    for id in [None, Some(json!(4)), Some(Value::Null)] {
+        let mut cancel = json!({"jsonrpc":"2.0","method":"session/cancel"});
+        let has_id = id.is_some();
+        if let Some(id) = id {
+            cancel["id"] = id;
+        }
+        let mut child = Command::new(env!("CARGO_BIN_EXE_sa-replay-cli"))
+            .arg("acp")
+            .env("SA_REPLAY_SCRIPT", &script)
+            .env("SA_REPLAY_RECEIPT", dir.path().join("receipt"))
+            .env_remove("SA_REPLAY_LIFETIME")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let mut input = child.stdin.take().unwrap();
+        let wire: String = [
+            json!({"jsonrpc":"2.0","method":"session/prompt","id":1}),
+            json!({"jsonrpc":"2.0","method":"session/prompt","id":2}),
+            json!({"jsonrpc":"2.0","method":"session/load","id":3}),
+            cancel.clone(),
+        ]
+        .iter()
+        .map(|frame| format!("{frame}\n"))
+        .collect();
+        let output = timeout(LIMIT, async {
+            input.write_all(wire.as_bytes()).await.unwrap();
+            drop(input);
+            child.wait_with_output().await.unwrap()
+        })
+        .await
+        .expect("fake CLI must finish");
+        if has_id {
+            assert_eq!(output.status.code(), Some(97));
+            assert!(output.stdout.is_empty());
+            let diagnostic = String::from_utf8(output.stderr).unwrap();
+            assert!(diagnostic.contains("expected notification without id"));
+            assert!(diagnostic.contains(&cancel.to_string()));
+        } else {
+            assert!(output.status.success(), "{output:?}");
+            let frame: Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(
+                frame,
+                json!({"jsonrpc":"2.0","id":2,"result":{"stopReason":"cancelled"}})
+            );
+        }
+    }
+}
+
 #[test]
 fn transcripts_are_scrubbed() {
     let private = regex::Regex::new(
-        r"(?i)hjy03|[a-z]:\\+|[cde]:/|[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}|sk-|ghp_|sab-[a-z0-9_-]{8,}",
+        r#"(?i)hjy03|\b[a-z]:[/\\]+|(?:^|[^\w/\\.-])/(?:home|users)/[^/\s"\\]+|[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}|sk-|ghp_|sab-[^\s"\\]{8,}"#,
     ).unwrap();
+    for (sample, rejected) in [
+        ("F:/Users/alice/project", true),
+        ("/home/alice/project", true),
+        ("/Users/bob/project", true),
+        (r"C:\\Users\\bob", true),
+        (r"X:\work\fixture.txt", true),
+        ("Z:/work/fixture.txt", true),
+        ("fixture@example.com", true),
+        ("sk-fixture", true),
+        ("ghp_fixture", true),
+        ("sab-12345678", true),
+        ("http://127.0.0.1:4318/mcp", false),
+        ("src/main.rs", false),
+    ] {
+        assert_eq!(private.is_match(sample), rejected, "{sample}");
+    }
     let mut directories = vec![transcripts()];
     let mut count = 0;
     while let Some(directory) = directories.pop() {

@@ -83,7 +83,7 @@ fn replay(
     output: &mut impl Write,
     receipt: &mut impl Write,
 ) -> Result<u8> {
-    let mut last_id = None;
+    let mut requests = Vec::new();
     let mut peer_id = None;
     let mut next_peer_id = 9000;
     for (index, line) in script.lines().enumerate() {
@@ -91,23 +91,51 @@ fn replay(
         let step = serde_json::from_str::<Value>(line)
             .with_context(|| format!("invalid transcript JSON on line {line_number}"))?;
         let fields = step.as_object().context("step must be an object")?;
-        ensure!(fields.len() == 1, "line {line_number} must have one action");
-        let (action, value) = fields.iter().next().unwrap();
+        let to = fields.get("to");
+        let mut actions = fields.iter().filter(|(key, _)| *key != "to");
+        let (action, value) = actions.next().context("step has no action")?;
+        ensure!(
+            actions.next().is_none(),
+            "line {line_number} must have one action"
+        );
+        ensure!(
+            to.is_none() || matches!(action.as_str(), "respond" | "respond_error"),
+            "line {line_number}: to is only valid for a response"
+        );
         let mut execute = || -> Result<Option<u8>> {
             match action.as_str() {
                 "expect" => {
-                    let actual = if let Some(record) = value.get("record") {
-                        match_frame(input, record, None)?
-                    } else {
-                        match_frame(input, value, None)?
-                    };
+                    let mut expected = value.clone();
+                    let notification = expected
+                        .as_object_mut()
+                        .and_then(|fields| fields.shift_remove("notification"))
+                        .is_some_and(|flag| flag == true);
+                    let actual =
+                        match_frame(input, expected.get("record").unwrap_or(&expected), None)?;
+                    ensure!(
+                        !notification || actual.get("id").is_none(),
+                        "expected notification without id, received {actual}"
+                    );
                     if let Some(id) = actual.get("id").filter(|id| !id.is_null()) {
-                        last_id = Some(id.clone());
+                        let method = actual["method"].as_str().map(str::to_owned);
+                        requests.push((method, id.clone()));
                     }
                     writeln!(receipt, "{line_number}")?;
                 }
                 "respond" | "respond_error" => {
-                    let id = last_id.take().context("no preceding request id")?;
+                    let method = to
+                        .map(|value| value.as_str().context("to must name a method"))
+                        .transpose()?;
+                    let index = requests
+                        .iter()
+                        .rposition(|(captured, _)| {
+                            method.is_none() || captured.as_deref() == method
+                        })
+                        .with_context(|| match method {
+                            Some(method) => format!("no pending request for {method}"),
+                            None => "no preceding request id".into(),
+                        })?;
+                    let (_, id) = requests.remove(index);
                     let key = if action == "respond" {
                         "result"
                     } else {
