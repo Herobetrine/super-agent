@@ -35,16 +35,23 @@ fn send(output: &mut impl Write, frame: &Value) -> Result<()> {
 
 // Adapter::run also performs local CLI discovery. These replies serve only those
 // invocations and never run against the turn transcript.
-fn probe(args: &[String], input: &mut impl BufRead, output: &mut impl Write) -> Result<bool> {
-    if args == ["debug", "models"] {
+fn probe(
+    args: &[String],
+    input: &mut impl BufRead,
+    output: &mut impl Write,
+) -> Result<Option<&'static str>> {
+    let kind = if args == ["debug", "models"] {
         send(output, &json!({"models":[{"slug":"codex-fixture"}]}))?;
+        "codex-models"
     } else if args.last().is_some_and(|arg| arg == "models")
         && args.first().is_some_and(|arg| arg == "--settings")
     {
         writeln!(output, "gemini-fixture\tFixture Gemini")?;
         output.flush()?;
+        "agy-models"
     } else if args.ends_with(&["auth".into(), "status".into()]) {
         send(output, &json!({"loggedIn":true,"apiProvider":"firstParty"}))?;
+        "claude-auth"
     } else if args.iter().any(|arg| arg == "--no-session-persistence") {
         let frame = read_frame(input)?;
         let expected = json!({"type":"control_request","request_id":"catalog","request":{"subtype":"initialize"}});
@@ -57,10 +64,11 @@ fn probe(args: &[String], input: &mut impl BufRead, output: &mut impl Write) -> 
             &json!({"type":"control_response","response":{"request_id":"catalog","subtype":"success",
                 "response":{"models":[{"value":"claude-fixture","displayName":"Fixture Claude"}]}}}),
         )?;
+        "claude-initialize"
     } else {
-        return Ok(false);
-    }
-    Ok(true)
+        return Ok(None);
+    };
+    Ok(Some(kind))
 }
 
 fn match_frame(
@@ -203,11 +211,17 @@ fn replay(
     Ok(0)
 }
 
+fn open_receipt() -> Result<fs::File> {
+    let path = env::var_os("SA_REPLAY_RECEIPT").context("missing receipt path")?;
+    Ok(OpenOptions::new().create(true).append(true).open(path)?)
+}
+
 fn run() -> Result<u8> {
     let args: Vec<String> = env::args().skip(1).collect();
     let mut input = io::stdin().lock();
     let mut output = io::stdout().lock();
-    if probe(&args, &mut input, &mut output)? {
+    if let Some(kind) = probe(&args, &mut input, &mut output)? {
+        writeln!(open_receipt()?, "probe:{kind}")?;
         return Ok(0);
     }
     let rpc = args.first().is_some_and(|arg| arg == "acp");
@@ -226,10 +240,7 @@ fn run() -> Result<u8> {
     }
     let script =
         fs::read_to_string(env::var_os("SA_REPLAY_SCRIPT").context("missing script path")?)?;
-    let mut receipt = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(env::var_os("SA_REPLAY_RECEIPT").context("missing receipt path")?)?;
+    let mut receipt = open_receipt()?;
     // For cancellation, keep this socket open for the lifetime of the peer.
     let _lifetime = env::var("SA_REPLAY_LIFETIME")
         .ok()
@@ -243,9 +254,7 @@ fn main() -> ExitCode {
         Ok(code) => ExitCode::from(code),
         Err(error) => {
             let diagnostic = format!("replay mismatch: {error:#}");
-            if let Some(path) = env::var_os("SA_REPLAY_RECEIPT")
-                && let Ok(mut receipt) = OpenOptions::new().create(true).append(true).open(path)
-            {
+            if let Ok(mut receipt) = open_receipt() {
                 let _ = writeln!(receipt, "{diagnostic}");
             }
             eprintln!("{diagnostic}");
