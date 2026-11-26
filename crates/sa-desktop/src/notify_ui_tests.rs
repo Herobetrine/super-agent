@@ -55,7 +55,7 @@ fn harness(data: &Path, observe: bool, demo: bool) -> Harness<'static, App> {
 
 fn open(h: &mut Harness<'_, App>) {
     h.run_steps(3);
-    h.get_by_role_and_label(Role::Button, "手机推送与隐私").click();
+    h.get_by_role_and_label(Role::Button, "通知与隐私").click();
     h.run_steps(3);
     assert!(h.state().notify.is_some());
     settle(h);
@@ -263,7 +263,7 @@ fn save_persists_and_a_new_window_reads_it_back() {
     assert_eq!(h.state().host.as_ref().unwrap().notify_settings(), Ok(want.clone()));
     assert_eq!(
         h.state().composer.message.as_ref().map(|m| m.0.as_str()),
-        Some("手机推送与隐私设置已保存，立即生效。")
+        Some("通知与隐私设置已保存，立即生效。")
     );
     drop(h);
 
@@ -824,4 +824,145 @@ fn unfinished_mapping_and_invalid_address() {
 fn notify_dialog_flag_is_supported() {
     let opts = crate::cli::parse(["--demo", "--dialog", "notify"].map(str::to_string)).unwrap();
     assert_eq!(opts.dialog.as_deref(), Some("notify"));
+}
+
+#[test]
+fn desktop_modes_and_bell_restore_the_last_enabled_mode() {
+    use crate::notifications::Mode;
+
+    let data = tempfile::tempdir().unwrap();
+    let mut h = harness(data.path(), false, false);
+    open(&mut h);
+    assert!(h.query_by_role_and_label(Role::Label, "通知与隐私").is_some());
+    let section = h.get_by_role_and_label(Role::Label, "桌面通知");
+    assert!(section.rect().top() < h.get_by_role_and_label(Role::Label, "手机推送").rect().top());
+    assert!(shown(&h, "选\"仅声音\"或\"关闭\"时，不弹系统通知和应用内提示。只有主窗口会发通知和显示任务栏角标。"));
+    for mode in Mode::ALL {
+        assert!(!disabled(&h, Role::RadioButton, mode.label()));
+    }
+    assert_eq!(h.state().notification_mode(), Mode::Visual);
+    h.get_by_role_and_label(Role::RadioButton, "仅声音").click();
+    h.run_steps(3);
+    assert_eq!(h.state().notification_mode(), Mode::Sound);
+    h.get_by_role_and_label(Role::Button, "取消").click();
+    h.run_steps(3);
+    assert!(h.state().notify.is_none());
+
+    h.get_by_role_and_label(Role::Button, "桌面通知").hover();
+    h.run_steps(40);
+    assert!(shown(&h, "桌面通知：仅声音 · 点击关闭"));
+    h.get_by_role_and_label(Role::Button, "桌面通知").click();
+    h.step();
+    assert_eq!(h.state().notification_mode(), Mode::Off);
+
+    // egui dismisses the tooltip on click until the pointer moves again.
+    let bell_center = h.get_by_role_and_label(Role::Button, "桌面通知").rect().center();
+    h.hover_at(bell_center - egui::vec2(0.0, 70.0));
+    h.step();
+    h.get_by_role_and_label(Role::Button, "桌面通知").hover();
+    h.run_steps(40);
+    assert!(shown(&h, "桌面通知已关闭 · 点击恢复"));
+    h.get_by_role_and_label(Role::Button, "桌面通知").click();
+    h.run_steps(3);
+    assert_eq!(h.state().notification_mode(), Mode::Sound);
+}
+
+fn seed_desktop_tickets(h: &Harness<'_, App>, goal: &str) {
+    h.state().host.as_ref().unwrap().engine().db().tx(|q| {
+        q.conn().execute_batch(
+            "INSERT INTO tickets(id,goal,cwd,writes,lead,created) VALUES
+                (1,'当前会话','',0,'claude',0),(2,'最早的会话','',0,'claude',0),
+                (3,'','',0,'claude',0),(4,'','',0,'claude',0),(5,'','',0,'claude',0);
+             INSERT INTO jobs(id,ticket,agent,body,writing,depth,state)
+             SELECT id,id,'claude','fixture',0,0,'done' FROM tickets;
+             INSERT INTO studio_ticket_meta(ticket,title) VALUES (4,'会话标题'),(5,'  ');"
+        )?;
+        q.conn().execute("UPDATE tickets SET goal=?1 WHERE id=3", [goal])?;
+        Ok(())
+    }).unwrap();
+}
+
+#[test]
+fn desktop_notification_cards_show_titles_stack_and_open_the_ticket() {
+    let data = tempfile::tempdir().unwrap();
+    let mut h = harness(data.path(), false, false);
+    h.state_mut().test_focus = Some(true);
+    let goal = "仅有目标的工单".repeat(24);
+    seed_desktop_tickets(&h, &goal);
+    h.state_mut().select(Some(1));
+    wait(&mut h, "desktop notification baseline", |app| app.notification_gate.has_baseline());
+    h.state().host.as_ref().unwrap().engine().db().with(|q| {
+        q.conn().execute_batch(
+            "INSERT INTO approvals(ticket,job,turn,action) VALUES
+                (2,2,1,'fixture'),(3,3,1,'fixture'),(4,4,1,'fixture');"
+        )?;
+        Ok(())
+    }).unwrap();
+    wait(&mut h, "three pending approvals", |app| app.notification_gate.count() == 3);
+    assert!(h.query_by_role_and_label(Role::Label, "工单 #2 待审批").is_some());
+    assert!(h.query_by_role_and_label(Role::Label, &goal).is_some());
+    assert!(h.query_by_role_and_label(Role::Label, "会话标题").is_some());
+    assert!(h.output().shapes.iter().any(|entry| {
+        matches!(&entry.shape, egui::Shape::Text(text) if text.galley.elided && text.galley.text() == goal)
+    }));
+    h.state().host.as_ref().unwrap().engine().db().with(|q| {
+        q.conn().execute_batch(
+            "INSERT INTO questions(ticket,job,turn,msgkey,question,asked)
+             VALUES (5,5,1,'fixture','问题正文',0);"
+        )?;
+        Ok(())
+    }).unwrap();
+    wait(&mut h, "four pending tickets", |app| app.notification_gate.count() == 4);
+    assert!(h.query_by_role_and_label(Role::Label, "工单 #2 待审批").is_none());
+    assert!(h.query_by_role_and_label(Role::Label, "未命名会话").is_some());
+    let newest = h.get_by_role_and_label(Role::Label, "工单 #5 等你回答");
+    assert!(newest.rect().top() < h.get_by_role_and_label(Role::Label, "工单 #4 待审批").rect().top());
+    assert_eq!(h.query_all_by_role_and_label(Role::Button, "打开").count(), 3);
+    h.get_all_by_role_and_label(Role::Button, "打开")
+        .min_by(|a, b| a.rect().top().total_cmp(&b.rect().top()))
+        .unwrap().click();
+    h.run_steps(3);
+    assert_eq!(h.state().view.as_ref().map(|view| view.id), Some(5));
+    assert!(h.query_by_role_and_label(Role::Label, "工单 #5 等你回答").is_none());
+
+    h.get_all_by_role_and_label(Role::Button, "×")
+        .min_by(|a, b| a.rect().top().total_cmp(&b.rect().top()))
+        .unwrap().click();
+    h.run_steps(3);
+    assert_eq!(h.state().view.as_ref().map(|view| view.id), Some(5));
+    assert!(h.query_by_role_and_label(Role::Label, "工单 #4 待审批").is_none());
+    h.get_by_role_and_label(Role::Label, "工单 #3 待审批").click();
+    h.run_steps(3);
+    assert_eq!(h.state().view.as_ref().map(|view| view.id), Some(3));
+    assert!(h.query_by_role_and_label(Role::Label, "工单 #3 待审批").is_none());
+}
+
+#[test]
+fn sidebar_paints_an_unread_dot_until_the_ticket_is_viewed() {
+    use crate::notifications::Mode;
+
+    let data = tempfile::tempdir().unwrap();
+    let mut h = harness(data.path(), false, false);
+    h.state_mut().test_focus = Some(true);
+    h.state_mut().set_notification_mode(Mode::Off);
+    seed_desktop_tickets(&h, "目标");
+    h.state_mut().select(Some(1));
+    wait(&mut h, "notification baseline and populated sidebar", |app| {
+        app.notification_gate.has_baseline() && app.history.iter().any(|row| row.id == 4)
+    });
+    record_completion_events(&h, &[(4, "failed", "failed", "null")]);
+    wait(&mut h, "unread result", |app| app.notification_gate.unread(4));
+    let row = h.get_by_role_and_label(Role::Button, "会话标题 · 未读");
+    let y = row.rect().center().y;
+    let dot_present = |h: &Harness<'_, App>| h.output().shapes.iter().any(|entry| {
+        matches!(&entry.shape, egui::Shape::Circle(dot)
+            if dot.radius == 2.5 && dot.fill == h.state().pal.accent && (dot.center.y - y).abs() < 1.0)
+    });
+    assert!(dot_present(&h));
+    row.click();
+    h.run_steps(3);
+    assert_eq!(h.state().view.as_ref().map(|view| view.id), Some(4));
+    assert_eq!(h.state().notification_gate.count(), 0);
+    assert!(h.query_by_role_and_label(Role::Button, "会话标题 · 未读").is_none());
+    assert!(!dot_present(&h));
 }

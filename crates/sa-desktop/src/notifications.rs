@@ -1,5 +1,15 @@
-//! Native Windows toasts. The worker owns COM objects, so shell/WinRT work
-//! never blocks an egui frame. Content contains only ticket ids and status.
+//! Journal watches and native Windows notifications.
+
+#[path = "notification_badge.rs"]
+mod badge;
+#[path = "notification_cards.rs"]
+mod cards;
+#[path = "notification_gate.rs"]
+mod gate;
+
+pub(crate) use badge::Badge;
+pub(crate) use cards::Cards;
+pub(crate) use gate::{Delivery, Gate, Mode, Preferences, Visual, Watch, Window};
 
 use std::sync::{
     Arc,
@@ -52,36 +62,47 @@ impl ApprovalWatch {
         {
             let data = data.to_path_buf();
             self.pending = Some(crate::ops::Pending::spawn(ctx, move || {
-                let connection = rusqlite::Connection::open_with_flags(
-                    data.join(sa_store::DB_FILE),
-                    rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-                )?;
-                connection.busy_timeout(std::time::Duration::from_secs(1))?;
-                let sql = match kind {
-                    NoticeKind::Approval => "SELECT id,ticket FROM approvals WHERE decision='pending'",
-                    NoticeKind::Question => {
-                        let exists: bool = connection.query_row(
-                            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='questions')",
-                            [], |row| row.get(0),
-                        )?;
-                        if !exists {
-                            return Ok(Vec::new());
-                        }
-                        "SELECT id,ticket FROM questions WHERE state='pending'"
-                    }
-                    NoticeKind::Completion => unreachable!(),
-                };
-                let mut statement = connection.prepare(sql)?;
-                let rows = statement
-                    .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
-                Ok(rows)
+                let connection = open_journal(&data.join(sa_store::DB_FILE))?;
+                read_pending(&connection, kind)
             }));
             self.last = Some(std::time::Instant::now());
         }
         ctx.request_repaint_after(std::time::Duration::from_secs(1));
         notices
     }
+}
+
+fn open_journal(path: &std::path::Path) -> rusqlite::Result<rusqlite::Connection> {
+    let connection = rusqlite::Connection::open_with_flags(
+        path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )?;
+    connection.busy_timeout(std::time::Duration::from_secs(1))?;
+    Ok(connection)
+}
+
+fn table_exists(connection: &rusqlite::Connection, name: &str) -> rusqlite::Result<bool> {
+    connection.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1")?
+        .exists([name])
+}
+
+fn read_pending(
+    connection: &rusqlite::Connection,
+    kind: NoticeKind,
+) -> anyhow::Result<Vec<(i64, i64)>> {
+    let sql = match kind {
+        NoticeKind::Approval => "SELECT id,ticket FROM approvals WHERE decision='pending'",
+        NoticeKind::Question => {
+            if !table_exists(connection, "questions")? {
+                return Ok(Vec::new());
+            }
+            "SELECT id,ticket FROM questions WHERE state='pending'"
+        }
+        NoticeKind::Completion => unreachable!(),
+    };
+    let mut statement = connection.prepare(sql)?;
+    let rows = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
 /// Questions share approval polling and its startup baseline, with their own ids.
@@ -149,22 +170,39 @@ impl CompletionWatch {
 }
 
 fn read_completions(path: &std::path::Path, cursor: Option<i64>) -> anyhow::Result<CompletionBatch> {
-    let mut conn = rusqlite::Connection::open_with_flags(
-        path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-    )?;
-    conn.busy_timeout(std::time::Duration::from_secs(1))?;
+    let mut conn = open_journal(path)?;
     let tx = conn.transaction()?;
-    let head = tx.query_row("SELECT coalesce(max(seq), 0) FROM events", [], |r| r.get(0))?;
+    let head = completion_head(&tx)?;
+    let rows = read_completion_rows(&tx, cursor, head)?;
+    Ok((head, rows.into_iter().map(|row| (row.ticket, row.state)).collect()))
+}
+
+struct CompletionRow {
+    seq: i64,
+    ticket: i64,
+    job: i64,
+    turn: i64,
+    state: String,
+}
+
+fn completion_head(conn: &rusqlite::Connection) -> rusqlite::Result<i64> {
+    conn.query_row("SELECT coalesce(max(seq), 0) FROM events", [], |r| r.get(0))
+}
+
+fn read_completion_rows(
+    conn: &rusqlite::Connection,
+    cursor: Option<i64>,
+    head: i64,
+) -> anyhow::Result<Vec<CompletionRow>> {
     let Some(after) = cursor.filter(|&after| after < head) else {
-        return Ok((head, Vec::new()));
+        return Ok(Vec::new());
     };
     // A reply or pause failure carries its resulting state in the payload.
     // Dedicated failure/interruption events encode the state in their kind.
     // CROSS JOIN keeps SQLite on the new event rowid range before root lookup.
-    let mut stmt = tx.prepare(
-        "SELECT ticket, state FROM (
-           SELECT e.seq, e.ticket, CASE
+    let mut stmt = conn.prepare(
+        "SELECT seq, ticket, job, turn, state FROM (
+           SELECT e.seq, e.ticket, e.job, coalesce(e.turn, j.turn) AS turn, CASE
              WHEN e.kind IN ('reply', 'turn.pause_failure') THEN
                CASE WHEN json_valid(e.payload) THEN json_extract(e.payload, '$.state') END
              ELSE e.kind END AS state
@@ -173,8 +211,14 @@ fn read_completions(path: &std::path::Path, cursor: Option<i64>) -> anyhow::Resu
              AND e.kind IN ('reply', 'turn.pause_failure', 'done', 'failed', 'partial', 'interrupted')
          ) WHERE state IN ('done', 'failed', 'partial', 'interrupted') ORDER BY seq",
     )?;
-    let rows = stmt.query_map([after, head], |r| Ok((r.get(0)?, r.get(1)?)))?;
-    Ok((head, rows.collect::<rusqlite::Result<_>>()?))
+    let rows = stmt.query_map([after, head], |r| Ok(CompletionRow {
+        seq: r.get(0)?,
+        ticket: r.get(1)?,
+        job: r.get(2)?,
+        turn: r.get(3)?,
+        state: r.get(4)?,
+    }))?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -194,7 +238,7 @@ pub struct Notice {
 impl Notice {
     pub fn title(&self) -> String {
         match self.kind {
-            NoticeKind::Approval => format!("工单 #{} 等待审批", self.ticket),
+            NoticeKind::Approval => format!("工单 #{} 待审批", self.ticket),
             NoticeKind::Question => "需要你的回答".into(),
             NoticeKind::Completion => format!("工单 #{} {}", self.ticket, self.status),
         }
@@ -206,6 +250,23 @@ impl Notice {
     }
 }
 
+pub(crate) enum Request {
+    Toast(ToastRequest),
+    Sound,
+}
+
+pub(crate) struct ToastRequest {
+    pub notice: Notice,
+    pub sound: bool,
+}
+
+#[cfg(all(windows, test))]
+impl From<Notice> for ToastRequest {
+    fn from(notice: Notice) -> Self {
+        Self { notice, sound: false }
+    }
+}
+
 pub enum Feedback {
     Open(i64),
     Failed(String),
@@ -213,14 +274,14 @@ pub enum Feedback {
 
 #[derive(Default)]
 pub struct Notifications {
-    tx: Option<mpsc::SyncSender<Notice>>,
+    tx: Option<mpsc::SyncSender<Request>>,
     rx: Option<mpsc::Receiver<Feedback>>,
     cancel: Option<Arc<AtomicBool>>,
     local_error: Option<String>,
 }
 
 impl Notifications {
-    pub fn post(&mut self, ctx: &egui::Context, data: &std::path::Path, notice: Notice) {
+    pub fn post(&mut self, ctx: &egui::Context, data: &std::path::Path, request: Request) {
         if self.tx.is_none() {
             let (tx, requests) = mpsc::sync_channel(32);
             let (feedback, rx) = mpsc::channel();
@@ -236,27 +297,38 @@ impl Notifications {
                     let _ = feedback.send(Feedback::Failed(message));
                     ctx.request_repaint();
                 };
-                let backend = native::Backend::new(&data);
-                match backend {
-                    Ok(mut backend) => {
-                        for notice in requests {
-                            if cancelled.load(Ordering::Acquire) {
-                                break;
+                let mut backend = None;
+                for request in requests {
+                    if cancelled.load(Ordering::Acquire) {
+                        break;
+                    }
+                    match request {
+                        Request::Sound => native::play_sound(),
+                        Request::Toast(toast) => {
+                            if backend.is_none() {
+                                match native::Backend::new(&data) {
+                                    Ok(ready) => backend = Some(ready),
+                                    Err(error) => {
+                                        send_error(format!("系统通知初始化失败：{error:#}"));
+                                        continue;
+                                    }
+                                }
                             }
-                            if let Err(error) = backend.show(notice, feedback.clone(), ctx.clone())
+                            if let Some(backend) = &mut backend
+                                && !cancelled.load(Ordering::Acquire)
+                                && let Err(error) = backend.show(toast, feedback.clone(), ctx.clone())
                             {
                                 send_error(format!("系统通知发送失败：{error:#}"));
                             }
                         }
                     }
-                    Err(error) => send_error(format!("系统通知初始化失败：{error:#}")),
                 }
             });
             self.tx = Some(tx);
             self.rx = Some(rx);
         }
         if let Some(tx) = &self.tx {
-            match tx.try_send(notice) {
+            match tx.try_send(request) {
                 Ok(()) => {}
                 Err(mpsc::TrySendError::Full(_)) => {
                     self.local_error = Some("系统通知队列已满，请在工作台查看最新状态".into())
@@ -294,7 +366,9 @@ impl Drop for Notifications {
 
 #[cfg(windows)]
 mod native {
-    use super::{Feedback, Notice};
+    use super::{Feedback, ToastRequest};
+    #[cfg(test)]
+    use super::Notice;
     use anyhow::{Context, Result};
     use sha2::{Digest, Sha256};
     use std::{
@@ -307,6 +381,7 @@ mod native {
         Foundation::TypedEventHandler,
         UI::Notifications::{ToastNotification, ToastNotificationManager, ToastNotifier},
         Win32::{
+            Media::Audio::{PlaySoundW, SND_ALIAS, SND_ASYNC, SND_NODEFAULT, SND_SYSTEM},
             Storage::EnhancedStorage::PKEY_AppUserModel_ID,
             System::{
                 Com::{
@@ -321,10 +396,20 @@ mod native {
                 SHGetKnownFolderPath, ShellLink,
             },
         },
-        core::{HSTRING, Interface, PCWSTR},
+        core::{HSTRING, Interface, PCWSTR, w},
     };
 
     const APP_ID: &str = "Herobetrine.SuperAgent";
+
+    pub fn play_sound() {
+        unsafe {
+            let _ = PlaySoundW(
+                w!("Notification.Default"),
+                None,
+                SND_ALIAS | SND_ASYNC | SND_NODEFAULT | SND_SYSTEM,
+            );
+        }
+    }
 
     struct Apartment;
     impl Apartment {
@@ -438,15 +523,23 @@ mod native {
 
         pub fn show(
             &mut self,
-            notice: Notice,
+            request: impl Into<ToastRequest>,
             feedback: mpsc::Sender<Feedback>,
             ctx: egui::Context,
         ) -> Result<()> {
+            let ToastRequest { notice, sound } = request.into();
             // Windows may return ELEMENT_NOT_FOUND from Setting() until the
             // first notification creates its settings record. Submit through
             // Show, as in the native desktop sample, and observe Failed.
             let document = XmlDocument::new()?;
-            document.LoadXml(&HSTRING::from("<toast><visual><binding template=\"ToastGeneric\"><text/><text/></binding></visual><audio silent=\"true\"/></toast>"))?;
+            let audio = if sound {
+                "<audio src=\"ms-winsoundevent:Notification.Default\"/>"
+            } else {
+                "<audio silent=\"true\"/>"
+            };
+            document.LoadXml(&HSTRING::from(format!(
+                "<toast><visual><binding template=\"ToastGeneric\"><text/><text/></binding></visual>{audio}</toast>"
+            )))?;
             let text = document.GetElementsByTagName(&HSTRING::from("text"))?;
             text.Item(0)?
                 .AppendChild(&document.CreateTextNode(&HSTRING::from(notice.title()))?)?;
@@ -697,18 +790,21 @@ mod native {
 
 #[cfg(not(windows))]
 mod native {
-    use super::{Feedback, Notice};
+    use super::{Feedback, ToastRequest};
+    pub fn play_sound() {}
     pub struct Backend;
     impl Backend {
         pub fn new(_: &std::path::Path) -> anyhow::Result<Self> {
-            anyhow::bail!("此平台尚未接入系统通知")
+            Ok(Self)
         }
         pub fn show(
             &mut self,
-            _: Notice,
+            request: ToastRequest,
             _: std::sync::mpsc::Sender<Feedback>,
             _: egui::Context,
         ) -> anyhow::Result<()> {
+            let ToastRequest { notice, sound } = request;
+            let _ = (notice, sound);
             Ok(())
         }
     }
@@ -727,7 +823,7 @@ mod tests {
                 status: String::new()
             }
             .title(),
-            "工单 #8 等待审批"
+            "工单 #8 待审批"
         );
         assert_eq!(
             Notice {

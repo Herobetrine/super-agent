@@ -6,6 +6,7 @@ use crate::host::Host;
 use crate::ops::Pending;
 use crate::feed::{self, Feed};
 use crate::labels;
+use crate::notifications::{self, Delivery, Mode, NoticeKind, Visual};
 use crate::theme::{self, Palette};
 use crate::widgets;
 use crate::worker::{Cmd, Msg, Worker};
@@ -171,10 +172,12 @@ pub struct App {
     live: Option<(i64, Instant, Vec<sa_engine::JobActivity>)>,
     /// Sidebar rename dialog: `(ticket, draft title)`.
     pub rename: Option<(i64, String)>,
-    /// Last seen root state per ticket (finish notifications).
-    known_states: std::collections::HashMap<i64, String>,
-    notifications: crate::notifications::Notifications,
-    notifications_enabled: bool,
+    notifications: notifications::Notifications,
+    notification_preferences: notifications::Preferences,
+    notification_watch: notifications::Watch,
+    pub(crate) notification_gate: notifications::Gate,
+    notification_cards: notifications::Cards,
+    notification_badge: notifications::Badge,
     approval_watch: crate::notifications::ApprovalWatch,
     question_watch: crate::notifications::QuestionWatch,
     pub(crate) completion_watch: crate::notifications::CompletionWatch,
@@ -266,9 +269,12 @@ impl App {
             show_archived: false,
             live: None,
             rename: None,
-            known_states: Default::default(),
             notifications: Default::default(),
-            notifications_enabled: cfg!(windows) && get("notifications").as_deref() != Some("0"),
+            notification_preferences: notifications::Preferences::load(get),
+            notification_watch: Default::default(),
+            notification_gate: Default::default(),
+            notification_cards: Default::default(),
+            notification_badge: Default::default(),
             approval_watch: Default::default(),
             question_watch: Default::default(),
             completion_watch: Default::default(),
@@ -312,6 +318,7 @@ impl App {
     }
 
     pub fn select(&mut self, ticket: Option<i64>) {
+        self.view_notification_ticket(ticket);
         if self.view.as_ref().map(|v| v.id) == ticket && ticket.is_some() {
             return;
         }
@@ -371,9 +378,6 @@ impl App {
                     if query != self.search {
                         continue;
                     }
-                    if query.is_empty() {
-                        self.notice_transitions(&rows);
-                    }
                     self.history = rows;
                     self.t3_history_changed();
                     self.history_loaded = true;
@@ -400,15 +404,6 @@ impl App {
                         continue;
                     }
                     let mut snap = *snap;
-                    let new_approval = v.snap.as_ref().is_some_and(|previous| {
-                        snap.approvals.iter().any(|approval| !previous.approvals.iter().any(|old| old.id == approval.id))
-                    });
-                    if new_approval {
-                        self.attention(true);
-                    }
-                    let Some(v) = self.view.as_mut().filter(|v| v.id == ticket) else {
-                        continue;
-                    };
                     let events = std::mem::take(&mut snap.events);
                     if full {
                         v.partial_history = events.iter().filter(|e| e.kind != "delta").count() >= 180;
@@ -593,7 +588,7 @@ fn save_png(path: &std::path::Path, image: &egui::ColorImage) -> Result<(), Stri
 }
 
 impl eframe::App for App {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         self.shortcuts(ctx);
         self.take_dropped_files(ctx);
         self.poll_host();
@@ -601,6 +596,7 @@ impl eframe::App for App {
         self.poll_knowledge();
         self.poll_extensions();
         self.drain();
+        self.poll_desktop_notifications();
         self.t3_poll_recent();
         if self.applied_dark != Some(self.dark) {
             self.pal = Palette::of(self.dark);
@@ -672,7 +668,14 @@ impl eframe::App for App {
                     let r = bar.response.rect;
                     ui.painter()
                         .hline(r.x_range(), r.bottom(), Stroke::new(1.0_f32, pal.line_soft));
+                    let conversation = egui::Rect::from_min_max(
+                        egui::pos2(ui.clip_rect().left(), r.bottom()),
+                        ui.clip_rect().max,
+                    );
                     self.conversation(ui);
+                    if let Some(ticket) = self.notification_cards.show(ctx, conversation, &pal) {
+                        self.select(Some(ticket));
+                    }
                 });
             });
         self.confirm_dialog(ctx);
@@ -685,6 +688,9 @@ impl eframe::App for App {
         self.extensions_dialog(ctx);
         self.palette_ui(ctx);
         self.rename_dialog(ctx);
+        if self.main_notification_window() {
+            self.notification_badge.update(frame, self.notification_gate.count());
+        }
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
@@ -699,7 +705,9 @@ impl eframe::App for App {
         );
         storage.set_string("tab", self.tab.key().into());
         storage.set_string("lead", self.composer.lead.clone());
-        storage.set_string("notifications", if self.notifications_enabled { "1" } else { "0" }.into());
+        if self.main_notification_window() {
+            self.notification_preferences.save(storage);
+        }
         storage.set_string(crate::t3_import_ui::DISMISS_KEY, if self.t3.dismissed() { "1" } else { "0" }.into());
         if let Some(p) = &self.composer.project {
             storage.set_string("project", p.to_string_lossy().into_owned());
@@ -758,46 +766,62 @@ impl App {
         self.export = Some(Pending::spawn(ctx, move || crate::ops::export(&data, ticket, &file)));
     }
 
-    /// Tell the operator when a ticket finishes or fails (in-app notice, and
-    /// a taskbar flash when the window is in the background).
-    pub(crate) fn notice_transitions(&mut self, rows: &[TicketSummary]) {
-        let mut done = None;
-        for r in rows {
-            let prev = self.known_states.insert(r.id, r.state.clone());
-            if prev.as_deref().is_some_and(labels::is_active) && !labels::is_active(&r.state) {
-                self.post_notice(crate::notifications::Notice {
-                    ticket: r.id,
-                    kind: crate::notifications::NoticeKind::Completion,
-                    status: labels::job_state(&r.state).to_string(),
-                });
-                done = Some(format!(
-                    "工单 #{} {}：{}",
-                    r.id,
-                    labels::job_state(&r.state),
-                    labels::compact(&r.goal, 60)
-                ));
-            }
-        }
-        if let Some(text) = done {
-            // The reader now sees a ticket finish within milliseconds, often in
-            // the same frame as the receipt of the action that started it; the
-            // receipt (or an error) is what the operator is waiting to read.
-            if self.composer.message.is_none() {
-                self.composer.message = Some((text, false));
-            }
-            self.attention(false);
-        }
-    }
-
     pub(crate) fn shot_active(&self) -> bool {
         self.shot.is_some()
     }
 
-    fn post_notice(&mut self, notice: crate::notifications::Notice) {
-        let focused = self.ctx.input(|input| input.viewport().focused).unwrap_or(true);
-        if self.notifications_enabled && self.writable() && !focused && self.shot.is_none() && !self.opts.demo && !cfg!(test) {
-            let data = self.opts.data.clone().unwrap_or_else(sa_store::default_data_dir);
-            self.notifications.post(&self.ctx, &data, notice);
+    fn main_notification_window(&self) -> bool {
+        self.writable() && !self.opts.demo && self.shot.is_none()
+    }
+
+    fn notification_window(&self, ticket: Option<i64>) -> notifications::Window {
+        notifications::Window {
+            main: self.main_notification_window(),
+            focused: self.window_focused(),
+            ticket,
+            mode: self.notification_mode(),
+        }
+    }
+
+    fn view_notification_ticket(&mut self, ticket: Option<i64>) {
+        let window = self.notification_window(ticket);
+        self.notification_gate.view(window);
+        if window.main && window.focused && let Some(ticket) = ticket {
+            self.notification_cards.remove_ticket(ticket);
+        }
+    }
+
+    fn poll_desktop_notifications(&mut self) {
+        let ticket = self.view.as_ref().map(|view| view.id);
+        let window = self.notification_window(ticket);
+        if !window.main {
+            return;
+        }
+        self.view_notification_ticket(ticket);
+        let data = self.opts.data.clone().unwrap_or_else(sa_store::default_data_dir);
+        for delivery in self.notification_watch.poll(
+            &self.ctx, &data, &mut self.notification_gate, window,
+        ) {
+            self.deliver_notification(&data, delivery);
+        }
+    }
+
+    fn deliver_notification(&mut self, data: &std::path::Path, delivery: Delivery) {
+        let Delivery { notice, visual, sound, title } = delivery;
+        if visual == Visual::Toast {
+            self.attention(notice.kind != NoticeKind::Completion);
+            if !cfg!(test) {
+                self.notifications.post(&self.ctx, data, notifications::Request::Toast(
+                    notifications::ToastRequest { notice, sound },
+                ));
+            }
+        } else {
+            if visual == Visual::Card {
+                self.notification_cards.push(notice, title, Instant::now());
+            }
+            if sound && !cfg!(test) {
+                self.notifications.post(&self.ctx, data, notifications::Request::Sound);
+            }
         }
     }
 
@@ -831,8 +855,7 @@ impl App {
 
     /// Flash the taskbar button when the window is not focused.
     fn attention(&self, critical: bool) {
-        let focused = self.ctx.input(|i| i.viewport().focused).unwrap_or(true);
-        if !focused {
+        if !self.window_focused() {
             let kind = if critical {
                 egui::UserAttentionType::Critical
             } else {
@@ -869,7 +892,6 @@ impl App {
             let notices = self.approval_watch.poll(&self.ctx, &data).into_iter()
                 .chain(self.question_watch.poll(&self.ctx, &data));
             for notice in notices {
-                self.attention(true);
                 match notice.kind {
                     crate::notifications::NoticeKind::Approval => {
                         self.push_event(crate::push::Event::Approval { ticket: notice.ticket });
@@ -879,7 +901,6 @@ impl App {
                     }
                     crate::notifications::NoticeKind::Completion => {}
                 }
-                self.post_notice(notice);
             }
             if completion_epoch.is_some() {
                 for (ticket, state) in self.completion_watch.poll(&self.ctx, &data) {
@@ -907,14 +928,22 @@ impl App {
         }
     }
 
-    pub(crate) fn notifications_on(&self) -> bool {
-        self.notifications_enabled
+    pub(crate) fn notification_mode(&self) -> Mode {
+        self.notification_preferences.mode()
     }
 
     pub(crate) fn toggle_notifications(&mut self) {
-        self.notifications_enabled = !self.notifications_enabled;
-        if !self.notifications_enabled {
-            self.notifications.stop();
+        self.set_notification_mode(self.notification_preferences.toggled());
+    }
+
+    pub(crate) fn set_notification_mode(&mut self, mode: Mode) {
+        if mode == self.notification_mode() {
+            return;
+        }
+        self.notification_preferences.set(mode);
+        self.notifications.stop();
+        if !mode.visual() {
+            self.notification_cards.clear();
         }
     }
 

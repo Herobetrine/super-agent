@@ -4,6 +4,7 @@
 use crate::app::App;
 use crate::host::Action;
 use crate::labels;
+use crate::notifications::Mode;
 use crate::theme::{self, Palette};
 use crate::widgets;
 use egui::{Align2, CornerRadius, Frame, Margin, RichText, Sense, Stroke, Ui, pos2, vec2};
@@ -368,7 +369,7 @@ impl App {
             if button(ui, icon::GAUGE, "Token 与缓存", "Token 与缓存") {
                 self.open_efficiency();
             }
-            if button(ui, icon::DEVICE_MOBILE, "手机推送与隐私", "手机推送与隐私") {
+            if button(ui, icon::DEVICE_MOBILE, "通知与隐私", "通知与隐私") {
                 self.open_notify();
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -381,13 +382,12 @@ impl App {
                 if button(ui, ic, "切换主题", tip) {
                     self.dark = !self.dark;
                 }
-                if cfg!(windows) && self.writable() {
-                    let (ic, tip) = if self.notifications_on() {
-                        (icon::BELL, "系统通知已开启 · 点击关闭")
-                    } else {
-                        (icon::BELL_SLASH, "系统通知已关闭 · 点击开启")
+                if self.writable() {
+                    let (ic, tip) = match self.notification_mode() {
+                        Mode::Off => (icon::BELL_SLASH, "桌面通知已关闭 · 点击恢复".into()),
+                        mode => (icon::BELL, format!("桌面通知：{} · 点击关闭", mode.label())),
                     };
-                    if button(ui, ic, "系统通知", tip) {
+                    if button(ui, ic, "桌面通知", &tip) {
                         self.toggle_notifications();
                     }
                 }
@@ -499,10 +499,14 @@ impl App {
         let w = ui.available_width();
         let (rect, resp) = ui.allocate_exact_size(vec2(w, ROW), Sense::click());
         let name = r.title.as_deref().filter(|title| !title.is_empty()).unwrap_or(&r.goal);
-        let row_label = match attention_reason(r) {
+        let mut row_label = match attention_reason(r) {
             Some(reason) => format!("{name} · {reason}"),
             None => name.to_string(),
         };
+        let unread = self.notification_gate.unread(r.id);
+        if unread {
+            row_label.push_str(" · 未读");
+        }
         resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &row_label));
         if ui.is_rect_visible(rect) {
             let p = ui.painter();
@@ -534,7 +538,13 @@ impl App {
                 pal.ink.gamma_multiply(0.86)
             };
             let left = rect.left() + TEXT_X;
-            let tg = widgets::line_galley(ui, &title, theme::body(theme::UI), color, rx - 10.0 - left);
+            let title_right = if unread {
+                p.circle_filled(pos2(rx - 7.0, y), 2.5, pal.accent);
+                rx - 15.0
+            } else {
+                rx - 10.0
+            };
+            let tg = widgets::line_galley(ui, &title, theme::body(theme::UI), color, title_right - left);
             p.galley(pos2(left, y - tg.size().y / 2.0), tg, color);
         }
         let resp = resp
