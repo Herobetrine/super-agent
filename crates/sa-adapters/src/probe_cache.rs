@@ -5,10 +5,10 @@ use crate::{common::Emit, custom, sys::Sys};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{
-    Arc, LazyLock, Mutex, Weak,
+    Arc, Condvar, LazyLock, Mutex, OnceLock, Weak,
     atomic::{AtomicBool, Ordering::Relaxed},
 };
 use std::time::{Duration, Instant, SystemTime};
@@ -129,10 +129,12 @@ struct Fetched {
 }
 
 impl Fetched {
-    fn invalidate_through(&mut self, cutoff: Stamp) {
+    fn invalidate_through(&mut self, cutoff: Stamp) -> bool {
         if !self.started.newer_than(cutoff) && self.value.take().is_some() {
             self.started = cutoff;
+            return true;
         }
+        false
     }
 }
 
@@ -153,16 +155,15 @@ struct DiskCache {
 type Slots = HashMap<String, Fetched>;
 
 struct State {
-    file: Option<PathBuf>,
     sources: HashMap<ProbeKey, Slots>,
     freshness: Duration,
+    revision: u64,
 }
 
 impl State {
-    fn open(file: Option<PathBuf>) -> Self {
+    fn open(file: Option<&Path>) -> Self {
         let now = Stamp::now();
         let sources = file
-            .as_ref()
             .and_then(|path| std::fs::File::open(path).ok())
             .and_then(|file| {
                 serde_json::from_reader::<_, DiskCache>(std::io::BufReader::new(file)).ok()
@@ -197,75 +198,171 @@ impl State {
                 },
             );
         Self {
-            file,
             sources,
             freshness: FRESHNESS,
+            revision: 0,
         }
     }
 
-    fn prune_and_write(&mut self) {
+    fn changed(&mut self) {
         let freshness = self.freshness;
         self.sources.retain(|_, slots| {
             slots.retain(|_, item| item.started.age() < freshness);
             !slots.is_empty()
         });
-        // Cache I/O is best effort. Keep the in-memory result on any I/O error.
-        let _ = self.persist();
+        self.revision += 1;
     }
 
-    fn persist(&self) -> anyhow::Result<()> {
-        let Some(path) = &self.file else {
-            return Ok(());
-        };
-        let dir = path.parent().expect("cache file has a parent");
-        std::fs::create_dir_all(dir)?;
-        let entries: Vec<_> = self.sources.iter().flat_map(|(key, slots)| {
-            slots.iter().map(move |(slot, entry)| json!({
-                "key": key, "slot": slot, "started_unix_ms": entry.started.unix_ms, "value": entry.value,
-            }))
-        }).collect();
-        let mut temp = tempfile::NamedTempFile::new_in(dir)?;
-        serde_json::to_writer(
-            temp.as_file_mut(),
-            &json!({"version": VERSION, "entries": entries}),
-        )?;
-        temp.persist(path)?;
-        Ok(())
+    fn snapshot(&self) -> Snapshot {
+        Snapshot {
+            version: VERSION,
+            entries: self
+                .sources
+                .iter()
+                .flat_map(|(key, slots)| {
+                    slots.iter().map(move |(slot, entry)| FileEntry {
+                        key: key.clone(),
+                        slot: slot.clone(),
+                        started_unix_ms: entry.started.unix_ms,
+                        value: entry.value.clone(),
+                    })
+                })
+                .collect(),
+        }
     }
 }
 
-/// Instances targeting one data directory share a lock so different adapters
-/// can update the same file without overwriting each other's entries.
-#[derive(Clone)]
-pub(crate) struct ProbeCache(Arc<Mutex<State>>);
+#[derive(Serialize)]
+struct Snapshot {
+    version: u32,
+    entries: Vec<FileEntry>,
+}
 
-type OpenCaches = HashMap<PathBuf, Weak<Mutex<State>>>;
+fn persist(path: &Path, snapshot: &Snapshot) -> anyhow::Result<()> {
+    let dir = path.parent().expect("cache file has a parent");
+    std::fs::create_dir_all(dir)?;
+    let mut temp = tempfile::NamedTempFile::new_in(dir)?;
+    serde_json::to_writer(temp.as_file_mut(), snapshot)?;
+    temp.persist(path)?;
+    Ok(())
+}
+
+#[derive(Default)]
+struct SharedCache {
+    file: Option<PathBuf>,
+    state: OnceLock<Mutex<State>>,
+    writer: Mutex<WriteProgress>,
+    writer_ready: Condvar,
+}
+
+#[derive(Default)]
+struct WriteProgress {
+    written_revision: u64,
+    active: bool,
+}
+
+struct ActiveWriter<'a> {
+    cache: &'a SharedCache,
+    published: Option<u64>,
+}
+
+impl Drop for ActiveWriter<'_> {
+    fn drop(&mut self) {
+        let mut writer = self.cache.writer.lock().unwrap();
+        if let Some(revision) = self.published {
+            writer.written_revision = revision;
+        }
+        writer.active = false;
+        self.cache.writer_ready.notify_all();
+    }
+}
+
+/// A data directory shares one in-memory cache and one disk writer.
+#[derive(Clone)]
+pub(crate) struct ProbeCache(Arc<SharedCache>);
+
+type OpenCaches = HashMap<PathBuf, Weak<SharedCache>>;
 static OPEN: LazyLock<Mutex<OpenCaches>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
 impl ProbeCache {
     pub(crate) fn new(data_dir: Option<&Path>) -> Self {
         let Some(dir) = data_dir else {
-            return Self(Arc::new(Mutex::new(State::open(None))));
+            return Self(Arc::default());
         };
         let dir = std::path::absolute(dir).unwrap_or_else(|_| dir.to_path_buf());
         let file = dir.join("cache/probes-v1.json");
-        let mut open = OPEN.lock().unwrap();
-        open.retain(|_, instance| instance.strong_count() > 0);
-        if let Some(state) = open.get(&file).and_then(Weak::upgrade) {
-            return Self(state);
+        let shared = {
+            let mut open = OPEN.lock().unwrap();
+            open.retain(|_, instance| instance.strong_count() > 0);
+            if let Some(shared) = open.get(&file).and_then(Weak::upgrade) {
+                shared
+            } else {
+                let shared = Arc::new(SharedCache {
+                    file: Some(file.clone()),
+                    ..Default::default()
+                });
+                open.insert(file, Arc::downgrade(&shared));
+                shared
+            }
+        };
+        let cache = Self(shared);
+        cache.state();
+        cache
+    }
+
+    fn state(&self) -> &Mutex<State> {
+        self.0
+            .state
+            .get_or_init(|| Mutex::new(State::open(self.0.file.as_deref())))
+    }
+
+    pub(crate) fn flush(&self) {
+        self.flush_with(persist);
+    }
+
+    fn flush_with(&self, write: impl FnOnce(&Path, &Snapshot) -> anyhow::Result<()>) {
+        let Some(file) = self.0.file.as_deref() else {
+            return;
+        };
+        // Snapshot only after reserving the disk writer. Queued flushes share
+        // the latest memory revision, so a slower writer cannot restore old data.
+        let mut writer = self
+            .0
+            .writer_ready
+            .wait_while(self.0.writer.lock().unwrap(), |writer| writer.active)
+            .unwrap();
+        let (revision, snapshot) = {
+            let state = self.state().lock().unwrap();
+            if state.revision == writer.written_revision {
+                return;
+            }
+            (state.revision, state.snapshot())
+        };
+        writer.active = true;
+        drop(writer);
+        let mut reservation = ActiveWriter {
+            cache: &self.0,
+            published: None,
+        };
+        if write(file, &snapshot).is_ok() {
+            reservation.published = Some(revision);
         }
-        let state = Arc::new(Mutex::new(State::open(Some(file.clone()))));
-        open.insert(file, Arc::downgrade(&state));
-        Self(state)
     }
 
     pub(crate) fn read<T: DeserializeOwned>(&self, key: &ProbeKey, slot: &str) -> Option<T> {
-        let state = self.0.lock().unwrap();
-        let item = state.sources.get(key)?.get(slot)?;
-        if item.started.age() >= state.freshness {
-            return None;
-        }
-        serde_json::from_value(item.value.clone()?).ok()
+        self.read_stamped(key, slot).map(|(value, _)| value)
+    }
+
+    fn read_stamped<T: DeserializeOwned>(&self, key: &ProbeKey, slot: &str) -> Option<(T, Stamp)> {
+        let (value, started) = {
+            let state = self.state().lock().unwrap();
+            let item = state.sources.get(key)?.get(slot)?;
+            if item.started.age() >= state.freshness {
+                return None;
+            }
+            (item.value.clone()?, item.started)
+        };
+        Some((serde_json::from_value(value).ok()?, started))
     }
 
     pub(crate) fn record<T: Serialize>(
@@ -287,7 +384,8 @@ impl ProbeCache {
         value: Option<&T>,
         keep_other: impl Fn(&str) -> bool,
     ) {
-        let mut state = self.0.lock().unwrap();
+        let value = value.and_then(|v| serde_json::to_value(v).ok());
+        let mut state = self.state().lock().unwrap();
         let slots = state.sources.entry(key.clone()).or_default();
         if slots
             .get(slot)
@@ -300,35 +398,64 @@ impl ProbeCache {
                 fetched.invalidate_through(started);
             }
         }
-        let value = value.and_then(|v| serde_json::to_value(v).ok());
         slots.insert(slot.into(), Fetched { value, started });
-        state.prune_and_write();
+        state.changed();
     }
 
     pub(crate) fn evict_through(&self, key: &ProbeKey, cutoff: Stamp) {
-        let mut state = self.0.lock().unwrap();
+        let mut state = self.state().lock().unwrap();
         if let Some(slots) = state.sources.get_mut(key) {
             for entry in slots.values_mut() {
                 entry.invalidate_through(cutoff);
             }
         }
-        state.prune_and_write();
+        state.changed();
+    }
+
+    pub(crate) fn evict_used(&self, key: &ProbeKey, used: &[ProbeUse]) {
+        let changed = {
+            let mut state = self.state().lock().unwrap();
+            let Some(slots) = state.sources.get_mut(key) else {
+                return;
+            };
+            let mut changed = false;
+            for item in used {
+                if let Some(entry) = slots.get_mut(&item.slot) {
+                    changed |= entry.invalidate_through(item.started);
+                }
+            }
+            if changed {
+                state.changed();
+            }
+            changed
+        };
+        if changed {
+            self.flush();
+        }
     }
 
     #[cfg(test)]
     pub(crate) fn set_freshness(&self, freshness: Duration) {
-        self.0.lock().unwrap().freshness = freshness;
+        self.state().lock().unwrap().freshness = freshness;
     }
 }
 
 /// Track which work a single discovery attempt actually performed.
 pub(crate) struct Probes<'a> {
-    pub(crate) cache: &'a ProbeCache,
-    pub(crate) key: &'a ProbeKey,
+    cache: &'a ProbeCache,
+    key: &'a ProbeKey,
     reuse: bool,
     hit: AtomicBool,
     probed: AtomicBool,
+    observed: Mutex<HashMap<String, Stamp>>,
 }
+
+pub(crate) struct ProbeUse {
+    slot: String,
+    started: Stamp,
+}
+
+pub(crate) type ModelProbeResult = (Vec<Value>, Option<String>);
 
 impl<'a> Probes<'a> {
     pub(crate) fn new(cache: &'a ProbeCache, key: &'a ProbeKey, reuse: bool) -> Self {
@@ -338,18 +465,44 @@ impl<'a> Probes<'a> {
             reuse,
             hit: false.into(),
             probed: false.into(),
+            observed: Mutex::default(),
         }
     }
 
     pub(crate) fn read<T: DeserializeOwned>(&self, slot: &str) -> Option<T> {
-        let found = self
+        let (value, started) = self
             .reuse
-            .then(|| self.cache.read(self.key, slot))
-            .flatten();
-        if found.is_some() {
-            self.hit.store(true, Relaxed);
+            .then(|| self.cache.read_stamped(self.key, slot))
+            .flatten()?;
+        self.observed.lock().unwrap().insert(slot.into(), started);
+        self.hit.store(true, Relaxed);
+        Some(value)
+    }
+
+    pub(crate) fn record<T: Serialize>(&self, slot: &str, started: Stamp, value: Option<&T>) {
+        self.cache.record(self.key, slot, started, value);
+        if value.is_some() {
+            self.observed.lock().unwrap().insert(slot.into(), started);
         }
-        found
+    }
+
+    pub(crate) fn observed(&self, slots: &[&str]) -> Vec<ProbeUse> {
+        let observed = self.observed.lock().unwrap();
+        slots
+            .iter()
+            .filter_map(|&slot| {
+                Some(ProbeUse {
+                    slot: slot.into(),
+                    started: *observed.get(slot)?,
+                })
+            })
+            .collect()
+    }
+
+    pub(crate) fn flush(&self) {
+        if self.probed.load(Relaxed) {
+            self.cache.flush();
+        }
     }
 
     pub(crate) fn used_cache(&self) -> bool {
@@ -369,10 +522,10 @@ impl<'a> Probes<'a> {
         &self,
         slot: &str,
         cancel: &CancellationToken,
-        probe: impl Future<Output = anyhow::Result<Vec<Value>>>,
-    ) -> anyhow::Result<Vec<Value>> {
+        probe: impl Future<Output = anyhow::Result<ModelProbeResult>>,
+    ) -> anyhow::Result<ModelProbeResult> {
         if let Some(models) = self.read(slot) {
-            return Ok(models);
+            return Ok((models, None));
         }
         let started = self.start();
         let result = probe.await;
@@ -380,9 +533,9 @@ impl<'a> Probes<'a> {
             let models = result
                 .as_ref()
                 .ok()
-                .filter(|models| !models.is_empty())
-                .map(|models| safe_models(&json!(models)));
-            self.cache.record(self.key, slot, started, models.as_ref());
+                .filter(|(models, error)| !models.is_empty() && error.is_none())
+                .map(|(models, _)| safe_models(&json!(models)));
+            self.record(slot, started, models.as_ref());
         }
         result
     }
@@ -390,6 +543,10 @@ impl<'a> Probes<'a> {
 
 pub(crate) fn probe_slot(kind: &str, identity: &Value) -> String {
     format!("{kind}:{}", digest(identity))
+}
+
+pub(crate) fn custom_probe_slot(id: &str) -> String {
+    probe_slot("custom", &json!(id))
 }
 
 /// Reapply only the remote model list to the freshly built custom rows,
@@ -414,7 +571,7 @@ pub(crate) async fn refresh_custom(
         {
             continue;
         }
-        let slot = probe_slot("custom", &json!(id));
+        let slot = custom_probe_slot(&id);
         if let Some(models) = probes.read::<Vec<Value>>(&slot) {
             cached.push((id, models));
         } else {
@@ -432,12 +589,7 @@ pub(crate) async fn refresh_custom(
                     continue;
                 };
                 let models = (row["catalog_complete"] == true).then(|| safe_models(&row["models"]));
-                probes.cache.record(
-                    probes.key,
-                    &probe_slot("custom", &json!(id)),
-                    started,
-                    models.as_ref(),
-                );
+                probes.record(&custom_probe_slot(&id), started, models.as_ref());
             }
         }
     }
@@ -459,6 +611,20 @@ fn custom_row<'a>(catalog: &'a mut Value, id: &str) -> Option<&'a mut Value> {
         .find(|row| row["id"] == id && row["custom"] == true)
 }
 
+/// Return only the model ids whose effort options came from shared metadata.
+pub(crate) fn supplement_efforts(rows: &mut [Value], metadata: &[Value]) -> HashSet<String> {
+    rows.iter_mut()
+        .filter_map(|row| {
+            if row.get("reasoningEfforts").is_some() {
+                return None;
+            }
+            crate::catalog::supplement(std::slice::from_mut(row), metadata);
+            row.get("reasoningEfforts")?;
+            row["id"].as_str().map(str::to_owned)
+        })
+        .collect()
+}
+
 /// Retain the model data used by routing and effort selection. Discovery
 /// diagnostics, provider labels and arbitrary nested metadata stay out of disk.
 pub(crate) fn safe_models(models: &Value) -> Vec<Value> {
@@ -468,33 +634,21 @@ pub(crate) fn safe_models(models: &Value) -> Vec<Value> {
         .flatten()
         .filter_map(|row| {
             let id = row["id"].as_str()?;
-            if id != "@native" && id.contains('@') {
-                return None;
-            }
-            let mut result = json!({"id": id, "label": row["label"].as_str()
-            .filter(|label| !label.contains('@')).unwrap_or(id)});
+            let mut result = json!({"id": id, "label": row["label"].as_str().unwrap_or(id)});
             for name in ["resolvedModel", "defaultReasoningEffort"] {
-                if let Some(value) = row[name].as_str().filter(|value| !value.contains('@')) {
+                if let Some(value) = row[name].as_str() {
                     result[name] = json!(value);
                 }
             }
             if let Some(levels) = row["reasoningEfforts"].as_array() {
-                result["reasoningEfforts"] = json!(
-                    levels
-                        .iter()
-                        .filter_map(Value::as_str)
-                        .filter(|level| !level.contains('@'))
-                        .collect::<Vec<_>>()
-                );
+                result["reasoningEfforts"] =
+                    json!(levels.iter().filter_map(Value::as_str).collect::<Vec<_>>());
             }
             if let Some(mapping) = row["reasoningEffortMapping"].as_object() {
                 result["reasoningEffortMapping"] = Value::Object(
                     mapping
                         .iter()
-                        .filter(|(key, value)| {
-                            !key.contains('@')
-                                && value.as_str().is_some_and(|value| !value.contains('@'))
-                        })
+                        .filter(|(_, value)| value.is_string())
                         .map(|(key, value)| (key.clone(), value.clone()))
                         .collect(),
                 );
@@ -520,11 +674,7 @@ impl DiscoveryTiming {
             "miss"
         };
         Self {
-            ms: if hit && !refreshed {
-                0
-            } else {
-                started.elapsed().as_millis()
-            },
+            ms: started.elapsed().as_millis(),
             cache,
         }
     }
@@ -572,9 +722,6 @@ pub(crate) fn assert_timing(events: &[sa_engine::adapter::AdapterEvent], cache: 
     assert_eq!(timing["cache"], cache);
     for field in ["discover_ms", "spawn_ms", "handshake_ms"] {
         assert!(timing[field].is_u64(), "{field}: {timing}");
-    }
-    if cache == "hit" {
-        assert_eq!(timing["discover_ms"], 0);
     }
 }
 
@@ -637,11 +784,11 @@ mod tests {
         cache.record(&old, "models", expired, Some(&"value"));
         cache.record::<String>(&failed, "models", expired, None);
         cache.record::<String>(&failed, "effort", expired, None);
-        assert_eq!(cache.0.lock().unwrap().sources.len(), 2);
+        assert_eq!(cache.state().lock().unwrap().sources.len(), 2);
         cache.set_freshness(Duration::from_secs(1));
         cache.record::<String>(&current, "models", now, None);
-        assert_eq!(cache.0.lock().unwrap().sources.len(), 1);
-        assert!(cache.0.lock().unwrap().sources.contains_key(&current));
+        assert_eq!(cache.state().lock().unwrap().sources.len(), 1);
+        assert!(cache.state().lock().unwrap().sources.contains_key(&current));
     }
 
     #[test]
@@ -651,6 +798,7 @@ mod tests {
         {
             let cache = ProbeCache::new(Some(dir.path()));
             cache.record(&key, "models", Stamp::now(), Some(&"valid"));
+            cache.flush();
         }
         let path = dir.path().join("cache/probes-v1.json");
         let mut disk: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
@@ -669,7 +817,132 @@ mod tests {
         );
         assert!(cache.read::<String>(&key, "future").is_none());
         cache.record(&key, "models", Stamp::now(), Some(&"updated"));
+        cache.flush();
         let disk: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(disk["entries"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn versioned_model_ids_survive_disk_round_trip_without_account_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = key("versioned-model");
+        let id = "model@20250101";
+        let rows = safe_models(&json!([{
+            "id": id, "label": id, "resolvedModel": "base@20250101",
+            "email": "account@example.com", "account": {"token": "private"}
+        }]));
+        {
+            let cache = ProbeCache::new(Some(dir.path()));
+            cache.record(&key, "models", Stamp::now(), Some(&rows));
+            cache.flush();
+        }
+        let cache = ProbeCache::new(Some(dir.path()));
+        assert_eq!(
+            cache.read::<Vec<Value>>(&key, "models"),
+            Some(vec![
+                json!({"id": id, "label": id, "resolvedModel": "base@20250101"})
+            ]),
+        );
+    }
+
+    #[test]
+    fn eviction_preserves_unrelated_slots_and_newer_results() {
+        let cache = ProbeCache::new(None);
+        let key = key("all-providers");
+        let now = Stamp::now();
+        let old = Stamp::load(now.unix_ms - 1000, now).unwrap();
+        for slot in ["a", "b"] {
+            cache.record(&key, slot, old, Some(&"cached"));
+        }
+        let probes = Probes::new(&cache, &key, true);
+        assert_eq!(probes.read::<String>("a").as_deref(), Some("cached"));
+        assert_eq!(probes.read::<String>("b").as_deref(), Some("cached"));
+        let used = probes.observed(&["a"]);
+        cache.record(&key, "a", now, Some(&"newer"));
+        cache.evict_used(&key, &used);
+        assert_eq!(cache.read::<String>(&key, "a").as_deref(), Some("newer"));
+
+        assert_eq!(probes.read::<String>("a").as_deref(), Some("newer"));
+        cache.evict_used(&key, &probes.observed(&["a"]));
+        assert!(cache.read::<String>(&key, "a").is_none());
+        assert_eq!(cache.read::<String>(&key, "b").as_deref(), Some("cached"));
+    }
+
+    #[test]
+    fn persistence_batches_records_and_coalesces_writers_without_locking_readers() {
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::mpsc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let key = key("many-models");
+        let cache = ProbeCache::new(Some(dir.path()));
+        let path = dir.path().join("cache/probes-v1.json");
+        for slot in ["models", "effort-a", "effort-b"] {
+            cache.record(&key, slot, Stamp::now(), Some(&"initial"));
+        }
+        assert!(!path.exists());
+
+        let (writing, in_flight) = mpsc::channel();
+        let (release, paused) = mpsc::channel();
+        std::thread::scope(|tasks| {
+            let writer_cache = &cache;
+            let writer = tasks.spawn(move || {
+                writer_cache.flush_with(|path, snapshot| {
+                    assert_eq!(snapshot.entries.len(), 3);
+                    writing.send(()).unwrap();
+                    paused.recv_timeout(Duration::from_secs(5)).unwrap();
+                    persist(path, snapshot)
+                })
+            });
+            in_flight.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert!(cache.state().try_lock().is_ok());
+            assert!(cache.0.writer.try_lock().is_ok());
+            assert_eq!(
+                cache.read::<String>(&key, "models").as_deref(),
+                Some("initial")
+            );
+            cache.record(&key, "models", Stamp::now(), Some(&"latest"));
+
+            let count = AtomicUsize::new(0);
+            std::thread::scope(|writers| {
+                for _ in 0..2 {
+                    writers.spawn(|| {
+                        cache.flush_with(|path, snapshot| {
+                            count.fetch_add(1, Relaxed);
+                            persist(path, snapshot)
+                        })
+                    });
+                }
+                release.send(()).unwrap();
+            });
+            writer.join().unwrap();
+            assert_eq!(count.load(Relaxed), 1);
+        });
+        drop(cache);
+        let reopened = ProbeCache::new(Some(dir.path()));
+        assert_eq!(
+            reopened.read::<String>(&key, "models").as_deref(),
+            Some("latest")
+        );
+        assert_eq!(
+            reopened.read::<String>(&key, "effort-a").as_deref(),
+            Some("initial")
+        );
+    }
+
+    #[test]
+    fn cache_hit_timing_includes_elapsed_discovery() {
+        let start = Instant::now() - Duration::from_millis(25);
+        let (events, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        DiscoveryTiming::new(start, true, false)
+            .spawned(Instant::now())
+            .emit(&Emit(events));
+        let sa_engine::adapter::AdapterEvent::Journal { kind, data } = rx.try_recv().unwrap()
+        else {
+            panic!("missing timing journal")
+        };
+        assert_eq!(kind, "turn.timing");
+        assert_eq!(data["cache"], "hit");
+        assert!(data["discover_ms"].as_u64().unwrap() >= 25);
     }
 }
