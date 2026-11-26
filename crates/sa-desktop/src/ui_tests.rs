@@ -328,7 +328,12 @@ fn stopped_auto_queue_confirms_before_dispatch_and_cancel_preserves_the_head() {
         assert_eq!(h.state().composer.pending, 0);
         assert!(!kinds(h.state(), ticket).iter().any(|k| k == "user.follow"));
         if confirm {
-            h.get_by_role_and_label(Role::Button, "恢复并发送").click();
+            // The stopped ticket's composer has a disabled button with the same label.
+            h.get_by(|node| {
+                node.role() == Role::Button
+                    && node.label().as_deref() == Some("恢复并发送")
+                    && !node.is_disabled()
+            }).click();
         } else {
             h.get_by_role_and_label(Role::Button, "取消").click();
             h.run_steps(4);
