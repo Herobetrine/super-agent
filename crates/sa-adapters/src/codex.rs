@@ -9,8 +9,7 @@ use crate::codex_config::{self, Discovery, discover_cached, routing};
 use crate::common::{Emit, denied, probe_failed, protocol, route_gone, select, session_mismatch};
 use crate::custom::{self, CustomProvider, Registry};
 use crate::probe_cache::{
-    DiscoveryTiming, ProbeCache, ProbeUse, Probes, TurnTiming, custom_probe_slot,
-    missing_effort_metadata, refresh_custom,
+    DiscoveryTiming, ProbeCache, ProbeUse, Probes, TurnTiming, custom_probe_slot, refresh_custom,
 };
 use crate::proc::{Lines, Proc, cancelled, capture, start};
 use crate::sys::Sys;
@@ -265,8 +264,9 @@ async fn run(
     let exe = codex_config::executable(&sys);
     let key = codex_config::probe_key(&sys, exe.as_deref(), &customs);
     let mut reuse = true;
+    let mut retry_slots = HashSet::new();
     let (d, s, timing, used) = loop {
-        let probes = Probes::new(&cache, &key, reuse);
+        let probes = Probes::new(&cache, &key, reuse).retrying(&retry_slots);
         let (mut d, route_probes) = match discover_cached(
             &sys, exe.clone(), &cancel, &probes, Some(&req.route),
         ).await {
@@ -276,7 +276,6 @@ async fn run(
                 return Err(if cancel.is_cancelled() { cancelled() } else { probe_failed(&error.to_string()) });
             }
         };
-        let deferred_donor = probes.skipped_failure();
         let donor = refresh_custom(&mut d.catalog, &customs, &sys, &cancel, &probes, Some(&req.route)).await;
         probes.flush().await;
         if cancel.is_cancelled() {
@@ -287,22 +286,35 @@ async fn run(
         } else {
             probes.observed(&route_probes.route_slots(&req.route))
         };
-        if let Some(donor) = donor {
-            used.extend(probes.observed(&route_probes.route_slots(&donor)));
+        if let Some(donor) = &donor {
+            used.extend(probes.observed(&route_probes.route_slots(donor)));
         }
         match select(&d.catalog, &req.route) {
             Ok(s) => {
-                let timing = DiscoveryTiming::new(started, ProbeUse::all_cached(&used), !reuse);
+                let timing = DiscoveryTiming::new(
+                    started,
+                    ProbeUse::all_cached(&used),
+                    !reuse || !retry_slots.is_empty(),
+                );
                 break (d, s, timing, used);
             }
-            Err(_)
-                if reuse
-                    && (used.iter().any(|probe| probe.cached)
-                        || (deferred_donor && missing_effort_metadata(&d.catalog, &req.route))) =>
-            {
-                reuse = false;
-            }
             Err(error) => {
+                if reuse && retry_slots.is_empty() {
+                    retry_slots = probes.deferred_effort_slots(
+                        &d.catalog,
+                        &req.route,
+                        donor.as_ref(),
+                        codex_config::NATIVE_SELECTED,
+                        |provider| route_probes.primary_slot(provider),
+                    );
+                    if !retry_slots.is_empty() {
+                        continue;
+                    }
+                    if used.iter().any(|probe| probe.cached) {
+                        reuse = false;
+                        continue;
+                    }
+                }
                 cache.evict_used(&key, &used).await;
                 return Err(error);
             }

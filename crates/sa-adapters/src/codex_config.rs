@@ -237,7 +237,7 @@ async fn custom_models(sys: &Sys, cfg: &Value, cancel: &CancellationToken) -> Re
     crate::catalog::fetch_with_status(&target, &headers, cancel).await
 }
 
-const NATIVE_SELECTED: &str = "native:selected";
+pub(crate) const NATIVE_SELECTED: &str = "native:selected";
 const NATIVE_OPENAI: &str = "native:openai";
 
 struct ProviderProbes {
@@ -256,6 +256,10 @@ pub struct Discovery {
 pub(crate) struct RouteProbes(HashMap<String, ProviderProbes>);
 
 impl RouteProbes {
+    pub(crate) fn primary_slot(&self, provider: &str) -> Option<&str> {
+        self.0.get(provider)?.primary.as_deref()
+    }
+
     pub(crate) fn route_slots(&self, route: &Route) -> Vec<&str> {
         let Some(probes) = self.0.get(&route.provider) else { return Vec::new() };
         let mut slots: Vec<_> = probes.primary.as_deref().into_iter().collect();

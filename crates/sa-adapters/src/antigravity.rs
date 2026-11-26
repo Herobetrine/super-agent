@@ -908,6 +908,9 @@ async fn run(
         Ok(())
     })
     .await;
+    if let Some(timing) = timing {
+        timing.failed_before_first_frame(&emit);
+    }
     if let Err(mut err) = streamed {
         // A nonzero exit may accompany an upstream ERROR terminal. Preserve
         // that terminal's provider classification instead of its exit code.
@@ -1137,6 +1140,7 @@ int main(int argc, char **argv) {
             usleep(200000);
 #endif
         }
+        if (getenv("FAKE_AGY_EXIT_BEFORE_INIT")) return 2;
         puts("{\"event\":\"init\",\"conversation_id\":\"fixture-session\"}");
         const char *gate = getenv("FAKE_AGY_RUN_GATE");
         if (gate) {

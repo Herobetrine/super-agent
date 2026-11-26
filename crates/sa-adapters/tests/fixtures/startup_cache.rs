@@ -485,6 +485,54 @@ async fn claude_retries_the_same_failed_provider_when_selected() {
 }
 
 #[tokio::test]
+async fn official_marked_gateway_member_with_base_does_not_require_sdk_login_probe() {
+    let mut fixture = Fixture::new("claude");
+    fixture.sys.set("FIXTURE_FAIL_CLAUDE_AUTH", "1");
+    let member = ModelEndpoint::new().await;
+    let gateway = ModelEndpoint::with_reply(
+        json!({"data":[{"id":"gateway-own-fixture-model"}]}),
+        "503 Service Unavailable",
+    )
+    .await;
+    fixture.configure_endpoints(&[("member", &member)]);
+    let cc = fixture.sys.home.join(".cc-switch");
+    let db = rusqlite::Connection::open(cc.join("cc-switch.db")).unwrap();
+    db.execute_batch(
+        "ALTER TABLE providers ADD COLUMN category TEXT DEFAULT 'official';
+         CREATE TABLE proxy_config(app_type TEXT,listen_address TEXT,listen_port INTEGER,enabled INTEGER);",
+    )
+    .unwrap();
+    let port: u16 = gateway.base.rsplit(':').next().unwrap().parse().unwrap();
+    db.execute(
+        "INSERT INTO proxy_config VALUES ('claude','127.0.0.1',?1,1)",
+        [port],
+    )
+    .unwrap();
+    drop(db);
+    std::fs::write(
+        cc.join("live-state.json"),
+        json!({"version":1,"apps":{"claude":{"mode":"proxy","proxy_route":"member"}}}).to_string(),
+    )
+    .unwrap();
+    fixture.request.route.provider = crate::common::fingerprint(
+        "ccs-",
+        &[
+            json!("cc-switch"),
+            json!("claude-proxy"),
+            json!(gateway.base),
+            json!("ANTHROPIC_AUTH_TOKEN"),
+        ],
+    );
+
+    let adapter = fixture.adapter();
+    fixture.assert_run(adapter.as_ref(), "miss").await;
+    fixture.assert_run(adapter.as_ref(), "hit").await;
+    let calls = std::fs::read_to_string(fixture.dir.path().join("calls")).unwrap();
+    assert_eq!(calls.lines().filter(|line| *line == "claude-auth").count(), 1);
+    assert_eq!((member.count(), gateway.count()), (1, 1));
+}
+
+#[tokio::test]
 async fn provider_failure_keeps_the_other_provider_warm() {
     for agent in ["codex", "claude"] {
         let mut fixture = Fixture::new(agent);
@@ -524,6 +572,53 @@ fn registry_provider(agent: &str, endpoint: &ModelEndpoint) -> custom::CustomPro
         models: vec![],
         enabled: true,
     }
+}
+
+#[tokio::test]
+async fn unsupported_borrowed_effort_reprobes_only_preceding_failed_sources() {
+    let mut fixture = Fixture::new("claude");
+    let upper = ModelEndpoint::with_reply(
+        json!({"data":[{"id":MODEL,"reasoningEfforts":["high"]}]}),
+        "503 Service Unavailable",
+    )
+    .await;
+    let lower = ModelEndpoint::new().await;
+    let unrelated = ModelEndpoint::new().await;
+    let endpoint =
+        ModelEndpoint::with_reply(json!({"data":[{"id":MODEL}]}), "503 Service Unavailable").await;
+    upper.failed.store(true, Relaxed);
+    unrelated.failed.store(true, Relaxed);
+    fixture.configure_endpoints(&[
+        ("a-upper", &upper),
+        ("b-lower", &lower),
+        ("z-unrelated", &unrelated),
+    ]);
+    let provider = registry_provider("claude", &endpoint);
+    fixture.request.route.provider = provider.route_id();
+    fixture.request.route.reasoning_effort = Some("high".into());
+    fixture
+        .adapter_with_customs(vec![provider.clone()])
+        .catalog()
+        .await
+        .unwrap();
+
+    // Keep the negative entries only. A live selected endpoint and lower
+    // donor must exercise the negative-cache retry without a stale-hit retry.
+    let path = fixture.dir.path().join("data/cache/probes-v1.json");
+    let mut snapshot: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    snapshot["entries"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|entry| entry["value"].is_null());
+    std::fs::write(path, snapshot.to_string()).unwrap();
+    upper.failed.store(false, Relaxed);
+
+    let adapter = fixture.adapter_with_customs(vec![provider]);
+    fixture.assert_run(adapter.as_ref(), "refresh").await;
+    assert_eq!(
+        (upper.count(), lower.count(), unrelated.count(), endpoint.count()),
+        (2, 2, 1, 2),
+    );
 }
 
 #[tokio::test]

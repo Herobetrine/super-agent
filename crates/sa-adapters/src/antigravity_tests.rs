@@ -374,6 +374,30 @@ async fn stream_json_turn_timing_includes_startup_before_the_first_native_frame(
 }
 
 #[tokio::test]
+async fn stream_json_exit_before_first_frame_still_emits_startup_timing() {
+    let fixture = ProbeFixture::setup_with(|sys| {
+        sys.set("FAKE_AGY_DELAY_INIT", "1");
+        sys.set("FAKE_AGY_EXIT_BEFORE_INIT", "1");
+    });
+    let (out, events, _) = execute_with(|host, events| {
+        fixture.adapter.run(fixture.req.clone(), host, events, CancellationToken::new())
+    })
+    .await;
+    assert!(out.is_err());
+    assert_timing(&events, "miss");
+    let timing = events
+        .iter()
+        .find_map(|event| match event {
+            AdapterEvent::Journal { kind, data } if kind == "turn.timing" => Some(data),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(timing["outcome"], "failed_before_first_frame");
+    assert!(timing["handshake_ms"].as_u64().unwrap() >= 175, "{timing}");
+    fixture.assert_counts(1, 1, 1);
+}
+
+#[tokio::test]
 async fn three_turns_reuse_probes_and_another_model_only_probes_its_effort() {
     let mut fixture = ProbeFixture::setup();
     for turn in 1..=3 {
