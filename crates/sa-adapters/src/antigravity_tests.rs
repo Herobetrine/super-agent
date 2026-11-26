@@ -114,6 +114,22 @@ where
 }
 
 #[tokio::test]
+async fn antigravity_acp_exit_during_session_creation_records_failed_handshake_timing() {
+    let (dir, sys, server, req) = setup("exit-new");
+    let (out, events, _) = execute(sys, server, req, CancellationToken::new()).await;
+    assert!(out.is_err());
+    assert_timing(&events, "hit");
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AdapterEvent::Journal { kind, data }
+            if kind == "turn.timing" && data["outcome"] == "failed_during_handshake"
+    )));
+    let wire = std::fs::read_to_string(dir.path().join("wire.jsonl")).unwrap();
+    assert!(wire.contains("session/new"));
+    assert!(!wire.contains("session/prompt"));
+}
+
+#[tokio::test]
 async fn antigravity_images_round_trip_bytes_and_resume_with_route_readback() {
     let (dir, sys, server, mut req) = setup("normal");
     for resumed in [false, true] {

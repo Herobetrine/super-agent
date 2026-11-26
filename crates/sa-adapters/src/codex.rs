@@ -265,8 +265,14 @@ async fn run(
     let key = codex_config::probe_key(&sys, exe.as_deref(), &customs);
     let mut reuse = true;
     let mut retry_slots = HashSet::new();
+    let mut positive_refresh = HashSet::new();
     let (d, s, timing, used) = loop {
-        let probes = Probes::new(&cache, &key, reuse).retrying(&retry_slots);
+        let forced_slots = if positive_refresh.is_empty() {
+            &retry_slots
+        } else {
+            &positive_refresh
+        };
+        let probes = Probes::new(&cache, &key, reuse).retrying(forced_slots);
         let (mut d, route_probes) = match discover_cached(
             &sys, exe.clone(), &cancel, &probes, Some(&req.route),
         ).await {
@@ -299,19 +305,24 @@ async fn run(
                 break (d, s, timing, used);
             }
             Err(error) => {
-                if reuse && retry_slots.is_empty() {
-                    retry_slots = probes.deferred_effort_slots(
-                        &d.catalog,
-                        &req.route,
-                        donor.as_ref(),
-                        codex_config::NATIVE_SELECTED,
-                        |provider| route_probes.primary_slot(provider),
-                    );
-                    if !retry_slots.is_empty() {
-                        continue;
+                if reuse && positive_refresh.is_empty() {
+                    if retry_slots.is_empty() {
+                        retry_slots = probes.deferred_effort_slots(
+                            &d.catalog,
+                            &req.route,
+                            donor.as_ref(),
+                            codex_config::NATIVE_SELECTED,
+                            |provider| route_probes.primary_slot(provider),
+                        );
+                        if !retry_slots.is_empty() {
+                            continue;
+                        }
                     }
-                    if used.iter().any(|probe| probe.cached) {
-                        reuse = false;
+                    positive_refresh = ProbeUse::cached_slots_except(&used, &retry_slots);
+                    if !positive_refresh.is_empty() {
+                        // A second retry refreshes positive route inputs while
+                        // keeping already retried sources warm.
+                        reuse = !retry_slots.is_empty();
                         continue;
                     }
                 }

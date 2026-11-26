@@ -622,6 +622,85 @@ async fn unsupported_borrowed_effort_reprobes_only_preceding_failed_sources() {
 }
 
 #[tokio::test]
+async fn stale_selected_catalog_is_refreshed_after_a_failed_donor_retry() {
+    for agent in ["codex", "claude"] {
+        let mut fixture = Fixture::new(agent);
+        let failed_donor = ModelEndpoint::new().await;
+        let lower_donor = ModelEndpoint::new().await;
+        let endpoint = ModelEndpoint::with_reply(
+            json!({"data":[{"id":MODEL,"reasoningEfforts":["high"]}]}),
+            "503 Service Unavailable",
+        )
+        .await;
+        failed_donor.failed.store(true, Relaxed);
+        let first = if agent == "codex" { "openai" } else { "a-upper" };
+        fixture.configure_endpoints(&[(first, &failed_donor), ("provider-b", &lower_donor)]);
+        let provider = registry_provider(agent, &endpoint);
+        fixture.request.route.provider = provider.route_id();
+        fixture.request.route.reasoning_effort = Some("high".into());
+        fixture
+            .adapter_with_customs(vec![provider.clone()])
+            .catalog()
+            .await
+            .unwrap();
+
+        // The earlier selected endpoint response contained the model ID only.
+        // Keep the lower donor warm so both forms of retry are necessary.
+        let path = fixture.dir.path().join("data/cache/probes-v1.json");
+        let mut snapshot: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let slot = custom_probe_slot(&provider.route_id());
+        let saved = snapshot["entries"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|entry| entry["slot"] == slot)
+            .unwrap();
+        saved["value"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("reasoningEfforts")
+            .unwrap();
+        std::fs::write(path, snapshot.to_string()).unwrap();
+
+        let adapter = fixture.adapter_with_customs(vec![provider]);
+        fixture.assert_run(adapter.as_ref(), "refresh").await;
+        assert_eq!(failed_donor.count(), 2, "{agent}: retry the donor once");
+        assert_eq!(
+            endpoint.count(),
+            2,
+            "{agent}: refresh the selected endpoint once",
+        );
+    }
+}
+
+#[tokio::test]
+async fn selected_custom_timeout_with_local_models_does_not_retry_borrowed_efforts() {
+    for agent in ["codex", "claude"] {
+        let mut fixture = Fixture::new(agent);
+        let skipped = ModelEndpoint::new().await;
+        skipped.failed.store(true, Relaxed);
+        fixture.configure_endpoints(&[("provider-a", &skipped)]);
+        let endpoint =
+            ModelEndpoint::with_reply(json!({"data":[{"id":MODEL}]}), "408 Request Timeout").await;
+        endpoint.failed.store(true, Relaxed);
+        let mut provider = registry_provider(agent, &endpoint);
+        provider.models.push(MODEL.into());
+        fixture.request.route.provider = provider.route_id();
+        let adapter = fixture.adapter_with_customs(vec![provider]);
+        adapter.catalog().await.unwrap();
+        assert_eq!((endpoint.count(), skipped.count()), (1, 1), "{agent}");
+
+        let (result, _) = fixture.run(adapter.as_ref()).await;
+        assert_eq!(
+            result.unwrap_err().code.as_deref(),
+            Some(sa_engine::resilience::CODE_ROUTE_PROBE_FAILED),
+            "{agent}",
+        );
+        assert_eq!((endpoint.count(), skipped.count()), (2, 1), "{agent}");
+    }
+}
+
+#[tokio::test]
 async fn cached_custom_models_are_enriched_from_current_native_efforts() {
     let endpoint =
         ModelEndpoint::with_reply(json!({"data":[{"id":MODEL}]}), "503 Service Unavailable").await;
