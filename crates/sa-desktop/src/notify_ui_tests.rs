@@ -91,10 +91,14 @@ fn settle(h: &mut Harness<'_, App>) {
 }
 
 fn wait(h: &mut Harness<'_, App>, what: &str, cond: impl Fn(&App) -> bool) {
+    wait_ui(h, what, |h| cond(h.state()));
+}
+
+fn wait_ui(h: &mut Harness<'_, App>, what: &str, cond: impl Fn(&Harness<'_, App>) -> bool) {
     let end = Instant::now() + Duration::from_secs(10);
     while Instant::now() < end {
         h.step();
-        if cond(h.state()) {
+        if cond(h) {
             h.run_steps(3);
             if h.state().notify.is_some() {
                 settle(h);
@@ -867,6 +871,36 @@ fn desktop_modes_and_bell_restore_the_last_enabled_mode() {
     assert_eq!(h.state().notification_mode(), Mode::Sound);
 }
 
+#[test]
+fn notification_settings_distinguish_immediate_and_saved_changes() {
+    let data = tempfile::tempdir().unwrap();
+    let mut h = harness(data.path(), false, false);
+    open(&mut h);
+    assert!(shown(&h, "手机推送的修改在保存后生效。"));
+    let section = h.get_by_role_and_label(Role::Label, "桌面通知").rect();
+    let note = h.get_by_role_and_label(Role::Label, "修改立即生效，无需保存。").rect();
+    let mode = h.get_by_role_and_label(Role::RadioButton, "仅通知").rect();
+    assert!(section.bottom() <= note.top());
+    assert!(note.bottom() <= mode.top());
+}
+
+#[test]
+fn changing_toast_sound_keeps_the_worker_until_visuals_are_disabled() {
+    use crate::notifications::Mode;
+    use std::sync::mpsc::TryRecvError;
+
+    let data = tempfile::tempdir().unwrap();
+    let mut h = harness(data.path(), false, false);
+    let app = h.state_mut();
+    let worker = app.test_notification_worker();
+    for mode in [Mode::Both, Mode::Visual] {
+        app.set_notification_mode(mode);
+        assert!(matches!(worker.try_recv(), Err(TryRecvError::Empty)));
+    }
+    app.set_notification_mode(Mode::Sound);
+    assert!(matches!(worker.try_recv(), Err(TryRecvError::Disconnected)));
+}
+
 fn seed_desktop_tickets(h: &Harness<'_, App>, goal: &str) {
     h.state().host.as_ref().unwrap().engine().db().tx(|q| {
         q.conn().execute_batch(
@@ -898,7 +932,10 @@ fn desktop_notification_cards_show_titles_stack_and_open_the_ticket() {
         )?;
         Ok(())
     }).unwrap();
-    wait(&mut h, "three pending approvals", |app| app.notification_gate.count() == 3);
+    wait_ui(&mut h, "three approval cards", |h| {
+        h.state().notification_gate.count() == 3
+            && h.query_all_by_role_and_label(Role::Button, "打开").count() == 3
+    });
     assert!(h.query_by_role_and_label(Role::Label, "工单 #2 待审批").is_some());
     assert!(h.query_by_role_and_label(Role::Label, &goal).is_some());
     assert!(h.query_by_role_and_label(Role::Label, "会话标题").is_some());
@@ -912,7 +949,10 @@ fn desktop_notification_cards_show_titles_stack_and_open_the_ticket() {
         )?;
         Ok(())
     }).unwrap();
-    wait(&mut h, "four pending tickets", |app| app.notification_gate.count() == 4);
+    wait_ui(&mut h, "new question card", |h| {
+        h.state().notification_gate.count() == 4
+            && h.query_by_role_and_label(Role::Label, "工单 #5 等你回答").is_some()
+    });
     assert!(h.query_by_role_and_label(Role::Label, "工单 #2 待审批").is_none());
     assert!(h.query_by_role_and_label(Role::Label, "未命名会话").is_some());
     let newest = h.get_by_role_and_label(Role::Label, "工单 #5 等你回答");
@@ -935,6 +975,27 @@ fn desktop_notification_cards_show_titles_stack_and_open_the_ticket() {
     h.run_steps(3);
     assert_eq!(h.state().view.as_ref().map(|view| view.id), Some(3));
     assert!(h.query_by_role_and_label(Role::Label, "工单 #3 待审批").is_none());
+}
+
+#[test]
+fn a_result_displayed_before_switching_tickets_is_not_renotified() {
+    let data = tempfile::tempdir().unwrap();
+    let mut h = harness(data.path(), false, false);
+    h.state_mut().test_focus = Some(true);
+    seed_desktop_tickets(&h, "目标");
+    h.state_mut().select(Some(1));
+    wait(&mut h, "notification baseline", |app| app.notification_gate.has_baseline());
+    let release = h.state_mut().hold_notification_snapshot();
+    let seq = record_completion_events(
+        &h, &[(1, "failed", "reply", r#"{"state":"failed","text":"本轮失败回执"}"#)],
+    );
+    wait_ui(&mut h, "final reply in the focused conversation", |h| shown(h, "本轮失败回执"));
+    assert!(!h.state().notification_gate.processed(seq));
+    h.state_mut().select(Some(2));
+    release();
+    wait(&mut h, "late notification snapshot", |app| app.notification_gate.processed(seq));
+    assert!(!h.state().notification_gate.unread(1));
+    assert!(!h.state().notification_gate.result_waiting(1));
 }
 
 #[test]

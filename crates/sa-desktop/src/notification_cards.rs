@@ -6,7 +6,7 @@ use egui::{
 use std::time::{Duration, Instant};
 
 const LIFETIME: Duration = Duration::from_secs(8);
-const MAX_VISIBLE: usize = 3;
+pub(super) const MAX_VISIBLE: usize = 3;
 const HEIGHT: f32 = 62.0;
 const UNNAMED: &str = "未命名会话";
 

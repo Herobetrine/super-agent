@@ -281,6 +281,13 @@ pub struct Notifications {
 }
 
 impl Notifications {
+    #[cfg(test)]
+    pub(crate) fn test_worker(&mut self) -> mpsc::Receiver<Request> {
+        let (tx, rx) = mpsc::sync_channel(1);
+        self.tx = Some(tx);
+        rx
+    }
+
     pub fn post(&mut self, ctx: &egui::Context, data: &std::path::Path, request: Request) {
         if self.tx.is_none() {
             let (tx, requests) = mpsc::sync_channel(32);

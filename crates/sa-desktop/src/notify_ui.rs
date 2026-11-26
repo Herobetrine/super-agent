@@ -304,7 +304,7 @@ impl App {
                     ui,
                     "",
                     "通知与隐私",
-                    "保存后立即生效。推送由本机直接发往你填写的 ntfy 服务器，不经过 Super Agent 的任何服务器。",
+                    "手机推送的修改在保存后生效。",
                     &pal,
                 );
                 if demo {
@@ -337,6 +337,7 @@ impl App {
                     .auto_shrink([false, true]);
                 scroll.show(ui, |ui| {
                     widgets::section(ui, "桌面通知", &pal);
+                    note(ui, "修改立即生效，无需保存。", pal.mute);
                     ui.add_space(8.0);
                     ui.add_enabled_ui(writable || demo, |ui| {
                         ui.horizontal(|ui| {

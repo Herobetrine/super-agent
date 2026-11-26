@@ -154,7 +154,13 @@ struct ResultKey {
     ticket: i64,
     job: i64,
     turn: i64,
+    attempt: i64,
     state: String,
+}
+
+struct Ending {
+    row: CompletionRow,
+    attempt: i64,
 }
 
 struct DueResult {
@@ -167,10 +173,9 @@ struct Snapshot {
     head: i64,
     approvals: Vec<(i64, i64)>,
     questions: Vec<(i64, i64)>,
-    results: Vec<CompletionRow>,
+    results: Vec<Ending>,
     /// Grace periods checked against a journal transaction started after the deadline.
     checked: Vec<(ResultKey, bool)>,
-    titles: HashMap<i64, String>,
 }
 
 #[derive(Default)]
@@ -180,6 +185,7 @@ pub(crate) struct Gate {
     questions: HashSet<i64>,
     needs_you: HashSet<i64>,
     unread: HashSet<i64>,
+    displayed: HashMap<i64, i64>,
     last_result: HashMap<i64, ResultKey>,
     waiting: BTreeMap<i64, DueResult>,
 }
@@ -190,10 +196,27 @@ impl Gate {
         self.cursor.is_some()
     }
 
+    #[cfg(test)]
+    pub(crate) fn processed(&self, seq: i64) -> bool {
+        self.cursor.is_some_and(|cursor| cursor >= seq)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn result_waiting(&self, ticket: i64) -> bool {
+        self.waiting.contains_key(&ticket)
+    }
+
     pub(crate) fn view(&mut self, window: Window) {
         if let Some(ticket) = window.viewed() {
             self.unread.remove(&ticket);
             self.waiting.remove(&ticket);
+        }
+    }
+
+    pub(crate) fn displayed(&mut self, window: Window, seq: i64) {
+        if let Some(ticket) = window.viewed() {
+            let seen = self.displayed.entry(ticket).or_insert(seq);
+            *seen = (*seen).max(seq);
         }
     }
 
@@ -266,11 +289,14 @@ impl Gate {
             *seen = rows.into_iter().map(|(id, _)| id).collect();
         }
         if baseline {
+            if self.cursor.is_some() {
+                self.displayed.clear();
+            }
             self.last_result.clear();
             self.waiting.clear();
         } else {
-            for row in snapshot.results {
-                self.record_result(row, now, window);
+            for ending in snapshot.results {
+                self.record_result(ending, now, window);
             }
             for (key, valid) in snapshot.checked {
                 if self
@@ -293,15 +319,10 @@ impl Gate {
             }
         }
         self.cursor = Some(snapshot.head);
-        for delivery in &mut deliveries {
-            if delivery.visual == Visual::Card {
-                delivery.title = snapshot.titles.get(&delivery.notice.ticket).cloned();
-            }
-        }
         deliveries
     }
 
-    fn record_result(&mut self, row: CompletionRow, now: Instant, window: Window) {
+    fn record_result(&mut self, Ending { row, attempt }: Ending, now: Instant, window: Window) {
         if self.cursor.is_some_and(|cursor| row.seq <= cursor) {
             return;
         }
@@ -309,13 +330,18 @@ impl Gate {
             ticket: row.ticket,
             job: row.job,
             turn: row.turn,
+            attempt,
             state: row.state,
         };
         if self.last_result.get(&key.ticket) == Some(&key) {
             return;
         }
         self.last_result.insert(key.ticket, key.clone());
-        if window.viewed() != Some(key.ticket) {
+        let displayed = self
+            .displayed
+            .get(&key.ticket)
+            .is_some_and(|&seq| row.seq <= seq);
+        if !displayed && window.viewed() != Some(key.ticket) {
             self.unread.insert(key.ticket);
             self.waiting.insert(
                 key.ticket,
@@ -332,9 +358,60 @@ impl Gate {
 pub(crate) struct Watch {
     last: Option<Instant>,
     pending: Option<Pending<Snapshot>>,
+    card_titles: Option<CardTitles>,
+}
+
+struct CardTitles {
+    cards: Vec<Delivery>,
+    titles: Pending<HashMap<i64, String>>,
+}
+
+fn split_card_deliveries(deliveries: Vec<Delivery>) -> (Vec<Delivery>, Vec<Delivery>) {
+    let mut overflow = deliveries
+        .iter()
+        .filter(|delivery| delivery.visual == Visual::Card)
+        .count()
+        .saturating_sub(super::cards::MAX_VISIBLE);
+    let mut immediate = Vec::new();
+    let mut cards = Vec::new();
+    for mut delivery in deliveries {
+        if delivery.visual != Visual::Card {
+            immediate.push(delivery);
+        } else if overflow > 0 {
+            overflow -= 1;
+            if delivery.sound {
+                delivery.visual = Visual::None;
+                immediate.push(delivery);
+            }
+        } else {
+            cards.push(delivery);
+        }
+    }
+    (immediate, cards)
 }
 
 impl Watch {
+    #[cfg(test)]
+    pub(crate) fn hold_snapshot(
+        &mut self,
+        path: std::path::PathBuf,
+        gate: &Gate,
+    ) -> impl FnOnce() + use<> {
+        let cursor = gate.cursor;
+        let (pending, tx) = Pending::controlled();
+        self.pending = Some(pending);
+        move || {
+            tx.send(read_snapshot(&path, cursor, Vec::new()).map_err(|error| error.to_string()))
+                .unwrap();
+        }
+    }
+
+    pub(crate) fn view(&mut self, ticket: i64) {
+        if let Some(lookup) = &mut self.card_titles {
+            lookup.cards.retain(|card| card.notice.ticket != ticket);
+        }
+    }
+
     pub(crate) fn poll(
         &mut self,
         ctx: &egui::Context,
@@ -343,16 +420,37 @@ impl Watch {
         window: Window,
     ) -> Vec<Delivery> {
         let now = Instant::now();
-        let deliveries = if let Some(result) = self.pending.as_ref().and_then(Pending::poll) {
+        let mut deliveries = Vec::new();
+        if let Some(lookup) = self.card_titles.take() {
+            let Some(titles) = lookup.titles.poll() else {
+                self.card_titles = Some(lookup);
+                return deliveries;
+            };
+            let titles = titles.unwrap_or_default();
+            deliveries.extend(lookup.cards.into_iter().filter_map(|card| {
+                let mut delivery = route(card.notice, window)?;
+                if delivery.visual == Visual::Card {
+                    delivery.title = titles.get(&delivery.notice.ticket).cloned();
+                }
+                Some(delivery)
+            }));
+        }
+        if let Some(result) = self.pending.as_ref().and_then(Pending::poll) {
             self.pending = None;
-            result.map_or_else(
-                |_| Vec::new(),
-                |snapshot| gate.ingest(snapshot, now, window),
-            )
-        } else {
-            Vec::new()
-        };
-        if self.pending.is_none() {
+            if let Ok(snapshot) = result {
+                let (immediate, cards) = split_card_deliveries(gate.ingest(snapshot, now, window));
+                deliveries.extend(immediate);
+                if !cards.is_empty() {
+                    let path = data.join(sa_store::DB_FILE);
+                    let tickets = cards.iter().map(|card| card.notice.ticket).collect();
+                    let titles = Pending::spawn(ctx, move || {
+                        Ok(read_titles(&open_journal(&path)?, tickets)?)
+                    });
+                    self.card_titles = Some(CardTitles { cards, titles });
+                }
+            }
+        }
+        if self.pending.is_none() && self.card_titles.is_none() {
             let next = self.last.map_or(now, |last| gate.next_poll(last));
             if now >= next {
                 let path = data.join(sa_store::DB_FILE);
@@ -380,37 +478,39 @@ fn read_snapshot(
     let head = completion_head(&tx)?;
     let approvals = super::read_pending(&tx, NoticeKind::Approval)?;
     let questions = super::read_pending(&tx, NoticeKind::Question)?;
-    let results = read_completion_rows(&tx, cursor, head)?;
+    let rows = read_completion_rows(&tx, cursor, head)?;
+    let mut results = Vec::with_capacity(rows.len());
     let mut checked = Vec::with_capacity(due.len());
-    if !due.is_empty() {
-        let mut statement = tx.prepare(
+    if !rows.is_empty() || !due.is_empty() {
+        let mut attempt = tx.prepare(
+            "SELECT coalesce(max(seq),0) FROM events
+             WHERE ticket=?1 AND job=?2 AND seq<=?3
+               AND kind IN ('turn.admitted','retry') AND kind NOT IN ('delta','native')",
+        )?;
+        for row in rows {
+            let seq = attempt
+                .query_row(rusqlite::params![row.ticket, row.job, row.seq - 1], |r| {
+                    r.get(0)
+                })?;
+            results.push(Ending { row, attempt: seq });
+        }
+        let mut current = tx.prepare(
             "SELECT 1 FROM jobs WHERE id=?1 AND ticket=?2 AND turn=?3 AND state=?4 AND parent IS NULL",
         )?;
         for key in due {
-            let valid =
-                statement.exists(rusqlite::params![key.job, key.ticket, key.turn, key.state])?;
+            let attempt_now: i64 =
+                attempt.query_row(rusqlite::params![key.ticket, key.job, head], |r| r.get(0))?;
+            let valid = attempt_now == key.attempt
+                && current.exists(rusqlite::params![key.job, key.ticket, key.turn, key.state])?;
             checked.push((key, valid));
         }
     }
-    let tickets: BTreeSet<_> = approvals
-        .iter()
-        .chain(&questions)
-        .map(|&(_, ticket)| ticket)
-        .chain(
-            checked
-                .iter()
-                .filter(|(_, valid)| *valid)
-                .map(|(key, _)| key.ticket),
-        )
-        .collect();
-    let titles = read_titles(&tx, tickets)?;
     Ok(Snapshot {
         head,
         approvals,
         questions,
         results,
         checked,
-        titles,
     })
 }
 
@@ -459,13 +559,16 @@ mod tests {
         }
     }
 
-    fn result(seq: i64, ticket: i64, turn: i64, state: &str) -> CompletionRow {
-        CompletionRow {
-            seq,
-            ticket,
-            job: ticket,
-            turn,
-            state: state.into(),
+    fn result(seq: i64, ticket: i64, turn: i64, state: &str) -> Ending {
+        Ending {
+            row: CompletionRow {
+                seq,
+                ticket,
+                job: ticket,
+                turn,
+                state: state.into(),
+            },
+            attempt: 0,
         }
     }
 
@@ -594,7 +697,6 @@ mod tests {
                 questions,
                 results: vec![result(2, 8, 1, "failed"), result(3, 8, 1, "failed")],
                 checked,
-                ..Snapshot::default()
             },
             now + GRACE,
             view,
@@ -646,11 +748,12 @@ mod tests {
         let path = data.path().join(sa_store::DB_FILE);
         let conn = Connection::open(&path).unwrap();
         conn.execute_batch(
-            "CREATE TABLE events(seq INTEGER PRIMARY KEY);
+            "CREATE TABLE events(seq INTEGER PRIMARY KEY, ticket INTEGER, job INTEGER,
+                                 turn INTEGER, kind TEXT, payload TEXT);
              CREATE TABLE jobs(id INTEGER PRIMARY KEY, ticket INTEGER, turn INTEGER, state TEXT, parent INTEGER);
              CREATE TABLE tickets(id INTEGER PRIMARY KEY, goal TEXT);
              CREATE TABLE approvals(id INTEGER PRIMARY KEY, ticket INTEGER, decision TEXT);
-             INSERT INTO events VALUES (2);
+             INSERT INTO events(seq) VALUES (2);
              INSERT INTO jobs VALUES (8,8,1,'done',NULL),(9,9,2,'failed',NULL);
              INSERT INTO tickets VALUES (8,'目标');",
         ).unwrap();
@@ -659,8 +762,108 @@ mod tests {
         assert_eq!(delivered.len(), 1);
         assert_eq!(delivered[0].notice.ticket, 8);
         assert_eq!(delivered[0].visual, Visual::Card);
-        assert_eq!(delivered[0].title.as_deref(), Some("目标"));
         assert!(gate.due(now + GRACE * 2).is_empty());
+    }
+
+    #[test]
+    fn manual_retry_rearms_the_same_turn_and_status_once_per_attempt() {
+        let data = tempfile::tempdir().unwrap();
+        let path = data.path().join(sa_store::DB_FILE);
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE events(seq INTEGER PRIMARY KEY, ticket INTEGER, job INTEGER,
+                                 turn INTEGER, kind TEXT, payload TEXT);
+             CREATE TABLE jobs(id INTEGER PRIMARY KEY, ticket INTEGER, turn INTEGER, state TEXT, parent INTEGER);
+             CREATE TABLE approvals(id INTEGER PRIMARY KEY, ticket INTEGER, decision TEXT);
+             INSERT INTO jobs VALUES (8,8,1,'failed',NULL);
+             INSERT INTO events VALUES (1,8,8,1,'turn.admitted','{}');",
+        ).unwrap();
+        let now = Instant::now();
+        let other = window(true, Some(9), Mode::Visual);
+        let mut gate = Gate::default();
+        gate.ingest(read_snapshot(&path, None, Vec::new()).unwrap(), now, other);
+        for (index, marker) in [(0_u32, 1_i64), (1, 4)] {
+            if index == 1 {
+                conn.execute("UPDATE jobs SET state='queued' WHERE id=8", [])
+                    .unwrap();
+                conn.execute("INSERT INTO events VALUES (4,8,8,1,'retry','null')", [])
+                    .unwrap();
+            }
+            conn.execute("UPDATE jobs SET state='failed' WHERE id=8", [])
+                .unwrap();
+            conn.execute(
+                "INSERT INTO events VALUES (?1,8,8,1,'failed','null'),(?2,8,8,1,'failed','null')",
+                [marker + 1, marker + 2],
+            )
+            .unwrap();
+            let now = now + GRACE * (2 * index);
+            let snapshot = read_snapshot(&path, gate.cursor, Vec::new()).unwrap();
+            assert!(gate.ingest(snapshot, now, other).is_empty());
+            assert!(gate.unread(8));
+            let due = gate.due(now + GRACE);
+            assert_eq!(
+                due.len(),
+                1,
+                "duplicate failure rows collapse within the attempt"
+            );
+            assert_eq!(due[0].attempt, marker);
+            let snapshot = read_snapshot(&path, gate.cursor, due).unwrap();
+            let deliveries = gate.ingest(snapshot, now + GRACE, other);
+            assert_eq!(deliveries.len(), 1);
+            assert_eq!(deliveries[0].notice.title(), "工单 #8 失败");
+            gate.view(window(true, Some(8), Mode::Visual));
+            assert!(!gate.unread(8));
+        }
+    }
+
+    #[test]
+    fn titles_are_read_only_for_cards_that_will_be_shown() {
+        let data = tempfile::tempdir().unwrap();
+        let path = data.path().join(sa_store::DB_FILE);
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE events(seq INTEGER PRIMARY KEY);
+             CREATE TABLE approvals(id INTEGER PRIMARY KEY, ticket INTEGER, decision TEXT);
+             CREATE TABLE tickets(id INTEGER PRIMARY KEY, goal TEXT);
+             INSERT INTO approvals VALUES (1,1,'pending');
+             INSERT INTO tickets VALUES (1,x'FF'),(2,x'FF'),(3,x'FF'),
+                                        (4,'目标 4'),(5,'目标 5'),(6,'目标 6'),(7,x'FF'),(8,x'FF');",
+        )
+        .unwrap();
+        let now = Instant::now();
+        let mut gate = Gate::default();
+        let view = window(true, Some(3), Mode::Visual);
+        gate.ingest(read_snapshot(&path, None, Vec::new()).unwrap(), now, view);
+        conn.execute_batch(
+            "INSERT INTO approvals VALUES (2,2,'pending'),(3,3,'pending'),(4,4,'pending'),
+                                         (5,5,'pending'),(6,6,'pending');",
+        )
+        .unwrap();
+        let batch = read_snapshot(&path, gate.cursor, Vec::new()).unwrap();
+        let (immediate, cards) = split_card_deliveries(gate.ingest(batch, now, view));
+        assert!(immediate.is_empty());
+        let tickets: BTreeSet<_> = cards.iter().map(|card| card.notice.ticket).collect();
+        assert_eq!(tickets, BTreeSet::from([4, 5, 6]));
+        assert_eq!(read_titles(&conn, tickets).unwrap()[&4], "目标 4");
+
+        conn.execute("INSERT INTO approvals VALUES (7,7,'pending')", [])
+            .unwrap();
+        let batch = read_snapshot(&path, gate.cursor, Vec::new()).unwrap();
+        let (immediate, cards) =
+            split_card_deliveries(gate.ingest(batch, now, window(false, None, Mode::Visual)));
+        assert!(cards.is_empty());
+        assert_eq!(immediate[0].visual, Visual::Toast);
+        assert_eq!(immediate[0].notice.ticket, 7);
+
+        conn.execute("INSERT INTO approvals VALUES (8,8,'pending')", [])
+            .unwrap();
+        let batch = read_snapshot(&path, gate.cursor, Vec::new()).unwrap();
+        let (immediate, cards) =
+            split_card_deliveries(gate.ingest(batch, now, window(true, None, Mode::Sound)));
+        assert!(cards.is_empty());
+        assert_eq!(immediate[0].visual, Visual::None);
+        assert!(immediate[0].sound);
+        assert_eq!(immediate[0].notice.ticket, 8);
     }
 
     #[test]
