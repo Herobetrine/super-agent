@@ -1,7 +1,8 @@
 //! Desktop routing and the journal snapshot it consumes.
 
 use super::{
-    CompletionRow, Notice, NoticeKind, completion_head, open_journal, read_completion_rows,
+    CompletionRow, Notice, NoticeKind, PendingRequest, PendingWatch, completion_head, open_journal,
+    read_completion_rows,
 };
 use crate::ops::Pending;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -171,8 +172,7 @@ struct DueResult {
 #[derive(Default)]
 struct Snapshot {
     head: i64,
-    approvals: Vec<(i64, i64)>,
-    questions: Vec<(i64, i64)>,
+    pending: Vec<PendingRequest>,
     results: Vec<Ending>,
     /// Grace periods checked against a journal transaction started after the deadline.
     checked: Vec<(ResultKey, bool)>,
@@ -181,8 +181,7 @@ struct Snapshot {
 #[derive(Default)]
 pub(crate) struct Gate {
     cursor: Option<i64>,
-    approvals: HashSet<i64>,
-    questions: HashSet<i64>,
+    pending: PendingWatch,
     needs_you: HashSet<i64>,
     unread: HashSet<i64>,
     displayed: HashMap<i64, i64>,
@@ -251,43 +250,16 @@ impl Gate {
         self.view(window);
         let mut deliveries = Vec::new();
         let baseline = self.cursor.is_none_or(|cursor| snapshot.head < cursor);
-        self.needs_you = snapshot
-            .approvals
-            .iter()
-            .chain(&snapshot.questions)
-            .map(|&(_, ticket)| ticket)
-            .collect();
-        for (kind, rows, seen) in [
-            (
-                NoticeKind::Approval,
-                snapshot.approvals,
-                &mut self.approvals,
-            ),
-            (
-                NoticeKind::Question,
-                snapshot.questions,
-                &mut self.questions,
-            ),
-        ] {
-            if !baseline {
-                let tickets: BTreeSet<_> = rows
-                    .iter()
-                    .filter(|(id, _)| !seen.contains(id))
-                    .map(|&(_, ticket)| ticket)
-                    .collect();
-                deliveries.extend(tickets.into_iter().filter_map(|ticket| {
-                    route(
-                        Notice {
-                            ticket,
-                            kind,
-                            status: String::new(),
-                        },
-                        window,
-                    )
-                }));
-            }
-            *seen = rows.into_iter().map(|(id, _)| id).collect();
+        self.needs_you = snapshot.pending.iter().map(|row| row.ticket).collect();
+        if baseline {
+            self.pending = PendingWatch::default();
         }
+        deliveries.extend(
+            self.pending
+                .observe(&snapshot.pending)
+                .into_iter()
+                .filter_map(|notice| route(notice, window)),
+        );
         if baseline {
             if self.cursor.is_some() {
                 self.displayed.clear();
@@ -359,6 +331,13 @@ pub(crate) struct Watch {
     last: Option<Instant>,
     pending: Option<Pending<Snapshot>>,
     card_titles: Option<CardTitles>,
+    phone: PendingWatch,
+}
+
+#[derive(Default)]
+pub(crate) struct PollResult {
+    pub deliveries: Vec<Delivery>,
+    pub phone: Vec<Notice>,
 }
 
 struct CardTitles {
@@ -367,26 +346,22 @@ struct CardTitles {
 }
 
 fn split_card_deliveries(deliveries: Vec<Delivery>) -> (Vec<Delivery>, Vec<Delivery>) {
-    let mut overflow = deliveries
-        .iter()
-        .filter(|delivery| delivery.visual == Visual::Card)
-        .count()
-        .saturating_sub(super::cards::MAX_VISIBLE);
+    let mut tickets = HashSet::new();
     let mut immediate = Vec::new();
     let mut cards = Vec::new();
-    for mut delivery in deliveries {
+    for mut delivery in deliveries.into_iter().rev() {
         if delivery.visual != Visual::Card {
             immediate.push(delivery);
-        } else if overflow > 0 {
-            overflow -= 1;
-            if delivery.sound {
-                delivery.visual = Visual::None;
-                immediate.push(delivery);
-            }
-        } else {
+        } else if cards.len() < super::cards::MAX_VISIBLE && tickets.insert(delivery.notice.ticket)
+        {
             cards.push(delivery);
+        } else if delivery.sound {
+            delivery.visual = Visual::None;
+            immediate.push(delivery);
         }
     }
+    immediate.reverse();
+    cards.reverse();
     (immediate, cards)
 }
 
@@ -418,28 +393,31 @@ impl Watch {
         data: &Path,
         gate: &mut Gate,
         window: Window,
-    ) -> Vec<Delivery> {
+    ) -> PollResult {
         let now = Instant::now();
-        let mut deliveries = Vec::new();
+        let mut output = PollResult::default();
         if let Some(lookup) = self.card_titles.take() {
             let Some(titles) = lookup.titles.poll() else {
                 self.card_titles = Some(lookup);
-                return deliveries;
+                return output;
             };
             let titles = titles.unwrap_or_default();
-            deliveries.extend(lookup.cards.into_iter().filter_map(|card| {
-                let mut delivery = route(card.notice, window)?;
-                if delivery.visual == Visual::Card {
-                    delivery.title = titles.get(&delivery.notice.ticket).cloned();
-                }
-                Some(delivery)
-            }));
+            output
+                .deliveries
+                .extend(lookup.cards.into_iter().filter_map(|card| {
+                    let mut delivery = route(card.notice, window)?;
+                    if delivery.visual == Visual::Card {
+                        delivery.title = titles.get(&delivery.notice.ticket).cloned();
+                    }
+                    Some(delivery)
+                }));
         }
         if let Some(result) = self.pending.as_ref().and_then(Pending::poll) {
             self.pending = None;
             if let Ok(snapshot) = result {
+                output.phone = self.phone.observe(&snapshot.pending);
                 let (immediate, cards) = split_card_deliveries(gate.ingest(snapshot, now, window));
-                deliveries.extend(immediate);
+                output.deliveries.extend(immediate);
                 if !cards.is_empty() {
                     let path = data.join(sa_store::DB_FILE);
                     let tickets = cards.iter().map(|card| card.notice.ticket).collect();
@@ -464,7 +442,7 @@ impl Watch {
                 ctx.request_repaint_after(next - now);
             }
         }
-        deliveries
+        output
     }
 }
 
@@ -476,8 +454,7 @@ fn read_snapshot(
     let mut conn = open_journal(path)?;
     let tx = conn.transaction()?;
     let head = completion_head(&tx)?;
-    let approvals = super::read_pending(&tx, NoticeKind::Approval)?;
-    let questions = super::read_pending(&tx, NoticeKind::Question)?;
+    let pending = super::read_pending(&tx)?;
     let rows = read_completion_rows(&tx, cursor, head)?;
     let mut results = Vec::with_capacity(rows.len());
     let mut checked = Vec::with_capacity(due.len());
@@ -507,8 +484,7 @@ fn read_snapshot(
     }
     Ok(Snapshot {
         head,
-        approvals,
-        questions,
+        pending,
         results,
         checked,
     })
@@ -572,6 +548,19 @@ mod tests {
         }
     }
 
+    fn requests(approvals: &[(i64, i64)], questions: &[(i64, i64)]) -> Vec<PendingRequest> {
+        [
+            (NoticeKind::Approval, approvals),
+            (NoticeKind::Question, questions),
+        ]
+        .into_iter()
+        .flat_map(|(kind, rows)| {
+            rows.iter()
+                .map(move |&(id, ticket)| PendingRequest { id, ticket, kind })
+        })
+        .collect()
+    }
+
     #[test]
     fn startup_baseline_counts_pending_tickets_without_announcements_or_unread() {
         let now = Instant::now();
@@ -579,8 +568,7 @@ mod tests {
         let deliveries = gate.ingest(
             Snapshot {
                 head: 30,
-                approvals: vec![(1, 8), (2, 8)],
-                questions: vec![(1, 8), (2, 9)],
+                pending: requests(&[(1, 8), (2, 8)], &[(1, 8), (2, 9)]),
                 results: vec![result(30, 3, 1, "done")],
                 ..Snapshot::default()
             },
@@ -638,7 +626,7 @@ mod tests {
             gate.ingest(
                 Snapshot {
                     head: 1,
-                    approvals: vec![(1, 4)],
+                    pending: requests(&[(1, 4)], &[]),
                     results: vec![result(1, 5, 1, "failed")],
                     ..Snapshot::default()
                 },
@@ -668,13 +656,11 @@ mod tests {
         let mut gate = Gate::default();
         let view = window(false, None, Mode::Both);
         gate.ingest(Snapshot::default(), now, view);
-        let approvals = vec![(1, 8), (2, 8)];
-        let questions = vec![(1, 8)];
+        let pending = requests(&[(1, 8), (2, 8)], &[(1, 8)]);
         let first = gate.ingest(
             Snapshot {
                 head: 2,
-                approvals: approvals.clone(),
-                questions: questions.clone(),
+                pending: pending.clone(),
                 results: vec![result(1, 8, 1, "failed"), result(2, 8, 1, "failed")],
                 ..Snapshot::default()
             },
@@ -693,8 +679,7 @@ mod tests {
         let second = gate.ingest(
             Snapshot {
                 head: 3,
-                approvals,
-                questions,
+                pending,
                 results: vec![result(2, 8, 1, "failed"), result(3, 8, 1, "failed")],
                 checked,
             },
@@ -713,7 +698,7 @@ mod tests {
             gate.ingest(
                 Snapshot {
                     head: 4,
-                    approvals: vec![(3, 8)],
+                    pending: requests(&[(3, 8)], &[]),
                     results: vec![result(4, 8, 2, "failed")],
                     ..Snapshot::default()
                 },
@@ -822,7 +807,7 @@ mod tests {
         let path = data.path().join(sa_store::DB_FILE);
         let conn = Connection::open(&path).unwrap();
         conn.execute_batch(
-            "CREATE TABLE events(seq INTEGER PRIMARY KEY);
+            "CREATE TABLE events(seq INTEGER PRIMARY KEY, ticket INTEGER, kind TEXT, payload TEXT);
              CREATE TABLE approvals(id INTEGER PRIMARY KEY, ticket INTEGER, decision TEXT);
              CREATE TABLE tickets(id INTEGER PRIMARY KEY, goal TEXT);
              INSERT INTO approvals VALUES (1,1,'pending');
@@ -867,6 +852,65 @@ mod tests {
     }
 
     #[test]
+    fn pending_cards_keep_the_three_latest_requests_in_journal_order() {
+        let data = tempfile::tempdir().unwrap();
+        let path = data.path().join(sa_store::DB_FILE);
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE events(seq INTEGER PRIMARY KEY, ticket INTEGER, job INTEGER,
+                                 turn INTEGER, kind TEXT, payload TEXT);
+             CREATE TABLE jobs(id INTEGER PRIMARY KEY, ticket INTEGER, turn INTEGER, state TEXT, parent INTEGER);
+             CREATE TABLE approvals(id INTEGER PRIMARY KEY, ticket INTEGER, decision TEXT);
+             CREATE TABLE questions(id INTEGER PRIMARY KEY, ticket INTEGER, state TEXT);",
+        ).unwrap();
+        let now = Instant::now();
+        let mut gate = Gate::default();
+        let view = window(true, None, Mode::Visual);
+        gate.ingest(read_snapshot(&path, None, Vec::new()).unwrap(), now, view);
+        conn.execute_batch(
+            r#"INSERT INTO approvals VALUES (1,40,'pending'),(2,20,'pending'),(3,10,'pending');
+               INSERT INTO questions VALUES (1,30,'pending');
+               INSERT INTO events VALUES
+                 (1,40,40,1,'approval.request','{"approval":1}'),
+                 (2,30,30,1,'ask','{"id":1}'),
+                 (3,20,20,1,'approval.request','{"approval":2}'),
+                 (4,10,10,1,'approval.request','{"approval":3}');"#,
+        )
+        .unwrap();
+        let snapshot = read_snapshot(&path, gate.cursor, Vec::new()).unwrap();
+        let (_, cards) = split_card_deliveries(gate.ingest(snapshot, now, view));
+        assert_eq!(
+            cards
+                .iter()
+                .rev()
+                .map(|card| card.notice.ticket)
+                .collect::<Vec<_>>(),
+            [10, 20, 30],
+        );
+
+        conn.execute_batch(
+            r#"INSERT INTO approvals VALUES (4,20,'pending'),(5,10,'pending'),(6,20,'pending');
+               INSERT INTO questions VALUES (2,10,'pending');
+               INSERT INTO events VALUES
+                 (5,20,20,1,'approval.request','{"approval":4}'),
+                 (6,10,10,1,'approval.request','{"approval":5}'),
+                 (7,20,20,1,'approval.request','{"approval":6}'),
+                 (8,10,10,1,'ask','{"id":2}');"#,
+        )
+        .unwrap();
+        let snapshot = read_snapshot(&path, gate.cursor, Vec::new()).unwrap();
+        let (_, cards) = split_card_deliveries(gate.ingest(snapshot, now, view));
+        assert_eq!(
+            cards
+                .iter()
+                .rev()
+                .map(|card| (card.notice.ticket, card.notice.kind))
+                .collect::<Vec<_>>(),
+            [(10, NoticeKind::Question), (20, NoticeKind::Approval)],
+        );
+    }
+
+    #[test]
     fn opening_a_ticket_cancels_grace_even_after_leaving_it() {
         let now = Instant::now();
         let mut gate = Gate::default();
@@ -893,10 +937,10 @@ mod tests {
         let now = Instant::now();
         let background = window(false, Some(8), Mode::Off);
         let mut gate = Gate::default();
-        let approvals = vec![(1, 8), (2, 8), (3, 7)];
+        let approvals = [(1, 8), (2, 8), (3, 7)];
         gate.ingest(
             Snapshot {
-                approvals: approvals.clone(),
+                pending: requests(&approvals, &[]),
                 ..Snapshot::default()
             },
             now,
@@ -906,8 +950,7 @@ mod tests {
             gate.ingest(
                 Snapshot {
                     head: 2,
-                    approvals: approvals.clone(),
-                    questions: vec![(1, 8)],
+                    pending: requests(&approvals, &[(1, 8)]),
                     results: vec![result(1, 8, 1, "interrupted"), result(2, 9, 1, "done")],
                     ..Snapshot::default()
                 },

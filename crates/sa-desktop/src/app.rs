@@ -178,8 +178,6 @@ pub struct App {
     pub(crate) notification_gate: notifications::Gate,
     notification_cards: notifications::Cards,
     notification_badge: notifications::Badge,
-    approval_watch: crate::notifications::ApprovalWatch,
-    question_watch: crate::notifications::QuestionWatch,
     pub(crate) completion_watch: crate::notifications::CompletionWatch,
     pub extensions: Option<crate::extensions::ExtDialog>,
     /// For background work started outside `update`.
@@ -241,7 +239,7 @@ impl App {
             view: None,
             scroll_to_bottom: false,
             auto_selected: false,
-            persist: !screenshot,
+            persist: crate::window_persists(&opts, host.is_ok()),
             window_size_checked: false,
             shot,
             applied_dark: None,
@@ -275,8 +273,6 @@ impl App {
             notification_gate: Default::default(),
             notification_cards: Default::default(),
             notification_badge: Default::default(),
-            approval_watch: Default::default(),
-            question_watch: Default::default(),
             completion_watch: Default::default(),
             extensions: None,
             ctx: cc.egui_ctx.clone(),
@@ -809,9 +805,17 @@ impl App {
         }
         self.view_notification_ticket(ticket);
         let data = self.opts.data.clone().unwrap_or_else(sa_store::default_data_dir);
-        for delivery in self.notification_watch.poll(
+        let output = self.notification_watch.poll(
             &self.ctx, &data, &mut self.notification_gate, window,
-        ) {
+        );
+        for notice in output.phone {
+            match notice.kind {
+                NoticeKind::Approval => self.push_event(crate::push::Event::Approval { ticket: notice.ticket }),
+                NoticeKind::Question => self.push_event(crate::push::Event::Question { ticket: notice.ticket }),
+                NoticeKind::Completion => {}
+            }
+        }
+        for delivery in output.deliveries {
             self.deliver_notification(&data, delivery);
         }
     }
@@ -899,19 +903,6 @@ impl App {
         self.completion_watch.set_epoch(completion_epoch);
         if self.writable() && !self.opts.demo && self.shot.is_none() {
             let data = self.opts.data.clone().unwrap_or_else(sa_store::default_data_dir);
-            let notices = self.approval_watch.poll(&self.ctx, &data).into_iter()
-                .chain(self.question_watch.poll(&self.ctx, &data));
-            for notice in notices {
-                match notice.kind {
-                    crate::notifications::NoticeKind::Approval => {
-                        self.push_event(crate::push::Event::Approval { ticket: notice.ticket });
-                    }
-                    crate::notifications::NoticeKind::Question => {
-                        self.push_event(crate::push::Event::Question { ticket: notice.ticket });
-                    }
-                    crate::notifications::NoticeKind::Completion => {}
-                }
-            }
             if completion_epoch.is_some() {
                 for (ticket, state) in self.completion_watch.poll(&self.ctx, &data) {
                     self.push_event(crate::push::Event::Finished { ticket, state });
@@ -953,6 +944,11 @@ impl App {
         self.notifications.test_worker()
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_queued_notification_sounds(&mut self) -> impl FnOnce() -> usize + use<> {
+        self.notifications.test_queued_sounds()
+    }
+
     pub(crate) fn toggle_notifications(&mut self) {
         self.set_notification_mode(self.notification_preferences.toggled());
     }
@@ -963,7 +959,7 @@ impl App {
             return;
         }
         self.notification_preferences.set(mode);
-        if previous.visual() && !mode.visual() {
+        if mode == Mode::Off || (previous.visual() && !mode.visual()) {
             self.notifications.stop();
             self.notification_cards.clear();
         }

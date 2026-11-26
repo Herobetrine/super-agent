@@ -901,6 +901,95 @@ fn changing_toast_sound_keeps_the_worker_until_visuals_are_disabled() {
     assert!(matches!(worker.try_recv(), Err(TryRecvError::Disconnected)));
 }
 
+#[test]
+fn switching_from_sound_only_to_off_cancels_queued_sounds() {
+    use crate::notifications::Mode;
+
+    let data = tempfile::tempdir().unwrap();
+    let mut h = harness(data.path(), false, false);
+    let app = h.state_mut();
+    app.set_notification_mode(Mode::Sound);
+    assert_eq!(app.test_queued_notification_sounds()(), 2, "the fixture queues two sounds");
+    let deliver = app.test_queued_notification_sounds();
+    app.set_notification_mode(Mode::Off);
+    assert_eq!(deliver(), 0);
+}
+
+#[test]
+fn observer_exit_keeps_the_main_windows_new_notification_preferences() {
+    use crate::notifications::Mode;
+    use eframe::{App as _, Storage as _};
+    use std::{collections::BTreeMap, fs, path::PathBuf};
+
+    // eframe flushes the whole loaded map whenever any key becomes dirty.
+    struct FileStorage {
+        path: PathBuf,
+        values: BTreeMap<String, String>,
+        dirty: bool,
+    }
+    impl FileStorage {
+        fn open(path: &Path) -> Self {
+            Self {
+                path: path.to_path_buf(),
+                values: serde_json::from_slice(&fs::read(path).unwrap()).unwrap(),
+                dirty: false,
+            }
+        }
+    }
+    impl eframe::Storage for FileStorage {
+        fn get_string(&self, key: &str) -> Option<String> { self.values.get(key).cloned() }
+        fn set_string(&mut self, key: &str, value: String) {
+            self.dirty |= self.values.get(key) != Some(&value);
+            self.values.insert(key.into(), value);
+        }
+        fn flush(&mut self) {
+            if std::mem::take(&mut self.dirty) {
+                fs::write(&self.path, serde_json::to_vec(&self.values).unwrap()).unwrap();
+            }
+        }
+    }
+
+    let data = tempfile::tempdir().unwrap();
+    let path = data.path().join("app.ron");
+    fs::write(&path, r#"{"notifications":"1","notifications_last_on":"1","dark":"0"}"#).unwrap();
+    let mut main = harness(data.path(), false, false);
+    let mut main_storage = FileStorage::open(&path);
+    let observers = [true, false].map(|observe| {
+        let old_storage = FileStorage::open(&path);
+        let mut cc = eframe::CreationContext::_new_kittest(egui::Context::default());
+        cc.storage = Some(&old_storage);
+        let opts = Options { observe, data: Some(data.path().into()), ..Default::default() };
+        let worker = worker::spawn(crate::data::StoreSource::opener(data.path().into()), cc.egui_ctx.clone());
+        let app = App::new(&cc, opts, worker, Arc::default(), Err(sa_engine::owner::BUSY.into()));
+        assert_eq!(app.notification_mode(), Mode::Visual);
+        (app, old_storage)
+    });
+
+    main.state_mut().set_notification_mode(Mode::Both);
+    main.state_mut().set_notification_mode(Mode::Off);
+    main.state_mut().save(&mut main_storage);
+    main_storage.flush();
+    let saved = fs::read(&path).unwrap();
+    assert_eq!(main_storage.get_string("notifications").as_deref(), Some("0"));
+    assert_eq!(main_storage.get_string("notifications_last_on").as_deref(), Some("both"));
+
+    for (mut observer, mut stale) in observers {
+        let native = crate::native_options(&observer.opts, observer.writable(), egui::ViewportBuilder::default());
+        if native.persist_window {
+            stale.set_string("window", "observer position".into());
+        }
+        if observer.persist_egui_memory() {
+            stale.set_string("egui", "observer memory".into());
+        }
+        observer.dark = true;
+        observer.save(&mut stale);
+        let was_dirty = stale.dirty;
+        stale.flush();
+        assert_eq!(fs::read(&path).unwrap(), saved);
+        assert!(!was_dirty, "observer must not dirty storage (`--observe`: {})", observer.opts.observe);
+    }
+}
+
 fn seed_desktop_tickets(h: &Harness<'_, App>, goal: &str) {
     h.state().host.as_ref().unwrap().engine().db().tx(|q| {
         q.conn().execute_batch(
@@ -914,6 +1003,40 @@ fn seed_desktop_tickets(h: &Harness<'_, App>, goal: &str) {
         q.conn().execute("UPDATE tickets SET goal=?1 WHERE id=3", [goal])?;
         Ok(())
     }).unwrap();
+}
+
+#[test]
+fn desktop_and_phone_consume_one_pending_query_per_poll() {
+    let data = tempfile::tempdir().unwrap();
+    let owner = Host::start_with(data.path().into(), fakes, || {}).unwrap();
+    owner.engine().db().with(|q| {
+        sa_store::notify::save(q.conn(), &Settings {
+            done: false,
+            unfinished: false,
+            ..enabled()
+        })
+    }).unwrap();
+    drop(owner);
+
+    let queries = crate::notifications::pending_query_probe::Probe::start(data.path());
+    let mut h = harness(data.path(), false, false);
+    h.state_mut().test_focus = Some(false);
+    seed_desktop_tickets(&h, "目标");
+    wait(&mut h, "shared pending baseline", |app| app.notification_gate.has_baseline());
+    assert_eq!(queries.count(), 1);
+    assert!(h.state().pushed.is_empty());
+    h.state().host.as_ref().unwrap().engine().db().with(|q| {
+        q.conn().execute_batch(
+            "INSERT INTO approvals(ticket,job,turn,action) VALUES (2,2,1,'fixture');
+             INSERT INTO questions(ticket,job,turn,msgkey,question,asked)
+             VALUES (3,3,1,'fixture','问题正文',0);"
+        )?;
+        Ok(())
+    }).unwrap();
+    wait(&mut h, "both pending consumers", |app| {
+        app.notification_gate.count() == 2 && app.pushed.len() == 2
+    });
+    assert_eq!(queries.count(), 2);
 }
 
 #[test]
