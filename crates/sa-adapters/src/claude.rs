@@ -664,7 +664,7 @@ async fn discover_with(
     let state = read_json_or(&dir.join("live-state.json"))["apps"]["claude-desktop"].clone();
     let bound = read_json_or(&sys.platform_dir().join("claude-route.json"));
     let rows = cc_rows(sys, &["claude", "claude-desktop"])?;
-    let row_id = |row: &Value| match &row["id"] {
+    let row_id = |id: &Value| match id {
         Value::String(s) => s.clone(),
         other => other.to_string(),
     };
@@ -713,7 +713,7 @@ async fn discover_with(
             && !rows.iter().filter(|row| row["category"] == "official").any(|row| {
                 let alias = Record {
                     app: row["app_type"].as_str().unwrap_or_default().into(),
-                    row: row_id(row),
+                    row: row_id(&row["id"]),
                     auth: "sdk-login".into(),
                     ..Record::default()
                 };
@@ -731,7 +731,7 @@ async fn discover_with(
         let (cache, official) = (online.then_some(&cache), official_probe.clone());
         async move {
             let app = row["app_type"].as_str().unwrap_or_default();
-            let id = row_id(row);
+            let id = row_id(&row["id"]);
             let name = row["name"].as_str().unwrap_or_default();
             let cfg: Option<Value> = row["settings_config"]
                 .as_str()
