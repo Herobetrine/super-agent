@@ -109,12 +109,23 @@ async fn candidate_waits_for_confirmation_survives_restart_and_rejects_stale_inp
     fx.engine.start().unwrap();
     assert_eq!(item(&fx, ticket).state, "awaiting_confirmation");
     std::fs::write(fx.project.join("user.txt"), "unsaved").unwrap();
+    // A busy workspace defers publication. Keep the dirty file in place
+    // until the deferred attempt has finished checking it.
+    if fx.engine.confirm_integration(ready.job, &head).await.is_ok() {
+        wait(&fx, || {
+            !matches!(item(&fx, ticket).state.as_str(), "confirmed" | "publishing")
+        })
+        .await;
+    }
+    let rejected = item(&fx, ticket);
+    assert_eq!(rejected.state, "stale");
     assert!(
-        fx.engine
-            .confirm_integration(ready.job, &head)
-            .await
-            .is_err()
+        rejected.detail.contains("工作区有未提交修改"),
+        "unexpected refusal: {}",
+        rejected.detail
     );
+    assert_eq!(git(&fx.project, &["rev-parse", "HEAD"]), baseline);
+    assert!(!fx.project.join("result.txt").exists());
     assert_eq!(
         std::fs::read_to_string(fx.project.join("user.txt")).unwrap(),
         "unsaved"
@@ -168,7 +179,7 @@ async fn candidate_waits_for_confirmation_survives_restart_and_rejects_stale_inp
         )
         .await
         .unwrap();
-    assert_eq!(item(&fx, ticket).state, "merged");
+    wait(&fx, || item(&fx, ticket).state == "merged").await;
     assert_eq!(
         std::fs::read_to_string(fx.project.join("result.txt")).unwrap(),
         "result\n"
