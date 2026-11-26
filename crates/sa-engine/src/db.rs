@@ -465,12 +465,12 @@ impl Q<'_> {
         key: Option<&str>,
         budget: i64,
     ) -> Result<i64> {
-        self.record_note_checked(ticket, dest, body, source, key, NoteDelivery { budget, answering: false, steering_files: None })
+        self.record_note_checked(ticket, dest, body, source, key, NoteDelivery { budget, answering: false, steering: false })
     }
 
-    pub(crate) fn steering_note(&self, ticket: i64, job: i64, body: &Value, files: &[Value]) -> Result<i64> {
+    pub(crate) fn steering_note(&self, ticket: i64, job: i64, body: &Value) -> Result<i64> {
         self.record_note_checked(ticket, Some(&json!(job)), Some(body), None, None,
-            NoteDelivery { budget: 128, answering: false, steering_files: Some(files) })
+            NoteDelivery { budget: 128, answering: false, steering: true })
     }
 
     /// A pending question can outlive an interrupted or draining turn. Its
@@ -478,7 +478,7 @@ impl Q<'_> {
     pub fn record_answer_note(&self, ticket: i64, job: i64, body: &str) -> Result<i64> {
         self.record_note_checked(
             ticket, Some(&json!(job)), Some(&json!(body)), None, None,
-            NoteDelivery { budget: 128, answering: true, steering_files: None },
+            NoteDelivery { budget: 128, answering: true, steering: false },
         )
     }
 
@@ -489,7 +489,7 @@ impl Q<'_> {
         body: Option<&Value>,
         source: Option<&NoteSource>,
         key: Option<&str>,
-        delivery: NoteDelivery<'_>,
+        delivery: NoteDelivery,
     ) -> Result<i64> {
         let dest = match p::safe_int(dest) {
             Some(d) if d > 0 && p::valid_text(body, usize::MAX) => d,
@@ -562,10 +562,7 @@ impl Q<'_> {
             (None, None) => return Err(anyhow!("目标不属于本工单或已停止收信")),
         };
         let kind = if rejection.is_some() { "note.rejected" }
-            else if let Some(files) = delivery.steering_files {
-                if !files.is_empty() { payload.insert("files".into(), json!(files)); }
-                "queue.steering"
-            } else { "note" };
+            else if delivery.steering { "queue.steering" } else { "note" };
         let seq = self.log(who, kind, &Value::Object(payload))?;
         let target = if rejection.is_some() { None } else { Some(dest) };
         let source_id = source.map(|s| s.who.id);
@@ -670,8 +667,8 @@ impl Q<'_> {
     }
 }
 
-struct NoteDelivery<'a> {
-    steering_files: Option<&'a [Value]>,
+struct NoteDelivery {
+    steering: bool,
     budget: i64,
     answering: bool,
 }

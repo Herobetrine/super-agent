@@ -53,7 +53,7 @@ pub enum Action {
     MoveQueued { ticket: i64, id: i64, before: Option<i64> },
     #[allow(dead_code)]
     PromoteQueued { ticket: i64, id: i64 },
-    ResumeQueue { ticket: i64 },
+    ResumeQueue { ticket: i64, confirmed_resume: bool },
     Note {
         ticket: i64,
         job: i64,
@@ -268,7 +268,7 @@ impl Action {
                 ticket: *ticket,
                 id: *id,
             }),
-            Action::ResumeQueue { ticket } => {
+            Action::ResumeQueue { ticket, .. } => {
                 ActionKind::Queue(QueueAction::Resume { ticket: *ticket })
             }
             Action::EditQueued { .. } | Action::MoveQueued { .. } | Action::PromoteQueued { .. } => {
@@ -344,6 +344,7 @@ pub enum QueueAction {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ActionKind {
     Queue(QueueAction),
+    ConfirmQueueResume { ticket: i64 },
     Create,
     Fork,
     Follow,
@@ -433,7 +434,14 @@ async fn action_loop(
                     });
                     kinds.insert(task.id(), kind);
                 } else {
-                    let result = execute(engine, shared, action).await.map_err(|e| format!("{e:#}"));
+                    let result = execute(engine, shared, action).await;
+                    let kind = match (&result, kind) {
+                        (Err(e), ActionKind::Queue(QueueAction::Resume { ticket }))
+                            if e.is::<sa_engine::ResumeConfirmationRequired>() =>
+                                ActionKind::ConfirmQueueResume { ticket },
+                        _ => kind,
+                    };
+                    let result = result.map_err(|e| format!("{e:#}"));
                     deliver(out, wake, Outcome { kind, result });
                 }
             }
@@ -1057,8 +1065,8 @@ async fn execute(engine: &Engine, shared: &Shared, action: Action) -> Result<Opt
             engine.promote_queued(ticket, id)?;
             Ok(None)
         }
-        Action::ResumeQueue { ticket } => {
-            engine.resume_queue(ticket)?;
+        Action::ResumeQueue { ticket, confirmed_resume } => {
+            engine.resume_queue(ticket, confirmed_resume)?;
             Ok(None)
         }
         Action::Answer { question, body } => {

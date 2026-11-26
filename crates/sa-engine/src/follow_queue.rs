@@ -35,6 +35,17 @@ impl std::fmt::Display for NotQueued {
 
 impl std::error::Error for NotQueued {}
 
+#[derive(Debug)]
+pub struct ResumeConfirmationRequired;
+
+impl std::fmt::Display for ResumeConfirmationRequired {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("恢复已停止的持续自动工单需要确认")
+    }
+}
+
+impl std::error::Error for ResumeConfirmationRequired {}
+
 fn changed(rows: usize) -> Result<()> {
     if rows == 1 {
         Ok(())
@@ -62,11 +73,13 @@ pub(crate) fn submit(
     let job = int_of(root, "id");
     let state = str_of(root, "state");
     if state == "running"
-        || (state == "queued"
+        || (matches!(state, "queued" | "waiting")
             && q.exists(
-                "SELECT 1 FROM follow_queue WHERE job=?1 AND NOT EXISTS
-         (SELECT 1 FROM follow_queue_status WHERE job=?1 AND hold IS NOT NULL)",
-                &[&job],
+                "SELECT 1 WHERE NOT EXISTS
+                 (SELECT 1 FROM follow_queue_status WHERE job=?1 AND hold IS NOT NULL)
+                 AND (EXISTS(SELECT 1 FROM follow_queue_status WHERE job=?1 AND awaiting_admission=1)
+                      OR (?2='queued' AND EXISTS(SELECT 1 FROM follow_queue WHERE job=?1)))",
+                &[&job, &state],
             )?)
     {
         let manifest = serde_json::to_string(additions)?;
@@ -293,12 +306,13 @@ impl Engine {
             let row = queued(q, ticket, id)?;
             let root = q.root(ticket)?;
             let job = int_of(&root, "id");
-            if str_of(&root, "state") == "running" && supports_mid_turn_notes(str_of(&root, "agent")) {
-                let files: Vec<Value> = serde_json::from_str(str_of(&row, "manifest"))?;
-                let seq = q.steering_note(ticket, job, &row["body"], &files)?;
+            if str_of(&root, "state") == "running"
+                && supports_mid_turn_notes(str_of(&root, "agent"))
+                && str_of(&row, "manifest") == "[]"
+            {
+                let seq = q.steering_note(ticket, job, &row["body"])?;
                 changed(q.run("UPDATE follow_queue SET state='steering',note_seq=?
                     WHERE ticket=? AND id=? AND state='queued'", &[&seq, &ticket, &id])?)?;
-                if !files.is_empty() { validate_manifests(q, job)?; }
                 return Ok(Promotion::Steered);
             }
             changed(q.run("UPDATE follow_queue SET position=(SELECT min(position)-1 FROM follow_queue WHERE job=?)
@@ -308,15 +322,23 @@ impl Engine {
         })
     }
 
-    pub fn resume_queue(&self, ticket: i64) -> Result<()> {
+    pub fn resume_queue(&self, ticket: i64, confirmed_resume: bool) -> Result<()> {
         self.db().tx(|q| {
             let mut root = q.root(ticket)?;
             let job = int_of(&root, "id");
             let state = str_of(&root, "state");
-            q.run(
+            if q.run(
                 "UPDATE follow_queue_status SET hold=NULL WHERE job=? AND hold IS NOT NULL",
                 &[&job],
-            )?;
+            )? == 0 {
+                return Ok(());
+            }
+            if state == "cancelled"
+                && !confirmed_resume
+                && q.exists("SELECT 1 FROM continuous_runs WHERE ticket=?", &[&ticket])?
+            {
+                return Err(ResumeConfirmationRequired.into());
+            }
             if state == "running"
                 || !q.exists(
                     "SELECT 1 FROM follow_queue WHERE job=? AND state='queued'",
@@ -360,8 +382,10 @@ fn consume(q: &Q, root: &Map<String, Value>, explicit_resume: bool) -> Result<()
     let Some(row) = q.one(
         "SELECT * FROM follow_queue WHERE job=?1 AND state='queued'
         AND NOT EXISTS(SELECT 1 FROM follow_queue_status WHERE job=?1 AND hold IS NOT NULL)
+        AND NOT EXISTS(SELECT 1 FROM ticket_pause WHERE ticket=?2)
+        AND NOT EXISTS(SELECT 1 FROM questions WHERE job=?1 AND origin='platform' AND state='pending')
         ORDER BY position,id LIMIT 1",
-        &[&job],
+        &[&job, &int_of(root, "ticket")],
     )?
     else {
         return Ok(());
@@ -386,6 +410,33 @@ fn consume(q: &Q, root: &Map<String, Value>, explicit_resume: bool) -> Result<()
         &[&job],
     )?;
     Ok(())
+}
+
+pub(crate) fn scheduling_resumed(q: &Q, root: &Map<String, Value>) -> Result<()> {
+    let state = str_of(root, "state");
+    let job = int_of(root, "id");
+    if matches!(state, "running" | "draining")
+        || (state == "interrupted"
+            && !q.exists(
+                "SELECT 1 FROM continuous_runs WHERE ticket=?",
+                &[&int_of(root, "ticket")],
+            )?)
+        || (state == "queued" && !root["dispatch_turn"].is_null())
+        || q.exists(
+            "SELECT 1 FROM follow_queue_status WHERE job=? AND awaiting_admission=1",
+            &[&job],
+        )?
+    {
+        return Ok(());
+    }
+    // Stop always sets a job-level hold. Only a confirmed queue resume can
+    // release it on a stopped continuous root, even while scheduling is paused.
+    let released_stop = state == "cancelled"
+        && q.exists(
+            "SELECT 1 FROM follow_queue_status WHERE job=? AND hold IS NULL",
+            &[&job],
+        )?;
+    consume(q, root, released_stop)
 }
 
 pub(crate) fn restore_steering(q: &Q, job: i64) -> Result<()> {
@@ -466,6 +517,7 @@ pub(crate) fn recover(q: &Q) -> Result<()> {
     for root in q.all(
         "SELECT j.* FROM jobs j LEFT JOIN follow_queue_status s ON s.job=j.id
         WHERE j.parent IS NULL AND j.state NOT IN ('running','draining')
+        AND NOT EXISTS(SELECT 1 FROM ticket_pause WHERE ticket=j.ticket)
         AND (j.state!='queued' OR j.dispatch_turn IS NULL)
         AND s.hold IS NULL AND coalesce(s.awaiting_admission,0)=0
         AND j.id IN (SELECT job FROM follow_queue)",

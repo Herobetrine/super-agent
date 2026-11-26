@@ -319,7 +319,7 @@ async fn unsupported_steering_moves_to_head_and_queued_root_preserves_fifo() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn native_note_delivers_the_immutable_attachment_and_is_not_replayed() {
+async fn promotion_with_attachments_moves_to_head_and_delivers_immutable_file_once() {
     let gate = Gate::new();
     let mut fx = Fx::new(
         script({
@@ -328,16 +328,17 @@ async fn native_note_delivers_the_immutable_attachment_and_is_not_replayed() {
                 let gate = gate.clone();
                 async move {
                     gate.wait().await;
-                    let notes = c.host.pending_notes();
-                    assert_eq!(notes.len(), 1);
-                    assert_eq!(notes[0]["body"], "inspect file");
-                    let file = &notes[0]["files"][0];
-                    assert_eq!(file["name"], "input.txt");
-                    assert_eq!(
-                        std::fs::read(file["object_path"].as_str().unwrap()).unwrap(),
-                        b"original"
-                    );
-                    c.host.accept_notes(&[notes[0]["seq"].as_i64().unwrap()]);
+                    assert!(c.host.pending_notes().is_empty());
+                    if c.turn() == 2 {
+                        let packet = c.full_packet();
+                        assert_eq!(packet["user_updates"], json!(["inspect file"]));
+                        let file = &packet["files"][0];
+                        assert_eq!(file["name"], "input.txt");
+                        assert_eq!(
+                            std::fs::read(file["object_path"].as_str().unwrap()).unwrap(),
+                            b"original"
+                        );
+                    }
                     Ok("inspected".into())
                 }
             }
@@ -347,6 +348,7 @@ async fn native_note_delivers_the_immutable_attachment_and_is_not_replayed() {
     project_file(&fx.project, "input.txt", b"original");
     let t = fx.begin(fx.params()).await;
     fx.until(|| fx.shared.count(|_| true) == 1).await;
+    let older = enqueue(&fx, t, "older");
     let FollowOutcome::Queued { id } = fx
         .engine
         .follow_with_files(t, "inspect file", false, &["input.txt".into()])
@@ -355,19 +357,21 @@ async fn native_note_delivers_the_immutable_attachment_and_is_not_replayed() {
     else {
         panic!("expected queued attachment")
     };
-    assert_eq!(snapshot(&fx, t).queue[0].files, ["input.txt"]);
     project_file(&fx.project, "input.txt", b"changed");
-    assert_eq!(fx.engine.promote_queued(t, id).unwrap(), Promotion::Steered);
+    assert_eq!(
+        fx.engine.promote_queued(t, id).unwrap(),
+        Promotion::NextTurn
+    );
+    let queue = snapshot(&fx, t).queue;
+    assert_eq!([queue[0].id, queue[1].id], [id, older]);
+    assert_eq!(queue[0].files, ["input.txt"]);
     gate.open();
     fx.finish(t, "done").await;
     fx.restart(quiet()).await;
     assert!(snapshot(&fx, t).queue.is_empty());
-    assert!(updates(&fx).is_empty());
-    assert_eq!(fx.int("SELECT count(*) FROM events WHERE kind='note'"), 1);
-    assert_eq!(
-        fx.int("SELECT count(*) FROM mailbox WHERE consumed_turn=1"),
-        1
-    );
+    assert_eq!(updates(&fx), [json!("inspect file"), json!("older")]);
+    assert_eq!(fx.int("SELECT count(*) FROM mailbox"), 0);
+    assert_eq!(fx.shared.count(|_| true), 3);
 }
 
 #[tokio::test]
@@ -389,7 +393,11 @@ async fn stopped_continuous_queue_persists_and_resume_is_explicit_authorization(
             .to_string(),
         "停止的工单需要明确恢复"
     );
-    fx.engine.resume_queue(t).unwrap();
+    let err = fx.engine.resume_queue(t, false).unwrap_err();
+    assert!(err.is::<sa_engine::ResumeConfirmationRequired>());
+    assert_eq!(snapshot(&fx, t), snap);
+    assert!(updates(&fx).is_empty());
+    fx.engine.resume_queue(t, true).unwrap();
     assert_eq!(updates(&fx), [json!("one")]);
     let snap = snapshot(&fx, t);
     assert_eq!(snap.ticket.state, "queued");
@@ -398,6 +406,44 @@ async fn stopped_continuous_queue_persists_and_resume_is_explicit_authorization(
     assert_eq!(snap.queue[0].id, two);
     fx.restart(quiet()).await;
     assert_eq!(updates(&fx), [json!("one")]);
+}
+
+#[tokio::test]
+async fn confirmed_stop_resume_survives_handoff_pause_and_a_changed_head() {
+    let mut fx = fixture();
+    let t = fx.create(fx.params().profile("auto")).await;
+    state(&fx, t, "running");
+    enqueue(&fx, t, "first");
+    let second = enqueue(&fx, t, "second");
+    fx.engine.cancel(t).unwrap();
+    fx.engine.request_pause_after_handoff(t).unwrap();
+    fx.engine.resume_queue(t, true).unwrap();
+    assert!(updates(&fx).is_empty());
+    fx.engine.promote_queued(t, second).unwrap();
+    fx.restart(quiet()).await;
+    assert_eq!(snapshot(&fx, t).queue_hold, None);
+    assert!(updates(&fx).is_empty());
+    fx.engine.resume_paused(t).unwrap();
+    assert_eq!(updates(&fx), [json!("second")]);
+    assert_eq!(snapshot(&fx, t).queue[0].body, "first");
+}
+
+#[tokio::test]
+async fn repeating_resume_before_admission_only_delivers_one_head() {
+    let fx = fixture();
+    let t = fx.create(fx.params()).await;
+    state(&fx, t, "running");
+    enqueue(&fx, t, "first");
+    let second = enqueue(&fx, t, "second");
+    fx.engine.cancel(t).unwrap();
+    fx.engine.resume_queue(t, false).unwrap();
+    let resumed = snapshot(&fx, t);
+    assert_eq!(resumed.queue_hold, None);
+    assert_eq!(resumed.queue.len(), 1);
+    assert_eq!(resumed.queue[0].id, second);
+    fx.engine.resume_queue(t, false).unwrap();
+    assert_eq!(snapshot(&fx, t), resumed);
+    assert_eq!(updates(&fx), [json!("first")]);
 }
 
 #[tokio::test]
@@ -418,7 +464,7 @@ async fn plain_follow_on_held_backlog_does_not_resume_it() {
     enqueue(&fx, t, "also held");
     assert_eq!(snapshot(&fx, t).queue.len(), 2);
     let before = updates(&fx);
-    fx.engine.resume_queue(t).unwrap();
+    fx.engine.resume_queue(t, false).unwrap();
     assert_eq!(snapshot(&fx, t).queue_hold, None);
     assert_eq!(updates(&fx), before);
 }
@@ -446,7 +492,7 @@ async fn permanent_failure_holds_and_resume_sends_the_first_item() {
     fx.finish(t, "failed").await;
     assert_eq!(snapshot(&fx, t).queue_hold, Some(HoldReason::Failed));
     assert!(updates(&fx).is_empty());
-    fx.engine.resume_queue(t).unwrap();
+    fx.engine.resume_queue(t, false).unwrap();
     assert_eq!(updates(&fx), [json!("new work")]);
     assert!(snapshot(&fx, t).queue.is_empty());
     assert_eq!(root_state(&fx.engine, t), "queued");
@@ -494,7 +540,7 @@ async fn interrupted_root_retries_the_same_turn_and_refusal_rolls_back_release()
         .unwrap();
     let before = fx.int("SELECT max(seq) FROM events");
     assert_eq!(
-        fx.engine.resume_queue(t).unwrap_err().to_string(),
+        fx.engine.resume_queue(t, false).unwrap_err().to_string(),
         fx.engine.retry(snap.queue[0].job).unwrap_err().to_string()
     );
     assert_eq!(snapshot(&fx, t), snap);
@@ -503,7 +549,7 @@ async fn interrupted_root_retries_the_same_turn_and_refusal_rolls_back_release()
         .db()
         .tx(|q| q.run("DELETE FROM job_workspaces WHERE ticket=?", &[&t]))
         .unwrap();
-    fx.engine.resume_queue(t).unwrap();
+    fx.engine.resume_queue(t, false).unwrap();
     assert_eq!(fx.int("SELECT turn FROM jobs"), 1);
     assert_eq!(
         fx.int("SELECT count(*) FROM progress_receipts WHERE source_turn=1 AND msgkey='receipt'"),
@@ -526,7 +572,7 @@ async fn resume_during_drain_waits_for_settlement() {
     enqueue(&fx, t, "after children");
     fx.engine.cancel(t).unwrap();
     state(&fx, t, "draining");
-    fx.engine.resume_queue(t).unwrap();
+    fx.engine.resume_queue(t, false).unwrap();
     assert_eq!(snapshot(&fx, t).queue_hold, None);
     assert_eq!(root_state(&fx.engine, t), "draining");
     fx.restart(quiet()).await;

@@ -368,12 +368,12 @@ pub enum Feed {
 /// Like [`stream`], but stdin stays open after `input` so `on_tick` (called
 /// about once a second while the process runs) can write further lines into
 /// the live turn. `on_event` closes stdin once the turn is complete.
-pub async fn stream_live(
+pub async fn stream_live<A: FnOnce()>(
     p: &mut Proc,
     input: &str,
     cancel: &CancellationToken,
     mut on_event: impl FnMut(Value) -> Result<Feed, AdapterError>,
-    mut on_tick: impl FnMut() -> Option<String>,
+    mut on_tick: impl FnMut() -> Option<(String, A)>,
 ) -> Result<(), AdapterError> {
     let mut stdin = p.stdin.take();
     if let Some(pipe) = stdin.as_mut()
@@ -389,11 +389,15 @@ pub async fn stream_live(
         let next = tokio::select! {
             r = lines.next() => r,
             _ = tick.tick(), if stdin.is_some() => {
-                if let (Some(line), Some(pipe)) = (on_tick(), stdin.as_mut())
-                    && pipe.write_all(line.as_bytes()).await.is_err()
-                {
-                    // A broken pipe surfaces through the exit contract.
-                    stdin = None;
+                if let (Some((line, acknowledge)), Some(pipe)) = (on_tick(), stdin.as_mut()) {
+                    // On Windows ChildStdin buffers the final write on a blocking
+                    // worker. Flush observes its result before retiring the note.
+                    if pipe.write_all(line.as_bytes()).await.is_ok() && pipe.flush().await.is_ok() {
+                        acknowledge();
+                    } else {
+                        // A broken pipe surfaces through the exit contract.
+                        stdin = None;
+                    }
                 }
                 continue;
             }

@@ -482,6 +482,12 @@ impl App {
                 (ActionKind::T3Import, r) => self.t3_projects_imported(r),
                 (ActionKind::Knowledge, r) => self.knowledge_saved(r.map(|_| ())),
                 (ActionKind::Providers, r) => self.providers_saved(r.map(|_| ())),
+                (ActionKind::ConfirmQueueResume { ticket }, _) => {
+                    self.composer.pending_queue.remove(&QueueAction::Resume { ticket });
+                    if self.view.as_ref().is_some_and(|view| view.id == ticket) {
+                        self.composer.confirm = Some(Confirm::ResumeQueue { ticket });
+                    }
+                }
                 (ActionKind::Meta | ActionKind::Queue(_), Ok(_)) => {}
                 (ActionKind::Notify, r) => self.notify_saved(r.map(|_| ())),
                 (_, Err(e)) => self.composer.message = Some((e, true)),
@@ -1207,7 +1213,7 @@ impl App {
         }
         match confirm {
             Confirm::Profile(p) => self.composer.profile = p,
-            Confirm::ResumeQueue { ticket } => self.submit(Action::ResumeQueue { ticket }),
+            Confirm::ResumeQueue { ticket } => self.submit(Action::ResumeQueue { ticket, confirmed_resume: true }),
             Confirm::Resume {
                 ticket,
                 body,

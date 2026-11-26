@@ -320,6 +320,20 @@ fn stopped_auto_queue_confirms_before_dispatch_and_cancel_preserves_the_head() {
     until(&mut h, "stopped continuous queue", |a| a.view.as_ref().and_then(|v| v.snap.as_ref())
         .is_some_and(|s| s.ticket.state == "cancelled" && s.ticket.permission_profile == "auto"
             && s.queue_hold == Some(sa_store::HoldReason::Stopped)));
+    // A click rendered before Stop committed carries no confirmation.
+    let mut stale = h.state().view.as_ref().unwrap().snap.as_ref().unwrap().ticket.clone();
+    stale.state = "running".into();
+    h.state_mut().submit_queue_action(
+        crate::host::Action::ResumeQueue { ticket, confirmed_resume: false }, &stale,
+    );
+    assert!(h.state().composer.confirm.is_none());
+    until(&mut h, "backend requested stop confirmation", |a|
+        matches!(a.composer.confirm, Some(crate::composer::Confirm::ResumeQueue { ticket: t }) if t == ticket)
+            && a.composer.pending == 0 && a.composer.pending_queue.is_empty());
+    h.run_steps(3);
+    assert!(!kinds(h.state(), ticket).iter().any(|k| k == "user.follow"));
+    h.get_by_role_and_label(Role::Button, "取消").click();
+    h.run_steps(4);
     for confirm in [false, true] {
         h.run_steps(3);
         h.get_by_role_and_label(Role::Button, "继续发送").click();

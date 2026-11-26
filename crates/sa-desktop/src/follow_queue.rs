@@ -51,7 +51,7 @@ pub fn strip(
                     .inner
                     .clicked()
                 {
-                    action = Some(Action::ResumeQueue { ticket });
+                    action = Some(Action::ResumeQueue { ticket, confirmed_resume: false });
                 }
             } else {
                 ui.label(muted("队列已暂停 · 请在主窗口继续", pal));

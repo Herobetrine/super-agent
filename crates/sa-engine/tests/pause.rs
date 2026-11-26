@@ -105,6 +105,65 @@ async fn waiting_root_drains_children_and_gets_exactly_one_consolidation() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn queued_business_instruction_waits_through_the_handoff_summary() {
+    let gate = Gate::new();
+    let fx = Fx::new(
+        script({
+            let gate = gate.clone();
+            move |c| {
+                let gate = gate.clone();
+                async move {
+                    if c.depth() == 0 && c.turn() == 1 {
+                        gate.wait().await;
+                        return Ok(send(json!({})));
+                    }
+                    if c.depth() == 0 && c.turn() == 2 {
+                        assert_eq!(c.packet["pause_after_handoff"]["consolidation"], true);
+                        assert!(!c.full_packet().to_string().contains("business instruction"));
+                    } else if c.depth() == 0 && c.turn() == 3 {
+                        assert_eq!(
+                            c.full_packet()["user_updates"],
+                            json!(["business instruction"])
+                        );
+                    }
+                    Ok("done".into())
+                }
+            }
+        }),
+        t1_catalog(),
+    );
+    let t = fx.begin(fx.params()).await;
+    fx.until(|| fx.shared.count(|_| true) == 1).await;
+    assert!(matches!(
+        fx.engine.follow(t, "business instruction", false).unwrap(),
+        sa_engine::FollowOutcome::Queued { .. }
+    ));
+    fx.engine.request_pause_after_handoff(t).unwrap();
+    gate.open();
+    fx.until(|| fx.engine.pause_status(t).unwrap() == PauseStatus::Paused)
+        .await;
+    settled(&fx.engine).await;
+    assert_eq!(fx.shared.count(|call| call.packet["depth"] == 0), 2);
+    assert_eq!(fx.int("SELECT count(*) FROM follow_queue"), 1);
+    assert_eq!(
+        fx.int("SELECT count(*) FROM events WHERE kind='user.follow'"),
+        0
+    );
+    fx.engine.resume_paused(t).unwrap();
+    assert_eq!(fx.int("SELECT count(*) FROM follow_queue"), 0);
+    assert_eq!(
+        fx.int("SELECT count(*) FROM events WHERE kind='user.follow'"),
+        1
+    );
+    fx.finish(t, "done").await;
+    assert_eq!(
+        fx.shared
+            .count(|call| call.packet["depth"] == 0 && call.packet["turn"] == 3),
+        1
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn pause_requested_during_root_preserves_planned_children_until_resume() {
     let root_gate = Gate::new();
     let fx = Fx::new(script({

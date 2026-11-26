@@ -120,6 +120,7 @@ pub(crate) fn resume(q: &Q, ticket: i64) -> Result<PauseStatus> {
         for row in stale {
             q.record_note(ticket, Some(&row["id"]), Some(&json!(CHILD_RESUME)), None, None)?;
         }
+        crate::follow_queue::scheduling_resumed(q, &q.root(ticket)?)?;
     }
     Ok(PauseStatus::Running)
 }

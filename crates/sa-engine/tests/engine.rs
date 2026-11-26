@@ -60,6 +60,80 @@ async fn image_follow_replaces_images_updates_text_and_survives_reopen() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn delivered_image_keeps_its_turn_when_another_follow_arrives_before_admission() {
+    let gate = Gate::new();
+    let fx = Fx::new(
+        script({
+            let gate = gate.clone();
+            move |c| {
+                let gate = gate.clone();
+                async move {
+                    if c.turn() == 1 {
+                        gate.wait().await;
+                    } else {
+                        assert_eq!(c.req.images.len(), 1);
+                        if c.turn() == 2 {
+                            assert_eq!(c.full_packet()["user_updates"], json!(["A"]));
+                        } else {
+                            assert_eq!(c.turn(), 3);
+                            assert_eq!(c.full_packet()["user_updates"], json!(["A", "B"]));
+                        }
+                    }
+                    Ok("done".into())
+                }
+            }
+        }),
+        t1_catalog(),
+    );
+    let a = write_image(&fx.project, "a.png", image::ImageFormat::Png, 2);
+    let b = write_image(&fx.project, "b.png", image::ImageFormat::Png, 4);
+    let t = fx.begin(fx.params()).await;
+    fx.until(|| fx.shared.count(|_| true) == 1).await;
+    assert!(matches!(
+        fx.engine
+            .follow_with_files(t, "A", false, &["a.png".into()])
+            .await
+            .unwrap(),
+        sa_engine::FollowOutcome::Queued { .. }
+    ));
+    // Delay admission, but let the first reply and its queue delivery commit.
+    fx.engine
+        .db()
+        .tx(|q| {
+            q.run(
+                "UPDATE jobs SET ready_after=4102444800 WHERE ticket=?",
+                &[&t],
+            )
+        })
+        .unwrap();
+    gate.open();
+    fx.until(|| root_state(&fx.engine, t) == "queued").await;
+    assert_eq!(fx.int("SELECT count(*) FROM follow_queue"), 0);
+    assert_eq!(
+        fx.int("SELECT count(*) FROM events WHERE kind='user.follow'"),
+        1
+    );
+    assert!(matches!(
+        fx.engine
+            .follow_with_files(t, "B", false, &["b.png".into()])
+            .await
+            .unwrap(),
+        sa_engine::FollowOutcome::Queued { .. }
+    ));
+    fx.engine
+        .db()
+        .tx(|q| q.run("UPDATE jobs SET ready_after=0 WHERE ticket=?", &[&t]))
+        .unwrap();
+    fx.finish(t, "done").await;
+    assert_eq!(
+        fx.shared
+            .calls(|call| call.req.images.first().map(|im| im.data().to_vec())),
+        [a, b]
+    );
+    assert_eq!(fx.shared.count(|_| true), 3);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn active_image_follows_replace_images_one_turn_at_a_time() {
     let entered = Gate::new();
     let release = Gate::new();
