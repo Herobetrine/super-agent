@@ -1,9 +1,26 @@
 /* Isolated Claude/Codex CLI fixture. Protocol and discovery stay local. */
+#ifndef _WIN32
+#define _POSIX_C_SOURCE 200809L
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <time.h>
+#endif
 
 #define MODEL "fixture-model@20250101"
+
+static void delay_preflight(void) {
+#ifdef _WIN32
+    Sleep(150);
+#else
+    const struct timespec delay = {0, 150000000};
+    nanosleep(&delay, NULL);
+#endif
+}
 
 static int has_arg(int argc, char **argv, const char *arg) {
     for (int i = 1; i < argc; ++i) {
@@ -34,11 +51,12 @@ static int codex_turn(void) {
             puts("{\"id\":1,\"result\":{}}");
         } else if (strstr(line, "\"method\":\"thread/start\"")) {
             const char *provider = "openai";
+            const char *sandbox = strstr(line, "\"sandbox\":\"read-only\"") ? "readOnly" : "dangerFullAccess";
             if (strstr(line, "\"modelProvider\":\"provider-a\"")) provider = "provider-a";
             if (strstr(line, "\"modelProvider\":\"provider-b\"")) provider = "provider-b";
-            printf("{\"id\":2,\"result\":{\"sandbox\":{\"type\":\"dangerFullAccess\"},"
+            printf("{\"id\":2,\"result\":{\"sandbox\":{\"type\":\"%s\"},"
                    "\"approvalPolicy\":\"never\",\"model\":\"" MODEL "\","
-                   "\"modelProvider\":\"%s\",\"thread\":{\"id\":\"fixture-session\"}}}\n", provider);
+                   "\"modelProvider\":\"%s\",\"thread\":{\"id\":\"fixture-session\"}}}\n", sandbox, provider);
         } else if (strstr(line, "\"method\":\"turn/start\"")) {
             if (fail_turn()) {
                 puts("{\"id\":3,\"error\":{\"code\":-32000,\"message\":\"fixture failure\"}}");
@@ -57,6 +75,18 @@ static int codex_turn(void) {
 }
 
 int main(int argc, char **argv) {
+    if (has_arg(argc, argv, "mcp") && has_arg(argc, argv, "list")) {
+        if (!receipt("mcp-list")) return 3;
+        delay_preflight();
+        puts("[]");
+        return 0;
+    }
+    if (has_arg(argc, argv, "--version")) {
+        if (!receipt("claude-version")) return 3;
+        delay_preflight();
+        puts("2.1.242");
+        return 0;
+    }
     if (has_arg(argc, argv, "debug")) {
         if (!receipt("codex-models")) return 3;
         puts("{\"models\":[{\"slug\":\"" MODEL "\",\"display_name\":\"Fixture\","

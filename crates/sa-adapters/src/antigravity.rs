@@ -80,35 +80,35 @@ fn google_account_stamp(sys: &Sys) -> Vec<Option<FileStamp>> {
 
 struct DiscoveryInputs {
     exe: Option<PathBuf>,
-    key: ProbeKey,
     settings: Value,
+    settings_digest: Option<String>,
 }
 
 impl DiscoveryInputs {
     fn read(sys: &Sys) -> Self {
         let exe = executable(sys);
         let settings = native_settings(sys);
-        let key = ProbeKey::new("antigravity", sys, exe.as_deref(), json!([
-            config_digest(&sys.home.join(SETTINGS_REL)),
-            fingerprint("agy-settings-", std::slice::from_ref(&settings)),
-            crate::revision::fingerprint(&crate::common::cc_watch_paths(sys)),
-            adc(sys).then(|| adc_credential_stamp(sys)).flatten(),
-            google_account_stamp(sys),
-        ]));
-        Self { exe, key, settings }
+        let settings_digest = config_digest(&sys.home.join(SETTINGS_REL));
+        Self { exe, settings, settings_digest }
     }
 
-    fn probe_key(&self, source: &str, overrides: &Value) -> ProbeKey {
-        self.key.scoped(&json!([source, overrides]))
-    }
-
-    fn route_key(&self, sys: &Sys, source: &str) -> Option<ProbeKey> {
-        let overrides = if matches!(source, "google" | "adc") {
-            environment(sys, source, None, false).ok()?.1
+    fn native_key(&self, env: &Sys, source: &str, overrides: &Value) -> ProbeKey {
+        let login_stamp = if source == "adc" {
+            json!(adc_credential_stamp(env))
         } else {
-            Value::Null
+            json!(google_account_stamp(env))
         };
-        Some(self.probe_key(source, &overrides))
+        ProbeKey::new("antigravity", env, self.exe.as_deref(), json!([
+            source, self.settings_digest, overrides, login_stamp,
+        ]))
+    }
+
+    fn configured_key(&self, sys: &Sys, row: &Row) -> ProbeKey {
+        // Include the selected CC Switch or native Gemini record. The key
+        // digests the active credential together with its endpoint and model.
+        ProbeKey::new("antigravity", sys, self.exe.as_deref(), json!([
+            row.id, row.base, row.model, row.token,
+        ]))
     }
 }
 
@@ -274,6 +274,7 @@ struct Discovery {
     catalog: Value,
     used_cached_probes: bool,
     probed: bool,
+    route_key: Option<ProbeKey>,
 }
 
 fn native_models(output: &str) -> Result<Vec<Value>, String> {
@@ -356,7 +357,7 @@ async fn discover(
 ) -> Result<Discovery, AdapterError> {
     let result = discover_sources(adapter, inputs, cancel, route, read_cache).await;
     if result.as_ref().map_or(true, |discovery| discovery.probed) {
-        adapter.probes.flush();
+        adapter.probes.flush().await;
     }
     result
 }
@@ -371,7 +372,11 @@ async fn discover_sources(
     let sys = &adapter.sys;
     let probes = &adapter.probes;
     let settings = &inputs.settings;
-    let mut rows = configured(sys);
+    let mut rows = if route.is_some_and(|route| matches!(route.provider.as_str(), "google" | "adc")) {
+        Vec::new()
+    } else {
+        configured(sys)
+    };
     let mut ids = vec!["google"];
     if adc(sys) {
         ids.push("adc");
@@ -385,12 +390,16 @@ async fn discover_sources(
     let mut providers: Vec<Value> = vec![];
     let mut used_cached_probes = false;
     let mut probed = false;
+    let mut route_key = None;
     for id in ids {
         let mut models: Vec<Value> = vec![];
         let mut catalog_error = None;
         if let Some(cli) = &inputs.exe {
             let (env, overrides) = environment(sys, id, None, false)?;
-            let key = inputs.probe_key(id, &overrides);
+            let key = inputs.native_key(&env, id, &overrides);
+            if route.is_some() {
+                route_key = Some(key.clone());
+            }
             let overrides = overrides.to_string();
             let cached_models = read_cache
                 .then(|| probes.read::<Vec<Value>>(&key, ""))
@@ -502,7 +511,10 @@ async fn discover_sources(
         } else {
             format!("{base}/v1beta/models?pageSize=1000")
         };
-        let key = inputs.probe_key(&row.id, &Value::Null);
+        let key = inputs.configured_key(sys, row);
+        if route.is_some() {
+            route_key = Some(key.clone());
+        }
         if let Some(models) = read_cache.then(|| probes.read::<Vec<Value>>(&key, "")).flatten() {
             used_cached_probes = true;
             row.public["catalog_complete"] = json!(true);
@@ -608,6 +620,7 @@ async fn discover_sources(
         catalog,
         used_cached_probes,
         probed,
+        route_key,
     })
 }
 
@@ -691,7 +704,7 @@ impl Adapter for Antigravity {
                 && let Some((key, completed)) = eviction
             {
                 adapter.probes.evict_through(&key, completed);
-                adapter.probes.flush();
+                adapter.probes.flush().await;
             }
             result
         })
@@ -723,7 +736,7 @@ async fn run(
     let inputs = DiscoveryInputs::read(sys);
     let mut read_cache = true;
     let (d, s) = loop {
-        let d = discover(adapter, &inputs, &cancel, Some(&req.route), read_cache)
+        let mut d = discover(adapter, &inputs, &cancel, Some(&req.route), read_cache)
             .await
             .map_err(|e| {
                 if e.class == ErrorClass::Cancelled {
@@ -732,7 +745,7 @@ async fn run(
                     probe_failed(&e.message)
                 }
             })?;
-        *eviction = inputs.route_key(sys, &req.route.provider).map(|key| (key, Stamp::now()));
+        *eviction = d.route_key.take().map(|key| (key, Stamp::now()));
         if cancel.is_cancelled() {
             return Err(crate::proc::cancelled());
         }

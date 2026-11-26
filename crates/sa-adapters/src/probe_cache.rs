@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc, Condvar, LazyLock, Mutex, OnceLock, Weak,
@@ -44,13 +45,6 @@ pub(crate) fn config_digest(path: &Path) -> Option<String> {
 }
 
 impl ProbeKey {
-    pub(crate) fn scoped(&self, inputs: &Value) -> Self {
-        Self {
-            agent: self.agent.clone(),
-            digest: digest(&json!([self.digest, inputs])),
-        }
-    }
-
     pub(crate) fn new(agent: &str, sys: &Sys, exe: Option<&Path>, inputs: Value) -> Self {
         // The child inherits the whole environment, including configurable
         // env_key/env_http_headers names. Persist only the combined digest.
@@ -239,10 +233,26 @@ struct Snapshot {
 }
 
 fn persist(path: &Path, snapshot: &Snapshot) -> anyhow::Result<()> {
+    persist_with_sync(path, snapshot, std::fs::File::sync_all)
+}
+
+fn write_snapshot(output: impl Write, snapshot: &Snapshot) -> anyhow::Result<()> {
+    let mut writer = BufWriter::new(output);
+    serde_json::to_writer(&mut writer, snapshot)?;
+    writer.flush()?;
+    Ok(())
+}
+
+fn persist_with_sync(
+    path: &Path,
+    snapshot: &Snapshot,
+    sync: impl FnOnce(&std::fs::File) -> std::io::Result<()>,
+) -> anyhow::Result<()> {
     let dir = path.parent().expect("cache file has a parent");
     std::fs::create_dir_all(dir)?;
     let mut temp = tempfile::NamedTempFile::new_in(dir)?;
-    serde_json::to_writer(temp.as_file_mut(), snapshot)?;
+    write_snapshot(temp.as_file_mut(), snapshot)?;
+    sync(temp.as_file())?;
     temp.persist(path)?;
     Ok(())
 }
@@ -316,8 +326,11 @@ impl ProbeCache {
             .get_or_init(|| Mutex::new(State::open(self.0.file.as_deref())))
     }
 
-    pub(crate) fn flush(&self) {
-        self.flush_with(persist);
+    pub(crate) async fn flush(&self) {
+        if self.0.file.is_some() {
+            let cache = self.clone();
+            let _ = tokio::task::spawn_blocking(move || cache.flush_with(persist)).await;
+        }
     }
 
     fn flush_with(&self, write: impl FnOnce(&Path, &Snapshot) -> anyhow::Result<()>) {
@@ -412,7 +425,7 @@ impl ProbeCache {
         state.changed();
     }
 
-    pub(crate) fn evict_used(&self, key: &ProbeKey, used: &[ProbeUse]) {
+    pub(crate) async fn evict_used(&self, key: &ProbeKey, used: &[ProbeUse]) {
         let changed = {
             let mut state = self.state().lock().unwrap();
             let Some(slots) = state.sources.get_mut(key) else {
@@ -430,7 +443,7 @@ impl ProbeCache {
             changed
         };
         if changed {
-            self.flush();
+            self.flush().await;
         }
     }
 
@@ -447,12 +460,13 @@ pub(crate) struct Probes<'a> {
     reuse: bool,
     hit: AtomicBool,
     probed: AtomicBool,
-    observed: Mutex<HashMap<String, Stamp>>,
+    observed: Mutex<HashMap<String, (Stamp, bool)>>,
 }
 
 pub(crate) struct ProbeUse {
     slot: String,
     started: Stamp,
+    pub(crate) cached: bool,
 }
 
 pub(crate) type ModelProbeResult = (Vec<Value>, Option<String>);
@@ -474,7 +488,10 @@ impl<'a> Probes<'a> {
             .reuse
             .then(|| self.cache.read_stamped(self.key, slot))
             .flatten()?;
-        self.observed.lock().unwrap().insert(slot.into(), started);
+        self.observed
+            .lock()
+            .unwrap()
+            .insert(slot.into(), (started, true));
         self.hit.store(true, Relaxed);
         Some(value)
     }
@@ -482,7 +499,10 @@ impl<'a> Probes<'a> {
     pub(crate) fn record<T: Serialize>(&self, slot: &str, started: Stamp, value: Option<&T>) {
         self.cache.record(self.key, slot, started, value);
         if value.is_some() {
-            self.observed.lock().unwrap().insert(slot.into(), started);
+            self.observed
+                .lock()
+                .unwrap()
+                .insert(slot.into(), (started, false));
         }
     }
 
@@ -491,21 +511,23 @@ impl<'a> Probes<'a> {
         slots
             .iter()
             .filter_map(|&slot| {
+                let &(started, cached) = observed.get(slot)?;
                 Some(ProbeUse {
                     slot: slot.into(),
-                    started: *observed.get(slot)?,
+                    started,
+                    cached,
                 })
             })
             .collect()
     }
 
-    pub(crate) fn flush(&self) {
+    pub(crate) async fn flush(&self) {
         if self.probed.load(Relaxed) {
-            self.cache.flush();
+            self.cache.flush().await;
         }
     }
 
-    pub(crate) fn used_cache(&self) -> bool {
+    fn used_cache(&self) -> bool {
         self.hit.load(Relaxed)
     }
 
@@ -546,7 +568,8 @@ pub(crate) fn probe_slot(kind: &str, identity: &Value) -> String {
 }
 
 pub(crate) fn custom_probe_slot(id: &str) -> String {
-    probe_slot("custom", &json!(id))
+    // Earlier entries included native enrichment. Refill with endpoint rows.
+    probe_slot("custom-raw", &json!(id))
 }
 
 /// Reapply only the remote model list to the freshly built custom rows,
@@ -557,69 +580,31 @@ pub(crate) async fn refresh_custom(
     sys: &Sys,
     cancel: &CancellationToken,
     probes: &Probes<'_>,
-) {
-    if customs.is_empty() {
-        return;
-    }
-    let mut cached = Vec::new();
-    let mut missed = Vec::new();
-    for provider in customs {
-        let id = provider.route_id();
-        if catalog["providers"]
-            .as_array()
-            .is_some_and(|rows| rows.iter().any(|row| row["id"] == id))
-        {
-            continue;
-        }
-        let slot = custom_probe_slot(&id);
-        if let Some(models) = probes.read::<Vec<Value>>(&slot) {
-            cached.push((id, models));
-        } else {
-            missed.push(provider.clone());
-        }
-    }
-    if !missed.is_empty() {
-        let started = probes.start();
-        // Keep native model metadata as the sole input to custom supplementation.
-        custom::refresh(catalog, &missed, sys, cancel).await;
-        if !cancel.is_cancelled() {
-            for provider in missed {
-                let id = provider.route_id();
-                let Some(row) = custom_row(catalog, &id) else {
-                    continue;
-                };
-                let models = (row["catalog_complete"] == true).then(|| safe_models(&row["models"]));
-                probes.record(&custom_probe_slot(&id), started, models.as_ref());
-            }
-        }
-    }
-    custom::merge(catalog, customs, sys);
-    for (id, models) in cached {
-        if let Some(row) = custom_row(catalog, &id) {
-            row["models"] = json!(models);
-            row["available"] = json!(true);
-            row["catalog_complete"] = json!(true);
-            row["detail"] = json!("供应商在线完整模型目录");
-        }
-    }
+    selected: Option<&sa_engine::adapter::Route>,
+) -> Option<sa_engine::adapter::Route> {
+    custom::refresh_with(catalog, customs, sys, selected, |provider| async move {
+        probes
+            .fetch_models(
+                &custom_probe_slot(&provider.route_id()),
+                cancel,
+                custom::probe_catalog(provider, sys, cancel),
+            )
+            .await
+    })
+    .await
 }
 
-fn custom_row<'a>(catalog: &'a mut Value, id: &str) -> Option<&'a mut Value> {
-    catalog["providers"]
-        .as_array_mut()?
-        .iter_mut()
-        .find(|row| row["id"] == id && row["custom"] == true)
-}
-
-/// Return only the model ids whose effort options came from shared metadata.
+/// Track which model's effort options were determined by shared metadata.
 pub(crate) fn supplement_efforts(rows: &mut [Value], metadata: &[Value]) -> HashSet<String> {
     rows.iter_mut()
         .filter_map(|row| {
             if row.get("reasoningEfforts").is_some() {
                 return None;
             }
-            crate::catalog::supplement(std::slice::from_mut(row), metadata);
-            row.get("reasoningEfforts")?;
+            let donor = metadata
+                .iter()
+                .find(|model| model["id"] == row["id"] || model["resolvedModel"] == row["id"])?;
+            crate::catalog::supplement(std::slice::from_mut(row), std::slice::from_ref(donor));
             row["id"].as_str().map(str::to_owned)
         })
         .collect()
@@ -662,6 +647,7 @@ pub(crate) fn safe_models(models: &Value) -> Vec<Value> {
 pub(crate) struct DiscoveryTiming {
     ms: u128,
     cache: &'static str,
+    completed: Instant,
 }
 
 impl DiscoveryTiming {
@@ -673,9 +659,11 @@ impl DiscoveryTiming {
         } else {
             "miss"
         };
+        let completed = Instant::now();
         Self {
-            ms: started.elapsed().as_millis(),
+            ms: completed.duration_since(started).as_millis(),
             cache,
+            completed,
         }
     }
 
@@ -684,6 +672,7 @@ impl DiscoveryTiming {
         TurnTiming {
             discovery: self,
             started,
+            preflight_ms: before.duration_since(self.completed).as_millis(),
             spawn_ms: started.duration_since(before).as_millis(),
         }
     }
@@ -693,6 +682,7 @@ impl DiscoveryTiming {
 pub(crate) struct TurnTiming {
     discovery: DiscoveryTiming,
     started: Instant,
+    preflight_ms: u128,
     spawn_ms: u128,
 }
 
@@ -702,6 +692,7 @@ impl TurnTiming {
             "turn.timing",
             json!({
                 "discover_ms": self.discovery.ms,
+                "preflight_ms": self.preflight_ms,
                 "spawn_ms": self.spawn_ms,
                 "handshake_ms": self.started.elapsed().as_millis(),
                 "cache": self.discovery.cache,
@@ -720,7 +711,7 @@ pub(crate) fn assert_timing(events: &[sa_engine::adapter::AdapterEvent], cache: 
     let timing = timings.next().expect("turn.timing");
     assert!(timings.next().is_none());
     assert_eq!(timing["cache"], cache);
-    for field in ["discover_ms", "spawn_ms", "handshake_ms"] {
+    for field in ["discover_ms", "preflight_ms", "spawn_ms", "handshake_ms"] {
         assert!(timing[field].is_u64(), "{field}: {timing}");
     }
 }
@@ -798,7 +789,7 @@ mod tests {
         {
             let cache = ProbeCache::new(Some(dir.path()));
             cache.record(&key, "models", Stamp::now(), Some(&"valid"));
-            cache.flush();
+            cache.flush_with(persist);
         }
         let path = dir.path().join("cache/probes-v1.json");
         let mut disk: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
@@ -817,7 +808,7 @@ mod tests {
         );
         assert!(cache.read::<String>(&key, "future").is_none());
         cache.record(&key, "models", Stamp::now(), Some(&"updated"));
-        cache.flush();
+        cache.flush_with(persist);
         let disk: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(disk["entries"].as_array().unwrap().len(), 1);
     }
@@ -834,7 +825,7 @@ mod tests {
         {
             let cache = ProbeCache::new(Some(dir.path()));
             cache.record(&key, "models", Stamp::now(), Some(&rows));
-            cache.flush();
+            cache.flush_with(persist);
         }
         let cache = ProbeCache::new(Some(dir.path()));
         assert_eq!(
@@ -845,8 +836,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn eviction_preserves_unrelated_slots_and_newer_results() {
+    #[tokio::test]
+    async fn eviction_preserves_unrelated_slots_and_newer_results() {
         let cache = ProbeCache::new(None);
         let key = key("all-providers");
         let now = Stamp::now();
@@ -859,11 +850,11 @@ mod tests {
         assert_eq!(probes.read::<String>("b").as_deref(), Some("cached"));
         let used = probes.observed(&["a"]);
         cache.record(&key, "a", now, Some(&"newer"));
-        cache.evict_used(&key, &used);
+        cache.evict_used(&key, &used).await;
         assert_eq!(cache.read::<String>(&key, "a").as_deref(), Some("newer"));
 
         assert_eq!(probes.read::<String>("a").as_deref(), Some("newer"));
-        cache.evict_used(&key, &probes.observed(&["a"]));
+        cache.evict_used(&key, &probes.observed(&["a"])).await;
         assert!(cache.read::<String>(&key, "a").is_none());
         assert_eq!(cache.read::<String>(&key, "b").as_deref(), Some("cached"));
     }
@@ -928,6 +919,92 @@ mod tests {
             reopened.read::<String>(&key, "effort-a").as_deref(),
             Some("initial")
         );
+    }
+
+    #[tokio::test]
+    async fn snapshot_commit_runs_off_the_discovery_thread() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = ProbeCache::new(Some(dir.path()));
+        let key = key("blocking-write");
+        cache.record(&key, "models", Stamp::now(), Some(&"first"));
+        let (active, waiting) = std::sync::mpsc::channel();
+        let (progress, progressed) = std::sync::mpsc::channel();
+        let prior = cache.clone();
+        let writer = std::thread::spawn(move || {
+            let mut scheduler_progressed = false;
+            prior.flush_with(|path, snapshot| {
+                active.send(()).unwrap();
+                scheduler_progressed = progressed.recv_timeout(Duration::from_secs(5)).is_ok();
+                persist(path, snapshot)
+            });
+            scheduler_progressed
+        });
+        waiting.recv_timeout(Duration::from_secs(5)).unwrap();
+        cache.record(&key, "models", Stamp::now(), Some(&"latest"));
+        // Poll flush first on the current-thread runtime while the prior
+        // writer is still active. A synchronous flush blocks the sibling.
+        tokio::join!(biased; cache.flush(), async { let _ = progress.send(()); });
+        assert!(
+            writer.join().unwrap(),
+            "snapshot flush blocked the scheduler"
+        );
+        drop(cache);
+        let reopened = ProbeCache::new(Some(dir.path()));
+        assert_eq!(
+            reopened.read::<String>(&key, "models").as_deref(),
+            Some("latest")
+        );
+    }
+
+    #[test]
+    fn snapshot_buffers_serialization_and_propagates_flush_failure() {
+        #[derive(Default)]
+        struct Output {
+            writes: usize,
+            fail_flush: bool,
+        }
+
+        impl Write for Output {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.writes += 1;
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                if self.fail_flush {
+                    return Err(std::io::Error::other("fixture flush failed"));
+                }
+                Ok(())
+            }
+        }
+
+        let snapshot = Snapshot {
+            version: VERSION,
+            entries: vec![],
+        };
+        let mut output = Output::default();
+        write_snapshot(&mut output, &snapshot).unwrap();
+        assert_eq!(output.writes, 1);
+        output.fail_flush = true;
+        assert!(write_snapshot(&mut output, &snapshot).is_err());
+    }
+
+    #[test]
+    fn sync_failure_preserves_the_previous_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("probes-v1.json");
+        let existing = b"previous snapshot";
+        std::fs::write(&path, existing).unwrap();
+        let snapshot = Snapshot {
+            version: VERSION,
+            entries: vec![],
+        };
+        let failed = persist_with_sync(&path, &snapshot, |file| {
+            assert!(file.metadata().unwrap().len() > 0);
+            Err(std::io::Error::other("fixture sync failed"))
+        });
+        assert!(failed.is_err());
+        assert_eq!(std::fs::read(path).unwrap().as_slice(), existing.as_slice());
     }
 
     #[test]
