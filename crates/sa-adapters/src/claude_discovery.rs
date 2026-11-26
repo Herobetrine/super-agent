@@ -92,6 +92,7 @@ async fn broken_steering_pipe_leaves_the_follow_available_for_the_next_turn() {
             Emit(events),
             &CancellationToken::new(),
             Some(host.clone()),
+            None,
         ),
     )
     .await
