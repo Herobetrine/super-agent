@@ -462,43 +462,6 @@ async fn promotion_with_attachments_moves_to_head_and_delivers_immutable_file_on
 }
 
 #[tokio::test]
-async fn stopped_v2_publication_resumes_without_folding_in_its_successor() {
-    let fx = fixture();
-    let t = fx.create(fx.params()).await;
-    fx.engine.follow(t, "already published", false).unwrap();
-    fx.engine
-        .db()
-        .tx(|q| {
-            q.run(
-                "INSERT INTO follow_queue_status(job,legacy_delivered)
-        SELECT id,1 FROM jobs WHERE ticket=?",
-                &[&t],
-            )
-        })
-        .unwrap();
-    enqueue(&fx, t, "successor");
-    fx.engine.cancel(t).unwrap();
-    fx.engine.resume_queue(t, false).unwrap();
-    assert_eq!(root_state(&fx.engine, t), "queued");
-    *fx.shared.script.lock().unwrap() = script(|c| async move {
-        let expected = if c.turn() == 2 {
-            json!(["already published"])
-        } else {
-            json!(["already published", "successor"])
-        };
-        assert_eq!(c.full_packet()["user_updates"], expected);
-        Ok("done".into())
-    });
-    fx.engine.start().unwrap();
-    fx.finish(t, "done").await;
-    assert_eq!(fx.shared.count(|_| true), 2);
-    assert_eq!(
-        updates(&fx),
-        [json!("already published"), json!("successor")]
-    );
-}
-
-#[tokio::test]
 async fn stopped_continuous_queue_persists_and_resume_is_explicit_authorization() {
     let mut fx = fixture();
     let t = fx.create(fx.params().profile("auto")).await;

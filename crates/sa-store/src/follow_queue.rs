@@ -26,45 +26,16 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             ticket INTEGER NOT NULL REFERENCES tickets, job INTEGER NOT NULL REFERENCES jobs,
             position INTEGER NOT NULL, body TEXT NOT NULL, manifest TEXT NOT NULL,
-            resume INTEGER NOT NULL, state TEXT NOT NULL CHECK(state IN ('queued','steering')),
+            resume INTEGER NOT NULL, state TEXT NOT NULL CHECK(state IN ('queued','assigned','steering')),
             note_seq INTEGER UNIQUE REFERENCES events(seq));
          CREATE INDEX follow_queue_order ON follow_queue(job,position,id);
+         CREATE UNIQUE INDEX follow_queue_assigned ON follow_queue(job) WHERE state='assigned';
          CREATE TABLE follow_queue_status(
             job INTEGER PRIMARY KEY REFERENCES jobs,
             hold TEXT CHECK(hold IN ('stopped','failed','interrupted')),
-            awaiting_admission INTEGER NOT NULL DEFAULT 0,
-            resume_after_drain INTEGER NOT NULL DEFAULT 0);",
-    )?;
-    Ok(())
-}
-
-pub(crate) fn migrate_assignments(conn: &Connection) -> Result<()> {
-    // Widen the state constraint without reusing IDs of previously deleted
-    // items. A v2 head already in the journal cannot be published again.
-    conn.execute_batch(
-        "CREATE TABLE follow_queue_v3(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            ticket INTEGER NOT NULL REFERENCES tickets, job INTEGER NOT NULL REFERENCES jobs,
-            position INTEGER NOT NULL, body TEXT NOT NULL, manifest TEXT NOT NULL,
-            resume INTEGER NOT NULL, state TEXT NOT NULL CHECK(state IN ('queued','assigned','steering')),
-            note_seq INTEGER UNIQUE REFERENCES events(seq));
-         INSERT INTO follow_queue_v3 SELECT * FROM follow_queue;
-         UPDATE sqlite_sequence SET seq=max(seq,coalesce((SELECT seq FROM sqlite_sequence
-             WHERE name='follow_queue'),0)) WHERE name='follow_queue_v3';
-         DROP TABLE follow_queue;
-         ALTER TABLE follow_queue_v3 RENAME TO follow_queue;
-         CREATE INDEX follow_queue_order ON follow_queue(job,position,id);
-         CREATE UNIQUE INDEX follow_queue_assigned ON follow_queue(job) WHERE state='assigned';
-         ALTER TABLE follow_queue_status RENAME COLUMN awaiting_admission TO legacy_delivered;
-         ALTER TABLE follow_queue_status ADD COLUMN delivery_turn INTEGER;
-         ALTER TABLE follow_queue_status ADD COLUMN release_on_admission INTEGER NOT NULL DEFAULT 0;
-         UPDATE follow_queue_status SET hold=NULL,resume_after_drain=0
-             WHERE NOT EXISTS(SELECT 1 FROM follow_queue f WHERE f.job=follow_queue_status.job);
-         INSERT INTO follow_queue_status(job,hold)
-             SELECT j.id,'failed' FROM jobs j WHERE j.parent IS NULL AND j.state='draining'
-             AND EXISTS(SELECT 1 FROM follow_queue f WHERE f.job=j.id)
-             ON CONFLICT(job) DO UPDATE SET hold='failed'
-             WHERE hold IS NULL AND resume_after_drain=0;
+            resume_after_drain INTEGER NOT NULL DEFAULT 0,
+            delivery_turn INTEGER,
+            release_on_admission INTEGER NOT NULL DEFAULT 0);
          CREATE TRIGGER follow_queue_empty AFTER DELETE ON follow_queue
              WHEN NOT EXISTS(SELECT 1 FROM follow_queue WHERE job=OLD.job)
              BEGIN UPDATE follow_queue_status SET hold=NULL,resume_after_drain=0,

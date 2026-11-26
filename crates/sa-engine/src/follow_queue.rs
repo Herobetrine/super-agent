@@ -76,7 +76,7 @@ pub(crate) fn submit(
         || (matches!(state, "queued" | "waiting")
             && q.exists(
                 "SELECT 1 WHERE EXISTS(SELECT 1 FROM follow_queue_status WHERE job=?1
-                     AND (delivery_turn IS NOT NULL OR legacy_delivered=1) AND hold IS NULL)
+                     AND delivery_turn IS NOT NULL AND hold IS NULL)
                  OR (EXISTS(SELECT 1 FROM follow_queue WHERE job=?1) AND
                      (EXISTS(SELECT 1 FROM questions WHERE job=?1 AND origin='platform' AND state='pending')
                       OR (?2='queued' AND NOT EXISTS(SELECT 1 FROM follow_queue_status
@@ -387,23 +387,10 @@ impl Engine {
 
 fn assign(q: &Q, root: &Map<String, Value>, explicit_resume: bool) -> Result<()> {
     let job = int_of(root, "id");
-    // A v2 journal may already have published the head before it was
-    // stopped. Resume that turn on its own; its successor is still queued.
-    if explicit_resume
-        && str_of(root, "state") == "cancelled"
-        && q.exists(
-            "SELECT 1 FROM follow_queue_status s JOIN jobs j ON j.id=s.job
-            WHERE s.job=? AND s.legacy_delivered=1 AND s.hold IS NULL
-            AND NOT EXISTS(SELECT 1 FROM ticket_pause p WHERE p.ticket=j.ticket)",
-            &[&job],
-        )?
-    {
-        return schedule(q, root, true);
-    }
     let Some(row) = q.one(
         "SELECT * FROM follow_queue WHERE job=?1 AND state='queued'
         AND NOT EXISTS(SELECT 1 FROM follow_queue_status WHERE job=?1
-            AND (hold IS NOT NULL OR delivery_turn IS NOT NULL OR legacy_delivered=1))
+            AND (hold IS NOT NULL OR delivery_turn IS NOT NULL))
         AND NOT EXISTS(SELECT 1 FROM ticket_pause WHERE ticket=?2)
         AND NOT EXISTS(SELECT 1 FROM questions WHERE job=?1 AND origin='platform' AND state='pending')
         ORDER BY position,id LIMIT 1",
@@ -455,7 +442,7 @@ pub(crate) fn admit(q: &Q, root: &Map<String, Value>) -> Result<bool> {
     let ticket = int_of(root, "ticket");
     if !q.exists(
         "SELECT 1 FROM follow_queue_status WHERE job=? AND
-        (delivery_turn IS NOT NULL OR release_on_admission=1 OR legacy_delivered=1)",
+        (delivery_turn IS NOT NULL OR release_on_admission=1)",
         &[&job],
     )? {
         return Ok(false);
@@ -464,8 +451,11 @@ pub(crate) fn admit(q: &Q, root: &Map<String, Value>) -> Result<bool> {
         revoke_assignment(q, job)?;
         return Ok(false);
     }
-    q.run("UPDATE follow_queue_status SET hold=CASE WHEN release_on_admission=1 THEN NULL ELSE hold END,
-           release_on_admission=0,legacy_delivered=0 WHERE job=? AND (release_on_admission=1 OR legacy_delivered=1)", &[&job])?;
+    q.run(
+        "UPDATE follow_queue_status SET hold=NULL,release_on_admission=0
+           WHERE job=? AND release_on_admission=1",
+        &[&job],
+    )?;
     let Some(item) = q.one(
         "SELECT f.* FROM follow_queue f JOIN follow_queue_status s ON s.job=f.job
          WHERE f.job=? AND s.delivery_turn=? AND s.hold IS NULL AND f.state IN ('assigned','queued')
@@ -602,7 +592,7 @@ pub(crate) fn recover(q: &Q) -> Result<()> {
         WHERE j.parent IS NULL AND j.state NOT IN ('running','draining')
         AND NOT EXISTS(SELECT 1 FROM ticket_pause WHERE ticket=j.ticket)
         AND (j.state!='queued' OR j.dispatch_turn IS NULL)
-        AND s.hold IS NULL AND s.delivery_turn IS NULL AND coalesce(s.legacy_delivered,0)=0
+        AND s.hold IS NULL AND s.delivery_turn IS NULL
         AND j.id IN (SELECT job FROM follow_queue)",
         &[],
     )? {

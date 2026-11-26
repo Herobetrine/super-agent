@@ -36,63 +36,67 @@ fn value(conn: &Connection) -> i64 {
 #[test]
 fn follow_queue_upgrade_snapshots_the_v1_journal_once() {
     let dir = tempfile::tempdir().unwrap();
-    drop(fixture(dir.path()));
-    let tables = |conn: &Connection| conn.query_row(
+    let v1 = fixture(dir.path());
+    v1.execute_batch("INSERT INTO tickets(id,goal,cwd,writes,lead,created) VALUES(1,'g','.',0,'codex',0);
+        INSERT INTO jobs(id,ticket,agent,body,writing,depth,state) VALUES(1,1,'codex','g',0,0,'queued');").unwrap();
+    drop(v1);
+    let tables = |conn: &Connection| {
+        conn.query_row(
         "SELECT count(*) FROM sqlite_schema WHERE type='table' AND name IN ('follow_queue','follow_queue_status')",
         [], |row| row.get::<_, i64>(0),
-    ).unwrap();
-    let upgraded = open_with_migrations(dir.path(), &super::MIGRATIONS[..2]).unwrap();
-    assert_eq!(tables(&upgraded), 2);
-    assert_eq!(value(&upgraded), 42);
-    let (path, _) = backup::latest_snapshot(dir.path()).unwrap();
-    let saved = Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
-    assert_eq!(saved.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0)).unwrap(), 1);
-    assert_eq!(value(&saved), 42);
-    assert_eq!(tables(&saved), 0);
-    drop(upgraded);
-    assert_eq!(tables(&open_with_migrations(dir.path(), &super::MIGRATIONS[..2]).unwrap()), 2);
-    assert_eq!(backup::latest_snapshot(dir.path()).unwrap().0, path);
-}
-
-#[test]
-fn assignment_upgrade_preserves_queue_ids_and_snapshots_v2() {
-    let dir = tempfile::tempdir().unwrap();
-    let old = open_with_migrations(dir.path(), &super::MIGRATIONS[..2]).unwrap();
-    old.execute_batch("INSERT INTO tickets(id,goal,cwd,writes,lead,created) VALUES(1,'g','.',0,'codex',0);
-        INSERT INTO jobs(id,ticket,agent,body,writing,depth,state) VALUES(1,1,'codex','g',0,0,'draining');
-        INSERT INTO follow_queue(ticket,job,position,body,manifest,resume,state)
-        VALUES(1,1,1,'A','[]',0,'queued'),(1,1,2,'B','[]',0,'queued');
-        DELETE FROM follow_queue WHERE id=2;").unwrap();
-    drop(old);
-    let current = open_journal(dir.path()).unwrap();
-    assert_eq!(current.query_row("SELECT hold FROM follow_queue_status WHERE job=1", [],
-        |r| r.get::<_,String>(0)).unwrap(), "failed");
-    let (path, _) = backup::latest_snapshot(dir.path()).unwrap();
-    let saved =
-        Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+    ).unwrap()
+    };
+    let upgraded = open_journal(dir.path()).unwrap();
     assert_eq!(
-        saved
+        upgraded
             .pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
             .unwrap(),
         2
     );
+    assert_eq!(tables(&upgraded), 2);
+    assert_eq!(value(&upgraded), 42);
+    assert_eq!(fs::read_dir(dir.path().join("backups")).unwrap().count(), 1);
+    let (path, _) = backup::latest_snapshot(dir.path()).unwrap();
+    let saved =
+        Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
     assert_eq!(
-        current
-            .execute(
-                "UPDATE follow_queue SET state='assigned' WHERE id=1 AND body='A'",
-                []
-            )
+        saved
+            .pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
             .unwrap(),
         1
     );
-    current
+    assert_eq!(value(&saved), 42);
+    assert_eq!(tables(&saved), 0);
+    drop(saved);
+    upgraded
+        .execute_batch(
+            "INSERT INTO follow_queue(ticket,job,position,body,manifest,resume,state)
+        VALUES(1,1,1,'A','[]',0,'assigned'),(1,1,2,'B','[]',0,'queued');
+        DELETE FROM follow_queue WHERE id=2;",
+        )
+        .unwrap();
+    drop(upgraded);
+    let reopened = open_journal(dir.path()).unwrap();
+    assert_eq!(tables(&reopened), 2);
+    assert_eq!(
+        reopened
+            .query_row(
+                "SELECT body FROM follow_queue WHERE id=1 AND state='assigned'",
+                [],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+        "A"
+    );
+    reopened
         .execute(
             "INSERT INTO follow_queue(ticket,job,position,body,manifest,resume,state)
         VALUES(1,1,2,'C','[]',0,'queued')",
             [],
         )
         .unwrap();
-    assert_eq!(current.last_insert_rowid(), 3);
+    assert_eq!(reopened.last_insert_rowid(), 3);
+    assert_eq!(backup::latest_snapshot(dir.path()).unwrap().0, path);
 }
 
 #[test]
