@@ -49,6 +49,7 @@ pub(crate) enum State {
 pub(crate) enum Success {
     Snapshot(Restored),
     Originals,
+    Rechecked,
 }
 
 fn open_folder(dir: &Path) -> Result<()> {
@@ -126,6 +127,7 @@ impl RecoveryPanel {
         observer: bool,
         ctx: &egui::Context,
     ) -> Self {
+        let data_dir = std::path::absolute(data_dir).unwrap_or_else(|_| data_dir.to_path_buf());
         let kind = match journal {
             JournalError::MigrationInterrupted { snapshot, .. } => Kind::Migration {
                 snapshot: snapshot.clone(),
@@ -155,19 +157,19 @@ impl RecoveryPanel {
         let check = matches!(kind, Kind::Migration { .. } | Kind::Corrupt { .. });
         let interrupted = matches!(kind, Kind::RestoreInterrupted { .. });
         let state = if check {
-            let dir = data_dir.to_path_buf();
+            let dir = data_dir.clone();
             let journal = journal.clone();
             State::Checking(Pending::spawn(ctx, move || {
                 Ok(check_restore_plan(&dir, &journal))
             }))
-        } else if interrupted && !observer && journal_busy(data_dir) {
+        } else if interrupted && !observer && journal_busy(&data_dir) {
             State::Busy
         } else {
             State::Ready
         };
         Self {
             kind,
-            data_dir: data_dir.to_path_buf(),
+            data_dir,
             observer,
             dismissed: false,
             reader_paused: Arc::new(AtomicBool::new(!observer && (check || interrupted))),
@@ -285,7 +287,7 @@ impl RecoveryPanel {
                     panel.reader_paused = Arc::clone(&self.reader_paused);
                     *self = panel;
                 }
-                Some(Ok(None)) => self.dismiss(),
+                Some(Ok(None)) => self.state = State::Succeeded(Success::Rechecked),
                 Some(Err(_)) => self.state = State::Stale,
                 None => {}
             },
@@ -456,6 +458,7 @@ impl RecoveryPanel {
             }
             State::Succeeded(success) | State::Relaunching(success, _) => {
                 let launching = matches!(self.state, State::Relaunching(..));
+                let show_data_folder = matches!(success, Success::Rechecked);
                 let backup = match success {
                     Success::Snapshot(restored) => {
                         paragraph(
@@ -473,6 +476,14 @@ impl RecoveryPanel {
                     }
                     Success::Originals => {
                         paragraph(ui, pal, &[Seg::Text("已放回原来的文件。")]);
+                        None
+                    }
+                    Success::Rechecked => {
+                        paragraph(
+                            ui,
+                            pal,
+                            &[Seg::Text("没有再检测到问题，请重新打开 Super Agent。")],
+                        );
                         None
                     }
                 };
@@ -495,6 +506,9 @@ impl RecoveryPanel {
                                 self.open_path(ui.ctx(), backup);
                             }
                         });
+                    }
+                    if show_data_folder {
+                        self.data_folder_button(ui, pal);
                     }
                 });
                 false
@@ -618,7 +632,7 @@ fn body(ui: &mut Ui, pal: &Palette, panel: &RecoveryPanel) {
                         &[Seg::Text("Super Agent 已停止调度，没有继续升级。")],
                     );
                     if panel.rejected {
-                        salvage_steps(ui, pal);
+                        salvage_steps(ui, pal, true);
                     }
                 } else {
                     paragraph(
@@ -693,7 +707,7 @@ fn body(ui: &mut Ui, pal: &Palette, panel: &RecoveryPanel) {
                 if offer {
                     paragraph(ui, pal, &[Seg::Text(CORRUPT_MANUAL)]);
                 }
-                salvage_steps(ui, pal);
+                salvage_steps(ui, pal, false);
             });
         }
         Kind::InvalidMigrationMarker { path, reason }
@@ -721,7 +735,7 @@ fn body(ui: &mut Ui, pal: &Palette, panel: &RecoveryPanel) {
     }
 }
 
-fn salvage_steps(ui: &mut Ui, pal: &Palette) {
+fn salvage_steps(ui: &mut Ui, pal: &Palette, has_migration_marker: bool) {
     paragraph(
         ui,
         pal,
@@ -732,9 +746,11 @@ fn salvage_steps(ui: &mut Ui, pal: &Palette) {
     paragraph(
         ui,
         pal,
-        &[Seg::Text(
-            "如果不需要旧数据，可以退出后把这些文件一起移走或改名，再次打开 Super Agent 会新建空的工单数据库。",
-        )],
+        &[Seg::Text(if has_migration_marker {
+            "如果不需要旧数据，可以退出后把这些文件一起移走或改名。连同 backups\\migration.json 一起移到别处保存。再次打开 Super Agent 会新建空的工单数据库。"
+        } else {
+            "如果不需要旧数据，可以退出后把这些文件一起移走或改名，再次打开 Super Agent 会新建空的工单数据库。"
+        })],
     );
 }
 

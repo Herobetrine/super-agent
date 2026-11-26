@@ -348,6 +348,28 @@ fn rejected_corruption_snapshot_never_appears_as_available() {
     assert!(!has_text(&h, "用最近快照恢复"));
     assert!(has_text(&h, SALVAGE));
     assert!(has_text(&h, EMPTY));
+    assert!(!has_text(
+        &h,
+        r"连同 backups\migration.json 一起移到别处保存。"
+    ));
+}
+
+#[test]
+fn rejected_migration_snapshot_requires_moving_the_marker_for_an_empty_journal() {
+    let data = tempfile::tempdir().unwrap();
+    let snapshot = interrupted(data.path(), true);
+    fs::write(snapshot, b"not a database").unwrap();
+    let mut h = harness(data.path(), false);
+    wait_for_snapshot_check(&mut h);
+    assert!(has_text(
+        &h,
+        "找到的快照都没有通过完整性校验，不能自动恢复。"
+    ));
+    assert!(has_text(
+        &h,
+        r"如果不需要旧数据，可以退出后把这些文件一起移走或改名。连同 backups\migration.json 一起移到别处保存。再次打开 Super Agent 会新建空的工单数据库。"
+    ));
+    assert!(!has_text(&h, OFFER));
 }
 
 #[test]
@@ -374,6 +396,40 @@ fn stale_plan_requires_a_fresh_diagnosis_and_never_moves_the_originals() {
         "找到的快照都没有通过完整性校验，不能自动恢复。"
     ));
     assert!(!has_text(&h, OFFER));
+}
+
+#[test]
+fn recheck_without_an_error_keeps_the_relaunch_and_data_folder_actions() {
+    let data = tempfile::tempdir().unwrap();
+    interrupted(data.path(), true);
+    let mut h = harness(data.path(), false);
+    wait_for_snapshot_check(&mut h);
+    let relaunched = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let on_relaunch = Arc::clone(&relaunched);
+    h.state_mut().recovery.as_mut().unwrap().relaunch = Arc::new(move || {
+        on_relaunch.store(true, std::sync::atomic::Ordering::Release);
+        anyhow::bail!("test keeps the window open");
+    });
+
+    click(&mut h, OFFER);
+    fs::remove_file(data.path().join("backups/migration.json")).unwrap();
+    click(&mut h, "确认恢复");
+    until(&mut h, "stale diagnosis", |app| {
+        matches!(recovery_state(app), State::Stale)
+    });
+    click(&mut h, "重新检查");
+    until(&mut h, "restart prompt", |app| {
+        matches!(recovery_state(app), State::Succeeded(Success::Rechecked))
+    });
+    assert!(h.state().host.is_none());
+    assert!(has_text(&h, "没有再检测到问题，请重新打开 Super Agent。"));
+    assert_buttons(&h, false);
+    assert!(!relaunched.load(std::sync::atomic::Ordering::Acquire));
+    click(&mut h, "重新打开");
+    until(&mut h, "relaunch attempted", |app| {
+        matches!(recovery_state(app), State::RelaunchFailed(_))
+    });
+    assert!(relaunched.load(std::sync::atomic::Ordering::Acquire));
 }
 
 fn pending_restore_fixture(dir: &Path) -> PathBuf {
@@ -500,6 +556,64 @@ fn desktop_store_holds_the_shared_reader_lock_for_its_lifetime() {
     ));
     drop(reader);
     sa_store::journal::restore_from_snapshot(data.path(), &plan).unwrap();
+}
+
+#[test]
+fn observer_can_open_when_the_readers_lock_path_cannot_be_opened_as_a_file() {
+    let data = tempfile::tempdir().unwrap();
+    drop(sa_store::journal::open_journal(data.path()).unwrap());
+    // A directory in this location prevents creating a writable lock even
+    // when the test runner has administrator privileges.
+    fs::create_dir(data.path().join(".journal-readers.lock")).unwrap();
+    assert!(
+        sa_store::journal::lock_journal_reader(data.path())
+            .unwrap()
+            .is_none()
+    );
+    let mut observer = crate::data::StoreSource::open(data.path()).unwrap();
+    assert!(
+        crate::data::DataSource::history(&mut observer, "")
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn a_relative_data_argument_can_restore_an_absolute_migration_snapshot() {
+    let data = tempfile::Builder::new()
+        .prefix(".sa-relative-restore-test-")
+        .tempdir_in(".")
+        .unwrap();
+    let absolute = std::path::absolute(data.path()).unwrap();
+    let relative = Path::new(".").join(absolute.file_name().unwrap());
+    assert!(relative.is_relative());
+    let snapshot = interrupted(&absolute, true);
+    let mut h = harness(&relative, false);
+    wait_for_snapshot_check(&mut h);
+    let expected = absolute.clone();
+    h.state_mut().recovery.as_mut().unwrap().restore = Arc::new(move |dir, plan, time| {
+        assert_eq!(dir, expected.as_path());
+        assert_eq!(
+            plan.snapshot.parent(),
+            Some(expected.join("backups").as_path())
+        );
+        restore_from_snapshot_at(dir, plan, time)
+    });
+    click(&mut h, OFFER);
+    click(&mut h, "确认恢复");
+    until(&mut h, "relative data restore", |app| {
+        matches!(recovery_state(app), State::Succeeded(Success::Snapshot(_)))
+    });
+    let State::Succeeded(Success::Snapshot(restored)) = recovery_state(h.state()) else {
+        unreachable!("restore should have completed");
+    };
+    assert!(restored.broken_dir.is_absolute());
+    assert!(restored.broken_dir.join(DB_FILE).exists());
+    assert_eq!(
+        fs::read(absolute.join(DB_FILE)).unwrap(),
+        fs::read(snapshot).unwrap()
+    );
+    assert!(!absolute.join("backups/migration.json").exists());
 }
 
 #[test]

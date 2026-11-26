@@ -39,7 +39,7 @@ pub type Opener = Box<dyn Fn() -> Result<Box<dyn DataSource>> + Send>;
 /// The ticket journal, opened read-only next to the running scheduler.
 pub struct StoreSource {
     store: Store,
-    _reader_lock: File,
+    _reader_lock: Option<File>,
     dir: PathBuf,
 }
 
