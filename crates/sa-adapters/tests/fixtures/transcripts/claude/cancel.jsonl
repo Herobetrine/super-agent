@@ -1,0 +1,4 @@
+{"expect":{"record":{"type":"user","message":{"role":"user","content":"Inspect fixture.txt."}}}}
+{"emit":{"type":"system","subtype":"init","cwd":".","session_id":"00000000-0000-4000-8000-000000000003","tools":["Bash"],"mcp_servers":[],"model":"claude-fixture","permissionMode":"bypassPermissions","uuid":"00000000-0000-4000-8000-000000000005"}}
+{"emit":{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Replay in progress."}},"session_id":"00000000-0000-4000-8000-000000000003","parent_tool_use_id":null,"uuid":"00000000-0000-4000-8000-000000000005","api_message_id":"message-1"}}
+{"wait_for_close":true}

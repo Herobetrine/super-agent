@@ -1,0 +1,5 @@
+{"expect":{"record":{"type":"user","message":{"role":"user","content":"Inspect fixture.txt."}}}}
+{"emit":{"type":"system","subtype":"init","cwd":".","session_id":"00000000-0000-4000-8000-000000000003","tools":["Bash"],"mcp_servers":[],"model":"claude-fixture","permissionMode":"bypassPermissions","uuid":"00000000-0000-4000-8000-000000000005"}}
+{"emit":{"type":"result","subtype":"success","is_error":true,"result":"API Error: 400 fixture failure","session_id":"00000000-0000-4000-8000-000000000003","uuid":"00000000-0000-4000-8000-000000000005","duration_ms":20,"duration_api_ms":10,"num_turns":1,"usage":{"input_tokens":10,"output_tokens":5},"permission_denials":[]}}
+{"stderr":"fixture exited after reporting a native error"}
+{"exit":7}
