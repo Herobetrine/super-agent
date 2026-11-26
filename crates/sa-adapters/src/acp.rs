@@ -4,6 +4,7 @@
 //! require an explicit operator declaration and an advertised matching mode.
 use crate::{
     common::{Emit, modes, route_gone, select},
+    probe_cache::DiscoveryTiming,
     proc,
     sys::Sys,
 };
@@ -24,7 +25,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio_util::{
     compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt},
@@ -222,7 +223,7 @@ async fn run(
         .into_iter()
         .find(|s| s.id == req.route.provider)
         .ok_or_else(|| route_gone("ACP 服务不存在"))?;
-    run_server(sys, req, host, emit, cancel, server, false).await
+    run_server(sys, req, host, emit, cancel, server, None).await
 }
 
 /// Reuse ACP lifecycle and permission handling for the built-in agy adapter.
@@ -234,8 +235,9 @@ pub(crate) async fn run_server(
     emit: Emit,
     cancel: CancellationToken,
     server: Server,
-    antigravity: bool,
+    discovery: Option<DiscoveryTiming>,
 ) -> Result<RunOutcome, AdapterError> {
+    let antigravity = discovery.is_some();
     if !matches!(
         req.profile.as_str(),
         "readonly" | "ask" | "partial" | "full" | "auto" | "legacy"
@@ -282,7 +284,9 @@ pub(crate) async fn run_server(
                 || server.env.iter().any(|n| name.eq_ignore_ascii_case(n))
         });
     }
+    let spawning = Instant::now();
     let mut process = proc::start(&exe, &server.args, &req.cwd, &env)?;
+    let timing = discovery.map(|d| d.spawned(spawning));
     let stdin = process
         .stdin
         .take()
@@ -365,13 +369,12 @@ pub(crate) async fn run_server(
                 (sid,serde_json::to_value(created).unwrap())
             };
             *callback_active.lock().unwrap()=Some(sid.clone()); callback_emit.session(&sid);
-            if let Some(mode)=&restricted_mode {
+            if antigravity {
+                configure_native(&connection, &callback_req, &sid, &session, restricted_mode.as_deref()).await?;
+            } else if let Some(mode)=&restricted_mode {
                 let advertised=session["modes"]["availableModes"].as_array().is_some_and(|m|m.iter().any(|m|m["id"]==*mode));
                 if !advertised{return Err(sdk::Error::invalid_params());}
                 connection.send_request(SetSessionModeRequest::new(sid.clone(),mode.clone())).block_task().await?;
-            }
-            if antigravity {
-                configure_native(&connection, &callback_req, &sid, &session, restricted_mode.as_deref()).await?;
             }
             if let Some(config_id)=server.model_config_id {
                 let advertised=session["configOptions"].as_array().is_some_and(|v|v.iter().any(|v|v["id"]==config_id && v["options"].as_array().is_some_and(|o|o.iter().any(|o|o["value"]==callback_req.route.model))));
@@ -386,6 +389,7 @@ pub(crate) async fn run_server(
                 content.push(ContentBlock::Image(ImageContent::new(STANDARD.encode(image.data()), image.media_type())));
             }
             let prompt=connection.send_request(PromptRequest::new(sid.clone(),content)).block_task();
+            if let Some(timing)=timing { timing.emit(&callback_emit); }
             tokio::pin!(prompt);
             let reply=tokio::select! {
                 r=&mut prompt=>r?,
@@ -502,6 +506,7 @@ async fn configure_native(
     session: &Value,
     mode: Option<&str>,
 ) -> Result<(), sdk::Error> {
+    let mut changed = false;
     if req.route.model != "@native" {
         if !session["models"]["availableModels"]
             .as_array()
@@ -509,23 +514,46 @@ async fn configure_native(
         {
             return Err(sdk::Error::invalid_params().data("requested model unavailable"));
         }
-        connection
+        if session["models"]["currentModelId"] != req.route.model {
+            connection
+                .send_request(sdk::UntypedMessage::new(
+                    "session/set_model",
+                    json!({"sessionId":sid,"modelId":req.route.model}),
+                )?)
+                .block_task()
+                .await?;
+            changed = true;
+        }
+    }
+    if let Some(mode) = mode {
+        if !session["modes"]["availableModes"].as_array()
+            .is_some_and(|modes| modes.iter().any(|m| m["id"] == mode))
+        {
+            return Err(sdk::Error::invalid_params().data("requested mode unavailable"));
+        }
+        if session["modes"]["currentModeId"] != mode {
+            connection
+                .send_request(SetSessionModeRequest::new(sid.to_string(), mode.to_owned()))
+                .block_task()
+                .await?;
+            changed = true;
+        }
+    }
+    // Verify the initial response directly, or read back both changes once.
+    // Any replayed history remains outside prompting.
+    let readback;
+    let loaded = if changed {
+        readback = connection
             .send_request(sdk::UntypedMessage::new(
-                "session/set_model",
-                json!({"sessionId":sid,"modelId":req.route.model}),
+                "session/load",
+                json!({"sessionId":sid,"cwd":req.cwd,"mcpServers":bus_servers(req)}),
             )?)
             .block_task()
             .await?;
-    }
-    // A load on the same ACP connection reads the selected exact model and
-    // mode back before any prompt. History updates remain outside prompting.
-    let loaded = connection
-        .send_request(sdk::UntypedMessage::new(
-            "session/load",
-            json!({"sessionId":sid,"cwd":req.cwd,"mcpServers":bus_servers(req)}),
-        )?)
-        .block_task()
-        .await?;
+        &readback
+    } else {
+        session
+    };
     if loaded["sessionId"] != sid
         || (req.route.model != "@native" && loaded["models"]["currentModelId"] != req.route.model)
         || mode.is_some_and(|mode| loaded["modes"]["currentModeId"] != mode)
@@ -533,7 +561,7 @@ async fn configure_native(
         return Err(sdk::Error::invalid_params().data("native route readback mismatch"));
     }
     if let Some(effort) = &req.route.reasoning_effort {
-        native_option(&loaded, "thought_level", effort)?;
+        native_option(loaded, "thought_level", effort)?;
         let configured = connection
             .send_request(SetSessionConfigOptionRequest::new(
                 sid.to_string(),

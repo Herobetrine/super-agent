@@ -13,6 +13,8 @@ pub struct Sys {
     pub home: PathBuf,
     /// `os.tmpdir()`.
     pub temp: PathBuf,
+    /// Explicit application data directory for the persistent probe cache.
+    pub data_dir: Option<PathBuf>,
 }
 
 fn same_key(a: &str, b: &str) -> bool {
@@ -26,6 +28,7 @@ impl Sys {
             vars,
             home: PathBuf::new(),
             temp: std::env::temp_dir(),
+            data_dir: None,
         };
         let home = if cfg!(windows) { sys.get("USERPROFILE") } else { sys.get("HOME") };
         sys.home = home.map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
@@ -34,7 +37,12 @@ impl Sys {
 
     /// A synthetic environment (tests).
     pub fn new(vars: Vec<(String, String)>, home: PathBuf, temp: PathBuf) -> Self {
-        Self { vars, home, temp }
+        Self { vars, home, temp, data_dir: None }
+    }
+
+    pub fn with_data_dir(mut self, dir: PathBuf) -> Self {
+        self.data_dir = Some(dir);
+        self
     }
 
     /// Environment lookup; case-insensitive on Windows like `process.env`.

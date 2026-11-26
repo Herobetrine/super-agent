@@ -52,5 +52,6 @@ mod images;
 pub mod custom;
 pub mod deepseek;
 pub mod proc;
+mod probe_cache;
 pub mod revision;
 pub mod sys;

@@ -4,9 +4,10 @@ const readline = require('node:readline');
 const [scenario, receipt] = process.argv.slice(2);
 const send = value => process.stdout.write(JSON.stringify({jsonrpc: '2.0', ...value}) + '\n');
 let session = 'agy-fixture-session';
-let model = 'gemini-fixture-high';
+let model = ['unchanged', 'mode-only', 'wrong-mode'].includes(scenario)
+  ? 'gemini-fixture-low' : 'gemini-fixture-high';
 let effort = 'high';
-let mode = 'default';
+let mode = ['mode-only', 'both', 'wrong-mode'].includes(scenario) ? 'other' : 'default';
 let promptId;
 const options = () => [
   {id: 'thought_level', name: 'Thinking', type: 'select', currentValue: effort,
@@ -37,7 +38,10 @@ readline.createInterface({input: process.stdin}).on('line', line => {
     return send({id, result: state()});
   }
   if (method === 'session/set_model') {model = params.modelId; return send({id, result: {}});}
-  if (method === 'session/set_mode') {mode = params.modeId; return send({id, result: {}});}
+  if (method === 'session/set_mode') {
+    if (scenario !== 'wrong-mode') mode = params.modeId;
+    return send({id, result: {}});
+  }
   if (method === 'session/set_config_option') {
     if (scenario !== 'wrong-effort') effort = params.value;
     return send({id, result: {configOptions: options()}});
