@@ -211,12 +211,19 @@ fn run() -> Result<u8> {
         return Ok(0);
     }
     let rpc = args.first().is_some_and(|arg| arg == "acp");
-    ensure!(
-        rpc || args
-            .iter()
-            .any(|arg| arg == "app-server" || arg == "stream-json"),
-        "unexpected invocation {args:?}"
-    );
+    if !rpc && !args.iter().any(|arg| arg == "app-server") {
+        for flag in ["--input-format", "--output-format"] {
+            ensure!(
+                args.windows(2)
+                    .any(|pair| pair[0] == flag && pair[1] == "stream-json"),
+                "expected {flag} stream-json, received arguments {args:?}"
+            );
+        }
+        ensure!(
+            args.iter().any(|arg| arg == "--include-partial-messages"),
+            "expected --include-partial-messages, received arguments {args:?}"
+        );
+    }
     let script =
         fs::read_to_string(env::var_os("SA_REPLAY_SCRIPT").context("missing script path")?)?;
     let mut receipt = OpenOptions::new()

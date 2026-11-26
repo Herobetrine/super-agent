@@ -15,7 +15,7 @@ use std::{
     fs,
     io::ErrorKind,
     path::{Path, PathBuf},
-    process::Stdio,
+    process::{Output, Stdio},
     sync::Arc,
     time::Duration,
 };
@@ -421,6 +421,28 @@ async fn antigravity_resume() {
     );
 }
 
+async fn fake_output(script: &Path, args: &[&str], wire: &str) -> Output {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_sa-replay-cli"))
+        .args(args)
+        .env("SA_REPLAY_SCRIPT", script)
+        .env("SA_REPLAY_RECEIPT", script.with_extension("receipt"))
+        .env_remove("SA_REPLAY_LIFETIME")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+    timeout(LIMIT, async {
+        input.write_all(wire.as_bytes()).await.unwrap();
+        drop(input);
+        child.wait_with_output().await.unwrap()
+    })
+    .await
+    .expect("fake CLI must finish")
+}
+
 #[tokio::test]
 async fn replay_binds_named_response_and_rejects_notification_with_id() {
     let dir = tempfile::tempdir().unwrap();
@@ -442,18 +464,6 @@ async fn replay_binds_named_response_and_rejects_notification_with_id() {
         if let Some(id) = id {
             cancel["id"] = id;
         }
-        let mut child = Command::new(env!("CARGO_BIN_EXE_sa-replay-cli"))
-            .arg("acp")
-            .env("SA_REPLAY_SCRIPT", &script)
-            .env("SA_REPLAY_RECEIPT", dir.path().join("receipt"))
-            .env_remove("SA_REPLAY_LIFETIME")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .unwrap();
-        let mut input = child.stdin.take().unwrap();
         let wire: String = [
             json!({"jsonrpc":"2.0","method":"session/prompt","id":1}),
             json!({"jsonrpc":"2.0","method":"session/prompt","id":2}),
@@ -463,13 +473,7 @@ async fn replay_binds_named_response_and_rejects_notification_with_id() {
         .iter()
         .map(|frame| format!("{frame}\n"))
         .collect();
-        let output = timeout(LIMIT, async {
-            input.write_all(wire.as_bytes()).await.unwrap();
-            drop(input);
-            child.wait_with_output().await.unwrap()
-        })
-        .await
-        .expect("fake CLI must finish");
+        let output = fake_output(&script, &["acp"], &wire).await;
         if has_id {
             assert_eq!(output.status.code(), Some(97));
             assert!(output.stdout.is_empty());
@@ -482,6 +486,112 @@ async fn replay_binds_named_response_and_rejects_notification_with_id() {
             assert_eq!(
                 frame,
                 json!({"jsonrpc":"2.0","id":2,"result":{"stopReason":"cancelled"}})
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn replay_requires_each_claude_stream_flag() {
+    let dir = tempfile::tempdir().unwrap();
+    let script = dir.path().join("claude.jsonl");
+    fs::write(&script, "{\"emit\":{\"type\":\"result\"}}\n").unwrap();
+
+    let good = [
+        "--input-format",
+        "stream-json",
+        "--output-format",
+        "stream-json",
+        "--include-partial-messages",
+    ];
+    let output = fake_output(&script, &good, "").await;
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output.stdout).unwrap(),
+        json!({"type":"result"})
+    );
+
+    for (args, required) in [
+        (&good[2..], "--input-format stream-json"),
+        (
+            &[
+                "--input-format",
+                "json",
+                "--output-format",
+                "stream-json",
+                "--include-partial-messages",
+            ][..],
+            "--input-format stream-json",
+        ),
+        (
+            &[
+                "--input-format",
+                "stream-json",
+                "--include-partial-messages",
+            ][..],
+            "--output-format stream-json",
+        ),
+        (
+            &[
+                "--input-format",
+                "stream-json",
+                "--output-format",
+                "json",
+                "--include-partial-messages",
+            ][..],
+            "--output-format stream-json",
+        ),
+        (&good[..4], "--include-partial-messages"),
+    ] {
+        let output = fake_output(&script, args, "").await;
+        assert_eq!(output.status.code(), Some(97), "{args:?}");
+        assert!(output.stdout.is_empty(), "{args:?}");
+        assert!(
+            String::from_utf8(output.stderr)
+                .unwrap()
+                .contains(&format!("expected {required}"))
+        );
+    }
+}
+
+#[tokio::test]
+async fn replay_requires_acp_bus_authorization_header() {
+    let dir = tempfile::tempdir().unwrap();
+    let script = dir.path().join("bus.jsonl");
+    let scenario = include_str!("fixtures/transcripts/antigravity/normal.jsonl");
+    let expect_new = scenario
+        .lines()
+        .find(|line| {
+            serde_json::from_str::<Value>(line).unwrap()["expect"]["method"] == "session/new"
+        })
+        .unwrap();
+    fs::write(&script, format!("{expect_new}\n")).unwrap();
+
+    for (headers, code) in [
+        (
+            Some(json!([{"name":"Authorization","value":"Bearer replay-fixture"}])),
+            0,
+        ),
+        (None, 97),
+        (Some(json!([])), 97),
+        (
+            Some(json!([{"name":"Authorization","value":"Bearer wrong-fixture"}])),
+            97,
+        ),
+    ] {
+        let mut server = json!({"type":"http","name":"sa_bus","url":"http://127.0.0.1:1/mcp"});
+        if let Some(headers) = headers {
+            server["headers"] = headers;
+        }
+        let frame = json!({"jsonrpc":"2.0","method":"session/new","id":1,
+            "params":{"cwd":".","mcpServers":[server]}});
+        let output = fake_output(&script, &["acp"], &format!("{frame}\n")).await;
+        assert_eq!(output.status.code(), Some(code), "{output:?}");
+        if code == 97 {
+            assert!(
+                String::from_utf8(output.stderr)
+                    .unwrap()
+                    .contains("received")
             );
         }
     }
