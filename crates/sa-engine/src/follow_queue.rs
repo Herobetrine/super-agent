@@ -75,10 +75,12 @@ pub(crate) fn submit(
     if state == "running"
         || (matches!(state, "queued" | "waiting")
             && q.exists(
-                "SELECT 1 WHERE NOT EXISTS
-                 (SELECT 1 FROM follow_queue_status WHERE job=?1 AND hold IS NOT NULL)
-                 AND (EXISTS(SELECT 1 FROM follow_queue_status WHERE job=?1 AND awaiting_admission=1)
-                      OR (?2='queued' AND EXISTS(SELECT 1 FROM follow_queue WHERE job=?1)))",
+                "SELECT 1 WHERE EXISTS(SELECT 1 FROM follow_queue_status WHERE job=?1
+                     AND (delivery_turn IS NOT NULL OR legacy_delivered=1) AND hold IS NULL)
+                 OR (EXISTS(SELECT 1 FROM follow_queue WHERE job=?1) AND
+                     (EXISTS(SELECT 1 FROM questions WHERE job=?1 AND origin='platform' AND state='pending')
+                      OR (?2='queued' AND NOT EXISTS(SELECT 1 FROM follow_queue_status
+                          WHERE job=?1 AND hold IS NOT NULL))))",
                 &[&job, &state],
             )?)
     {
@@ -93,7 +95,9 @@ pub(crate) fn submit(
         }
         Ok(FollowOutcome::Queued { id })
     } else {
-        let seq = send(q, ticket, root, body, resume, additions)?;
+        schedule(q, root, resume)?;
+        let seq = deliver(q, ticket, root, body, additions)?;
+        fresh_turn(q, job)?;
         if !additions.is_empty() {
             validate_manifests(q, job)?;
         }
@@ -163,7 +167,8 @@ fn project_files(
 // cumulative attachment set must never roll back a later, completed reply.
 fn validate_manifests(q: &Q, job: i64) -> Result<()> {
     let rows = q.all(
-        "SELECT manifest,state FROM follow_queue WHERE job=? AND manifest!='[]' ORDER BY position,id",
+        "SELECT manifest,state FROM follow_queue WHERE job=? AND manifest!='[]'
+         ORDER BY state='assigned' DESC,position,id",
         &[&job],
     )?;
     if !rows.is_empty() {
@@ -177,14 +182,8 @@ fn validate_manifests(q: &Q, job: i64) -> Result<()> {
     Ok(())
 }
 
-fn send(
-    q: &Q,
-    ticket: i64,
-    root: &Map<String, Value>,
-    body: &str,
-    resume: bool,
-    additions: &[Value],
-) -> Result<i64> {
+fn schedule(q: &Q, root: &Map<String, Value>, resume: bool) -> Result<()> {
+    let ticket = int_of(root, "ticket");
     let state = str_of(root, "state");
     let cont = q.exists("SELECT 1 FROM continuous_runs WHERE ticket=?", &[&ticket])?;
     if !cont && matches!(state, "interrupted" | "draining") {
@@ -193,6 +192,34 @@ fn send(
     if cont && state == "cancelled" && !resume {
         bail!("停止的工单需要明确恢复");
     }
+    let auto = q.exists(
+        "SELECT 1 FROM tickets WHERE id=? AND permission_profile='auto'",
+        &[&ticket],
+    )?;
+    if p::is_terminal(state)
+        || (auto && (state == "waiting" || (cont && matches!(state, "interrupted" | "draining"))))
+    {
+        q.run(
+            "UPDATE jobs SET state='queued',turn=turn+1,dispatch_turn=NULL WHERE id=?",
+            &[&int_of(root, "id")],
+        )?;
+    }
+    if cont {
+        q.run(
+            "UPDATE jobs SET ready_after=0 WHERE id=?",
+            &[&int_of(root, "id")],
+        )?;
+    }
+    Ok(())
+}
+
+fn deliver(
+    q: &Q,
+    ticket: i64,
+    root: &Map<String, Value>,
+    body: &str,
+    additions: &[Value],
+) -> Result<i64> {
     let id = int_of(root, "id");
     if !additions.is_empty() {
         let new_images = additions.iter().any(|file| {
@@ -213,34 +240,15 @@ fn send(
     }
     q.withdraw_question(who_of(root))?;
     let seq = q.log(who_of(root), "user.follow", &json!(body))?;
-    if cont {
-        q.run(
-            "UPDATE continuous_runs SET phase='work',probe=0,success=0,stalls=0,last_signal='',
+    q.run(
+        "UPDATE continuous_runs SET phase='work',probe=0,success=0,stalls=0,last_signal='',
   boundary_seq=? WHERE ticket=?",
-            &[&seq, &ticket],
-        )?;
-        q.run("UPDATE jobs SET ready_after=0 WHERE id=?", &[&id])?;
-    }
-    let auto = q
-        .one(
-            "SELECT permission_profile FROM tickets WHERE id=?",
-            &[&ticket],
-        )?
-        .is_some_and(|t| str_of(&t, "permission_profile") == "auto");
-    if auto {
-        q.run(
-            "UPDATE tickets SET auto_cycles=0,objective=? WHERE id=?",
-            &[&body, &ticket],
-        )?;
-    }
-    if p::is_terminal(state)
-        || (auto && (state == "waiting" || (cont && matches!(state, "interrupted" | "draining"))))
-    {
-        q.run(
-            "UPDATE jobs SET state='queued',turn=turn+1,dispatch_turn=NULL WHERE id=?",
-            &[&id],
-        )?;
-    }
+        &[&seq, &ticket],
+    )?;
+    q.run(
+        "UPDATE tickets SET auto_cycles=0,objective=? WHERE id=? AND permission_profile='auto'",
+        &[&body, &ticket],
+    )?;
     Ok(seq)
 }
 
@@ -327,17 +335,17 @@ impl Engine {
             let mut root = q.root(ticket)?;
             let job = int_of(&root, "id");
             let state = str_of(&root, "state");
-            if q.run(
-                "UPDATE follow_queue_status SET hold=NULL WHERE job=? AND hold IS NOT NULL",
-                &[&job],
-            )? == 0 {
-                return Ok(());
-            }
             if state == "cancelled"
                 && !confirmed_resume
                 && q.exists("SELECT 1 FROM continuous_runs WHERE ticket=?", &[&ticket])?
             {
                 return Err(ResumeConfirmationRequired.into());
+            }
+            if q.run(
+                "UPDATE follow_queue_status SET hold=NULL,release_on_admission=0 WHERE job=? AND hold IS NOT NULL",
+                &[&job],
+            )? == 0 {
+                return Ok(());
             }
             if state == "running"
                 || !q.exists(
@@ -362,7 +370,7 @@ impl Engine {
                 Self::retry_in(q, job)?;
                 root = q.root(ticket)?;
             }
-            consume(q, &root, true)
+            assign(q, &root, true)
         })
     }
 
@@ -377,11 +385,25 @@ impl Engine {
     }
 }
 
-fn consume(q: &Q, root: &Map<String, Value>, explicit_resume: bool) -> Result<()> {
+fn assign(q: &Q, root: &Map<String, Value>, explicit_resume: bool) -> Result<()> {
     let job = int_of(root, "id");
+    // A v2 journal may already have published the head before it was
+    // stopped. Resume that turn on its own; its successor is still queued.
+    if explicit_resume
+        && str_of(root, "state") == "cancelled"
+        && q.exists(
+            "SELECT 1 FROM follow_queue_status s JOIN jobs j ON j.id=s.job
+            WHERE s.job=? AND s.legacy_delivered=1 AND s.hold IS NULL
+            AND NOT EXISTS(SELECT 1 FROM ticket_pause p WHERE p.ticket=j.ticket)",
+            &[&job],
+        )?
+    {
+        return schedule(q, root, true);
+    }
     let Some(row) = q.one(
         "SELECT * FROM follow_queue WHERE job=?1 AND state='queued'
-        AND NOT EXISTS(SELECT 1 FROM follow_queue_status WHERE job=?1 AND hold IS NOT NULL)
+        AND NOT EXISTS(SELECT 1 FROM follow_queue_status WHERE job=?1
+            AND (hold IS NOT NULL OR delivery_turn IS NOT NULL OR legacy_delivered=1))
         AND NOT EXISTS(SELECT 1 FROM ticket_pause WHERE ticket=?2)
         AND NOT EXISTS(SELECT 1 FROM questions WHERE job=?1 AND origin='platform' AND state='pending')
         ORDER BY position,id LIMIT 1",
@@ -390,26 +412,81 @@ fn consume(q: &Q, root: &Map<String, Value>, explicit_resume: bool) -> Result<()
     else {
         return Ok(());
     };
-    let additions: Vec<Value> = serde_json::from_str(str_of(&row, "manifest"))?;
-    send(
-        q,
-        int_of(root, "ticket"),
-        root,
-        str_of(&row, "body"),
-        explicit_resume || int_of(&row, "resume") != 0,
-        &additions,
-    )?;
+    schedule(q, root, explicit_resume || int_of(&row, "resume") != 0)?;
     changed(q.run(
-        "DELETE FROM follow_queue WHERE id=? AND state='queued'",
+        "UPDATE follow_queue SET state='assigned' WHERE id=? AND state='queued'",
         &[&int_of(&row, "id")],
     )?)?;
-    // A second open before the upcoming admission must not fold in another item.
+    // An ordinary waiting parent keeps its child barrier. wake() increments
+    // its turn when that barrier clears, even if its own question is parked.
     q.run(
-        "INSERT INTO follow_queue_status(job,awaiting_admission) VALUES(?,1)
-        ON CONFLICT(job) DO UPDATE SET awaiting_admission=1",
+        "INSERT INTO follow_queue_status(job,delivery_turn)
+         SELECT id,turn+(state='waiting') FROM jobs WHERE id=?
+         ON CONFLICT(job) DO UPDATE SET delivery_turn=excluded.delivery_turn",
         &[&job],
     )?;
     Ok(())
+}
+
+pub(crate) fn fresh_turn(q: &Q, job: i64) -> Result<()> {
+    q.run(
+        "UPDATE follow_queue_status SET release_on_admission=1 WHERE job=? AND hold IS NOT NULL",
+        &[&job],
+    )?;
+    Ok(())
+}
+
+fn return_head(q: &Q, job: i64) -> Result<()> {
+    q.run("UPDATE follow_queue SET state='queued',position=CASE WHEN position>(SELECT min(position) FROM follow_queue WHERE job=?1)
+           THEN (SELECT min(position)-1 FROM follow_queue WHERE job=?1) ELSE position END
+           WHERE job=?1 AND state='assigned'", &[&job])?;
+    Ok(())
+}
+
+pub(crate) fn revoke_assignment(q: &Q, job: i64) -> Result<()> {
+    return_head(q, job)?;
+    q.run("UPDATE follow_queue_status SET delivery_turn=NULL WHERE job=? AND delivery_turn IS NOT NULL", &[&job])?;
+    Ok(())
+}
+
+/// Called after route, quota and workspace gates, before building the packet.
+pub(crate) fn admit(q: &Q, root: &Map<String, Value>) -> Result<bool> {
+    let job = int_of(root, "id");
+    let ticket = int_of(root, "ticket");
+    if !q.exists(
+        "SELECT 1 FROM follow_queue_status WHERE job=? AND
+        (delivery_turn IS NOT NULL OR release_on_admission=1 OR legacy_delivered=1)",
+        &[&job],
+    )? {
+        return Ok(false);
+    }
+    if q.exists("SELECT 1 FROM ticket_pause WHERE ticket=?", &[&ticket])? {
+        revoke_assignment(q, job)?;
+        return Ok(false);
+    }
+    q.run("UPDATE follow_queue_status SET hold=CASE WHEN release_on_admission=1 THEN NULL ELSE hold END,
+           release_on_admission=0,legacy_delivered=0 WHERE job=? AND (release_on_admission=1 OR legacy_delivered=1)", &[&job])?;
+    let Some(item) = q.one(
+        "SELECT f.* FROM follow_queue f JOIN follow_queue_status s ON s.job=f.job
+         WHERE f.job=? AND s.delivery_turn=? AND s.hold IS NULL AND f.state IN ('assigned','queued')
+         AND NOT EXISTS(SELECT 1 FROM questions WHERE job=f.job AND origin='platform' AND state='pending')
+         ORDER BY f.state='assigned' DESC,f.position,f.id LIMIT 1",
+        &[&job, &int_of(root, "turn")],
+    )? else {
+        revoke_assignment(q, job)?;
+        return Ok(false);
+    };
+    let files: Vec<Value> = serde_json::from_str(str_of(&item, "manifest"))?;
+    deliver(q, ticket, root, str_of(&item, "body"), &files)?;
+    changed(q.run(
+        "DELETE FROM follow_queue WHERE id=?",
+        &[&int_of(&item, "id")],
+    )?)?;
+    q.run(
+        "UPDATE follow_queue_status SET delivery_turn=NULL WHERE job=?",
+        &[&job],
+    )?;
+    Ok(true)
 }
 
 pub(crate) fn scheduling_resumed(q: &Q, root: &Map<String, Value>) -> Result<()> {
@@ -423,7 +500,7 @@ pub(crate) fn scheduling_resumed(q: &Q, root: &Map<String, Value>) -> Result<()>
             )?)
         || (state == "queued" && !root["dispatch_turn"].is_null())
         || q.exists(
-            "SELECT 1 FROM follow_queue_status WHERE job=? AND awaiting_admission=1",
+            "SELECT 1 FROM follow_queue_status WHERE job=? AND delivery_turn IS NOT NULL",
             &[&job],
         )?
     {
@@ -436,7 +513,7 @@ pub(crate) fn scheduling_resumed(q: &Q, root: &Map<String, Value>) -> Result<()>
             "SELECT 1 FROM follow_queue_status WHERE job=? AND hold IS NULL",
             &[&job],
         )?;
-    consume(q, root, released_stop)
+    assign(q, root, released_stop)
 }
 
 pub(crate) fn restore_steering(q: &Q, job: i64) -> Result<()> {
@@ -466,6 +543,7 @@ pub(crate) fn restore_steering(q: &Q, job: i64) -> Result<()> {
 }
 
 pub(crate) fn hold(q: &Q, job: i64, reason: HoldReason) -> Result<()> {
+    revoke_assignment(q, job)?;
     restore_steering(q, job)?;
     let reason = match reason {
         HoldReason::Stopped => "stopped",
@@ -473,8 +551,8 @@ pub(crate) fn hold(q: &Q, job: i64, reason: HoldReason) -> Result<()> {
         HoldReason::Interrupted => "interrupted",
     };
     q.run(
-        "INSERT INTO follow_queue_status(job,hold) VALUES(?,?)
-        ON CONFLICT(job) DO UPDATE SET hold=excluded.hold,resume_after_drain=0",
+        "INSERT INTO follow_queue_status(job,hold) SELECT ?1,?2 WHERE EXISTS(SELECT 1 FROM follow_queue WHERE job=?1)
+        ON CONFLICT(job) DO UPDATE SET hold=excluded.hold,resume_after_drain=0,release_on_admission=0",
         &[&job, &reason],
     )?;
     Ok(())
@@ -487,7 +565,7 @@ pub(crate) fn finish(q: &Q, ticket: i64) -> Result<()> {
         "failed" => hold(q, job, HoldReason::Failed),
         "cancelled" => hold(q, job, HoldReason::Stopped),
         "interrupted" => hold(q, job, HoldReason::Interrupted),
-        "queued" | "done" | "partial" | "waiting" => consume(q, &root, false),
+        "queued" | "done" | "partial" | "waiting" => assign(q, &root, false),
         _ => Ok(()),
     }
 }
@@ -499,13 +577,18 @@ pub(crate) fn drain_finished(q: &Q, ticket: i64) -> Result<()> {
         &[&int_of(&root, "id")],
     )? == 1
     {
-        consume(q, &root, false)
+        assign(q, &root, true)
     } else {
         hold(q, int_of(&root, "id"), HoldReason::Failed)
     }
 }
 
 pub(crate) fn recover(q: &Q) -> Result<()> {
+    // Keep the reserved business turn, but make the head editable again.
+    // Admission will pick the current head if the operator edits the queue.
+    for item in q.all("SELECT job FROM follow_queue WHERE state='assigned'", &[])? {
+        return_head(q, int_of(&item, "job"))?;
+    }
     for row in q.all(
         "SELECT DISTINCT job FROM follow_queue WHERE state='steering'",
         &[],
@@ -519,7 +602,7 @@ pub(crate) fn recover(q: &Q) -> Result<()> {
         WHERE j.parent IS NULL AND j.state NOT IN ('running','draining')
         AND NOT EXISTS(SELECT 1 FROM ticket_pause WHERE ticket=j.ticket)
         AND (j.state!='queued' OR j.dispatch_turn IS NULL)
-        AND s.hold IS NULL AND coalesce(s.awaiting_admission,0)=0
+        AND s.hold IS NULL AND s.delivery_turn IS NULL AND coalesce(s.legacy_delivered,0)=0
         AND j.id IN (SELECT job FROM follow_queue)",
         &[],
     )? {
@@ -540,7 +623,7 @@ pub(crate) fn recover(q: &Q) -> Result<()> {
             {
                 hold(q, job, HoldReason::Stopped)?;
             }
-            _ => consume(q, &root, false)?,
+            _ => assign(q, &root, false)?,
         }
     }
     Ok(())

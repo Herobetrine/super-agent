@@ -150,17 +150,88 @@ async fn queued_business_instruction_waits_through_the_handoff_summary() {
         0
     );
     fx.engine.resume_paused(t).unwrap();
+    fx.finish(t, "done").await;
     assert_eq!(fx.int("SELECT count(*) FROM follow_queue"), 0);
     assert_eq!(
         fx.int("SELECT count(*) FROM events WHERE kind='user.follow'"),
         1
     );
-    fx.finish(t, "done").await;
     assert_eq!(
         fx.shared
             .count(|call| call.packet["depth"] == 0 && call.packet["turn"] == 3),
         1
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn handoff_requested_after_assignment_returns_head_before_summary_admission() {
+    let gate = Gate::new();
+    let fx = Fx::new(
+        script({
+            let gate = gate.clone();
+            move |c| {
+                let gate = gate.clone();
+                async move {
+                    let packet = c.full_packet();
+                    match c.turn() {
+                        1 => gate.wait().await,
+                        2 => {
+                            assert_eq!(packet["pause_after_handoff"]["consolidation"], true);
+                            assert_eq!(packet["user_updates"], json!([]));
+                        }
+                        3 => assert_eq!(packet["user_updates"], json!(["business only"])),
+                        turn => panic!("unexpected turn {turn}"),
+                    }
+                    Ok("done".into())
+                }
+            }
+        }),
+        t1_catalog(),
+    );
+    let t = fx.begin(fx.params()).await;
+    fx.until(|| fx.shared.count(|_| true) == 1).await;
+    fx.engine.follow(t, "business only", false).unwrap();
+    fx.engine
+        .db()
+        .tx(|q| {
+            q.run(
+                "UPDATE jobs SET ready_after=4102444800 WHERE ticket=?",
+                &[&t],
+            )
+        })
+        .unwrap();
+    gate.open();
+    fx.until(|| root_state(&fx.engine, t) == "queued").await;
+    assert_eq!(
+        fx.int("SELECT count(*) FROM follow_queue WHERE state='assigned'"),
+        1
+    );
+    fx.engine.request_pause_after_handoff(t).unwrap();
+    assert_eq!(
+        fx.int("SELECT count(*) FROM follow_queue WHERE state='queued'"),
+        1
+    );
+    fx.engine
+        .db()
+        .tx(|q| q.run("UPDATE jobs SET ready_after=0 WHERE ticket=?", &[&t]))
+        .unwrap();
+    fx.until(|| fx.engine.pause_status(t).unwrap() == PauseStatus::Paused)
+        .await;
+    assert_eq!(
+        fx.int("SELECT count(*) FROM events WHERE kind='user.follow'"),
+        0
+    );
+    assert_eq!(
+        fx.int("SELECT count(*) FROM follow_queue WHERE state='queued'"),
+        1
+    );
+    fx.engine.resume_paused(t).unwrap();
+    fx.finish(t, "done").await;
+    assert_eq!(
+        fx.int("SELECT count(*) FROM events WHERE kind='user.follow' AND turn=3"),
+        1
+    );
+    assert_eq!(fx.shared.count(|_| true), 3);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

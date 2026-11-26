@@ -164,6 +164,11 @@ const MIGRATIONS: &[Migration] = &[
         needs_snapshot: true,
         apply: crate::follow_queue::migrate,
     },
+    Migration {
+        to: 3,
+        needs_snapshot: true,
+        apply: crate::follow_queue::migrate_assignments,
+    },
 ];
 
 fn open_with_migrations(dir: &Path, migrations: &[Migration]) -> Result<Connection> {

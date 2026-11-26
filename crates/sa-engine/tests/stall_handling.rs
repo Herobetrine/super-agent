@@ -98,6 +98,18 @@ async fn queued_follow_cannot_answer_the_platform_continue_or_stop_question() {
     assert_eq!(fx.engine.questions(ticket).unwrap(), questions);
     assert_eq!(root_state(&fx.engine, ticket), "waiting");
     assert_eq!(fx.int("SELECT count(*) FROM follow_queue"), 1);
+    assert!(matches!(
+        fx.engine.follow(ticket, "behind A", false).unwrap(),
+        sa_engine::FollowOutcome::Queued { .. }
+    ));
+    assert_eq!(fx.engine.questions(ticket).unwrap(), questions);
+    assert_eq!(
+        fx.all("SELECT body FROM follow_queue ORDER BY position,id")
+            .iter()
+            .map(|row| row["body"].clone())
+            .collect::<Vec<_>>(),
+        [json!("later work"), json!("behind A")]
+    );
     assert_eq!(
         fx.int("SELECT count(*) FROM events WHERE kind='user.follow'"),
         0
@@ -106,7 +118,7 @@ async fn queued_follow_cannot_answer_the_platform_continue_or_stop_question() {
         .answer(questions[0]["id"].as_i64().unwrap(), "停止")
         .unwrap();
     assert_eq!(root_state(&fx.engine, ticket), "cancelled");
-    assert_eq!(fx.int("SELECT count(*) FROM follow_queue"), 1);
+    assert_eq!(fx.int("SELECT count(*) FROM follow_queue"), 2);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

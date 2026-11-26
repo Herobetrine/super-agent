@@ -1130,6 +1130,7 @@ impl Engine {
             "UPDATE jobs SET state='queued',ready_after=0 WHERE id=?",
             &[&id],
         )?;
+        if job["parent"].is_null() { follow_queue::fresh_turn(q, id)?; }
         q.log(
             who_of(&job),
             "retry",
@@ -2039,13 +2040,12 @@ impl Inner {
                         "reason": if reserve { "quota_reserve" } else { "quota_window" }, "window": kind}))?;
                     continue;
                 }
+                if job.is_root() && follow_queue::admit(q, &row)? {
+                    job.auto_cycles = 0;
+                }
                 if job.auto_root() {
                     if !job.continuous && job.auto_cycles >= 64 {
-                        let state = if q.pending_children(job.id)? { "draining" } else { "failed" };
-                        q.run("UPDATE jobs SET state=?,result=? WHERE id=?", &[&state, &BUDGET_REASON, &job.id])?;
-                        if p::is_terminal(state) { q.withdraw_question(job.who())?; }
-                        q.log(job.who(), state, &json!(BUDGET_REASON))?;
-                        if state == "failed" { follow_queue::hold(q, job.id, sa_store::HoldReason::Failed)?; }
+                        self.give_up(q, &job, BUDGET_REASON)?;
                         continue;
                     }
                     q.run("UPDATE tickets SET auto_cycles=auto_cycles+1 WHERE id=?", &[&job.ticket])?;
@@ -2073,9 +2073,6 @@ impl Inner {
                 }
                 q.run("UPDATE jobs SET state='running' WHERE id=?", &[&job.id])?;
                 job.admission = q.log(job.who(), "turn.admitted", &json!({}))?;
-                if job.is_root() {
-                    q.run("UPDATE follow_queue_status SET awaiting_admission=0 WHERE job=? AND awaiting_admission=1", &[&job.id])?;
-                }
                 q.run(
                     "UPDATE mailbox SET consumed_turn=? WHERE target=? AND consumed_turn IS NULL",
                     &[&job.turn, &job.id],
@@ -3519,7 +3516,7 @@ impl Inner {
         q.run("UPDATE jobs SET state=?,result=? WHERE id=?", &[&state, &reason, &job.id])?;
         if p::is_terminal(state) { q.withdraw_question(job.who())?; }
         q.log(job.who(), state, &json!(reason))?;
-        if job.is_root() && state == "failed" { follow_queue::hold(q, job.id, sa_store::HoldReason::Failed)?; }
+        if job.is_root() { follow_queue::hold(q, job.id, sa_store::HoldReason::Failed)?; }
         Ok(())
     }
 

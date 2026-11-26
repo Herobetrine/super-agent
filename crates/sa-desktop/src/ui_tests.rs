@@ -278,7 +278,7 @@ fn follow_queue_strip_deletes_and_resumes_the_selected_ticket() {
     h.run_steps(3);
     assert!(h.query_by_label("追加队列已暂停 · 1 条（工单已停止）").is_some());
     writer.execute_batch(
-        "CREATE TRIGGER refuse_resume BEFORE DELETE ON follow_queue
+        "CREATE TRIGGER refuse_resume BEFORE UPDATE OF state ON follow_queue WHEN NEW.state='assigned'
          BEGIN SELECT RAISE(ABORT,'测试恢复失败'); END; BEGIN IMMEDIATE",
     ).unwrap();
     h.get_by_role_and_label(Role::Button, "继续发送").click();

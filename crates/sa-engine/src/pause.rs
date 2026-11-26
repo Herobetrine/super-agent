@@ -71,6 +71,7 @@ pub(crate) fn request(q: &Q, ticket: i64) -> Result<PauseStatus> {
     } else {
         ("paused", false)
     };
+    crate::follow_queue::revoke_assignment(q, int_of(&root, "id"))?;
     set(q, &root, phase, consolidation, "ticket.pause_requested")?;
     if state == "queued" && queued_recovery(q, &root)? {
         settle_failure(q, &root, "暂停请求终止已排队的恢复尝试。")?;

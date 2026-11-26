@@ -41,7 +41,7 @@ fn follow_queue_upgrade_snapshots_the_v1_journal_once() {
         "SELECT count(*) FROM sqlite_schema WHERE type='table' AND name IN ('follow_queue','follow_queue_status')",
         [], |row| row.get::<_, i64>(0),
     ).unwrap();
-    let upgraded = open_journal(dir.path()).unwrap();
+    let upgraded = open_with_migrations(dir.path(), &super::MIGRATIONS[..2]).unwrap();
     assert_eq!(tables(&upgraded), 2);
     assert_eq!(value(&upgraded), 42);
     let (path, _) = backup::latest_snapshot(dir.path()).unwrap();
@@ -50,8 +50,49 @@ fn follow_queue_upgrade_snapshots_the_v1_journal_once() {
     assert_eq!(value(&saved), 42);
     assert_eq!(tables(&saved), 0);
     drop(upgraded);
-    assert_eq!(tables(&open_journal(dir.path()).unwrap()), 2);
+    assert_eq!(tables(&open_with_migrations(dir.path(), &super::MIGRATIONS[..2]).unwrap()), 2);
     assert_eq!(backup::latest_snapshot(dir.path()).unwrap().0, path);
+}
+
+#[test]
+fn assignment_upgrade_preserves_queue_ids_and_snapshots_v2() {
+    let dir = tempfile::tempdir().unwrap();
+    let old = open_with_migrations(dir.path(), &super::MIGRATIONS[..2]).unwrap();
+    old.execute_batch("INSERT INTO tickets(id,goal,cwd,writes,lead,created) VALUES(1,'g','.',0,'codex',0);
+        INSERT INTO jobs(id,ticket,agent,body,writing,depth,state) VALUES(1,1,'codex','g',0,0,'draining');
+        INSERT INTO follow_queue(ticket,job,position,body,manifest,resume,state)
+        VALUES(1,1,1,'A','[]',0,'queued'),(1,1,2,'B','[]',0,'queued');
+        DELETE FROM follow_queue WHERE id=2;").unwrap();
+    drop(old);
+    let current = open_journal(dir.path()).unwrap();
+    assert_eq!(current.query_row("SELECT hold FROM follow_queue_status WHERE job=1", [],
+        |r| r.get::<_,String>(0)).unwrap(), "failed");
+    let (path, _) = backup::latest_snapshot(dir.path()).unwrap();
+    let saved =
+        Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+    assert_eq!(
+        saved
+            .pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
+            .unwrap(),
+        2
+    );
+    assert_eq!(
+        current
+            .execute(
+                "UPDATE follow_queue SET state='assigned' WHERE id=1 AND body='A'",
+                []
+            )
+            .unwrap(),
+        1
+    );
+    current
+        .execute(
+            "INSERT INTO follow_queue(ticket,job,position,body,manifest,resume,state)
+        VALUES(1,1,2,'C','[]',0,'queued')",
+            [],
+        )
+        .unwrap();
+    assert_eq!(current.last_insert_rowid(), 3);
 }
 
 #[test]

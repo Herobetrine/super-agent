@@ -61,6 +61,15 @@ async fn image_follow_replaces_images_updates_text_and_survives_reopen() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn delivered_image_keeps_its_turn_when_another_follow_arrives_before_admission() {
+    assigned_images(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stop_and_resume_between_assignment_and_admission_preserves_both_image_turns() {
+    assigned_images(true).await;
+}
+
+async fn assigned_images(stop_before_admission: bool) {
     let gate = Gate::new();
     let fx = Fx::new(
         script({
@@ -72,10 +81,11 @@ async fn delivered_image_keeps_its_turn_when_another_follow_arrives_before_admis
                         gate.wait().await;
                     } else {
                         assert_eq!(c.req.images.len(), 1);
-                        if c.turn() == 2 {
+                        let first_business_turn = if stop_before_admission { 3 } else { 2 };
+                        if c.turn() == first_business_turn {
                             assert_eq!(c.full_packet()["user_updates"], json!(["A"]));
                         } else {
-                            assert_eq!(c.turn(), 3);
+                            assert_eq!(c.turn(), first_business_turn + 1);
                             assert_eq!(c.full_packet()["user_updates"], json!(["A", "B"]));
                         }
                     }
@@ -89,14 +99,11 @@ async fn delivered_image_keeps_its_turn_when_another_follow_arrives_before_admis
     let b = write_image(&fx.project, "b.png", image::ImageFormat::Png, 4);
     let t = fx.begin(fx.params()).await;
     fx.until(|| fx.shared.count(|_| true) == 1).await;
-    assert!(matches!(
-        fx.engine
-            .follow_with_files(t, "A", false, &["a.png".into()])
-            .await
-            .unwrap(),
-        sa_engine::FollowOutcome::Queued { .. }
-    ));
-    // Delay admission, but let the first reply and its queue delivery commit.
+    let sa_engine::FollowOutcome::Queued { id: a_id } = fx.engine
+        .follow_with_files(t, "A", false, &["a.png".into()]).await.unwrap() else {
+        panic!("A must queue during the active turn");
+    };
+    // Delay admission while allowing the first reply and assignment to commit.
     fx.engine
         .db()
         .tx(|q| {
@@ -108,18 +115,40 @@ async fn delivered_image_keeps_its_turn_when_another_follow_arrives_before_admis
         .unwrap();
     gate.open();
     fx.until(|| root_state(&fx.engine, t) == "queued").await;
-    assert_eq!(fx.int("SELECT count(*) FROM follow_queue"), 0);
+    assert!(fx.engine.delete_queued(t, a_id).unwrap_err().is::<sa_engine::NotQueued>());
     assert_eq!(
-        fx.int("SELECT count(*) FROM events WHERE kind='user.follow'"),
+        fx.int("SELECT count(*) FROM follow_queue WHERE state='assigned'"),
         1
     );
-    assert!(matches!(
-        fx.engine
-            .follow_with_files(t, "B", false, &["b.png".into()])
-            .await
-            .unwrap(),
-        sa_engine::FollowOutcome::Queued { .. }
-    ));
+    assert_eq!(
+        fx.int("SELECT count(*) FROM events WHERE kind='user.follow'"),
+        0
+    );
+    let sa_engine::FollowOutcome::Queued { id: b_id } = fx.engine
+        .follow_with_files(t, "B", false, &["b.png".into()]).await.unwrap() else {
+        panic!("B must wait for its own turn");
+    };
+    if stop_before_admission {
+        assert_eq!(fx.engine.promote_queued(t,b_id).unwrap(),sa_engine::Promotion::NextTurn);
+        fx.engine.cancel(t).unwrap();
+        assert_eq!(
+            fx.int("SELECT count(*) FROM follow_queue WHERE state='queued'"),
+            2
+        );
+        assert_eq!(
+            fx.int("SELECT count(*) FROM job_files WHERE manifest!='[]'"),
+            0
+        );
+        assert_eq!(
+            fx.int("SELECT count(*) FROM events WHERE kind='user.follow'"),
+            0
+        );
+        fx.engine.resume_queue(t, false).unwrap();
+        assert_eq!(
+            fx.int("SELECT count(*) FROM follow_queue WHERE state='assigned' AND body='A'"),
+            1
+        );
+    }
     fx.engine
         .db()
         .tx(|q| q.run("UPDATE jobs SET ready_after=0 WHERE ticket=?", &[&t]))

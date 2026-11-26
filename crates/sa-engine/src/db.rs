@@ -323,7 +323,10 @@ impl Q<'_> {
     pub fn interrupt(&self, who: Who, ticket_profile: &str) -> Result<()> {
         let root = self.exists("SELECT 1 FROM jobs WHERE id=? AND parent IS NULL", &[&who.id])?;
         if ticket_profile == "auto" {
-            if root { crate::follow_queue::restore_steering(self, who.id)?; }
+            if root {
+                crate::follow_queue::revoke_assignment(self, who.id)?;
+                crate::follow_queue::restore_steering(self, who.id)?;
+            }
             self.run(
                 "UPDATE jobs SET state='queued',dispatch_turn=coalesce(dispatch_turn,turn),turn=turn+1,result=? WHERE id=?",
                 &[&INTERRUPT_REASON, &who.id],
@@ -649,7 +652,8 @@ impl Q<'_> {
             format!("NOT EXISTS(SELECT 1 FROM jobs c WHERE c.parent=p.id AND c.state NOT IN {END_SQL})");
         self.run(
             &format!(
-                "UPDATE jobs AS p SET state='queued',turn=turn+1 WHERE state='waiting' AND (({settled} AND NOT EXISTS(SELECT 1 FROM questions a WHERE a.job=p.id AND a.state='pending' AND a.parked=1)) OR EXISTS(SELECT 1 FROM mailbox m JOIN events e ON e.seq=m.seq WHERE m.target=p.id AND m.consumed_turn IS NULL
+                "UPDATE jobs AS p SET state='queued',turn=turn+1 WHERE state='waiting' AND (({settled} AND NOT EXISTS(SELECT 1 FROM questions a WHERE a.job=p.id AND a.state='pending' AND a.parked=1
+                    AND (a.origin='platform' OR NOT EXISTS(SELECT 1 FROM follow_queue_status s WHERE s.job=p.id AND s.delivery_turn=p.turn+1)))) OR EXISTS(SELECT 1 FROM mailbox m JOIN events e ON e.seq=m.seq WHERE m.target=p.id AND m.consumed_turn IS NULL
             AND (NOT EXISTS(SELECT 1 FROM questions a WHERE a.job=p.id AND a.state='pending' AND a.origin='platform' AND a.parked=1)
               OR (m.source IS NULL AND json_extract(e.payload,'$.sender')='user'))))"
             ),
