@@ -810,7 +810,9 @@ async fn run(
                 .collect(),
             trusted_sandbox: true,
         };
-        return crate::acp::run_server(env, req, host, emit, cancel, server, Some(timing)).await;
+        return crate::acp::run_server(
+            env, req, host, emit, cancel, server, crate::acp::ServerDiscovery::Antigravity(timing),
+        ).await;
     }
     let mut args: Vec<String> = [
         "--input-format",
@@ -854,12 +856,16 @@ async fn run(
     );
     let spawning = Instant::now();
     let mut proc = start(exe, &args, &req.cwd, &env)?;
-    let timing = timing.spawned(spawning);
+    let mut timing = Some(timing.spawned(spawning));
     let mut last: Option<Value> = None;
     let mut session = req.session_id.clone();
     let mut open_tools: HashSet<String> = HashSet::new();
-    timing.emit(&emit);
     let streamed = stream(&mut proc, &input, &cancel, |e| {
+        // Text turns have no ACP handshake. Their first native frame is the
+        // observable startup boundary for the stream-json transport.
+        if let Some(timing) = timing.take() {
+            timing.emit(&emit);
+        }
         emit.journal("native", e.clone());
         if e["event"] == json!("init")
             && let Some(id) = e["conversation_id"].as_str()
@@ -1124,6 +1130,13 @@ int main(int argc, char **argv) {
         if (base && (!getenv("GOOGLE_GEMINI_BASE_URL") || strcmp(base, getenv("GOOGLE_GEMINI_BASE_URL")))) return 4;
         char input[8192];
         while (fgets(input, sizeof(input), stdin)) {}
+        if (getenv("FAKE_AGY_DELAY_INIT")) {
+#ifdef _WIN32
+            Sleep(200);
+#else
+            usleep(200000);
+#endif
+        }
         puts("{\"event\":\"init\",\"conversation_id\":\"fixture-session\"}");
         const char *gate = getenv("FAKE_AGY_RUN_GATE");
         if (gate) {

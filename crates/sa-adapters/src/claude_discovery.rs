@@ -472,6 +472,49 @@ async fn aggregation_mode_routes_default_and_prefixed_member_models() {
 }
 
 #[tokio::test]
+async fn failed_stack_member_is_only_retried_when_the_gateway_route_needs_it() {
+    let fixture = Fixture::new();
+    let default = HttpFixture::new(None, false);
+    let failed = HttpFixture::new(None, true);
+    let listener = HttpFixture::new(None, false);
+    for endpoint in [&default, &failed, &listener] {
+        endpoint.release();
+    }
+    fixture.row("default", "claude", config(&default.base, "ANTHROPIC_API_KEY", "default"), "");
+    fixture.row("other", "claude", config(&failed.base, "ANTHROPIC_API_KEY", "other"), "");
+    fixture.proxy(
+        &listener.base,
+        json!({"mode":"proxy","proxy_route":"default","stack":{
+            "enabled":true,"members":["default","other"],"keys":{"other":"other"}
+        }}),
+    );
+    let provider = configured_record(
+        "cc-switch",
+        "claude-proxy",
+        "CC Switch 路由",
+        &config(&listener.base, "ANTHROPIC_AUTH_TOKEN", "PROXY_MANAGED"),
+    ).id();
+    let cancel = CancellationToken::new();
+    let cache = ProbeCache::new(None);
+    let key = probe_key(&fixture.sys, None, &[]);
+    for (model, expected) in [("key-default", 1), ("key-default", 1), ("ccs-claude-other--key-other", 2)] {
+        let route = Route {
+            provider: provider.clone(),
+            model: model.into(),
+            mode: "cli".into(),
+            reasoning_effort: None,
+        };
+        let probes = Probes::new(&cache, &key, true);
+        discover_with(&fixture.sys, None, &cancel, true, Some(&probes), Some(&route))
+            .await
+            .unwrap();
+        assert_eq!(failed.count(), expected);
+        assert_eq!(default.count(), 1);
+        assert_eq!(listener.count(), 1);
+    }
+}
+
+#[tokio::test]
 async fn routing_mode_without_native_pointer_adds_listener_source() {
     let fixture = Fixture::new();
     let members = HttpFixture::new(None, false);
