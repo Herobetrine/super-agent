@@ -59,6 +59,7 @@ pub(crate) struct Cards {
 
 impl Cards {
     pub(crate) fn push(&mut self, notice: Notice, title: Option<String>, now: Instant) {
+        self.remove_ticket(notice.ticket);
         self.next_id += 1;
         self.cards.insert(
             0,
