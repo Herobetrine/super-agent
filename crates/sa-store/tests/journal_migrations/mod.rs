@@ -151,6 +151,7 @@ fn failed_step_rolls_back_and_leaves_the_pre_step_snapshot_and_marker() {
         snapshot,
         from: 1,
         to: 2,
+        ..
     }) = error.downcast_ref::<JournalError>()
     else {
         panic!("{error:#}");

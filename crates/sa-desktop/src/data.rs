@@ -6,6 +6,7 @@
 
 use anyhow::{Result, bail};
 use sa_store::{DB_FILE, JobsPage, Snapshot, Store, TicketSummary};
+use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -38,6 +39,7 @@ pub type Opener = Box<dyn Fn() -> Result<Box<dyn DataSource>> + Send>;
 /// The ticket journal, opened read-only next to the running scheduler.
 pub struct StoreSource {
     store: Store,
+    _reader_lock: Option<File>,
     dir: PathBuf,
 }
 
@@ -47,10 +49,12 @@ impl StoreSource {
         if !db.is_file() {
             bail!("未找到工单数据库：{}", db.display());
         }
+        let reader_lock = sa_store::journal::lock_journal_reader(dir)?;
         let store = Store::open_read_only(dir)
             .map_err(|e| anyhow::anyhow!("无法以只读方式打开工单数据库：{e:#}"))?;
         Ok(Self {
             store,
+            _reader_lock: reader_lock,
             dir: dir.to_path_buf(),
         })
     }

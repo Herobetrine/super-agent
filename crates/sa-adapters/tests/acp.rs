@@ -118,7 +118,10 @@ async fn actual_stdio_new_load_stream_permission_and_model_selection() {
     assert_eq!(two.text, "精确结果\n");
     assert_eq!(two.session_id, out.session_id);
     let wire = std::fs::read_to_string(dir.path().join("wire.jsonl")).unwrap();
-    assert!(wire.contains("session/load"));
+    assert_eq!(
+        wire.lines().filter(|line| line.contains("\"method\":\"session/load\"")).count(),
+        1
+    );
     assert!(wire.contains("session/set_config_option"));
     assert!(wire.contains("\"optionId\":\"once\""));
     assert!(!wire.contains("\"optionId\":\"always\""));

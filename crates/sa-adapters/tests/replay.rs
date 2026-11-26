@@ -69,6 +69,14 @@ impl Harness {
         }
     }
 
+    fn cold_probes(self) -> &'static str {
+        match self {
+            Self::Codex => "probe:codex-models\n",
+            Self::Claude => "probe:claude-auth\nprobe:claude-initialize\n",
+            Self::Antigravity => "probe:agy-models\n",
+        }
+    }
+
     fn session(self) -> &'static str {
         match self {
             Self::Codex => "00000000-0000-4000-8000-000000000001",
@@ -181,7 +189,14 @@ impl Replay {
     }
 }
 
-async fn replay(harness: Harness, scenario: &str) -> Replay {
+struct ReplayFixture {
+    harness: Harness,
+    dir: tempfile::TempDir,
+    adapter: Box<dyn Adapter>,
+    listener: Option<TcpListener>,
+}
+
+async fn replay_fixture(harness: Harness, cancels: bool) -> ReplayFixture {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     let exe = root.join(format!(
@@ -190,9 +205,9 @@ async fn replay(harness: Harness, scenario: &str) -> Replay {
         std::env::consts::EXE_SUFFIX
     ));
     fs::copy(env!("CARGO_BIN_EXE_sa-replay-cli"), exe).unwrap();
-    let script = transcripts()
-        .join(harness.agent())
-        .join(format!("{scenario}.jsonl"));
+    // The transcript path stays fixed across turns so the environment in
+    // the probe cache key stays identical.
+    let script = root.join("replay.jsonl");
     let receipt = root.join("replay-receipt");
     let mut sys = Sys::new(vec![], root.to_owned(), root.to_owned());
     for key in ["SystemRoot", "WINDIR"] {
@@ -210,7 +225,7 @@ async fn replay(harness: Harness, scenario: &str) -> Replay {
     );
     sys.set("SA_REPLAY_SCRIPT", script.to_string_lossy());
     sys.set("SA_REPLAY_RECEIPT", receipt.to_string_lossy());
-    let listener = if scenario == "cancel" {
+    let listener = if cancels {
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         sys.set(
             "SA_REPLAY_LIFETIME",
@@ -220,11 +235,33 @@ async fn replay(harness: Harness, scenario: &str) -> Replay {
     } else {
         None
     };
+    ReplayFixture {
+        harness,
+        dir,
+        adapter: harness.adapter(sys),
+        listener,
+    }
+}
 
+async fn replay(harness: Harness, scenario: &str) -> Replay {
+    let fixture = replay_fixture(harness, scenario == "cancel").await;
+    replay_turn(&fixture, scenario, false).await
+}
+
+async fn replay_turn(fixture: &ReplayFixture, scenario: &str, warm: bool) -> Replay {
+    let harness = fixture.harness;
+    let root = fixture.dir.path();
+    let script = transcripts()
+        .join(harness.agent())
+        .join(format!("{scenario}.jsonl"));
+    let receipt = root.join("replay-receipt");
+    fs::copy(&script, root.join("replay.jsonl")).unwrap();
+    fs::write(&receipt, "").unwrap();
+    let listener = fixture.listener.as_ref();
     let req = RunRequest {
         ticket: 1,
         job: 1,
-        turn: 1,
+        turn: if warm { 2 } else { 1 },
         agent: harness.agent().into(),
         prompt: PROMPT.into(),
         images: vec![],
@@ -241,9 +278,7 @@ async fn replay(harness: Harness, scenario: &str) -> Replay {
     };
     let cancel = CancellationToken::new();
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let run = harness
-        .adapter(sys)
-        .run(req, Arc::new(Host), tx, cancel.clone());
+    let run = fixture.adapter.run(req, Arc::new(Host), tx, cancel.clone());
     let mut events = Vec::new();
     let result = timeout(LIMIT, async {
         tokio::pin!(run);
@@ -269,7 +304,7 @@ async fn replay(harness: Harness, scenario: &str) -> Replay {
 
     // The adapter can redact stderr or translate a peer failure into its own
     // error. Independently require every expected outbound frame to match.
-    let expected_receipt: String = fs::read_to_string(&script)
+    let expected_frames: String = fs::read_to_string(&script)
         .unwrap()
         .lines()
         .enumerate()
@@ -282,13 +317,15 @@ async fn replay(harness: Harness, scenario: &str) -> Replay {
             }
         })
         .collect();
+    let expected_probes = if warm { "" } else { harness.cold_probes() };
+    let expected_receipt = format!("{expected_probes}{expected_frames}");
     let actual_receipt = fs::read_to_string(receipt)
         .unwrap_or_default()
         .replace("\r\n", "\n");
     assert_eq!(
         actual_receipt,
         expected_receipt,
-        "{} outbound transcript diverged. Adapter result: {result:?}",
+        "{} probe invocations or outbound transcript diverged. Adapter result: {result:?}",
         script.display(),
     );
     let result = result.unwrap_or_else(|_| panic!("{} timed out", script.display()));
@@ -317,24 +354,28 @@ async fn replay(harness: Harness, scenario: &str) -> Replay {
 #[tokio::test]
 async fn codex_normal() {
     let harness = Harness::Codex;
-    let replay = replay(harness, "normal").await;
-    replay.assert_success(harness, "Codex fixture result.\n", "command-1", "ok");
-    let startup: Vec<_> = replay
-        .native()
-        .filter_map(|frame| match frame["method"].as_str() {
-            method
-            @ Some("thread/started" | "mcpServer/startupStatus/updated" | "turn/started") => method,
-            _ => None,
-        })
-        .collect();
-    assert_eq!(
-        startup,
-        [
-            "thread/started",
-            "mcpServer/startupStatus/updated",
-            "turn/started"
-        ]
-    );
+    let fixture = replay_fixture(harness, false).await;
+    for warm in [false, true] {
+        let replay = replay_turn(&fixture, "normal", warm).await;
+        replay.assert_success(harness, "Codex fixture result.\n", "command-1", "ok");
+        let startup: Vec<_> = replay
+            .native()
+            .filter_map(|frame| match frame["method"].as_str() {
+                method @ Some(
+                    "thread/started" | "mcpServer/startupStatus/updated" | "turn/started",
+                ) => method,
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            startup,
+            [
+                "thread/started",
+                "mcpServer/startupStatus/updated",
+                "turn/started"
+            ]
+        );
+    }
 }
 
 #[tokio::test]
@@ -359,12 +400,15 @@ async fn codex_cancel() {
 #[tokio::test]
 async fn claude_normal() {
     let harness = Harness::Claude;
-    replay(harness, "normal").await.assert_success(
-        harness,
-        "Claude fixture result.\n",
-        "tool-1",
-        "ok",
-    );
+    let fixture = replay_fixture(harness, false).await;
+    for warm in [false, true] {
+        replay_turn(&fixture, "normal", warm).await.assert_success(
+            harness,
+            "Claude fixture result.\n",
+            "tool-1",
+            "ok",
+        );
+    }
 }
 
 #[tokio::test]
@@ -413,7 +457,14 @@ async fn antigravity_cancel() {
 #[tokio::test]
 async fn antigravity_resume() {
     let harness = Harness::Antigravity;
-    replay(harness, "resume").await.assert_success(
+    let fixture = replay_fixture(harness, false).await;
+    replay_turn(&fixture, "normal", false).await.assert_success(
+        harness,
+        "Gemini fixture result.\n",
+        "tool-1",
+        "ok",
+    );
+    replay_turn(&fixture, "resume", true).await.assert_success(
         harness,
         "Gemini resumed result.\n",
         "tool-1",

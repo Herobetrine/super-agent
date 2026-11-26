@@ -18,23 +18,40 @@ use std::{
 #[path = "journal_backup.rs"]
 mod backup;
 
+pub use backup::{
+    JournalObservation, PendingRestore, RestoreError, RestorePlan, Restored, SnapshotCheck,
+    check_restore_plan, continue_restore, journal_busy, lock_journal_reader, put_back_originals,
+    restore_backup_stamp, restore_from_snapshot, restore_from_snapshot_at, restore_plan,
+};
+
 #[cfg(test)]
 #[path = "../tests/journal_migrations/mod.rs"]
 mod migration_tests;
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum JournalError {
     MigrationInterrupted {
         snapshot: PathBuf,
         from: u32,
         to: u32,
+        observed: Option<JournalObservation>,
     },
     Corrupt {
         path: PathBuf,
         code: i32,
         latest_snapshot: Option<(PathBuf, SystemTime)>,
+        observed: Option<JournalObservation>,
     },
     InvalidMigrationMarker {
+        path: PathBuf,
+        reason: String,
+    },
+    RestoreInterrupted {
+        broken_dir: PathBuf,
+        pending: Box<PendingRestore>,
+        can_put_back: bool,
+    },
+    InvalidRestoreMarker {
         path: PathBuf,
         reason: String,
     },
@@ -43,7 +60,7 @@ pub enum JournalError {
 impl fmt::Display for JournalError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::MigrationInterrupted { snapshot, from, to } => {
+            Self::MigrationInterrupted { snapshot, from, to, .. } => {
                 write!(
                     f,
                     "工单库迁移中断（{from} → {to}），可恢复的快照位于 {}",
@@ -54,6 +71,7 @@ impl fmt::Display for JournalError {
                 path,
                 code,
                 latest_snapshot,
+                ..
             } => {
                 write!(f, "工单库损坏（SQLite {code}）：{}", path.display())?;
                 if let Some((snapshot, _)) = latest_snapshot {
@@ -64,6 +82,12 @@ impl fmt::Display for JournalError {
             Self::InvalidMigrationMarker { path, reason } => {
                 write!(f, "无法读取迁移标记（{}）：{reason}", path.display())
             }
+            Self::RestoreInterrupted { broken_dir, .. } => {
+                write!(f, "工单库恢复中断，原文件备份位于 {}", broken_dir.display())
+            }
+            Self::InvalidRestoreMarker { path, reason } => {
+                write!(f, "无法读取恢复标记（{}）：{reason}", path.display())
+            }
         }
     }
 }
@@ -73,7 +97,7 @@ impl std::error::Error for JournalError {}
 /// Classify SQLite corruption reported by journal startup and schema setup.
 pub fn classify_open_error(dir: &Path, error: anyhow::Error) -> anyhow::Error {
     match error.downcast_ref().and_then(corruption_code) {
-        Some(code) => corrupt_error(dir, code).into(),
+        Some(code) => corrupt_error(dir, code, backup::observe_journal(dir).ok()).into(),
         None => error,
     }
 }
@@ -90,25 +114,27 @@ fn corruption_code(error: &rusqlite::Error) -> Option<i32> {
     .then_some(code)
 }
 
-fn corrupt_error(dir: &Path, code: i32) -> JournalError {
+fn corrupt_error(dir: &Path, code: i32, observed: Option<JournalObservation>) -> JournalError {
     let path = dir.join(DB_FILE);
     JournalError::Corrupt {
         path,
         code,
         latest_snapshot: backup::latest_snapshot(dir),
+        observed,
     }
 }
 
-/// Observe the migration marker and probe the main database header without taking
+/// Observe the recovery markers and probe the main database header without taking
 /// locks or creating SQLite sidecars. This probe ignores WAL content.
 pub fn inspect(data_dir: &Path) -> Option<JournalError> {
     if let Some(error) = backup::inspect_marker(data_dir) {
         return Some(error);
     }
+    let observed = backup::observe_journal(data_dir).ok();
     let result = open_immutable(&data_dir.join(DB_FILE)).and_then(|conn| {
         Ok(conn.query_row("PRAGMA schema_version", [], |row| row.get::<_, i64>(0))?)
     });
-    corruption_code(result.err()?.downcast_ref()?).map(|code| corrupt_error(data_dir, code))
+    corruption_code(result.err()?.downcast_ref()?).map(|code| corrupt_error(data_dir, code, observed))
 }
 
 fn open_immutable(path: &Path) -> Result<Connection> {

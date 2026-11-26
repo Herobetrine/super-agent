@@ -1,26 +1,29 @@
 //! Codex configuration and model discovery (port of `codex-config.cjs`).
 
 use crate::common::{endpoint, modes, read_json};
+use crate::probe_cache::{
+    ModelProbeResult, ProbeCache, ProbeKey, Probes, config_digest, file_stamp, supplement_efforts,
+};
 use crate::proc::capture;
 use crate::sys::{Sys, resolve};
 use anyhow::{Result, anyhow, bail};
 use futures::future::join_all;
 use regex::Regex;
+use sa_engine::adapter::Route;
 use serde_json::{Map, Value, json};
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
-static ID_OK: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^[\p{L}\p{N}_][\p{L}\p{N}_./:+-]{0,199}$").expect("valid regex"));
 static PROVIDER_ID: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^[\w-]{1,96}$").expect("valid regex"));
 static PROFILE_NAME: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^[A-Za-z0-9_-]+$").expect("valid regex"));
 
 pub fn id_ok(v: &Value) -> bool {
-    v.as_str().is_some_and(|s| ID_OK.is_match(s))
+    v.as_str().is_some_and(sa_store::providers::valid_model_id)
 }
 
 pub fn config_home(sys: &Sys) -> PathBuf {
@@ -186,7 +189,7 @@ pub(crate) fn local_catalog(sys: &Sys) -> Result<Value> {
 }
 
 /// `customModels(cfg)` (CXC:71-86).
-async fn custom_models(sys: &Sys, cfg: &Value, cancel: &CancellationToken) -> Result<Vec<Value>> {
+async fn custom_models(sys: &Sys, cfg: &Value, cancel: &CancellationToken) -> Result<ModelProbeResult> {
     let origin = endpoint(cfg["base_url"].as_str().unwrap_or_default())?;
     let catalog_url = cfg["model_catalog_url"]
         .as_str()
@@ -231,7 +234,15 @@ async fn custom_models(sys: &Sys, cfg: &Value, cancel: &CancellationToken) -> Re
         Some(u) => u.to_string(),
         None => format!("{}/models", origin.as_str().trim_end_matches('/')),
     };
-    crate::catalog::fetch(&target, &headers, cancel).await
+    crate::catalog::fetch_with_status(&target, &headers, cancel).await
+}
+
+const NATIVE_SELECTED: &str = "native:selected";
+const NATIVE_OPENAI: &str = "native:openai";
+
+struct ProviderProbes {
+    primary: Option<String>,
+    inferred_efforts: HashSet<String>,
 }
 
 pub struct Discovery {
@@ -242,9 +253,57 @@ pub struct Discovery {
     pub catalog: Value,
 }
 
+pub(crate) struct RouteProbes(HashMap<String, ProviderProbes>);
+
+impl RouteProbes {
+    pub(crate) fn route_slots(&self, route: &Route) -> Vec<&str> {
+        let Some(probes) = self.0.get(&route.provider) else { return Vec::new() };
+        let mut slots: Vec<_> = probes.primary.as_deref().into_iter().collect();
+        if route.reasoning_effort.is_some() && probes.inferred_efforts.contains(&route.model)
+            && probes.primary.as_deref() != Some(NATIVE_SELECTED)
+        {
+            slots.push(NATIVE_SELECTED);
+        }
+        slots
+    }
+}
+
+pub(crate) fn probe_key(sys: &Sys, exe: Option<&Path>, customs: &[crate::custom::CustomProvider]) -> ProbeKey {
+    let paths = crate::revision::watch_paths(sys, "codex");
+    let dir = config_home(sys);
+    let config: Vec<_> = paths.iter()
+        .filter(|path| path.parent() == Some(dir.as_path()) && path.file_name().is_some_and(|name| {
+            let name = name.to_string_lossy();
+            name == "config.toml" || name.ends_with(".config.toml")
+        }))
+        .map(|path| (path, config_digest(path)))
+        .collect();
+    ProbeKey::new("codex", sys, exe, json!([
+        crate::revision::fingerprint(&paths), config, customs,
+        file_stamp(&dir.join("auth.json")),
+    ]))
+}
+
+async fn native_models(
+    exe: &Path, args: &[String], sys: &Sys, timeout: Duration, cancel: &CancellationToken,
+) -> Result<ModelProbeResult> {
+    let output = capture(exe, args, &sys.home, sys, "", timeout, cancel)
+        .await.map_err(|e| anyhow!(e.message))?;
+    Ok((visible(&serde_json::from_str(&output)?), None))
+}
+
 /// `discover()` (CXC:87-173).
 pub async fn discover(sys: &Sys, cancel: &CancellationToken) -> Result<Discovery> {
     let exe = executable(sys);
+    let key = probe_key(sys, exe.as_deref(), &[]);
+    let cache = ProbeCache::new(None);
+    let probes = Probes::new(&cache, &key, false);
+    discover_cached(sys, exe, cancel, &probes).await.map(|(discovery, _)| discovery)
+}
+
+pub(crate) async fn discover_cached(
+    sys: &Sys, exe: Option<PathBuf>, cancel: &CancellationToken, probes: &Probes<'_>,
+) -> Result<(Discovery, RouteProbes)> {
     let Settings {
         config,
         profile,
@@ -272,19 +331,11 @@ pub async fn discover(sys: &Sys, cancel: &CancellationToken) -> Result<Discovery
         .as_str()
         .map(|p| resolve(&dir, p));
     let native = match &exe {
-        Some(exe) => capture(
-            exe,
-            &["debug".into(), "models".into()],
-            &sys.home,
-            sys,
-            "",
-            Duration::from_secs(15),
+        Some(exe) => probes.fetch_models(
+            NATIVE_SELECTED,
             cancel,
-        )
-        .await
-        .map_err(|e| anyhow!(e.message))
-        .and_then(|s| serde_json::from_str::<Value>(&s).map_err(Into::into))
-        .map(|v| visible(&v)),
+            native_models(exe, &["debug".into(), "models".into()], sys, Duration::from_secs(15), cancel),
+        ).await.map(|(models, _)| models),
         None => Err(anyhow!("本机未安装 Codex CLI")),
     };
     let mut names: Vec<String> = vec!["openai".into()];
@@ -294,7 +345,7 @@ pub async fn discover(sys: &Sys, cancel: &CancellationToken) -> Result<Discovery
         }
     }
     names.retain(|n| PROVIDER_ID.is_match(n));
-    let probes = names.iter().map(|name| {
+    let sources = names.iter().map(|name| {
         let (sys, config, custom, file_catalog, exe, def, saved, native) =
             (sys, &config, &custom, &file_catalog, &exe, &def, &saved, &native);
         async move {
@@ -308,37 +359,46 @@ pub async fn discover(sys: &Sys, cancel: &CancellationToken) -> Result<Discovery
             }
             let mut models: Vec<Value> = vec![];
             let mut detail = "没有该来源的模型目录".to_string();
+            let mut primary = None;
+            let mut fallback = None;
             let attempt: Result<()> = async {
                 if let (Some(fc), true) = (file_catalog, name == def) {
                     models = file_models(fc)?;
                     detail = "本机 model_catalog_json".into();
                 } else if let Some(c) = cfg.as_ref().filter(|c| c["base_url"].as_str().is_some()) {
-                    models = custom_models(sys, c, cancel).await?;
+                    let slot = primary.insert(format!("provider:{name}"));
+                    (models, fallback) = probes.fetch_models(slot, cancel, custom_models(sys, c, cancel)).await?;
                     detail = "供应商在线模型目录".into();
                 } else if name == def {
+                    primary = Some(NATIVE_SELECTED.into());
                     models = native.as_ref().map_err(|e| anyhow!("{e}"))?.clone();
                     detail = "Codex CLI 模型目录（遵循原生刷新与缓存策略）".into();
                 } else if let (true, Some(exe)) = (name == "openai", exe) {
+                    primary = Some(NATIVE_OPENAI.into());
                     let mut args: Vec<String> =
                         ["-c", "model_provider=\"openai\"", "debug", "models"].iter().map(|s| s.to_string()).collect();
                     if file_catalog.is_some() {
                         args.push("--bundled".into());
                     }
-                    let out = capture(exe, &args, &sys.home, sys, "", Duration::from_secs(8), cancel)
-                        .await
-                        .map_err(|e| anyhow!(e.message))?;
-                    models = visible(&serde_json::from_str(&out)?);
+                    (models, _) = probes.fetch_models(
+                        NATIVE_OPENAI, cancel,
+                        native_models(exe, &args, sys, Duration::from_secs(8), cancel),
+                    ).await?;
                     detail = "Codex CLI 模型目录".into();
                 }
                 Ok(())
             }
             .await;
-            let failed = attempt.is_err();
+            let failed = attempt.is_err() || fallback.is_some();
             let complete = !failed && !models.is_empty();
             if let Err(error) = attempt {
                 detail = format!("在线模型目录获取失败：{error}；以下仅为已保存型号");
+            } else if let Some(error) = fallback {
+                detail = format!("在线模型目录获取失败：{error}；已保留上次目录");
             }
-            if let Ok(metadata) = &native { crate::catalog::supplement(&mut models, metadata); }
+            let inferred_efforts = native.as_ref()
+                .map(|metadata| supplement_efforts(&mut models, metadata))
+                .unwrap_or_default();
             let mut by_id: Vec<Value> = models;
             for c in saved.iter() {
                 let provider = c["model_provider"].as_str().unwrap_or("openai");
@@ -367,10 +427,11 @@ pub async fn discover(sys: &Sys, cancel: &CancellationToken) -> Result<Discovery
                 source["env_http_headers"].clone(), source["http_headers"].clone(),
                 json!(file_catalog.as_ref().filter(|_| name == def)),
             ]);
-            json!({"id": name, "sourceIdentity":identity, "label": label, "models": by_id, "detail": detail, "available": available, "catalog_complete":complete, "catalogError":failed})
+            let row = json!({"id": name, "sourceIdentity":identity, "label": label, "models": by_id, "detail": detail, "available": available, "catalog_complete":complete, "catalogError":failed});
+            (row, (name.clone(), ProviderProbes { primary, inferred_efforts }))
         }
     });
-    let providers: Vec<Value> = join_all(probes).await;
+    let (providers, provider_probes): (Vec<Value>, HashMap<_, _>) = join_all(sources).await.into_iter().unzip();
     if cancel.is_cancelled() {
         bail!("已取消");
     }
@@ -395,13 +456,13 @@ pub async fn discover(sys: &Sys, cancel: &CancellationToken) -> Result<Discovery
             {"label": "Windows 桌面端", "url": "https://developers.openai.com/codex/app/windows/"}
         ]
     });
-    Ok(Discovery {
+    Ok((Discovery {
         exe,
         config,
         profile,
         dir,
         catalog,
-    })
+    }, RouteProbes(provider_probes)))
 }
 
 /// `routing(d, s)` (CXC:174-200): CLI overrides and thread `config`.
