@@ -213,6 +213,7 @@ async fn run(
     emit: Emit,
     cancel: CancellationToken,
 ) -> Result<RunOutcome, AdapterError> {
+    let started = Instant::now();
     if !req.images.is_empty() {
         return Err(failure(ErrorClass::InputTooLarge, "acp:images_unsupported"));
     }
@@ -223,7 +224,13 @@ async fn run(
         .into_iter()
         .find(|s| s.id == req.route.provider)
         .ok_or_else(|| route_gone("ACP 服务不存在"))?;
-    run_server(sys, req, host, emit, cancel, server, None).await
+    let discovery = DiscoveryTiming::new(started, false, false);
+    run_server(sys, req, host, emit, cancel, server, ServerDiscovery::Generic(discovery)).await
+}
+
+pub(crate) enum ServerDiscovery {
+    Generic(DiscoveryTiming),
+    Antigravity(DiscoveryTiming),
 }
 
 /// Reuse ACP lifecycle and permission handling for the built-in agy adapter.
@@ -235,9 +242,12 @@ pub(crate) async fn run_server(
     emit: Emit,
     cancel: CancellationToken,
     server: Server,
-    discovery: Option<DiscoveryTiming>,
+    discovery: ServerDiscovery,
 ) -> Result<RunOutcome, AdapterError> {
-    let antigravity = discovery.is_some();
+    let (antigravity, discovery) = match discovery {
+        ServerDiscovery::Generic(timing) => (false, timing),
+        ServerDiscovery::Antigravity(timing) => (true, timing),
+    };
     if !matches!(
         req.profile.as_str(),
         "readonly" | "ask" | "partial" | "full" | "auto" | "legacy"
@@ -286,7 +296,7 @@ pub(crate) async fn run_server(
     }
     let spawning = Instant::now();
     let mut process = proc::start(&exe, &server.args, &req.cwd, &env)?;
-    let timing = discovery.map(|d| d.spawned(spawning));
+    let timing = discovery.spawned(spawning);
     let stdin = process
         .stdin
         .take()
@@ -388,8 +398,9 @@ pub(crate) async fn run_server(
             for image in &callback_req.images {
                 content.push(ContentBlock::Image(ImageContent::new(STANDARD.encode(image.data()), image.media_type())));
             }
-            let prompt=connection.send_request(PromptRequest::new(sid.clone(),content)).block_task();
-            if let Some(timing)=timing { timing.emit(&callback_emit); }
+            let request = PromptRequest::new(sid.clone(), content);
+            timing.emit(&callback_emit);
+            let prompt=connection.send_request(request).block_task();
             tokio::pin!(prompt);
             let reply=tokio::select! {
                 r=&mut prompt=>r?,

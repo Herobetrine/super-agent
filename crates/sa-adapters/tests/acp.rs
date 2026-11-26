@@ -127,6 +127,21 @@ async fn actual_stdio_new_load_stream_permission_and_model_selection() {
     assert!(!wire.contains("\"optionId\":\"always\""));
 }
 #[tokio::test]
+async fn turn_timing_includes_delayed_session_creation() {
+    let (_dir, sys, req) = setup("slow-new", false);
+    let (out, events, _) = execute(sys, req, false, CancellationToken::new()).await;
+    assert_eq!(out.unwrap().text, "精确结果\n");
+    let mut timings = events.iter().filter_map(|event| match event {
+        AdapterEvent::Journal { kind, data } if kind == "turn.timing" => Some(data),
+        _ => None,
+    });
+    let timing = timings.next().expect("ACP turn timing");
+    assert!(timings.next().is_none());
+    assert!(timing["handshake_ms"].as_u64().unwrap() >= 200, "{timing}");
+    assert!(timing["spawn_ms"].is_u64());
+}
+
+#[tokio::test]
 async fn restricted_runs_fail_closed_and_verified_ask_uses_host() {
     let (_dir, sys, mut req) = setup("normal", false);
     req.profile = "readonly".into();

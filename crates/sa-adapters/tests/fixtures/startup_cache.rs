@@ -307,6 +307,17 @@ async fn codex_discovery_is_reused_and_persisted() {
 }
 
 #[tokio::test]
+async fn codex_cli_model_cache_rewrites_keep_persisted_probe_warm() {
+    let fixture = Fixture::new("codex");
+    let cli_cache = fixture.sys.home.join(".codex/models_cache.json");
+    std::fs::write(&cli_cache, r#"{"models":[]}"#).unwrap();
+    fixture.assert_run(fixture.adapter().as_ref(), "miss").await;
+    std::fs::write(&cli_cache, r#"{"models":[],"etag":"updated"}"#).unwrap();
+    fixture.assert_run(fixture.adapter().as_ref(), "hit").await;
+    fixture.assert_discoveries(1);
+}
+
+#[tokio::test]
 async fn claude_discovery_is_reused_and_persisted() {
     exercise("claude").await;
 }
@@ -414,6 +425,66 @@ async fn http_fallback_remains_usable_without_renewing_persistent_probe() {
 }
 
 #[tokio::test]
+async fn unselected_claude_provider_failure_is_reused_across_restart() {
+    let fixture = Fixture::new("claude");
+    let endpoint = ModelEndpoint::new().await;
+    endpoint.failed.store(true, Relaxed);
+    fixture.configure_endpoints(&[("failing-provider", &endpoint)]);
+    fixture.assert_run(fixture.adapter().as_ref(), "miss").await;
+    let adapter = fixture.adapter();
+    fixture.assert_run(adapter.as_ref(), "hit").await;
+    assert_eq!(endpoint.count(), 1);
+    adapter.catalog().await.unwrap();
+    assert_eq!(endpoint.count(), 2, "picker must probe despite the marker");
+}
+
+#[tokio::test]
+async fn unselected_claude_provider_failure_expires_after_ten_minutes() {
+    let fixture = Fixture::new("claude");
+    let endpoint = ModelEndpoint::new().await;
+    endpoint.failed.store(true, Relaxed);
+    fixture.configure_endpoints(&[("failing-provider", &endpoint)]);
+    fixture.assert_run(fixture.adapter().as_ref(), "miss").await;
+    let path = fixture.dir.path().join("data/cache/probes-v1.json");
+    let mut disk: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let failure = disk["entries"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|entry| entry["value"].is_null())
+        .unwrap();
+    failure["started_unix_ms"] = json!(unix_ms() - 10 * 60 * 1000);
+    std::fs::write(path, disk.to_string()).unwrap();
+
+    fixture.assert_run(fixture.adapter().as_ref(), "hit").await;
+    assert_eq!(endpoint.count(), 2, "expired unselected probe must run again");
+    fixture.assert_run(fixture.adapter().as_ref(), "hit").await;
+    assert_eq!(endpoint.count(), 2, "new failure is fresh");
+}
+
+#[tokio::test]
+async fn claude_retries_the_same_failed_provider_when_selected() {
+    let mut fixture = Fixture::new("claude");
+    let endpoint = ModelEndpoint::new().await;
+    endpoint.failed.store(true, Relaxed);
+    fixture.configure_endpoints(&[("failing-provider", &endpoint)]);
+    let adapter = fixture.adapter();
+    fixture.assert_run(adapter.as_ref(), "miss").await;
+    fixture.assert_run(adapter.as_ref(), "hit").await;
+    assert_eq!(endpoint.count(), 1);
+
+    fixture.select_endpoint("failing-provider", &endpoint);
+    for expected in [2, 3] {
+        let (outcome, _) = fixture.run(adapter.as_ref()).await;
+        assert_eq!(
+            outcome.unwrap_err().code.as_deref(),
+            Some(sa_engine::resilience::CODE_ROUTE_PROBE_FAILED),
+        );
+        assert_eq!(endpoint.count(), expected);
+    }
+}
+
+#[tokio::test]
 async fn provider_failure_keeps_the_other_provider_warm() {
     for agent in ["codex", "claude"] {
         let mut fixture = Fixture::new(agent);
@@ -436,7 +507,7 @@ async fn provider_failure_keeps_the_other_provider_warm() {
 
         fixture.select_endpoint("provider-b", &b);
         let adapter = fixture.adapter();
-        fixture.assert_run(adapter.as_ref(), "miss").await;
+        fixture.assert_run(adapter.as_ref(), "hit").await;
         assert_eq!((a.count(), b.count()), (2, 1), "{agent}");
         fixture.assert_run(adapter.as_ref(), "hit").await;
         assert_eq!((a.count(), b.count()), (2, 1), "{agent}");
