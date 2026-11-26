@@ -5,22 +5,28 @@ use crate::common::{
     route_gone, scope, select, session_mismatch,
 };
 use crate::custom::{self, CustomProvider, Registry};
-use crate::proc::{Proc, capture, start, stream};
+use crate::probe_cache::{
+    DiscoveryTiming, ModelProbeResult, ProbeCache, ProbeKey, Probes, Stamp, TurnTiming,
+    config_digest, custom_probe_slot, file_stamp, probe_slot, refresh_custom,
+    safe_models, supplement_efforts,
+};
+use crate::proc::{Proc, cancelled, capture, start, stream};
 use crate::sys::Sys;
 use futures::FutureExt;
 use futures::future::{BoxFuture, Shared, join_all};
 use regex::Regex;
 use sa_engine::adapter::{
-    Adapter, AdapterError, Catalog, ErrorClass, EventSink, RunOutcome, RunRequest, TurnHost,
+    Adapter, AdapterError, Catalog, ErrorClass, EventSink, Route, RunOutcome, RunRequest, TurnHost,
 };
 use sa_engine::resilience::classify::{
     MAX_QUOTA_RESET, classified, classify_text, claude_api_retry, from_http_status, quota,
 };
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::Mutex as AsyncMutex;
 use tokio_util::sync::CancellationToken;
 
@@ -31,6 +37,7 @@ pub struct Claude {
     sys: Sys,
     registry: Registry,
     efficiency: sa_store::efficiency::Shared,
+    probes: ProbeCache,
 }
 
 impl Claude {
@@ -51,11 +58,8 @@ impl Claude {
         registry: Registry,
         efficiency: sa_store::efficiency::Shared,
     ) -> Self {
-        Self {
-            sys,
-            registry,
-            efficiency,
-        }
+        let probes = ProbeCache::new(sys.data_dir.as_deref());
+        Self { sys, registry, efficiency, probes }
     }
 }
 
@@ -80,6 +84,25 @@ pub fn executable(sys: &Sys) -> Option<PathBuf> {
         .parent()?
         .join("node_modules/@anthropic-ai/claude-code/bin/claude.exe");
     npm.is_file().then_some(npm)
+}
+
+fn probe_key(sys: &Sys, exe: Option<&Path>, customs: &[CustomProvider]) -> ProbeKey {
+    let native = native_file(sys);
+    let cc = sys.home.join(".cc-switch");
+    let config = [
+        native.clone(),
+        cc.join("settings.json"),
+        cc.join("live-state.json"),
+        sys.platform_dir().join("claude-route.json"),
+    ].map(|path| config_digest(&path));
+    let mut env = sys.clone();
+    // This preference is consumed by the turn launcher after model discovery.
+    env.remove("SUPERAGENT_CLAUDE_CACHE_TTL");
+    ProbeKey::new("claude", &env, exe, json!([
+        crate::revision::fingerprint(&crate::revision::watch_paths(sys, "claude")),
+        config, customs,
+        file_stamp(&native.with_file_name(".credentials.json")),
+    ]))
 }
 
 fn api_base(base: &str) -> String {
@@ -129,9 +152,13 @@ struct Record {
     models: Vec<String>,
     model_info: Vec<Value>,
     catalog_error: Option<String>,
+    catalog_fallback: bool,
     preferred: String,
     reason: String,
     cache_settings: Value,
+    probe_slot: Option<String>,
+    routed_slots: HashMap<String, String>,
+    inferred_efforts: HashSet<String>,
 }
 
 impl Record {
@@ -162,16 +189,23 @@ impl Record {
     }
 }
 
-/// `firstParty(exe)` (CL:52-101).
-async fn first_party(sys: &Sys, exe: Option<&PathBuf>, cancel: &CancellationToken) -> Record {
-    let mut rec = Record {
+const OFFICIAL_SLOT: &str = "native:official";
+
+fn official_record() -> Record {
+    Record {
         app: "native".into(),
         row: "first-party".into(),
         name: "官方账号".into(),
         auth: "sdk-login".into(),
+        probe_slot: Some(OFFICIAL_SLOT.into()),
         reason: "未验证官方登录或模型目录".into(),
         ..Default::default()
-    };
+    }
+}
+
+/// `firstParty(exe)` (CL:52-101).
+async fn first_party(sys: &Sys, exe: Option<&PathBuf>, cancel: &CancellationToken) -> Record {
+    let mut rec = official_record();
     let Some(exe) = exe else { return rec };
     let env = official_env(sys);
     let flags = ["--safe-mode", "--setting-sources", ""].map(String::from);
@@ -266,8 +300,86 @@ async fn first_party(sys: &Sys, exe: Option<&PathBuf>, cancel: &CancellationToke
     rec
 }
 
-type ModelProbe = Shared<BoxFuture<'static, Result<Vec<Value>, String>>>;
-type ModelCache = Arc<AsyncMutex<HashMap<(String, String, String), ModelProbe>>>;
+#[derive(Serialize, Deserialize)]
+struct OfficialModels {
+    available: bool,
+    models: Vec<String>,
+    model_info: Vec<Value>,
+}
+
+async fn discover_official(
+    sys: &Sys, exe: Option<&PathBuf>, cancel: &CancellationToken, probes: Option<&Probes<'_>>,
+) -> Record {
+    let Some(probes) = probes.filter(|_| exe.is_some()) else {
+        return first_party(sys, exe, cancel).await;
+    };
+    if let Some(models) = probes.read::<OfficialModels>(OFFICIAL_SLOT) {
+        let mut record = official_record();
+        if models.available {
+            record.reason.clear();
+        }
+        record.models = models.models;
+        record.model_info = models.model_info;
+        return record;
+    }
+    let started = probes.start();
+    let record = first_party(sys, exe, cancel).await;
+    if !cancel.is_cancelled() {
+        let models = record.catalog_error.is_none().then(|| OfficialModels {
+            available: record.reason.is_empty(),
+            models: record.models.clone(),
+            model_info: safe_models(&json!(record.model_info)),
+        });
+        probes.record(OFFICIAL_SLOT, started, models.as_ref());
+    }
+    record
+}
+
+type ModelProbe = Shared<BoxFuture<'static, (Stamp, Result<ModelProbeResult, String>)>>;
+type ModelCache = AsyncMutex<HashMap<(String, String, String), ModelProbe>>;
+
+struct DiscoveryProbes<'a> {
+    http: ModelCache,
+    reusable: Option<&'a Probes<'a>>,
+}
+
+impl DiscoveryProbes<'_> {
+    async fn models(
+        &self, url: String, auth: &str, token: String, slot: &str, cancel: &CancellationToken,
+    ) -> Result<ModelProbeResult, String> {
+        if let Some(models) = self.reusable.and_then(|cache| cache.read(slot)) {
+            return Ok((models, None));
+        }
+        let auth = auth.to_string();
+        let key = (url.clone(), auth.clone(), token.clone());
+        let probe = {
+            let mut pending = self.http.lock().await;
+            pending.entry(key).or_insert_with(|| {
+                let cancel = cancel.clone();
+                let started = self.reusable.map_or_else(Stamp::now, Probes::start);
+                async move {
+                    let mut headers = if auth == "ANTHROPIC_API_KEY" {
+                        vec![("x-api-key".to_string(), token)]
+                    } else {
+                        vec![("Authorization".to_string(), format!("Bearer {token}"))]
+                    };
+                    headers.push(("anthropic-version".into(), "2023-06-01".into()));
+                    let result = crate::catalog::fetch_with_status(&url, &headers, &cancel).await
+                        .map_err(|error| error.to_string());
+                    (started, result)
+                }.boxed().shared()
+            }).clone()
+        };
+        let (started, result) = probe.await;
+        if let Some(probes) = self.reusable && !cancel.is_cancelled() {
+            let models = result.as_ref().ok()
+                .filter(|(_, error)| error.is_none())
+                .map(|(models, _)| safe_models(&json!(models)));
+            probes.record(slot, started, models.as_ref());
+        }
+        result
+    }
+}
 
 /// `makeRecord(app, id, name, cfg, meta, cache)` (CL:102-160).
 #[allow(clippy::too_many_arguments)]
@@ -277,7 +389,7 @@ async fn make_record(
     name: &str,
     cfg: &Value,
     meta: &Value,
-    cache: Option<&ModelCache>,
+    cache: Option<&DiscoveryProbes<'_>>,
     cancel: &CancellationToken,
 ) -> Record {
     let env = &cfg["env"];
@@ -349,31 +461,13 @@ async fn make_record(
             .collect();
         if let Some(cache) = cache {
             let url = format!("{}/v1/models?limit=1000", api_base(&base));
-            let key = (url.clone(), auth.to_string(), token.clone());
-            let probe = {
-                let mut probes = cache.lock().await;
-                probes
-                    .entry(key)
-                    .or_insert_with(|| {
-                        let cancel = cancel.clone();
-                        async move {
-                            let mut headers = if auth == "ANTHROPIC_API_KEY" {
-                                vec![("x-api-key".to_string(), token)]
-                            } else {
-                                vec![("Authorization".to_string(), format!("Bearer {token}"))]
-                            };
-                            headers.push(("anthropic-version".into(), "2023-06-01".into()));
-                            crate::catalog::fetch(&url, &headers, &cancel)
-                                .await
-                                .map_err(|e| e.to_string())
-                        }
-                        .boxed()
-                        .shared()
-                    })
-                    .clone()
-            };
-            match probe.await {
-                Ok(discovered) => {
+            let slot = probe_slot("provider", &json!(rec.id()));
+            let result = cache.models(url, auth, token, &slot, cancel).await;
+            rec.probe_slot = Some(slot);
+            match result {
+                Ok((discovered, fallback)) => {
+                    rec.catalog_fallback = fallback.is_some();
+                    rec.catalog_error = fallback;
                     rec.model_info = discovered.clone();
                     for m in discovered {
                         if let Some(id) = m["id"].as_str()
@@ -402,6 +496,23 @@ struct Discovery {
     exe: Option<PathBuf>,
     records: Vec<Record>,
     catalog: Value,
+}
+
+impl Discovery {
+    fn route_slots(&self, route: &Route) -> Vec<&str> {
+        let Some(record) = self.records.iter().find(|record| record.id() == route.provider)
+        else { return Vec::new() };
+        let mut slots: Vec<_> = record.probe_slot.as_deref().into_iter().collect();
+        if let Some(slot) = record.routed_slots.get(&route.model) {
+            slots.push(slot);
+        }
+        if route.reasoning_effort.is_some() && record.inferred_efforts.contains(&route.model)
+            && !slots.contains(&OFFICIAL_SLOT)
+        {
+            slots.push(OFFICIAL_SLOT);
+        }
+        slots
+    }
 }
 
 /// CC Switch model id that its aggregation ("Stack") mode routes to one member.
@@ -476,6 +587,9 @@ fn add_routed(rec: &mut Record, id: String, source: &Record, model: &str, tag: &
     let label = info["label"].as_str().unwrap_or(model).to_string();
     info["id"] = json!(id);
     info["label"] = json!(format!("{label}（{tag}）"));
+    if let Some(slot) = &source.probe_slot {
+        rec.routed_slots.insert(id.clone(), slot.clone());
+    }
     rec.models.push(id);
     rec.model_info.push(info);
 }
@@ -514,23 +628,25 @@ fn aggregate(rec: &mut Record, gateway: &Gateway, records: &[Record]) {
 }
 
 /// `discover()` (CL:167-266).
+#[cfg(test)]
 async fn discover(
     sys: &Sys,
     exe: Option<PathBuf>,
     cancel: &CancellationToken,
 ) -> anyhow::Result<Discovery> {
-    discover_with(sys, exe, cancel, true).await
+    discover_with(sys, exe, cancel, true, None).await
 }
 
 async fn discover_with(
     sys: &Sys, exe: Option<PathBuf>, cancel: &CancellationToken, online: bool,
+    reusable: Option<&Probes<'_>>,
 ) -> anyhow::Result<Discovery> {
     let dir = sys.home.join(".cc-switch");
     let device = read_json_or(&dir.join("settings.json"));
     let state = read_json_or(&dir.join("live-state.json"))["apps"]["claude-desktop"].clone();
     let bound = read_json_or(&sys.platform_dir().join("claude-route.json"));
-    let official_probe = first_party(sys, exe.as_ref().filter(|_| online), cancel).shared();
-    let cache: ModelCache = Arc::default();
+    let official_probe = discover_official(sys, exe.as_ref().filter(|_| online), cancel, reusable).shared();
+    let cache = DiscoveryProbes { http: AsyncMutex::default(), reusable };
     let rows = cc_rows(sys, &["claude", "claude-desktop"])?;
     let records = join_all(rows.iter().map(|row| {
         let (cache, official) = (online.then_some(&cache), official_probe.clone());
@@ -565,6 +681,7 @@ async fn discover_with(
                 record.model_info = official.model_info;
                 record.reason = official.reason;
                 record.catalog_error = official.catalog_error;
+                record.probe_slot = official.probe_slot;
             }
             record
         }
@@ -598,7 +715,9 @@ async fn discover_with(
         // Routing-only mode may publish no models; a reachable listener with an
         // empty catalog still routes every member model aggregated below.
         let enrich = |rec: &mut Record| {
-            if rec.catalog_error.is_none() && rec.token.as_deref().is_some_and(|t| !t.is_empty()) {
+            if (rec.catalog_error.is_none() || rec.catalog_fallback)
+                && rec.token.as_deref().is_some_and(|t| !t.is_empty())
+            {
                 aggregate(rec, &gateway, &records);
                 if !rec.models.is_empty() {
                     rec.reason.clear();
@@ -705,7 +824,7 @@ async fn discover_with(
                     .unwrap_or_else(|| json!({"id":id,"label":id}))
             })
             .collect();
-        crate::catalog::supplement(&mut rows, &official.model_info);
+        record.inferred_efforts = supplement_efforts(&mut rows, &official.model_info);
         crate::catalog::restrict_efforts(&mut rows, &["low", "medium", "high", "xhigh", "max"]);
         record.model_info = rows;
     }
@@ -720,7 +839,10 @@ async fn discover_with(
                 "defaultModel": r.preferred,
                 "catalogError": r.catalog_error.is_some(),
                 "catalog_complete": r.catalog_error.is_none() && r.reason.is_empty(),
-                "detail": if let Some(error) = &r.catalog_error { format!("在线目录获取失败：{error}；以下仅为已保存型号") } else if r.reason.is_empty() { "同源认证的在线模型目录".to_string() } else { r.reason.clone() },
+                "detail": if let Some(error) = &r.catalog_error {
+                    let fallback = if r.catalog_fallback { "已保留上次目录" } else { "以下仅为已保存型号" };
+                    format!("在线目录获取失败：{error}；{fallback}")
+                } else if r.reason.is_empty() { "同源认证的在线模型目录".to_string() } else { r.reason.clone() },
             })
         })
         .collect();
@@ -760,18 +882,24 @@ impl Adapter for Claude {
 
     fn local_catalog(&self) -> Value {
         // Local mode reads saved source identities and defaults only.
-        discover_with(&self.sys, executable(&self.sys), &CancellationToken::new(), false)
+        discover_with(&self.sys, executable(&self.sys), &CancellationToken::new(), false, None)
             .now_or_never().and_then(Result::ok).map(|d| d.catalog).unwrap_or_default()
     }
 
     fn catalog(&self) -> BoxFuture<'static, anyhow::Result<Catalog>> {
         let sys = self.sys.clone();
         let customs = custom::snapshot(&self.registry, "claude");
+        let cache = self.probes.clone();
         Box::pin(async move {
-            let mut value = discover(&sys, executable(&sys), &CancellationToken::new())
+            let exe = executable(&sys);
+            let key = probe_key(&sys, exe.as_deref(), &customs);
+            let probes = Probes::new(&cache, &key, false);
+            let cancel = CancellationToken::new();
+            let mut value = discover_with(&sys, exe, &cancel, true, Some(&probes))
                 .await?
                 .catalog;
-            custom::refresh(&mut value, &customs, &sys, &CancellationToken::new()).await;
+            let _ = refresh_custom(&mut value, &customs, &sys, &cancel, &probes, None).await;
+            probes.flush().await;
             Ok(Catalog { value })
         })
     }
@@ -791,7 +919,8 @@ impl Adapter for Claude {
             .claude_cache_ttl;
         crate::cache_policy::select_fallback(&mut sys, ttl);
         let customs = custom::snapshot(&self.registry, "claude");
-        Box::pin(async move { run(sys, customs, request, host, Emit(events), cancel, false).await })
+        let cache = self.probes.clone();
+        Box::pin(async move { run(sys, customs, request, host, Emit(events), cancel, false, cache).await })
     }
 
     /// A forked, unpersisted one-line turn on the same session. Claude Code
@@ -813,7 +942,8 @@ impl Adapter for Claude {
             .claude_cache_ttl;
         crate::cache_policy::select_fallback(&mut sys, ttl);
         let customs = custom::snapshot(&self.registry, "claude");
-        Some(Box::pin(async move { run(sys, customs, request, host, Emit(events), cancel, true).await }))
+        let cache = self.probes.clone();
+        Some(Box::pin(async move { run(sys, customs, request, host, Emit(events), cancel, true, cache).await }))
     }
 }
 
@@ -866,6 +996,7 @@ fn local_gateway_settings(
 }
 
 /// `run(o)` (CL:267-356).
+#[allow(clippy::too_many_arguments)]
 async fn run(
     sys: Sys,
     customs: Vec<CustomProvider>,
@@ -874,15 +1005,63 @@ async fn run(
     emit: Emit,
     cancel: CancellationToken,
     fork: bool,
+    cache: ProbeCache,
 ) -> Result<RunOutcome, AdapterError> {
     crate::images::check(&req)?;
     let boundary = scope("claude", &req, &host, &cancel, false).await?;
+    let started = Instant::now();
+    let exe = executable(&sys);
+    let key = probe_key(&sys, exe.as_deref(), &customs);
+    let mut reuse = true;
+    let (d, s, timing, used) = loop {
+        let probes = Probes::new(&cache, &key, reuse);
+        let mut d = discover_with(&sys, exe.clone(), &cancel, true, Some(&probes))
+            .await
+            .map_err(|e| if cancel.is_cancelled() { cancelled() } else { probe_failed(&e.to_string()) })?;
+        let donor = refresh_custom(&mut d.catalog, &customs, &sys, &cancel, &probes, Some(&req.route)).await;
+        probes.flush().await;
+        if cancel.is_cancelled() {
+            return Err(cancelled());
+        }
+        let mut used = if custom::lookup(&d.catalog, &customs, &req.route.provider).is_some() {
+            probes.observed(&[&custom_probe_slot(&req.route.provider)])
+        } else {
+            probes.observed(&d.route_slots(&req.route))
+        };
+        if let Some(donor) = donor {
+            used.extend(probes.observed(&d.route_slots(&donor)));
+        }
+        match select(&d.catalog, &req.route) {
+            Ok(s) => break (d, s, DiscoveryTiming::new(started, probes.reused_all(), !reuse), used),
+            Err(_) if reuse && used.iter().any(|probe| probe.cached) => reuse = false,
+            Err(error) => {
+                cache.evict_used(&key, &used).await;
+                return Err(error);
+            }
+        }
+    };
+    let result = run_selected(sys, customs, req, host, emit, cancel, fork, d, s, boundary, timing).await;
+    if result.as_ref().is_err_and(|error| error.class != ErrorClass::Cancelled) {
+        cache.evict_used(&key, &used).await;
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_selected(
+    sys: Sys,
+    customs: Vec<CustomProvider>,
+    req: RunRequest,
+    host: Arc<dyn TurnHost>,
+    emit: Emit,
+    cancel: CancellationToken,
+    fork: bool,
+    d: Discovery,
+    s: sa_engine::adapter::Route,
+    boundary: &'static str,
+    discovery: DiscoveryTiming,
+) -> Result<RunOutcome, AdapterError> {
     let high = boundary == "danger-full-access";
-    let mut d = discover(&sys, executable(&sys), &cancel)
-        .await
-        .map_err(|e| probe_failed(&e.to_string()))?;
-    custom::refresh(&mut d.catalog, &customs, &sys, &cancel).await;
-    let s = select(&d.catalog, &req.route)?;
     let chosen = custom::lookup(&d.catalog, &customs, &s.provider).cloned();
     let r = match &chosen {
         Some(_) => Record::default(),
@@ -1025,7 +1204,9 @@ async fn run(
         "{}\n",
         json!({"type": "user", "message": {"role": "user", "content": crate::images::claude(&req)}})
     );
+    let spawning = Instant::now();
     let mut proc = start(&exe, &args, &req.cwd, &env)?;
+    let timing = discovery.spawned(spawning);
     collect_turn(
         &mut proc,
         &input,
@@ -1035,6 +1216,7 @@ async fn run(
         emit,
         &cancel,
         (!fork).then_some(host),
+        Some(timing),
     )
     .await
 }
@@ -1043,6 +1225,7 @@ async fn run(
 const MAX_STEER_BYTES: usize = 64 * 1024;
 
 /// Consume the native process using the same terminal contract for real and fake CLIs.
+#[allow(clippy::too_many_arguments)]
 async fn collect_turn(
     proc: &mut Proc,
     input: &str,
@@ -1051,6 +1234,7 @@ async fn collect_turn(
     emit: Emit,
     cancel: &CancellationToken,
     steer: Option<Arc<dyn TurnHost>>,
+    timing: Option<TurnTiming>,
 ) -> Result<RunOutcome, AdapterError> {
     let mut terminal: Option<Value> = None;
     let mut last_retry: Option<Value> = None;
@@ -1119,6 +1303,9 @@ async fn collect_turn(
         }
         Ok(crate::proc::Feed::Continue)
     };
+    if let Some(timing) = timing {
+        timing.emit(&emit);
+    }
     let streamed = match &steer {
         None => stream(proc, input, cancel, |e| on_event(e).map(|_| ())).await,
         Some(host) => {
@@ -1327,6 +1514,7 @@ mod terminal_tests {
             None,
             Emit(events),
             &CancellationToken::new(),
+            None,
             None,
         )
         .await

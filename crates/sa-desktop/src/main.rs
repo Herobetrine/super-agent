@@ -51,7 +51,7 @@ mod workflow_tests;
 use std::{
     path::PathBuf,
     process::Command,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
     time::Duration,
 };
 
@@ -211,27 +211,50 @@ fn icon() -> Option<egui::IconData> {
     })
 }
 
-/// Shared by native startup and the recovery harness, which supplies fake
-/// adapters only when this branch actually starts a scheduler.
-fn create_app(
-    cc: &eframe::CreationContext<'_>,
-    opts: cli::Options,
-    dir: PathBuf,
-    opener: data::Opener,
-    shot_result: Arc<Mutex<Option<Result<(), String>>>>,
-    start_host: impl FnOnce(PathBuf, egui::Context) -> anyhow::Result<host::Host>,
-) -> app::App {
-    theme::install_fonts(&cc.egui_ctx);
-    // Start the scheduler before the reader so it can create the journal.
-    let host = if opts.demo {
+fn start_scheduler(
+    opts: &cli::Options,
+    start: impl FnOnce() -> anyhow::Result<host::Host>,
+) -> anyhow::Result<host::Host> {
+    if opts.demo {
         Err(anyhow::anyhow!("演示数据不调度"))
     } else if opts.observe {
         Err(anyhow::anyhow!("以 --observe 启动，不调度"))
     } else if opts.screenshot.is_some() && !opts.schedule {
         Err(anyhow::anyhow!("截图模式不调度"))
     } else {
-        start_host(dir.clone(), cc.egui_ctx.clone())
-    };
+        start()
+    }
+}
+
+fn window_persists(opts: &cli::Options, has_host: bool) -> bool {
+    has_host && !opts.observe && opts.screenshot.is_none()
+}
+
+fn native_options(
+    opts: &cli::Options,
+    has_host: bool,
+    viewport: egui::ViewportBuilder,
+) -> eframe::NativeOptions {
+    eframe::NativeOptions {
+        viewport,
+        centered: true,
+        persist_window: window_persists(opts, has_host),
+        // Keep screenshots independent of the user's saved layout.
+        persistence_path: opts.screenshot.is_some()
+            .then(|| std::env::temp_dir().join("super-agent-screenshot-state")),
+        ..Default::default()
+    }
+}
+
+fn create_app_with_host(
+    cc: &eframe::CreationContext<'_>,
+    opts: cli::Options,
+    dir: PathBuf,
+    opener: data::Opener,
+    shot_result: Arc<Mutex<Option<Result<(), String>>>>,
+    host: anyhow::Result<host::Host>,
+) -> app::App {
+    theme::install_fonts(&cc.egui_ctx);
     let host_error = host.as_ref().err();
     let observer = !opts.demo
         && (opts.observe
@@ -269,6 +292,19 @@ fn create_app(
     app
 }
 
+#[cfg(test)]
+fn create_app(
+    cc: &eframe::CreationContext<'_>,
+    opts: cli::Options,
+    dir: PathBuf,
+    opener: data::Opener,
+    shot_result: Arc<Mutex<Option<Result<(), String>>>>,
+    start_host: impl FnOnce(PathBuf, egui::Context) -> anyhow::Result<host::Host>,
+) -> app::App {
+    let host = start_scheduler(&opts, || start_host(dir.clone(), cc.egui_ctx.clone()));
+    create_app_with_host(cc, opts, dir, opener, shot_result, host)
+}
+
 fn main() {
     await_previous_instance();
     let opts = match cli::parse(std::env::args().skip(1)) {
@@ -293,20 +329,23 @@ fn main() {
             .with_min_inner_size([320.0, 240.0])
             .with_resizable(false);
     }
-    let mut native = eframe::NativeOptions {
-        viewport,
-        centered: true,
-        ..Default::default()
-    };
-    if opts.screenshot.is_some() {
-        // Keep screenshots independent of the user's saved layout.
-        native.persistence_path = Some(std::env::temp_dir().join("super-agent-screenshot-state"));
-        native.persist_window = false;
-    } else {
+    let dir = opts.data.clone().unwrap_or_else(sa_store::default_data_dir);
+    // eframe fixes its window-persistence policy before constructing the app.
+    // Acquire the actual scheduler lock first, including automatic observers.
+    let repaint = Arc::new(OnceLock::<egui::Context>::new());
+    let wake = repaint.clone();
+    let host = start_scheduler(&opts, || {
+        host::Host::start(dir.clone(), move || {
+            if let Some(ctx) = wake.get() {
+                ctx.request_repaint();
+            }
+        })
+    });
+    let native = native_options(&opts, host.is_ok(), viewport);
+    if native.persist_window {
         sanitize_persisted_window("super-agent");
     }
 
-    let dir = opts.data.clone().unwrap_or_else(sa_store::default_data_dir);
     let opener: data::Opener = if opts.demo {
         Box::new(|| Ok(Box::new(demo::DemoSource::new()) as Box<dyn data::DataSource>))
     } else {
@@ -319,13 +358,14 @@ fn main() {
         "super-agent",
         native,
         Box::new(move |cc| {
-            Ok(Box::new(create_app(
+            let _ = repaint.set(cc.egui_ctx.clone());
+            Ok(Box::new(create_app_with_host(
                 cc,
                 opts,
                 dir,
                 opener,
                 result,
-                |dir, ctx| host::Host::start(dir, move || ctx.request_repaint()),
+                host,
             )))
         }),
     );

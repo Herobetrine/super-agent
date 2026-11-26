@@ -1,0 +1,10 @@
+{"expect":{"method":"initialize","params":{"clientInfo":{"name":"superagent_local"},"capabilities":{"experimentalApi":false}}}}
+{"respond":{"userAgent":"replay-cli"}}
+{"expect":{"method":"initialized","params":{},"notification":true}}
+{"expect":{"method":"thread/start","params":{"modelProvider":"openai","model":"codex-fixture","sandbox":"danger-full-access","approvalPolicy":"never"}}}
+{"respond":{"thread":{"id":"00000000-0000-4000-8000-000000000001","sessionId":"00000000-0000-4000-8000-000000000001","preview":"","ephemeral":false,"modelProvider":"openai","model":"codex-fixture","createdAt":1,"updatedAt":1,"status":{"type":"idle"},"path":null,"cwd":".","originator":"fixture","source":"cli","gitInfo":null,"turns":[]},"model":"codex-fixture","modelProvider":"openai","approvalPolicy":"never","sandbox":{"type":"dangerFullAccess"}}}
+{"expect":{"method":"account/rateLimits/read","params":{}}}
+{"respond":{"rateLimits":{"primary":null,"secondary":null}}}
+{"expect":{"method":"turn/start","params":{"threadId":"00000000-0000-4000-8000-000000000001","input":[{"type":"text","text":"Inspect fixture.txt."}]}}}
+{"respond_error":{"code":-32000,"message":"HTTP 401 from fixture","data":{"codexErrorInfo":"unauthorized"}}}
+{"wait_for_close":true}

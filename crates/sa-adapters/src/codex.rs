@@ -5,9 +5,10 @@
 //! steer same-ticket notes into the live turn, and return the last
 //! non-commentary agent message.
 
-use crate::codex_config::{Discovery, discover, routing};
+use crate::codex_config::{self, Discovery, discover_cached, routing};
 use crate::common::{Emit, denied, probe_failed, protocol, route_gone, select, session_mismatch};
 use crate::custom::{self, CustomProvider, Registry};
+use crate::probe_cache::{DiscoveryTiming, ProbeCache, Probes, TurnTiming, custom_probe_slot, refresh_custom};
 use crate::proc::{Lines, Proc, cancelled, capture, start};
 use crate::sys::Sys;
 use futures::future::BoxFuture;
@@ -33,6 +34,7 @@ const MAX_STEER_BYTES: usize = 65_536;
 pub struct Codex {
     sys: Sys,
     registry: Registry,
+    probes: ProbeCache,
 }
 
 impl Codex {
@@ -45,7 +47,8 @@ impl Codex {
         // independently spawned CLI. Keep this override local to Codex so its
         // discovery probes and turns use the same sandbox-capable environment.
         sys.remove("CODEX_WINDOWS_REGISTERED_CORE");
-        Self { sys, registry }
+        let probes = ProbeCache::new(sys.data_dir.as_deref());
+        Self { sys, registry, probes }
     }
 }
 
@@ -217,9 +220,15 @@ impl Adapter for Codex {
     fn catalog(&self) -> BoxFuture<'static, anyhow::Result<Catalog>> {
         let sys = self.sys.clone();
         let customs = custom::snapshot(&self.registry, "codex");
+        let cache = self.probes.clone();
         Box::pin(async move {
-            let mut d = discover(&sys, &CancellationToken::new()).await?;
-            custom::refresh(&mut d.catalog, &customs, &sys, &CancellationToken::new()).await;
+            let exe = codex_config::executable(&sys);
+            let key = codex_config::probe_key(&sys, exe.as_deref(), &customs);
+            let probes = Probes::new(&cache, &key, false);
+            let cancel = CancellationToken::new();
+            let (mut d, _) = discover_cached(&sys, exe, &cancel, &probes).await?;
+            let _ = refresh_custom(&mut d.catalog, &customs, &sys, &cancel, &probes, None).await;
+            probes.flush().await;
             Ok(Catalog { value: d.catalog })
         })
     }
@@ -233,25 +242,77 @@ impl Adapter for Codex {
     ) -> BoxFuture<'static, Result<RunOutcome, AdapterError>> {
         let sys = self.sys.clone();
         let customs = custom::snapshot(&self.registry, "codex");
-        Box::pin(async move { run(sys, customs, request, host, Emit(events), cancel).await })
+        let cache = self.probes.clone();
+        Box::pin(async move { run(sys, customs, request, host, Emit(events), cancel, cache).await })
     }
 }
 
 async fn run(
+    sys: Sys,
+    customs: Vec<CustomProvider>,
+    req: RunRequest,
+    host: Arc<dyn TurnHost>,
+    emit: Emit,
+    cancel: CancellationToken,
+    cache: ProbeCache,
+) -> Result<RunOutcome, AdapterError> {
+    crate::images::check(&req)?;
+    let perm = policy(&req.profile, req.writable)?;
+    let started = std::time::Instant::now();
+    let exe = codex_config::executable(&sys);
+    let key = codex_config::probe_key(&sys, exe.as_deref(), &customs);
+    let mut reuse = true;
+    let (d, s, timing, used) = loop {
+        let probes = Probes::new(&cache, &key, reuse);
+        let (mut d, route_probes) = match discover_cached(&sys, exe.clone(), &cancel, &probes).await {
+            Ok(discovery) => discovery,
+            Err(error) => {
+                probes.flush().await;
+                return Err(if cancel.is_cancelled() { cancelled() } else { probe_failed(&error.to_string()) });
+            }
+        };
+        let donor = refresh_custom(&mut d.catalog, &customs, &sys, &cancel, &probes, Some(&req.route)).await;
+        probes.flush().await;
+        if cancel.is_cancelled() {
+            return Err(cancelled());
+        }
+        let mut used = if custom::lookup(&d.catalog, &customs, &req.route.provider).is_some() {
+            probes.observed(&[&custom_probe_slot(&req.route.provider)])
+        } else {
+            probes.observed(&route_probes.route_slots(&req.route))
+        };
+        if let Some(donor) = donor {
+            used.extend(probes.observed(&route_probes.route_slots(&donor)));
+        }
+        match select(&d.catalog, &req.route) {
+            Ok(s) => break (d, s, DiscoveryTiming::new(started, probes.reused_all(), !reuse), used),
+            Err(_) if reuse && used.iter().any(|probe| probe.cached) => reuse = false,
+            Err(error) => {
+                cache.evict_used(&key, &used).await;
+                return Err(error);
+            }
+        }
+    };
+    let result = run_selected(sys, customs, req, host, emit, cancel, d, s, perm, timing).await;
+    if result.as_ref().is_err_and(|error| error.class != ErrorClass::Cancelled) {
+        cache.evict_used(&key, &used).await;
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_selected(
     mut sys: Sys,
     customs: Vec<CustomProvider>,
     req: RunRequest,
     host: Arc<dyn TurnHost>,
     emit: Emit,
     cancel: CancellationToken,
+    d: Discovery,
+    s: sa_engine::adapter::Route,
+    perm: Policy,
+    discovery: DiscoveryTiming,
 ) -> Result<RunOutcome, AdapterError> {
-    crate::images::check(&req)?;
-    let perm = policy(&req.profile, req.writable)?;
-    let mut d: Discovery = discover(&sys, &cancel)
-        .await
-        .map_err(|e| probe_failed(&e.to_string()))?;
-    custom::refresh(&mut d.catalog, &customs, &sys, &cancel).await;
-    let s = select(&d.catalog, &req.route)?;
     let exe = d
         .exe
         .clone()
@@ -325,8 +386,10 @@ async fn run(
         return Err(cancelled());
     }
     args.extend(["app-server", "--listen", "stdio://"].map(String::from));
+    let spawning = std::time::Instant::now();
     let proc = start(&exe, &args, &req.cwd, &sys)?;
-    converse(proc, &req, &s, perm, settings, host, emit, cancel).await
+    let timing = discovery.spawned(spawning);
+    converse(proc, &req, &s, perm, settings, host, emit, cancel, Some(timing)).await
 }
 
 /// Drive one JSON-RPC session over an already started app-server.
@@ -340,8 +403,9 @@ async fn converse(
     host: Arc<dyn TurnHost>,
     emit: Emit,
     cancel: CancellationToken,
+    timing: Option<TurnTiming>,
 ) -> Result<RunOutcome, AdapterError> {
-    let mut turn = Turn::new(req, s, perm, settings, host, emit, cancel, &mut proc);
+    let mut turn = Turn::new(req, s, perm, settings, host, emit, cancel, &mut proc, timing);
     let result = turn.drive(&mut proc).await;
     turn.finish(&mut proc).await;
     result
@@ -385,13 +449,18 @@ impl Turn {
         emit: Emit,
         cancel: CancellationToken,
         proc: &mut Proc,
+        mut timing: Option<TurnTiming>,
     ) -> Self {
         let (out, mut rx) = mpsc::unbounded_channel::<Value>();
         let mut stdin = proc.stdin.take();
+        let writer_emit = emit.clone();
         let writer = tokio::spawn(async move {
             while let Some(msg) = rx.recv().await {
                 let Some(pipe) = stdin.as_mut() else { break };
                 let line = format!("{}\n", serde_json::to_string(&msg).unwrap_or_default());
+                if msg["method"] == "turn/start" && let Some(timing) = timing.take() {
+                    timing.emit(&writer_emit);
+                }
                 if pipe.write_all(line.as_bytes()).await.is_err() || pipe.flush().await.is_err() {
                     break;
                 }
@@ -1001,6 +1070,7 @@ const recv = async () => JSON.parse((await lines.next()).value), send = (o) => p
                 host.clone(),
                 Emit(tx),
                 CancellationToken::new(),
+                None,
             ),
         )
         .await
@@ -1084,7 +1154,7 @@ const recv = async () => JSON.parse((await lines.next()).value), send = o => pro
             let (tx, mut rx) = mpsc::unbounded_channel();
             let outcome = tokio::time::timeout(Duration::from_secs(10), converse(
                 proc, &req, &req.route, policy("readonly", false).unwrap(), Map::new(), host,
-                Emit(tx), CancellationToken::new(),
+                Emit(tx), CancellationToken::new(), None,
             )).await.expect("fixture finished").expect("optional account request preserved turn");
             assert_eq!(outcome.text, "ok");
             assert_eq!(outcome.session_id.as_deref(), Some("thread"));

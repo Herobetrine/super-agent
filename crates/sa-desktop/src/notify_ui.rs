@@ -1,10 +1,9 @@
-//! The "手机推送与隐私" dialog: ntfy settings, a test push and a plain statement
-//! of what Super Agent sends where. Settings live in the journal database and
-//! apply as soon as they are saved.
+//! The "通知与隐私" dialog: desktop mode, ntfy settings and privacy information.
 
 use crate::{
     app::App,
     host::Action,
+    notifications::Mode,
     ops::Pending,
     push::{self, Event, SendError},
     theme, widgets,
@@ -220,7 +219,7 @@ impl App {
             Ok(()) => {
                 self.notify = None;
                 self.composer.message =
-                    Some(("手机推送与隐私设置已保存，立即生效。".into(), false));
+                    Some(("通知与隐私设置已保存，立即生效。".into(), false));
             }
             Err(error) => {
                 if let Some(dialog) = self.notify.as_mut() {
@@ -236,6 +235,7 @@ impl App {
     pub fn notify_dialog(&mut self, ctx: &egui::Context) {
         let writable = self.writable();
         let demo = self.opts.demo;
+        let mut desktop_mode = self.notification_mode();
         let data = self.data_dir();
         let last_push = self.pusher.last();
         let pal = self.pal.clone();
@@ -289,15 +289,22 @@ impl App {
         let mut save = false;
         let mut retry = false;
         let mut test = false;
-        let modal = egui::Modal::new(egui::Id::new("sa-notify"))
+        let modal_id = egui::Id::new("sa-notify");
+        let modal = egui::Modal::new(modal_id)
+            // Keep the form's origin stable when scrolling content, validation
+            // and status messages change the measured dialog height.
+            .area(
+                egui::Modal::default_area(modal_id)
+                    .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 24.0)),
+            )
             .frame(widgets::modal_frame(&pal))
             .show(ctx, |ui| {
                 ui.set_width(560.0);
                 close = widgets::modal_header(
                     ui,
                     "",
-                    "手机推送与隐私",
-                    "保存后立即生效。推送由本机直接发往你填写的 ntfy 服务器，不经过 Super Agent 的任何服务器。",
+                    "通知与隐私",
+                    "手机推送的修改在保存后生效。",
                     &pal,
                 );
                 if demo {
@@ -323,7 +330,30 @@ impl App {
                     ui.add_space(8.0);
                 }
                 let max_height = (ctx.content_rect().height() - 240.0).max(180.0);
-                egui::ScrollArea::vertical().max_height(max_height).show(ui, |ui| {
+                // Use the viewport's scroll budget even during the modal sizing pass.
+                let scroll = egui::ScrollArea::vertical()
+                    .max_height(max_height)
+                    .min_scrolled_height(max_height)
+                    .auto_shrink([false, true]);
+                scroll.show(ui, |ui| {
+                    widgets::section(ui, "桌面通知", &pal);
+                    note(ui, "修改立即生效，无需保存。", pal.mute);
+                    ui.add_space(8.0);
+                    ui.add_enabled_ui(writable || demo, |ui| {
+                        ui.horizontal(|ui| {
+                            for mode in Mode::ALL {
+                                ui.radio_value(&mut desktop_mode, mode, mode.label());
+                            }
+                        });
+                    });
+                    note(
+                        ui,
+                        "选\"仅声音\"或\"关闭\"时，不弹系统通知和应用内提示。只有主窗口会发通知和显示任务栏角标。",
+                        pal.mute,
+                    );
+                    ui.add_space(16.0);
+                    widgets::rule(ui, pal.line_soft);
+                    ui.add_space(16.0);
                     widgets::section(ui, "手机推送", &pal);
                     ui.add_space(8.0);
                     ui.add_enabled(
@@ -655,6 +685,7 @@ impl App {
             settings.server = settings.server.trim().to_string();
             self.submit(Action::SaveNotify(settings));
         }
+        self.set_notification_mode(desktop_mode);
     }
 
     /// Whether the window currently has the keyboard focus (toast gate).

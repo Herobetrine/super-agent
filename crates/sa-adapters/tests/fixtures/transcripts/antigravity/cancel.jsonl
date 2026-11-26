@@ -1,0 +1,13 @@
+{"expect":{"method":"initialize","params":{"protocolVersion":1}}}
+{"respond":{"protocolVersion":1,"agentCapabilities":{"loadSession":true},"authMethods":[]}}
+{"expect":{"method":"session/new","params":{"mcpServers":[{"type":"http","name":"sa_bus","url":"http://127.0.0.1:1/mcp","headers":[{"name":"Authorization","value":"Bearer replay-fixture"}]}]}}}
+{"respond":{"sessionId":"00000000-0000-4000-8000-000000000004","_meta":{"antigravity":{"tier":{"id":"00000000-0000-4000-8000-000000000006"}}},"models":{"currentModelId":"gemini-fixture-default","availableModels":[{"modelId":"gemini-fixture","name":"Fixture Gemini"}]}}}
+{"expect":{"method":"session/set_model","params":{"sessionId":"00000000-0000-4000-8000-000000000004","modelId":"gemini-fixture"}}}
+{"respond":{}}
+{"expect":{"method":"session/load","params":{"sessionId":"00000000-0000-4000-8000-000000000004","mcpServers":[{"type":"http","name":"sa_bus","url":"http://127.0.0.1:1/mcp","headers":[{"name":"Authorization","value":"Bearer replay-fixture"}]}]}}}
+{"respond":{"sessionId":"00000000-0000-4000-8000-000000000004","_meta":{"antigravity":{"tier":{"id":"00000000-0000-4000-8000-000000000006"}}},"models":{"currentModelId":"gemini-fixture","availableModels":[{"modelId":"gemini-fixture","name":"Fixture Gemini"}]}}}
+{"expect":{"method":"session/prompt","params":{"sessionId":"00000000-0000-4000-8000-000000000004","prompt":[{"type":"text","text":"Inspect fixture.txt."}]}}}
+{"emit":{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"00000000-0000-4000-8000-000000000004","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Replay in progress."}}}}}
+{"expect":{"method":"session/cancel","params":{"sessionId":"00000000-0000-4000-8000-000000000004"},"notification":true}}
+{"respond":{"stopReason":"cancelled"},"to":"session/prompt"}
+{"wait_for_close":true}

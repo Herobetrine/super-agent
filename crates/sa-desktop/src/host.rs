@@ -505,9 +505,14 @@ impl Host {
     /// Claim `dir`, open the journal and start scheduling. `notify` is called
     /// after every outcome (the UI repaints).
     pub fn start(dir: PathBuf, notify: impl Fn() + Send + Sync + 'static) -> Result<Self> {
+        let data_dir = dir.clone();
         Self::start_with(
             dir,
-            |shared| sa_adapters::all_with_efficiency(Sys::from_process(), shared.registry.clone(), shared.efficiency.clone()),
+            move |shared| sa_adapters::all_with_efficiency(
+                Sys::from_process().with_data_dir(data_dir),
+                shared.registry.clone(),
+                shared.efficiency.clone(),
+            ),
             notify,
         )
     }

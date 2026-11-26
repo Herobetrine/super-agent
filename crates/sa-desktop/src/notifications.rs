@@ -1,96 +1,135 @@
-//! Native Windows toasts. The worker owns COM objects, so shell/WinRT work
-//! never blocks an egui frame. Content contains only ticket ids and status.
+//! Journal watches and native Windows notifications.
 
+#[path = "notification_badge.rs"]
+mod badge;
+#[path = "notification_cards.rs"]
+mod cards;
+#[path = "notification_gate.rs"]
+mod gate;
+
+pub(crate) use badge::Badge;
+pub(crate) use cards::Cards;
+pub(crate) use gate::{Delivery, Gate, Mode, Preferences, Visual, Watch, Window};
+
+use std::collections::HashSet;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
     mpsc,
 };
 
-/// Poll all pending approvals independently of the selected conversation.
-#[derive(Default)]
-pub struct ApprovalWatch {
-    pending: Option<crate::ops::Pending<Vec<(i64, i64)>>>,
-    last: Option<std::time::Instant>,
-    seen: Option<std::collections::HashSet<i64>>,
+#[derive(Clone, Copy)]
+struct PendingRequest {
+    id: i64,
+    ticket: i64,
+    kind: NoticeKind,
 }
 
-impl ApprovalWatch {
-    pub fn poll(&mut self, ctx: &egui::Context, data: &std::path::Path) -> Vec<Notice> {
-        self.poll_kind(ctx, data, NoticeKind::Approval)
-    }
+/// Each consumer keeps its own baseline over the shared journal rows.
+#[derive(Default)]
+struct PendingWatch {
+    seen: Option<HashSet<(NoticeKind, i64)>>,
+}
 
-    fn poll_kind(
-        &mut self,
-        ctx: &egui::Context,
-        data: &std::path::Path,
-        kind: NoticeKind,
-    ) -> Vec<Notice> {
-        let mut notices = Vec::new();
-        if let Some(result) = self.pending.as_ref().and_then(crate::ops::Pending::poll) {
-            self.pending = None;
-            if let Ok(rows) = result {
-                if let Some(seen) = &self.seen {
-                    let tickets: std::collections::BTreeSet<i64> = rows
-                        .iter()
-                        .filter(|(id, _)| !seen.contains(id))
-                        .map(|(_, ticket)| *ticket)
-                        .collect();
-                    notices.extend(tickets.into_iter().map(|ticket| Notice {
-                        ticket,
-                        kind,
-                        status: String::new(),
-                    }));
-                }
-                self.seen = Some(rows.iter().map(|(id, _)| *id).collect());
-            }
-        }
-        if self.pending.is_none()
-            && self
-                .last
-                .is_none_or(|last| last.elapsed() >= std::time::Duration::from_secs(1))
-        {
-            let data = data.to_path_buf();
-            self.pending = Some(crate::ops::Pending::spawn(ctx, move || {
-                let connection = rusqlite::Connection::open_with_flags(
-                    data.join(sa_store::DB_FILE),
-                    rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-                )?;
-                connection.busy_timeout(std::time::Duration::from_secs(1))?;
-                let sql = match kind {
-                    NoticeKind::Approval => "SELECT id,ticket FROM approvals WHERE decision='pending'",
-                    NoticeKind::Question => {
-                        let exists: bool = connection.query_row(
-                            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='questions')",
-                            [], |row| row.get(0),
-                        )?;
-                        if !exists {
-                            return Ok(Vec::new());
-                        }
-                        "SELECT id,ticket FROM questions WHERE state='pending'"
-                    }
-                    NoticeKind::Completion => unreachable!(),
-                };
-                let mut statement = connection.prepare(sql)?;
-                let rows = statement
-                    .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
-                Ok(rows)
-            }));
-            self.last = Some(std::time::Instant::now());
-        }
-        ctx.request_repaint_after(std::time::Duration::from_secs(1));
+impl PendingWatch {
+    fn observe(&mut self, rows: &[PendingRequest]) -> Vec<Notice> {
+        let current = rows.iter().map(|row| (row.kind, row.id)).collect();
+        let Some(seen) = self.seen.replace(current) else {
+            return Vec::new();
+        };
+        let mut emitted = HashSet::new();
+        let mut notices: Vec<_> = rows.iter().rev()
+            .filter(|row| !seen.contains(&(row.kind, row.id)) && emitted.insert((row.kind, row.ticket)))
+            .map(|row| Notice { ticket: row.ticket, kind: row.kind, status: String::new() })
+            .collect();
+        notices.reverse();
         notices
     }
 }
 
-/// Questions share approval polling and its startup baseline, with their own ids.
-#[derive(Default)]
-pub struct QuestionWatch(ApprovalWatch);
+fn open_journal(path: &std::path::Path) -> rusqlite::Result<rusqlite::Connection> {
+    let connection = rusqlite::Connection::open_with_flags(
+        path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )?;
+    connection.busy_timeout(std::time::Duration::from_secs(1))?;
+    Ok(connection)
+}
 
-impl QuestionWatch {
-    pub fn poll(&mut self, ctx: &egui::Context, data: &std::path::Path) -> Vec<Notice> {
-        self.0.poll_kind(ctx, data, NoticeKind::Question)
+fn table_exists(connection: &rusqlite::Connection, name: &str) -> rusqlite::Result<bool> {
+    connection.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1")?
+        .exists([name])
+}
+
+fn read_pending(connection: &rusqlite::Connection) -> rusqlite::Result<Vec<PendingRequest>> {
+    let mut sources = Vec::new();
+    let has_events = table_exists(connection, "events")?;
+    for (tag, table, status, event, field) in [
+        (0, "approvals", "decision", "approval.request", "approval"),
+        (1, "questions", "state", "ask", "id"),
+    ] {
+        if !table_exists(connection, table)? {
+            continue;
+        }
+        // Global journal seq orders approvals and questions together. Legacy
+        // requests without a journal event fall back to their per-table ids.
+        let order = if has_events {
+            format!("(SELECT e.seq FROM events e WHERE e.ticket=p.ticket AND e.kind='{event}'
+                     AND CASE WHEN json_valid(e.payload) THEN json_extract(e.payload,'$.{field}') END=p.id
+                     ORDER BY e.seq DESC LIMIT 1)")
+        } else {
+            "NULL".into()
+        };
+        sources.push(format!("SELECT {tag},p.id,p.ticket,{order} FROM {table} p WHERE p.{status}='pending'"));
+    }
+    if sources.is_empty() {
+        return Ok(Vec::new());
+    }
+    let sql = format!("{} ORDER BY 4,2,1", sources.join(" UNION ALL "));
+    #[cfg(test)]
+    pending_query_probe::record(connection.path());
+    let mut statement = connection.prepare(&sql)?;
+    let rows = statement.query_map([], |row| Ok(PendingRequest {
+        kind: if row.get::<_, i64>(0)? == 0 { NoticeKind::Approval } else { NoticeKind::Question },
+        id: row.get(1)?,
+        ticket: row.get(2)?,
+    }))?;
+    rows.collect()
+}
+
+#[cfg(test)]
+pub(crate) mod pending_query_probe {
+    use std::{collections::BTreeMap, ffi::OsString, path::Path, sync::Mutex};
+
+    static COUNTS: Mutex<BTreeMap<OsString, usize>> = Mutex::new(BTreeMap::new());
+
+    pub(crate) struct Probe(OsString);
+
+    impl Probe {
+        pub(crate) fn start(data: &Path) -> Self {
+            let key = data.file_name().unwrap().to_owned();
+            COUNTS.lock().unwrap().insert(key.clone(), 0);
+            Self(key)
+        }
+
+        pub(crate) fn count(&self) -> usize {
+            COUNTS.lock().unwrap()[&self.0]
+        }
+    }
+
+    impl Drop for Probe {
+        fn drop(&mut self) {
+            COUNTS.lock().unwrap().remove(&self.0);
+        }
+    }
+
+    pub(super) fn record(database: Option<&str>) {
+        if let Some(dir) = database.map(Path::new).and_then(Path::parent)
+            .and_then(Path::file_name)
+            && let Some(count) = COUNTS.lock().unwrap().get_mut(dir)
+        {
+            *count += 1;
+        }
     }
 }
 
@@ -149,22 +188,39 @@ impl CompletionWatch {
 }
 
 fn read_completions(path: &std::path::Path, cursor: Option<i64>) -> anyhow::Result<CompletionBatch> {
-    let mut conn = rusqlite::Connection::open_with_flags(
-        path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-    )?;
-    conn.busy_timeout(std::time::Duration::from_secs(1))?;
+    let mut conn = open_journal(path)?;
     let tx = conn.transaction()?;
-    let head = tx.query_row("SELECT coalesce(max(seq), 0) FROM events", [], |r| r.get(0))?;
+    let head = completion_head(&tx)?;
+    let rows = read_completion_rows(&tx, cursor, head)?;
+    Ok((head, rows.into_iter().map(|row| (row.ticket, row.state)).collect()))
+}
+
+struct CompletionRow {
+    seq: i64,
+    ticket: i64,
+    job: i64,
+    turn: i64,
+    state: String,
+}
+
+fn completion_head(conn: &rusqlite::Connection) -> rusqlite::Result<i64> {
+    conn.query_row("SELECT coalesce(max(seq), 0) FROM events", [], |r| r.get(0))
+}
+
+fn read_completion_rows(
+    conn: &rusqlite::Connection,
+    cursor: Option<i64>,
+    head: i64,
+) -> anyhow::Result<Vec<CompletionRow>> {
     let Some(after) = cursor.filter(|&after| after < head) else {
-        return Ok((head, Vec::new()));
+        return Ok(Vec::new());
     };
     // A reply or pause failure carries its resulting state in the payload.
     // Dedicated failure/interruption events encode the state in their kind.
     // CROSS JOIN keeps SQLite on the new event rowid range before root lookup.
-    let mut stmt = tx.prepare(
-        "SELECT ticket, state FROM (
-           SELECT e.seq, e.ticket, CASE
+    let mut stmt = conn.prepare(
+        "SELECT seq, ticket, job, turn, state FROM (
+           SELECT e.seq, e.ticket, e.job, coalesce(e.turn, j.turn) AS turn, CASE
              WHEN e.kind IN ('reply', 'turn.pause_failure') THEN
                CASE WHEN json_valid(e.payload) THEN json_extract(e.payload, '$.state') END
              ELSE e.kind END AS state
@@ -173,11 +229,17 @@ fn read_completions(path: &std::path::Path, cursor: Option<i64>) -> anyhow::Resu
              AND e.kind IN ('reply', 'turn.pause_failure', 'done', 'failed', 'partial', 'interrupted')
          ) WHERE state IN ('done', 'failed', 'partial', 'interrupted') ORDER BY seq",
     )?;
-    let rows = stmt.query_map([after, head], |r| Ok((r.get(0)?, r.get(1)?)))?;
-    Ok((head, rows.collect::<rusqlite::Result<_>>()?))
+    let rows = stmt.query_map([after, head], |r| Ok(CompletionRow {
+        seq: r.get(0)?,
+        ticket: r.get(1)?,
+        job: r.get(2)?,
+        turn: r.get(3)?,
+        state: r.get(4)?,
+    }))?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum NoticeKind {
     Approval,
     Question,
@@ -194,7 +256,7 @@ pub struct Notice {
 impl Notice {
     pub fn title(&self) -> String {
         match self.kind {
-            NoticeKind::Approval => format!("工单 #{} 等待审批", self.ticket),
+            NoticeKind::Approval => format!("工单 #{} 待审批", self.ticket),
             NoticeKind::Question => "需要你的回答".into(),
             NoticeKind::Completion => format!("工单 #{} {}", self.ticket, self.status),
         }
@@ -206,6 +268,36 @@ impl Notice {
     }
 }
 
+pub(crate) enum Request {
+    Toast(ToastRequest),
+    Sound,
+}
+
+fn deliver_pending(
+    requests: impl IntoIterator<Item = Request>,
+    cancelled: &AtomicBool,
+    mut deliver: impl FnMut(Request),
+) {
+    for request in requests {
+        if cancelled.load(Ordering::Acquire) {
+            break;
+        }
+        deliver(request);
+    }
+}
+
+pub(crate) struct ToastRequest {
+    pub notice: Notice,
+    pub sound: bool,
+}
+
+#[cfg(all(windows, test))]
+impl From<Notice> for ToastRequest {
+    fn from(notice: Notice) -> Self {
+        Self { notice, sound: false }
+    }
+}
+
 pub enum Feedback {
     Open(i64),
     Failed(String),
@@ -213,14 +305,36 @@ pub enum Feedback {
 
 #[derive(Default)]
 pub struct Notifications {
-    tx: Option<mpsc::SyncSender<Notice>>,
+    tx: Option<mpsc::SyncSender<Request>>,
     rx: Option<mpsc::Receiver<Feedback>>,
     cancel: Option<Arc<AtomicBool>>,
     local_error: Option<String>,
 }
 
 impl Notifications {
-    pub fn post(&mut self, ctx: &egui::Context, data: &std::path::Path, notice: Notice) {
+    #[cfg(test)]
+    pub(crate) fn test_worker(&mut self) -> mpsc::Receiver<Request> {
+        let (tx, rx) = mpsc::sync_channel(32);
+        self.tx = Some(tx);
+        self.cancel = Some(Arc::new(AtomicBool::new(false)));
+        rx
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_queued_sounds(&mut self) -> impl FnOnce() -> usize + use<> {
+        let requests = self.test_worker();
+        let cancelled = self.cancel.as_ref().unwrap().clone();
+        for _ in 0..2 {
+            assert!(self.tx.as_ref().unwrap().try_send(Request::Sound).is_ok());
+        }
+        move || {
+            let mut delivered = 0;
+            deliver_pending(requests.try_iter(), &cancelled, |_| delivered += 1);
+            delivered
+        }
+    }
+
+    pub fn post(&mut self, ctx: &egui::Context, data: &std::path::Path, request: Request) {
         if self.tx.is_none() {
             let (tx, requests) = mpsc::sync_channel(32);
             let (feedback, rx) = mpsc::channel();
@@ -236,27 +350,35 @@ impl Notifications {
                     let _ = feedback.send(Feedback::Failed(message));
                     ctx.request_repaint();
                 };
-                let backend = native::Backend::new(&data);
-                match backend {
-                    Ok(mut backend) => {
-                        for notice in requests {
-                            if cancelled.load(Ordering::Acquire) {
-                                break;
+                let mut backend = None;
+                deliver_pending(requests, &cancelled, |request| {
+                    match request {
+                        Request::Sound => native::play_sound(),
+                        Request::Toast(toast) => {
+                            if backend.is_none() {
+                                match native::Backend::new(&data) {
+                                    Ok(ready) => backend = Some(ready),
+                                    Err(error) => {
+                                        send_error(format!("系统通知初始化失败：{error:#}"));
+                                        return;
+                                    }
+                                }
                             }
-                            if let Err(error) = backend.show(notice, feedback.clone(), ctx.clone())
+                            if let Some(backend) = &mut backend
+                                && !cancelled.load(Ordering::Acquire)
+                                && let Err(error) = backend.show(toast, feedback.clone(), ctx.clone())
                             {
                                 send_error(format!("系统通知发送失败：{error:#}"));
                             }
                         }
                     }
-                    Err(error) => send_error(format!("系统通知初始化失败：{error:#}")),
-                }
+                });
             });
             self.tx = Some(tx);
             self.rx = Some(rx);
         }
         if let Some(tx) = &self.tx {
-            match tx.try_send(notice) {
+            match tx.try_send(request) {
                 Ok(()) => {}
                 Err(mpsc::TrySendError::Full(_)) => {
                     self.local_error = Some("系统通知队列已满，请在工作台查看最新状态".into())
@@ -294,7 +416,9 @@ impl Drop for Notifications {
 
 #[cfg(windows)]
 mod native {
-    use super::{Feedback, Notice};
+    use super::{Feedback, ToastRequest};
+    #[cfg(test)]
+    use super::Notice;
     use anyhow::{Context, Result};
     use sha2::{Digest, Sha256};
     use std::{
@@ -307,6 +431,7 @@ mod native {
         Foundation::TypedEventHandler,
         UI::Notifications::{ToastNotification, ToastNotificationManager, ToastNotifier},
         Win32::{
+            Media::Audio::{PlaySoundW, SND_ALIAS, SND_ASYNC, SND_NODEFAULT, SND_SYSTEM},
             Storage::EnhancedStorage::PKEY_AppUserModel_ID,
             System::{
                 Com::{
@@ -321,10 +446,20 @@ mod native {
                 SHGetKnownFolderPath, ShellLink,
             },
         },
-        core::{HSTRING, Interface, PCWSTR},
+        core::{HSTRING, Interface, PCWSTR, w},
     };
 
     const APP_ID: &str = "Herobetrine.SuperAgent";
+
+    pub fn play_sound() {
+        unsafe {
+            let _ = PlaySoundW(
+                w!("Notification.Default"),
+                None,
+                SND_ALIAS | SND_ASYNC | SND_NODEFAULT | SND_SYSTEM,
+            );
+        }
+    }
 
     struct Apartment;
     impl Apartment {
@@ -438,15 +573,23 @@ mod native {
 
         pub fn show(
             &mut self,
-            notice: Notice,
+            request: impl Into<ToastRequest>,
             feedback: mpsc::Sender<Feedback>,
             ctx: egui::Context,
         ) -> Result<()> {
+            let ToastRequest { notice, sound } = request.into();
             // Windows may return ELEMENT_NOT_FOUND from Setting() until the
             // first notification creates its settings record. Submit through
             // Show, as in the native desktop sample, and observe Failed.
             let document = XmlDocument::new()?;
-            document.LoadXml(&HSTRING::from("<toast><visual><binding template=\"ToastGeneric\"><text/><text/></binding></visual><audio silent=\"true\"/></toast>"))?;
+            let audio = if sound {
+                "<audio src=\"ms-winsoundevent:Notification.Default\"/>"
+            } else {
+                "<audio silent=\"true\"/>"
+            };
+            document.LoadXml(&HSTRING::from(format!(
+                "<toast><visual><binding template=\"ToastGeneric\"><text/><text/></binding></visual>{audio}</toast>"
+            )))?;
             let text = document.GetElementsByTagName(&HSTRING::from("text"))?;
             text.Item(0)?
                 .AppendChild(&document.CreateTextNode(&HSTRING::from(notice.title()))?)?;
@@ -569,22 +712,12 @@ mod native {
                 "CREATE TABLE questions(id INTEGER PRIMARY KEY, ticket INTEGER, state TEXT, question TEXT);",
             )?;
             let context = egui::Context::default();
-            let mut watch = crate::notifications::QuestionWatch::default();
-            let drain = |watch: &mut crate::notifications::QuestionWatch| -> Result<Vec<Notice>> {
-                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-                watch.0.last = None;
-                let mut notices = watch.poll(&context, data.path());
-                while watch.0.pending.is_some() {
-                    if std::time::Instant::now() >= deadline {
-                        bail!("问题轮询超时");
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(5));
-                    notices.extend(watch.poll(&context, data.path()));
-                }
-                Ok(notices)
+            let mut watch = crate::notifications::PendingWatch::default();
+            let mut drain = || -> Result<Vec<Notice>> {
+                Ok(watch.observe(&crate::notifications::read_pending(&connection)?))
             };
             assert!(
-                drain(&mut watch)?.is_empty(),
+                drain()?.is_empty(),
                 "startup establishes a baseline"
             );
             let private_question = "PRIVATE QUESTION CONTENT MUST STAY IN THE JOURNAL";
@@ -592,7 +725,7 @@ mod native {
                 "INSERT INTO questions VALUES(1,731,'pending',?)",
                 [private_question],
             )?;
-            let mut notices = drain(&mut watch)?;
+            let mut notices = drain()?;
             assert_eq!(
                 notices,
                 vec![Notice {
@@ -602,7 +735,7 @@ mod native {
                 }]
             );
             assert!(
-                drain(&mut watch)?.is_empty(),
+                drain()?.is_empty(),
                 "pending question is not repeated"
             );
             let mut backend = Backend::with_id(&identity.id, data.path(), Apartment::new()?)?;
@@ -697,18 +830,21 @@ mod native {
 
 #[cfg(not(windows))]
 mod native {
-    use super::{Feedback, Notice};
+    use super::{Feedback, ToastRequest};
+    pub fn play_sound() {}
     pub struct Backend;
     impl Backend {
         pub fn new(_: &std::path::Path) -> anyhow::Result<Self> {
-            anyhow::bail!("此平台尚未接入系统通知")
+            Ok(Self)
         }
         pub fn show(
             &mut self,
-            _: Notice,
+            request: ToastRequest,
             _: std::sync::mpsc::Sender<Feedback>,
             _: egui::Context,
         ) -> anyhow::Result<()> {
+            let ToastRequest { notice, sound } = request;
+            let _ = (notice, sound);
             Ok(())
         }
     }
@@ -727,7 +863,7 @@ mod tests {
                 status: String::new()
             }
             .title(),
-            "工单 #8 等待审批"
+            "工单 #8 待审批"
         );
         assert_eq!(
             Notice {
@@ -746,38 +882,26 @@ mod tests {
         let connection =
             rusqlite::Connection::open(directory.path().join(sa_store::DB_FILE)).unwrap();
         connection.execute_batch("CREATE TABLE approvals(id INTEGER PRIMARY KEY, ticket INTEGER, decision TEXT); INSERT INTO approvals VALUES(1,101,'pending');").unwrap();
-        let context = egui::Context::default();
-        let mut watch = ApprovalWatch::default();
-        let drain = |watch: &mut ApprovalWatch| {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-            let mut notices = Vec::new();
-            watch.last = None;
-            notices.extend(watch.poll(&context, directory.path()));
-            while watch.pending.is_some() {
-                assert!(std::time::Instant::now() < deadline);
-                std::thread::sleep(std::time::Duration::from_millis(5));
-                notices.extend(watch.poll(&context, directory.path()));
-            }
-            notices
-        };
+        let mut watch = PendingWatch::default();
+        let mut drain = || watch.observe(&read_pending(&connection).unwrap());
         assert!(
-            drain(&mut watch).is_empty(),
+            drain().is_empty(),
             "initial pending approvals establish a baseline"
         );
         connection.execute_batch("UPDATE approvals SET decision='allow' WHERE id=1; INSERT INTO approvals VALUES(2,202,'pending');").unwrap();
-        let notices = drain(&mut watch);
+        let notices = drain();
         assert_eq!(notices.len(), 1);
         assert_eq!(notices[0].ticket, 202);
         assert_eq!(notices[0].kind, NoticeKind::Approval);
         assert!(
-            drain(&mut watch).is_empty(),
+            drain().is_empty(),
             "same pending approval is not repeated"
         );
         connection
             .execute_batch("INSERT INTO approvals VALUES(3,202,'pending'),(4,303,'pending');")
             .unwrap();
         assert_eq!(
-            drain(&mut watch)
+            drain()
                 .iter()
                 .map(|notice| notice.ticket)
                 .collect::<Vec<_>>(),
@@ -791,32 +915,20 @@ mod tests {
         assert_eq!(notice.detail(), "工单 #19 · 点击返回工作台查看");
     }
 
-    fn drain_questions(watch: &mut QuestionWatch, context: &egui::Context, data: &std::path::Path) -> Vec<Notice> {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-        watch.0.last = None;
-        let mut notices = watch.poll(context, data);
-        while watch.0.pending.is_some() {
-            assert!(std::time::Instant::now() < deadline);
-            std::thread::sleep(std::time::Duration::from_millis(5));
-            notices.extend(watch.poll(context, data));
-        }
-        notices
-    }
-
     #[test]
     fn question_watch_baselines_and_observes_background_replacements() {
         let directory = tempfile::tempdir().unwrap();
         let connection = rusqlite::Connection::open(directory.path().join(sa_store::DB_FILE)).unwrap();
         connection.execute_batch("CREATE TABLE questions(id INTEGER PRIMARY KEY, ticket INTEGER, state TEXT); INSERT INTO questions VALUES(1,101,'pending');").unwrap();
-        let context = egui::Context::default();
-        let mut watch = QuestionWatch::default();
-        assert!(drain_questions(&mut watch, &context, directory.path()).is_empty());
+        let mut watch = PendingWatch::default();
+        let mut drain = || watch.observe(&read_pending(&connection).unwrap());
+        assert!(drain().is_empty());
         connection.execute_batch("UPDATE questions SET state='answered' WHERE id=1; INSERT INTO questions VALUES(2,202,'pending'),(3,202,'pending'),(4,303,'withdrawn');").unwrap();
-        let notices = drain_questions(&mut watch, &context, directory.path());
+        let notices = drain();
         assert_eq!(notices, vec![Notice { ticket: 202, kind: NoticeKind::Question, status: String::new() }]);
-        assert!(drain_questions(&mut watch, &context, directory.path()).is_empty());
+        assert!(drain().is_empty());
         connection.execute_batch("INSERT INTO questions VALUES(5,303,'pending');").unwrap();
-        assert_eq!(drain_questions(&mut watch, &context, directory.path())[0].ticket, 303);
+        assert_eq!(drain()[0].ticket, 303);
     }
 
     #[test]
@@ -824,10 +936,9 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let connection = rusqlite::Connection::open(directory.path().join(sa_store::DB_FILE)).unwrap();
         connection.execute_batch("CREATE TABLE legacy(id INTEGER);").unwrap();
-        let context = egui::Context::default();
-        let mut watch = QuestionWatch::default();
-        assert!(drain_questions(&mut watch, &context, directory.path()).is_empty());
-        assert_eq!(watch.0.seen, Some(Default::default()));
+        let mut watch = PendingWatch::default();
+        assert!(watch.observe(&read_pending(&connection).unwrap()).is_empty());
+        assert_eq!(watch.seen, Some(Default::default()));
         assert_eq!(connection.query_row("SELECT COUNT(*) FROM sqlite_master WHERE name='questions'", [], |row| row.get::<_, i64>(0)).unwrap(), 0);
     }
 }

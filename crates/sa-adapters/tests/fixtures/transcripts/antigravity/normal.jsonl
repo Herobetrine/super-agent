@@ -1,0 +1,17 @@
+{"expect":{"method":"initialize","params":{"protocolVersion":1}}}
+{"respond":{"protocolVersion":1,"agentCapabilities":{"loadSession":true},"authMethods":[]}}
+{"expect":{"method":"session/new","params":{"mcpServers":[{"type":"http","name":"sa_bus","url":"http://127.0.0.1:1/mcp","headers":[{"name":"Authorization","value":"Bearer replay-fixture"}]}]}}}
+{"respond":{"sessionId":"00000000-0000-4000-8000-000000000004","_meta":{"antigravity":{"tier":{"id":"00000000-0000-4000-8000-000000000006"}}},"models":{"currentModelId":"gemini-fixture-default","availableModels":[{"modelId":"gemini-fixture","name":"Fixture Gemini"}]}}}
+{"expect":{"method":"session/set_model","params":{"sessionId":"00000000-0000-4000-8000-000000000004","modelId":"gemini-fixture"}}}
+{"respond":{}}
+{"expect":{"method":"session/load","params":{"sessionId":"00000000-0000-4000-8000-000000000004","mcpServers":[{"type":"http","name":"sa_bus","url":"http://127.0.0.1:1/mcp","headers":[{"name":"Authorization","value":"Bearer replay-fixture"}]}]}}}
+{"respond":{"sessionId":"00000000-0000-4000-8000-000000000004","_meta":{"antigravity":{"tier":{"id":"00000000-0000-4000-8000-000000000006"}}},"models":{"currentModelId":"gemini-fixture","availableModels":[{"modelId":"gemini-fixture","name":"Fixture Gemini"}]}}}
+{"expect":{"method":"session/prompt","params":{"sessionId":"00000000-0000-4000-8000-000000000004","prompt":[{"type":"text","text":"Inspect fixture.txt."}]}}}
+{"emit":{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"00000000-0000-4000-8000-000000000004","update":{"sessionUpdate":"tool_call","toolCallId":"tool-1","name":"read_file","title":"Read fixture.txt","rawInput":{"toolSummary":"Inspect fixture.txt"},"status":"in_progress"}}}}
+{"request":{"method":"session/request_permission","params":{"sessionId":"00000000-0000-4000-8000-000000000004","toolCall":{"toolCallId":"tool-1","title":"Read fixture.txt"},"options":[{"optionId":"deny","name":"Deny","kind":"reject_once"},{"optionId":"allow","name":"Allow","kind":"allow_once"}]}}}
+{"expect_response":{"result":{"outcome":{"outcome":"selected","optionId":"allow"}}}}
+{"emit":{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"00000000-0000-4000-8000-000000000004","update":{"sessionUpdate":"tool_call_update","toolCallId":"tool-1","name":"read_file","title":"Read fixture.txt","rawInput":{"toolSummary":"Inspect fixture.txt"},"kind":"other","status":"completed"}}}}
+{"emit":{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"00000000-0000-4000-8000-000000000004","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Gemini fixture "}}}}}
+{"emit":{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"00000000-0000-4000-8000-000000000004","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"result.\n"}}}}}
+{"respond":{"stopReason":"end_turn"}}
+{"wait_for_close":true}
