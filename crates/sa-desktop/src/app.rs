@@ -673,6 +673,15 @@ impl eframe::App for App {
                         ui.clip_rect().max,
                     );
                     self.conversation(ui);
+                    if !ui.is_sizing_pass()
+                        && !ctx.will_discard()
+                        && let Some(view) = &self.view
+                        && view.snap.is_some()
+                        && let Some(event) = view.events.last()
+                    {
+                        let window = self.notification_window(Some(view.id));
+                        self.notification_gate.displayed(window, event.seq);
+                    }
                     if let Some(ticket) = self.notification_cards.show(ctx, conversation, &pal) {
                         self.select(Some(ticket));
                     }
@@ -787,6 +796,7 @@ impl App {
         let window = self.notification_window(ticket);
         self.notification_gate.view(window);
         if window.main && window.focused && let Some(ticket) = ticket {
+            self.notification_watch.view(ticket);
             self.notification_cards.remove_ticket(ticket);
         }
     }
@@ -932,17 +942,29 @@ impl App {
         self.notification_preferences.mode()
     }
 
+    #[cfg(test)]
+    pub(crate) fn hold_notification_snapshot(&mut self) -> impl FnOnce() + use<> {
+        let path = self.opts.data.as_ref().unwrap().join(sa_store::DB_FILE);
+        self.notification_watch.hold_snapshot(path, &self.notification_gate)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_notification_worker(&mut self) -> std::sync::mpsc::Receiver<notifications::Request> {
+        self.notifications.test_worker()
+    }
+
     pub(crate) fn toggle_notifications(&mut self) {
         self.set_notification_mode(self.notification_preferences.toggled());
     }
 
     pub(crate) fn set_notification_mode(&mut self, mode: Mode) {
-        if mode == self.notification_mode() {
+        let previous = self.notification_mode();
+        if mode == previous {
             return;
         }
         self.notification_preferences.set(mode);
-        self.notifications.stop();
-        if !mode.visual() {
+        if previous.visual() && !mode.visual() {
+            self.notifications.stop();
             self.notification_cards.clear();
         }
     }
