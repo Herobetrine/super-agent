@@ -237,7 +237,7 @@ async fn custom_models(sys: &Sys, cfg: &Value, cancel: &CancellationToken) -> Re
     crate::catalog::fetch_with_status(&target, &headers, cancel).await
 }
 
-const NATIVE_SELECTED: &str = "native:selected";
+pub(crate) const NATIVE_SELECTED: &str = "native:selected";
 const NATIVE_OPENAI: &str = "native:openai";
 
 struct ProviderProbes {
@@ -256,6 +256,10 @@ pub struct Discovery {
 pub(crate) struct RouteProbes(HashMap<String, ProviderProbes>);
 
 impl RouteProbes {
+    pub(crate) fn primary_slot(&self, provider: &str) -> Option<&str> {
+        self.0.get(provider)?.primary.as_deref()
+    }
+
     pub(crate) fn route_slots(&self, route: &Route) -> Vec<&str> {
         let Some(probes) = self.0.get(&route.provider) else { return Vec::new() };
         let mut slots: Vec<_> = probes.primary.as_deref().into_iter().collect();
@@ -269,8 +273,14 @@ impl RouteProbes {
 }
 
 pub(crate) fn probe_key(sys: &Sys, exe: Option<&Path>, customs: &[crate::custom::CustomProvider]) -> ProbeKey {
-    let paths = crate::revision::watch_paths(sys, "codex");
     let dir = config_home(sys);
+    // The CLI rewrites this generated catalog during ordinary runs.
+    let cli_cache = dir.join("models_cache.json");
+    let mut paths = crate::revision::watch_paths(sys, "codex");
+    if let Some(index) = paths.iter().position(|path| path == &cli_cache) {
+        // Keep any separate occurrence from an explicit model_catalog_json.
+        paths.remove(index);
+    }
     let config: Vec<_> = paths.iter()
         .filter(|path| path.parent() == Some(dir.as_path()) && path.file_name().is_some_and(|name| {
             let name = name.to_string_lossy();
@@ -298,11 +308,12 @@ pub async fn discover(sys: &Sys, cancel: &CancellationToken) -> Result<Discovery
     let key = probe_key(sys, exe.as_deref(), &[]);
     let cache = ProbeCache::new(None);
     let probes = Probes::new(&cache, &key, false);
-    discover_cached(sys, exe, cancel, &probes).await.map(|(discovery, _)| discovery)
+    discover_cached(sys, exe, cancel, &probes, None).await.map(|(discovery, _)| discovery)
 }
 
 pub(crate) async fn discover_cached(
     sys: &Sys, exe: Option<PathBuf>, cancel: &CancellationToken, probes: &Probes<'_>,
+    selected: Option<&Route>,
 ) -> Result<(Discovery, RouteProbes)> {
     let Settings {
         config,
@@ -330,9 +341,18 @@ pub(crate) async fn discover_cached(
     let file_catalog = config["model_catalog_json"]
         .as_str()
         .map(|p| resolve(&dir, p));
+    let optional_provider = |name: &str| selected.is_some_and(|route| route.provider != name);
+    let default_uses_native = file_catalog.is_none()
+        && custom
+            .get(&def)
+            .and_then(|cfg| cfg["base_url"].as_str())
+            .is_none()
+        && (def != "openai" || !config["openai_base_url"].is_string());
+    let optional_native = selected.is_some() && (optional_provider(&def) || !default_uses_native);
     let native = match &exe {
         Some(exe) => probes.fetch_models(
             NATIVE_SELECTED,
+            optional_native,
             cancel,
             native_models(exe, &["debug".into(), "models".into()], sys, Duration::from_secs(15), cancel),
         ).await.map(|(models, _)| models),
@@ -367,7 +387,9 @@ pub(crate) async fn discover_cached(
                     detail = "本机 model_catalog_json".into();
                 } else if let Some(c) = cfg.as_ref().filter(|c| c["base_url"].as_str().is_some()) {
                     let slot = primary.insert(format!("provider:{name}"));
-                    (models, fallback) = probes.fetch_models(slot, cancel, custom_models(sys, c, cancel)).await?;
+                    (models, fallback) = probes.fetch_models(
+                        slot, optional_provider(name), cancel, custom_models(sys, c, cancel),
+                    ).await?;
                     detail = "供应商在线模型目录".into();
                 } else if name == def {
                     primary = Some(NATIVE_SELECTED.into());
@@ -381,7 +403,7 @@ pub(crate) async fn discover_cached(
                         args.push("--bundled".into());
                     }
                     (models, _) = probes.fetch_models(
-                        NATIVE_OPENAI, cancel,
+                        NATIVE_OPENAI, optional_provider(name), cancel,
                         native_models(exe, &args, sys, Duration::from_secs(8), cancel),
                     ).await?;
                     detail = "Codex CLI 模型目录".into();

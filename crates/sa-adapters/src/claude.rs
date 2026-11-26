@@ -6,8 +6,8 @@ use crate::common::{
 };
 use crate::custom::{self, CustomProvider, Registry};
 use crate::probe_cache::{
-    DiscoveryTiming, ModelProbeResult, ProbeCache, ProbeKey, Probes, Stamp, TurnTiming,
-    config_digest, custom_probe_slot, file_stamp, probe_slot, refresh_custom,
+    CACHED_FAILURE, DiscoveryTiming, ModelProbeResult, ProbeCache, ProbeKey, ProbeUse, Probes, Stamp,
+    TurnTiming, config_digest, custom_probe_slot, file_stamp, probe_slot, refresh_custom,
     safe_models, supplement_efforts,
 };
 use crate::proc::{Proc, cancelled, capture, start, stream};
@@ -309,6 +309,7 @@ struct OfficialModels {
 
 async fn discover_official(
     sys: &Sys, exe: Option<&PathBuf>, cancel: &CancellationToken, probes: Option<&Probes<'_>>,
+    optional: bool,
 ) -> Record {
     let Some(probes) = probes.filter(|_| exe.is_some()) else {
         return first_party(sys, exe, cancel).await;
@@ -320,6 +321,11 @@ async fn discover_official(
         }
         record.models = models.models;
         record.model_info = models.model_info;
+        return record;
+    }
+    if probes.failure_is_fresh(OFFICIAL_SLOT, optional) {
+        let mut record = official_record();
+        record.catalog_error = Some(CACHED_FAILURE.into());
         return record;
     }
     let started = probes.start();
@@ -341,14 +347,20 @@ type ModelCache = AsyncMutex<HashMap<(String, String, String), ModelProbe>>;
 struct DiscoveryProbes<'a> {
     http: ModelCache,
     reusable: Option<&'a Probes<'a>>,
+    selected: Option<&'a Route>,
+    routed_member: Option<&'a str>,
 }
 
 impl DiscoveryProbes<'_> {
     async fn models(
-        &self, url: String, auth: &str, token: String, slot: &str, cancel: &CancellationToken,
+        &self, url: String, auth: &str, token: String, slot: &str, optional: bool,
+        cancel: &CancellationToken,
     ) -> Result<ModelProbeResult, String> {
         if let Some(models) = self.reusable.and_then(|cache| cache.read(slot)) {
             return Ok((models, None));
+        }
+        if self.reusable.is_some_and(|cache| cache.failure_is_fresh(slot, optional)) {
+            return Err(CACHED_FAILURE.into());
         }
         let auth = auth.to_string();
         let key = (url.clone(), auth.clone(), token.clone());
@@ -381,17 +393,7 @@ impl DiscoveryProbes<'_> {
     }
 }
 
-/// `makeRecord(app, id, name, cfg, meta, cache)` (CL:102-160).
-#[allow(clippy::too_many_arguments)]
-async fn make_record(
-    app: &str,
-    id: &str,
-    name: &str,
-    cfg: &Value,
-    meta: &Value,
-    cache: Option<&DiscoveryProbes<'_>>,
-    cancel: &CancellationToken,
-) -> Record {
+fn configured_record(app: &str, id: &str, name: &str, cfg: &Value) -> Record {
     let env = &cfg["env"];
     let base = env["ANTHROPIC_BASE_URL"]
         .as_str()
@@ -412,19 +414,30 @@ async fn make_record(
         .or_else(|| env["ANTHROPIC_MODEL"].as_str())
         .unwrap_or_default()
         .to_string();
-    let mut rec = Record {
+    Record {
         app: app.into(),
         row: id.into(),
         name: name.into(),
-        base: base.clone(),
+        base,
         auth: auth.into(),
         token: env[auth].as_str().map(str::to_string),
         preferred,
         cache_settings: crate::cache_policy::selected_settings(cfg),
         ..Default::default()
-    };
+    }
+}
+
+/// `makeRecord(app, id, name, cfg, meta, cache)` (CL:102-160).
+async fn make_record(
+    mut rec: Record,
+    cfg: &Value,
+    meta: &Value,
+    cache: Option<&DiscoveryProbes<'_>>,
+    cancel: &CancellationToken,
+) -> Record {
+    let env = &cfg["env"];
     let attempt: anyhow::Result<()> = async {
-        endpoint(&base)?;
+        endpoint(&rec.base)?;
         let token = rec
             .token
             .clone()
@@ -460,9 +473,14 @@ async fn make_record(
             .filter(|v| !v.is_empty() && v.encode_utf16().count() < 200 && seen.insert(v.clone()))
             .collect();
         if let Some(cache) = cache {
-            let url = format!("{}/v1/models?limit=1000", api_base(&base));
-            let slot = probe_slot("provider", &json!(rec.id()));
-            let result = cache.models(url, auth, token, &slot, cancel).await;
+            let url = format!("{}/v1/models?limit=1000", api_base(&rec.base));
+            let provider = rec.id();
+            let slot = probe_slot("provider", &json!(provider));
+            let optional = cache.selected.is_some_and(|route| {
+                route.provider != provider
+                    && !(rec.app == "claude" && cache.routed_member == Some(rec.row.as_str()))
+            });
+            let result = cache.models(url, &rec.auth, token, &slot, optional, cancel).await;
             rec.probe_slot = Some(slot);
             match result {
                 Ok((discovered, fallback)) => {
@@ -499,6 +517,14 @@ struct Discovery {
 }
 
 impl Discovery {
+    fn primary_slot(&self, provider: &str) -> Option<&str> {
+        self.records
+            .iter()
+            .find(|record| record.id() == provider)?
+            .probe_slot
+            .as_deref()
+    }
+
     fn route_slots(&self, route: &Route) -> Vec<&str> {
         let Some(record) = self.records.iter().find(|record| record.id() == route.provider)
         else { return Vec::new() };
@@ -634,23 +660,20 @@ async fn discover(
     exe: Option<PathBuf>,
     cancel: &CancellationToken,
 ) -> anyhow::Result<Discovery> {
-    discover_with(sys, exe, cancel, true, None).await
+    discover_with(sys, exe, cancel, true, None, None).await
 }
 
 async fn discover_with(
     sys: &Sys, exe: Option<PathBuf>, cancel: &CancellationToken, online: bool,
-    reusable: Option<&Probes<'_>>,
+    reusable: Option<&Probes<'_>>, selected: Option<&Route>,
 ) -> anyhow::Result<Discovery> {
     let dir = sys.home.join(".cc-switch");
     let device = read_json_or(&dir.join("settings.json"));
     let state = read_json_or(&dir.join("live-state.json"))["apps"]["claude-desktop"].clone();
     let bound = read_json_or(&sys.platform_dir().join("claude-route.json"));
-    let official_probe = discover_official(sys, exe.as_ref().filter(|_| online), cancel, reusable).shared();
-    let cache = DiscoveryProbes { http: AsyncMutex::default(), reusable };
-    let rows = cc_rows(sys, &["claude", "claude-desktop"])?;
-    let records = join_all(rows.iter().map(|row| {
-        let (cache, official) = (online.then_some(&cache), official_probe.clone());
-        async move {
+    let sources = cc_rows(sys, &["claude", "claude-desktop"])?
+        .into_iter()
+        .map(|row| {
             let app = row["app_type"].as_str().unwrap_or_default();
             let id = match &row["id"] {
                 Value::String(s) => s.clone(),
@@ -664,28 +687,24 @@ async fn discover_with(
                 Some(m) => serde_json::from_str(m).ok(),
                 None => Some(json!({})),
             };
-            let (Some(cfg), Some(meta)) = (cfg, meta) else {
-                return Record {
+            let Some((cfg, meta)) = cfg.zip(meta) else {
+                let record = Record {
                     app: app.into(),
                     row: id,
                     name: name.into(),
                     reason: "无效的来源记录".into(),
                     ..Default::default()
                 };
+                return (record, None, false);
             };
-            let mut record = make_record(app, &id, name, &cfg, &meta, cache, cancel).await;
-            if row["category"] == json!("official") && record.base.is_empty() {
-                let official = official.await;
-                record.auth = official.auth;
-                record.models = official.models;
-                record.model_info = official.model_info;
-                record.reason = official.reason;
-                record.catalog_error = official.catalog_error;
-                record.probe_slot = official.probe_slot;
+            let mut record = configured_record(app, &id, name, &cfg);
+            let uses_official = row["category"] == "official" && record.base.is_empty();
+            if uses_official {
+                record.auth = "sdk-login".into();
             }
-            record
-        }
-    }));
+            (record, Some((cfg, meta)), uses_official)
+        })
+        .collect::<Vec<_>>();
     let cfg = if sys.var("ANTHROPIC_BASE_URL").is_some() {
         let env: serde_json::Map<String, Value> = sys
             .vars()
@@ -697,45 +716,91 @@ async fn discover_with(
         read_json_or(&native_file(sys))
     };
     let native_path = native_file(sys).to_string_lossy().into_owned();
+    let native_record = configured_record("native", &native_path, "当前 Claude Code 配置", &cfg);
+    let claude_state = read_json_or(&dir.join("live-state.json"))["apps"]["claude"].clone();
+    let gateway = gateway(sys, &claude_state);
+    let gateway_source = gateway
+        .as_ref()
+        .filter(|gateway| {
+            native_record.base.is_empty() || api_base(&native_record.base) != api_base(&gateway.base)
+        })
+        .map(|gateway| {
+            let config = json!({"env": {
+                "ANTHROPIC_BASE_URL": gateway.base,
+                "ANTHROPIC_AUTH_TOKEN": "PROXY_MANAGED",
+            }});
+            let record = configured_record("cc-switch", "claude-proxy", "CC Switch 路由", &config);
+            (record, config)
+        });
+    let routed_member = gateway.as_ref().and_then(|gateway| {
+        let provider = gateway_source
+            .as_ref()
+            .map_or(&native_record, |(record, _)| record)
+            .id();
+        let route = selected.filter(|route| route.provider == provider)?;
+        if let Some(model) = route.model.strip_prefix(STACK_PREFIX) {
+            let (key, _) = model.split_once("--")?;
+            gateway.members.iter().find(|(k, _)| k == key).map(|(_, row)| row.as_str())
+        } else {
+            Some(gateway.route.as_str())
+        }
+    });
+    let optional_official = selected.is_some_and(|route| {
+        route.provider != official_record().id()
+            && !sources.iter().any(|(alias, _, uses_official)| {
+                *uses_official
+                    && (route.provider == alias.id()
+                        || (alias.app == "claude" && routed_member == Some(alias.row.as_str())))
+            })
+    });
+    let official_probe = discover_official(
+        sys, exe.as_ref().filter(|_| online), cancel, reusable, optional_official,
+    ).shared();
+    let cache = DiscoveryProbes {
+        http: AsyncMutex::default(), reusable, selected, routed_member,
+    };
+    let records = join_all(sources.into_iter().map(|(record, config, uses_official)| {
+        let (cache, official) = (online.then_some(&cache), official_probe.clone());
+        async move {
+            let Some((cfg, meta)) = config else {
+                return record;
+            };
+            let mut record = make_record(record, &cfg, &meta, cache, cancel).await;
+            if uses_official {
+                let official = official.await;
+                record.models = official.models;
+                record.model_info = official.model_info;
+                record.reason = official.reason;
+                record.catalog_error = official.catalog_error;
+                record.probe_slot = official.probe_slot;
+            }
+            record
+        }
+    }));
     let meta = json!({});
-    let native = make_record(
-        "native",
-        &native_path,
-        "当前 Claude Code 配置",
-        &cfg,
-        &meta,
-        online.then_some(&cache),
-        cancel,
-    );
+    let native = make_record(native_record, &cfg, &meta, online.then_some(&cache), cancel);
     let (official, mut records, mut native) =
         tokio::join!(official_probe.clone(), records, native,);
     drop(official_probe);
-    let claude_state = read_json_or(&dir.join("live-state.json"))["apps"]["claude"].clone();
-    if let Some(gateway) = gateway(sys, &claude_state) {
+    if let Some(gateway) = &gateway {
         // Routing-only mode may publish no models; a reachable listener with an
         // empty catalog still routes every member model aggregated below.
         let enrich = |rec: &mut Record| {
             if (rec.catalog_error.is_none() || rec.catalog_fallback)
                 && rec.token.as_deref().is_some_and(|t| !t.is_empty())
             {
-                aggregate(rec, &gateway, &records);
+                aggregate(rec, gateway, &records);
                 if !rec.models.is_empty() {
                     rec.reason.clear();
                 }
             }
         };
-        if !native.base.is_empty() && api_base(&native.base) == api_base(&gateway.base) {
-            enrich(&mut native);
-        } else {
-            let cfg = json!({"env": {
-                "ANTHROPIC_BASE_URL": gateway.base,
-                "ANTHROPIC_AUTH_TOKEN": "PROXY_MANAGED",
-            }});
-            let mut rec =
-                make_record("cc-switch", "claude-proxy", "CC Switch 路由", &cfg, &json!({}), online.then_some(&cache), cancel)
-                    .await;
+        if let Some((record, cfg)) = gateway_source {
+            let mut rec = make_record(record, &cfg, &meta, online.then_some(&cache), cancel).await;
             enrich(&mut rec);
             records.push(rec);
+        } else {
+            enrich(&mut native);
         }
     }
     if !native.base.is_empty() {
@@ -882,7 +947,7 @@ impl Adapter for Claude {
 
     fn local_catalog(&self) -> Value {
         // Local mode reads saved source identities and defaults only.
-        discover_with(&self.sys, executable(&self.sys), &CancellationToken::new(), false, None)
+        discover_with(&self.sys, executable(&self.sys), &CancellationToken::new(), false, None, None)
             .now_or_never().and_then(Result::ok).map(|d| d.catalog).unwrap_or_default()
     }
 
@@ -895,7 +960,7 @@ impl Adapter for Claude {
             let key = probe_key(&sys, exe.as_deref(), &customs);
             let probes = Probes::new(&cache, &key, false);
             let cancel = CancellationToken::new();
-            let mut value = discover_with(&sys, exe, &cancel, true, Some(&probes))
+            let mut value = discover_with(&sys, exe, &cancel, true, Some(&probes), None)
                 .await?
                 .catalog;
             let _ = refresh_custom(&mut value, &customs, &sys, &cancel, &probes, None).await;
@@ -1013,9 +1078,16 @@ async fn run(
     let exe = executable(&sys);
     let key = probe_key(&sys, exe.as_deref(), &customs);
     let mut reuse = true;
+    let mut retry_slots = HashSet::new();
+    let mut positive_refresh = HashSet::new();
     let (d, s, timing, used) = loop {
-        let probes = Probes::new(&cache, &key, reuse);
-        let mut d = discover_with(&sys, exe.clone(), &cancel, true, Some(&probes))
+        let forced_slots = if positive_refresh.is_empty() {
+            &retry_slots
+        } else {
+            &positive_refresh
+        };
+        let probes = Probes::new(&cache, &key, reuse).retrying(forced_slots);
+        let mut d = discover_with(&sys, exe.clone(), &cancel, true, Some(&probes), Some(&req.route))
             .await
             .map_err(|e| if cancel.is_cancelled() { cancelled() } else { probe_failed(&e.to_string()) })?;
         let donor = refresh_custom(&mut d.catalog, &customs, &sys, &cancel, &probes, Some(&req.route)).await;
@@ -1028,13 +1100,40 @@ async fn run(
         } else {
             probes.observed(&d.route_slots(&req.route))
         };
-        if let Some(donor) = donor {
-            used.extend(probes.observed(&d.route_slots(&donor)));
+        if let Some(donor) = &donor {
+            used.extend(probes.observed(&d.route_slots(donor)));
         }
         match select(&d.catalog, &req.route) {
-            Ok(s) => break (d, s, DiscoveryTiming::new(started, probes.reused_all(), !reuse), used),
-            Err(_) if reuse && used.iter().any(|probe| probe.cached) => reuse = false,
+            Ok(s) => {
+                let timing = DiscoveryTiming::new(
+                    started,
+                    ProbeUse::all_cached(&used),
+                    !reuse || !retry_slots.is_empty(),
+                );
+                break (d, s, timing, used);
+            }
             Err(error) => {
+                if reuse && positive_refresh.is_empty() {
+                    if retry_slots.is_empty() {
+                        retry_slots = probes.deferred_effort_slots(
+                            &d.catalog,
+                            &req.route,
+                            donor.as_ref(),
+                            OFFICIAL_SLOT,
+                            |provider| d.primary_slot(provider),
+                        );
+                        if !retry_slots.is_empty() {
+                            continue;
+                        }
+                    }
+                    positive_refresh = ProbeUse::cached_slots_except(&used, &retry_slots);
+                    if !positive_refresh.is_empty() {
+                        // A second retry refreshes positive route inputs while
+                        // keeping already retried sources warm.
+                        reuse = !retry_slots.is_empty();
+                        continue;
+                    }
+                }
                 cache.evict_used(&key, &used).await;
                 return Err(error);
             }

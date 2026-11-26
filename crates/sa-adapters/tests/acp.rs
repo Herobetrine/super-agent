@@ -127,6 +127,69 @@ async fn actual_stdio_new_load_stream_permission_and_model_selection() {
     assert!(!wire.contains("\"optionId\":\"always\""));
 }
 #[tokio::test]
+async fn turn_timing_includes_delayed_session_creation() {
+    let (_dir, sys, req) = setup("slow-new", false);
+    let (out, events, _) = execute(sys, req, false, CancellationToken::new()).await;
+    assert_eq!(out.unwrap().text, "精确结果\n");
+    let timing = turn_timing(&events);
+    assert!(timing["handshake_ms"].as_u64().unwrap() >= 200, "{timing}");
+    assert!(timing.get("outcome").is_none());
+}
+
+fn turn_timing(events: &[AdapterEvent]) -> &Value {
+    let mut timings = events.iter().filter_map(|event| match event {
+        AdapterEvent::Journal { kind, data } if kind == "turn.timing" => Some(data),
+        _ => None,
+    });
+    let timing = timings.next().expect("ACP turn timing");
+    assert!(timings.next().is_none());
+    assert!(timing["spawn_ms"].is_u64());
+    assert!(timing["handshake_ms"].is_u64());
+    timing
+}
+
+#[tokio::test]
+async fn exit_during_session_creation_records_one_failed_handshake_timing() {
+    let (dir, sys, req) = setup("exit-new", false);
+    let (out, events, _) = execute(sys, req, false, CancellationToken::new()).await;
+    assert!(out.is_err());
+    assert_eq!(turn_timing(&events)["outcome"], "failed_during_handshake");
+    let wire = std::fs::read_to_string(dir.path().join("wire.jsonl")).unwrap();
+    assert!(wire.contains("session/new"));
+    assert!(!wire.contains("session/prompt"));
+}
+
+async fn cancel_on_request(dir: &std::path::Path, method: &str, cancel: CancellationToken) {
+    let wire = dir.join("wire.jsonl");
+    let matching = format!("\"method\":\"{method}\"");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if std::fs::read_to_string(&wire).is_ok_and(|log| log.contains(&matching)) {
+                cancel.cancel();
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("fixture received request before cancellation");
+}
+
+#[tokio::test]
+async fn cancellation_during_session_creation_records_one_cancelled_handshake_timing() {
+    let (dir, sys, req) = setup("wait-new", false);
+    let cancel = CancellationToken::new();
+    let ((out, events, _), ()) = tokio::join!(
+        execute(sys, req, false, cancel.clone()),
+        cancel_on_request(dir.path(), "session/new", cancel),
+    );
+    assert_eq!(out.unwrap_err().class, ErrorClass::Cancelled);
+    assert_eq!(turn_timing(&events)["outcome"], "cancelled_during_handshake");
+    let wire = std::fs::read_to_string(dir.path().join("wire.jsonl")).unwrap();
+    assert!(!wire.contains("session/prompt"));
+}
+
+#[tokio::test]
 async fn restricted_runs_fail_closed_and_verified_ask_uses_host() {
     let (_dir, sys, mut req) = setup("normal", false);
     req.profile = "readonly".into();
@@ -196,15 +259,12 @@ async fn no_resume_capability_and_incomplete_terminal_are_failures() {
 async fn cancellation_sends_native_notification_and_reaps_process() {
     let (dir, sys, req) = setup("wait", false);
     let cancel = CancellationToken::new();
-    let fire = cancel.clone();
-    tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(400)).await;
-        fire.cancel();
-    });
-    assert_eq!(
-        execute(sys, req, false, cancel).await.0.unwrap_err().class,
-        ErrorClass::Cancelled
+    let ((out, events, _), ()) = tokio::join!(
+        execute(sys, req, false, cancel.clone()),
+        cancel_on_request(dir.path(), "session/prompt", cancel),
     );
+    assert_eq!(out.unwrap_err().class, ErrorClass::Cancelled);
+    assert!(turn_timing(&events).get("outcome").is_none());
     let wire = std::fs::read_to_string(dir.path().join("wire.jsonl")).unwrap();
     assert!(wire.contains("session/cancel"));
 }

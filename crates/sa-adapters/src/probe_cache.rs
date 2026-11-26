@@ -2,6 +2,7 @@
 //! configuration stay with the adapter and are never serialized here.
 
 use crate::{common::Emit, custom, sys::Sys};
+use sa_engine::adapter::Route;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -16,6 +17,8 @@ use std::time::{Duration, Instant, SystemTime};
 use tokio_util::sync::CancellationToken;
 
 pub(crate) const FRESHNESS: Duration = Duration::from_secs(24 * 60 * 60);
+const FAILURE_FRESHNESS: Duration = Duration::from_secs(10 * 60);
+pub(crate) const CACHED_FAILURE: &str = "最近一次模型目录探测失败";
 const VERSION: u32 = 1;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
@@ -117,15 +120,16 @@ impl Stamp {
 }
 
 struct Fetched {
-    // A failed probe retains its ordering marker without offering a hit.
     value: Option<Value>,
     started: Stamp,
+    failed: bool,
 }
 
 impl Fetched {
     fn invalidate_through(&mut self, cutoff: Stamp) -> bool {
         if !self.started.newer_than(cutoff) && self.value.take().is_some() {
             self.started = cutoff;
+            self.failed = false;
             return true;
         }
         false
@@ -138,6 +142,9 @@ struct FileEntry {
     slot: String,
     started_unix_ms: u64,
     value: Option<Value>,
+    // Older snapshots used an empty value for both eviction and failure.
+    #[serde(default)]
+    failed: bool,
 }
 
 #[derive(Deserialize)]
@@ -175,6 +182,7 @@ impl State {
                     Fetched {
                         value: entry.value,
                         started,
+                        failed: entry.failed,
                     },
                 ))
             })
@@ -219,6 +227,7 @@ impl State {
                         slot: slot.clone(),
                         started_unix_ms: entry.started.unix_ms,
                         value: entry.value.clone(),
+                        failed: entry.failed,
                     })
                 })
                 .collect(),
@@ -378,6 +387,17 @@ impl ProbeCache {
         Some((serde_json::from_value(value).ok()?, started))
     }
 
+    fn failure_is_fresh(&self, key: &ProbeKey, slot: &str) -> bool {
+        let state = self.state().lock().unwrap();
+        state
+            .sources
+            .get(key)
+            .and_then(|slots| slots.get(slot))
+            .is_some_and(|entry| {
+                entry.failed && entry.started.age() < FAILURE_FRESHNESS.min(state.freshness)
+            })
+    }
+
     pub(crate) fn record<T: Serialize>(
         &self,
         key: &ProbeKey,
@@ -397,6 +417,7 @@ impl ProbeCache {
         value: Option<&T>,
         keep_other: impl Fn(&str) -> bool,
     ) {
+        let failed = value.is_none();
         let value = value.and_then(|v| serde_json::to_value(v).ok());
         let mut state = self.state().lock().unwrap();
         let slots = state.sources.entry(key.clone()).or_default();
@@ -411,7 +432,10 @@ impl ProbeCache {
                 fetched.invalidate_through(started);
             }
         }
-        slots.insert(slot.into(), Fetched { value, started });
+        slots.insert(
+            slot.into(),
+            Fetched { value, started, failed },
+        );
         state.changed();
     }
 
@@ -458,15 +482,29 @@ pub(crate) struct Probes<'a> {
     cache: &'a ProbeCache,
     key: &'a ProbeKey,
     reuse: bool,
-    hit: AtomicBool,
+    retry_slots: Option<&'a HashSet<String>>,
     probed: AtomicBool,
+    skipped_failures: Mutex<HashSet<String>>,
     observed: Mutex<HashMap<String, (Stamp, bool)>>,
 }
 
 pub(crate) struct ProbeUse {
     slot: String,
     started: Stamp,
-    pub(crate) cached: bool,
+    cached: bool,
+}
+
+impl ProbeUse {
+    pub(crate) fn all_cached(used: &[Self]) -> bool {
+        !used.is_empty() && used.iter().all(|probe| probe.cached)
+    }
+
+    pub(crate) fn cached_slots_except(used: &[Self], retried: &HashSet<String>) -> HashSet<String> {
+        used.iter()
+            .filter(|probe| probe.cached && !retried.contains(&probe.slot))
+            .map(|probe| probe.slot.clone())
+            .collect()
+    }
 }
 
 pub(crate) type ModelProbeResult = (Vec<Value>, Option<String>);
@@ -477,33 +515,109 @@ impl<'a> Probes<'a> {
             cache,
             key,
             reuse,
-            hit: false.into(),
+            retry_slots: None,
             probed: false.into(),
+            skipped_failures: Mutex::default(),
             observed: Mutex::default(),
         }
     }
 
+    pub(crate) fn retrying(mut self, slots: &'a HashSet<String>) -> Self {
+        self.retry_slots = Some(slots);
+        self
+    }
+
     pub(crate) fn read<T: DeserializeOwned>(&self, slot: &str) -> Option<T> {
         let (value, started) = self
-            .reuse
+            .can_reuse(slot)
             .then(|| self.cache.read_stamped(self.key, slot))
             .flatten()?;
         self.observed
             .lock()
             .unwrap()
             .insert(slot.into(), (started, true));
-        self.hit.store(true, Relaxed);
         Some(value)
+    }
+
+    pub(crate) fn failure_is_fresh(&self, slot: &str, optional: bool) -> bool {
+        let skip = self.can_reuse(slot) && optional && self.cache.failure_is_fresh(self.key, slot);
+        if skip {
+            self.skipped_failures.lock().unwrap().insert(slot.into());
+        }
+        skip
+    }
+
+    fn can_reuse(&self, slot: &str) -> bool {
+        self.reuse && self.retry_slots.is_none_or(|slots| !slots.contains(slot))
+    }
+
+    pub(crate) fn deferred_effort_slots<'slot>(
+        &self,
+        catalog: &Value,
+        route: &Route,
+        donor: Option<&Route>,
+        shared_effort_slot: &str,
+        primary_slot: impl Fn(&str) -> Option<&'slot str>,
+    ) -> HashSet<String> {
+        let skipped = self.skipped_failures.lock().unwrap();
+        let mut retry = HashSet::new();
+        if skipped.is_empty() {
+            return retry;
+        }
+        let Some((effort, providers)) = route
+            .reasoning_effort
+            .as_ref()
+            .zip(catalog["providers"].as_array())
+        else {
+            return retry;
+        };
+        let Some(provider) = providers.iter().find(|p| p["id"] == route.provider) else {
+            return retry;
+        };
+        let custom = provider["custom"] == true;
+        // A hard failure keeps only the configured model IDs. Enrichment
+        // runs when refresh_with obtained online or last-good models.
+        if custom && provider["catalog_complete"] != true && provider["cachedModels"] != true {
+            return retry;
+        }
+        let Some(model) = provider["models"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|model| model["id"] == route.model)
+        else {
+            return retry;
+        };
+        if crate::catalog::efforts(model).contains(effort) {
+            return retry;
+        }
+        let missing = model.get("reasoningEfforts").is_none();
+        if missing && skipped.contains(shared_effort_slot) {
+            retry.insert(shared_effort_slot.to_string());
+        }
+        // A donor is reported only when the custom endpoint omitted effort
+        // declarations. An earlier skipped provider could replace that donor.
+        if custom && (donor.is_some() || missing) {
+            for native in providers.iter().filter(|p| p["custom"] != true) {
+                if let Some(slot) = native["id"].as_str().and_then(&primary_slot)
+                    && skipped.contains(slot)
+                {
+                    retry.insert(slot.to_string());
+                }
+                if donor.is_some_and(|donor| native["id"] == donor.provider) {
+                    break;
+                }
+            }
+        }
+        retry
     }
 
     pub(crate) fn record<T: Serialize>(&self, slot: &str, started: Stamp, value: Option<&T>) {
         self.cache.record(self.key, slot, started, value);
-        if value.is_some() {
-            self.observed
-                .lock()
-                .unwrap()
-                .insert(slot.into(), (started, false));
-        }
+        self.observed
+            .lock()
+            .unwrap()
+            .insert(slot.into(), (started, false));
     }
 
     pub(crate) fn observed(&self, slots: &[&str]) -> Vec<ProbeUse> {
@@ -527,27 +641,23 @@ impl<'a> Probes<'a> {
         }
     }
 
-    fn used_cache(&self) -> bool {
-        self.hit.load(Relaxed)
-    }
-
     pub(crate) fn start(&self) -> Stamp {
         self.probed.store(true, Relaxed);
         Stamp::now()
     }
 
-    pub(crate) fn reused_all(&self) -> bool {
-        self.used_cache() && !self.probed.load(Relaxed)
-    }
-
     pub(crate) async fn fetch_models(
         &self,
         slot: &str,
+        optional: bool,
         cancel: &CancellationToken,
         probe: impl Future<Output = anyhow::Result<ModelProbeResult>>,
     ) -> anyhow::Result<ModelProbeResult> {
         if let Some(models) = self.read(slot) {
             return Ok((models, None));
+        }
+        if self.failure_is_fresh(slot, optional) {
+            anyhow::bail!(CACHED_FAILURE);
         }
         let started = self.start();
         let result = probe.await;
@@ -580,12 +690,14 @@ pub(crate) async fn refresh_custom(
     sys: &Sys,
     cancel: &CancellationToken,
     probes: &Probes<'_>,
-    selected: Option<&sa_engine::adapter::Route>,
-) -> Option<sa_engine::adapter::Route> {
+    selected: Option<&Route>,
+) -> Option<Route> {
     custom::refresh_with(catalog, customs, sys, selected, |provider| async move {
+        let id = provider.route_id();
         probes
             .fetch_models(
-                &custom_probe_slot(&provider.route_id()),
+                &custom_probe_slot(&id),
+                selected.is_some_and(|route| route.provider != id),
                 cancel,
                 custom::probe_catalog(provider, sys, cancel),
             )
@@ -688,16 +800,23 @@ pub(crate) struct TurnTiming {
 
 impl TurnTiming {
     pub(crate) fn emit(self, emit: &Emit) {
-        emit.journal(
-            "turn.timing",
-            json!({
-                "discover_ms": self.discovery.ms,
-                "preflight_ms": self.preflight_ms,
-                "spawn_ms": self.spawn_ms,
-                "handshake_ms": self.started.elapsed().as_millis(),
-                "cache": self.discovery.cache,
-            }),
-        );
+        emit.journal("turn.timing", self.data());
+    }
+
+    pub(crate) fn emit_with_outcome(self, emit: &Emit, outcome: &str) {
+        let mut data = self.data();
+        data["outcome"] = json!(outcome);
+        emit.journal("turn.timing", data);
+    }
+
+    fn data(self) -> Value {
+        json!({
+            "discover_ms": self.discovery.ms,
+            "preflight_ms": self.preflight_ms,
+            "spawn_ms": self.spawn_ms,
+            "handshake_ms": self.started.elapsed().as_millis(),
+            "cache": self.discovery.cache,
+        })
     }
 }
 

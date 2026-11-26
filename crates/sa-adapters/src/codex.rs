@@ -8,7 +8,9 @@
 use crate::codex_config::{self, Discovery, discover_cached, routing};
 use crate::common::{Emit, denied, probe_failed, protocol, route_gone, select, session_mismatch};
 use crate::custom::{self, CustomProvider, Registry};
-use crate::probe_cache::{DiscoveryTiming, ProbeCache, Probes, TurnTiming, custom_probe_slot, refresh_custom};
+use crate::probe_cache::{
+    DiscoveryTiming, ProbeCache, ProbeUse, Probes, TurnTiming, custom_probe_slot, refresh_custom,
+};
 use crate::proc::{Lines, Proc, cancelled, capture, start};
 use crate::sys::Sys;
 use futures::future::BoxFuture;
@@ -226,7 +228,7 @@ impl Adapter for Codex {
             let key = codex_config::probe_key(&sys, exe.as_deref(), &customs);
             let probes = Probes::new(&cache, &key, false);
             let cancel = CancellationToken::new();
-            let (mut d, _) = discover_cached(&sys, exe, &cancel, &probes).await?;
+            let (mut d, _) = discover_cached(&sys, exe, &cancel, &probes, None).await?;
             let _ = refresh_custom(&mut d.catalog, &customs, &sys, &cancel, &probes, None).await;
             probes.flush().await;
             Ok(Catalog { value: d.catalog })
@@ -262,9 +264,18 @@ async fn run(
     let exe = codex_config::executable(&sys);
     let key = codex_config::probe_key(&sys, exe.as_deref(), &customs);
     let mut reuse = true;
+    let mut retry_slots = HashSet::new();
+    let mut positive_refresh = HashSet::new();
     let (d, s, timing, used) = loop {
-        let probes = Probes::new(&cache, &key, reuse);
-        let (mut d, route_probes) = match discover_cached(&sys, exe.clone(), &cancel, &probes).await {
+        let forced_slots = if positive_refresh.is_empty() {
+            &retry_slots
+        } else {
+            &positive_refresh
+        };
+        let probes = Probes::new(&cache, &key, reuse).retrying(forced_slots);
+        let (mut d, route_probes) = match discover_cached(
+            &sys, exe.clone(), &cancel, &probes, Some(&req.route),
+        ).await {
             Ok(discovery) => discovery,
             Err(error) => {
                 probes.flush().await;
@@ -281,13 +292,40 @@ async fn run(
         } else {
             probes.observed(&route_probes.route_slots(&req.route))
         };
-        if let Some(donor) = donor {
-            used.extend(probes.observed(&route_probes.route_slots(&donor)));
+        if let Some(donor) = &donor {
+            used.extend(probes.observed(&route_probes.route_slots(donor)));
         }
         match select(&d.catalog, &req.route) {
-            Ok(s) => break (d, s, DiscoveryTiming::new(started, probes.reused_all(), !reuse), used),
-            Err(_) if reuse && used.iter().any(|probe| probe.cached) => reuse = false,
+            Ok(s) => {
+                let timing = DiscoveryTiming::new(
+                    started,
+                    ProbeUse::all_cached(&used),
+                    !reuse || !retry_slots.is_empty(),
+                );
+                break (d, s, timing, used);
+            }
             Err(error) => {
+                if reuse && positive_refresh.is_empty() {
+                    if retry_slots.is_empty() {
+                        retry_slots = probes.deferred_effort_slots(
+                            &d.catalog,
+                            &req.route,
+                            donor.as_ref(),
+                            codex_config::NATIVE_SELECTED,
+                            |provider| route_probes.primary_slot(provider),
+                        );
+                        if !retry_slots.is_empty() {
+                            continue;
+                        }
+                    }
+                    positive_refresh = ProbeUse::cached_slots_except(&used, &retry_slots);
+                    if !positive_refresh.is_empty() {
+                        // A second retry refreshes positive route inputs while
+                        // keeping already retried sources warm.
+                        reuse = !retry_slots.is_empty();
+                        continue;
+                    }
+                }
                 cache.evict_used(&key, &used).await;
                 return Err(error);
             }

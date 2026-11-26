@@ -78,7 +78,18 @@ async fn execute(
     cancel: CancellationToken,
 ) -> (Result<RunOutcome, AdapterError>, Vec<AdapterEvent>, usize) {
     let timing = DiscoveryTiming::new(Instant::now(), true, false);
-    execute_with(|host, events| run_server(sys, req, host, Emit(events), cancel, server, Some(timing))).await
+    execute_with(|host, events| {
+        run_server(
+            sys,
+            req,
+            host,
+            Emit(events),
+            cancel,
+            server,
+            ServerDiscovery::Antigravity(timing),
+        )
+    })
+    .await
 }
 
 async fn execute_with<F>(
@@ -100,6 +111,22 @@ where
         events.push(event);
     }
     (result, events, calls.load(Ordering::SeqCst))
+}
+
+#[tokio::test]
+async fn antigravity_acp_exit_during_session_creation_records_failed_handshake_timing() {
+    let (dir, sys, server, req) = setup("exit-new");
+    let (out, events, _) = execute(sys, server, req, CancellationToken::new()).await;
+    assert!(out.is_err());
+    assert_timing(&events, "hit");
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AdapterEvent::Journal { kind, data }
+            if kind == "turn.timing" && data["outcome"] == "failed_during_handshake"
+    )));
+    let wire = std::fs::read_to_string(dir.path().join("wire.jsonl")).unwrap();
+    assert!(wire.contains("session/new"));
+    assert!(!wire.contains("session/prompt"));
 }
 
 #[tokio::test]
@@ -341,6 +368,49 @@ impl ProbeFixture {
         assert_eq!(self.args("effort").len(), efforts);
         assert_eq!(self.args("run").len(), runs);
     }
+}
+
+#[tokio::test]
+async fn stream_json_turn_timing_includes_startup_before_the_first_native_frame() {
+    let fixture = ProbeFixture::setup_with(|sys| sys.set("FAKE_AGY_DELAY_INIT", "1"));
+    let (out, events, _) = execute_with(|host, events| {
+        fixture.adapter.run(fixture.req.clone(), host, events, CancellationToken::new())
+    })
+    .await;
+    assert_eq!(out.unwrap().text, "fixture-ok");
+    assert_timing(&events, "miss");
+    let timing = events
+        .iter()
+        .find_map(|event| match event {
+            AdapterEvent::Journal { kind, data } if kind == "turn.timing" => Some(data),
+            _ => None,
+        })
+        .unwrap();
+    assert!(timing["handshake_ms"].as_u64().unwrap() >= 175, "{timing}");
+}
+
+#[tokio::test]
+async fn stream_json_exit_before_first_frame_still_emits_startup_timing() {
+    let fixture = ProbeFixture::setup_with(|sys| {
+        sys.set("FAKE_AGY_DELAY_INIT", "1");
+        sys.set("FAKE_AGY_EXIT_BEFORE_INIT", "1");
+    });
+    let (out, events, _) = execute_with(|host, events| {
+        fixture.adapter.run(fixture.req.clone(), host, events, CancellationToken::new())
+    })
+    .await;
+    assert!(out.is_err());
+    assert_timing(&events, "miss");
+    let timing = events
+        .iter()
+        .find_map(|event| match event {
+            AdapterEvent::Journal { kind, data } if kind == "turn.timing" => Some(data),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(timing["outcome"], "failed_before_first_frame");
+    assert!(timing["handshake_ms"].as_u64().unwrap() >= 175, "{timing}");
+    fixture.assert_counts(1, 1, 1);
 }
 
 #[tokio::test]

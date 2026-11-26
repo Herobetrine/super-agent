@@ -307,6 +307,17 @@ async fn codex_discovery_is_reused_and_persisted() {
 }
 
 #[tokio::test]
+async fn codex_cli_model_cache_rewrites_keep_persisted_probe_warm() {
+    let fixture = Fixture::new("codex");
+    let cli_cache = fixture.sys.home.join(".codex/models_cache.json");
+    std::fs::write(&cli_cache, r#"{"models":[]}"#).unwrap();
+    fixture.assert_run(fixture.adapter().as_ref(), "miss").await;
+    std::fs::write(&cli_cache, r#"{"models":[],"etag":"updated"}"#).unwrap();
+    fixture.assert_run(fixture.adapter().as_ref(), "hit").await;
+    fixture.assert_discoveries(1);
+}
+
+#[tokio::test]
 async fn claude_discovery_is_reused_and_persisted() {
     exercise("claude").await;
 }
@@ -414,6 +425,114 @@ async fn http_fallback_remains_usable_without_renewing_persistent_probe() {
 }
 
 #[tokio::test]
+async fn unselected_claude_provider_failure_is_reused_across_restart() {
+    let fixture = Fixture::new("claude");
+    let endpoint = ModelEndpoint::new().await;
+    endpoint.failed.store(true, Relaxed);
+    fixture.configure_endpoints(&[("failing-provider", &endpoint)]);
+    fixture.assert_run(fixture.adapter().as_ref(), "miss").await;
+    let adapter = fixture.adapter();
+    fixture.assert_run(adapter.as_ref(), "hit").await;
+    assert_eq!(endpoint.count(), 1);
+    adapter.catalog().await.unwrap();
+    assert_eq!(endpoint.count(), 2, "picker must probe despite the marker");
+}
+
+#[tokio::test]
+async fn unselected_claude_provider_failure_expires_after_ten_minutes() {
+    let fixture = Fixture::new("claude");
+    let endpoint = ModelEndpoint::new().await;
+    endpoint.failed.store(true, Relaxed);
+    fixture.configure_endpoints(&[("failing-provider", &endpoint)]);
+    fixture.assert_run(fixture.adapter().as_ref(), "miss").await;
+    let path = fixture.dir.path().join("data/cache/probes-v1.json");
+    let mut disk: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let failure = disk["entries"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|entry| entry["value"].is_null())
+        .unwrap();
+    failure["started_unix_ms"] = json!(unix_ms() - 10 * 60 * 1000);
+    std::fs::write(path, disk.to_string()).unwrap();
+
+    fixture.assert_run(fixture.adapter().as_ref(), "hit").await;
+    assert_eq!(endpoint.count(), 2, "expired unselected probe must run again");
+    fixture.assert_run(fixture.adapter().as_ref(), "hit").await;
+    assert_eq!(endpoint.count(), 2, "new failure is fresh");
+}
+
+#[tokio::test]
+async fn claude_retries_the_same_failed_provider_when_selected() {
+    let mut fixture = Fixture::new("claude");
+    let endpoint = ModelEndpoint::new().await;
+    endpoint.failed.store(true, Relaxed);
+    fixture.configure_endpoints(&[("failing-provider", &endpoint)]);
+    let adapter = fixture.adapter();
+    fixture.assert_run(adapter.as_ref(), "miss").await;
+    fixture.assert_run(adapter.as_ref(), "hit").await;
+    assert_eq!(endpoint.count(), 1);
+
+    fixture.select_endpoint("failing-provider", &endpoint);
+    for expected in [2, 3] {
+        let (outcome, _) = fixture.run(adapter.as_ref()).await;
+        assert_eq!(
+            outcome.unwrap_err().code.as_deref(),
+            Some(sa_engine::resilience::CODE_ROUTE_PROBE_FAILED),
+        );
+        assert_eq!(endpoint.count(), expected);
+    }
+}
+
+#[tokio::test]
+async fn official_marked_gateway_member_with_base_does_not_require_sdk_login_probe() {
+    let mut fixture = Fixture::new("claude");
+    fixture.sys.set("FIXTURE_FAIL_CLAUDE_AUTH", "1");
+    let member = ModelEndpoint::new().await;
+    let gateway = ModelEndpoint::with_reply(
+        json!({"data":[{"id":"gateway-own-fixture-model"}]}),
+        "503 Service Unavailable",
+    )
+    .await;
+    fixture.configure_endpoints(&[("member", &member)]);
+    let cc = fixture.sys.home.join(".cc-switch");
+    let db = rusqlite::Connection::open(cc.join("cc-switch.db")).unwrap();
+    db.execute_batch(
+        "ALTER TABLE providers ADD COLUMN category TEXT DEFAULT 'official';
+         CREATE TABLE proxy_config(app_type TEXT,listen_address TEXT,listen_port INTEGER,enabled INTEGER);",
+    )
+    .unwrap();
+    let port: u16 = gateway.base.rsplit(':').next().unwrap().parse().unwrap();
+    db.execute(
+        "INSERT INTO proxy_config VALUES ('claude','127.0.0.1',?1,1)",
+        [port],
+    )
+    .unwrap();
+    drop(db);
+    std::fs::write(
+        cc.join("live-state.json"),
+        json!({"version":1,"apps":{"claude":{"mode":"proxy","proxy_route":"member"}}}).to_string(),
+    )
+    .unwrap();
+    fixture.request.route.provider = crate::common::fingerprint(
+        "ccs-",
+        &[
+            json!("cc-switch"),
+            json!("claude-proxy"),
+            json!(gateway.base),
+            json!("ANTHROPIC_AUTH_TOKEN"),
+        ],
+    );
+
+    let adapter = fixture.adapter();
+    fixture.assert_run(adapter.as_ref(), "miss").await;
+    fixture.assert_run(adapter.as_ref(), "hit").await;
+    let calls = std::fs::read_to_string(fixture.dir.path().join("calls")).unwrap();
+    assert_eq!(calls.lines().filter(|line| *line == "claude-auth").count(), 1);
+    assert_eq!((member.count(), gateway.count()), (1, 1));
+}
+
+#[tokio::test]
 async fn provider_failure_keeps_the_other_provider_warm() {
     for agent in ["codex", "claude"] {
         let mut fixture = Fixture::new(agent);
@@ -436,7 +555,7 @@ async fn provider_failure_keeps_the_other_provider_warm() {
 
         fixture.select_endpoint("provider-b", &b);
         let adapter = fixture.adapter();
-        fixture.assert_run(adapter.as_ref(), "miss").await;
+        fixture.assert_run(adapter.as_ref(), "hit").await;
         assert_eq!((a.count(), b.count()), (2, 1), "{agent}");
         fixture.assert_run(adapter.as_ref(), "hit").await;
         assert_eq!((a.count(), b.count()), (2, 1), "{agent}");
@@ -452,6 +571,132 @@ fn registry_provider(agent: &str, endpoint: &ModelEndpoint) -> custom::CustomPro
         key_env: String::new(),
         models: vec![],
         enabled: true,
+    }
+}
+
+#[tokio::test]
+async fn unsupported_borrowed_effort_reprobes_only_preceding_failed_sources() {
+    let mut fixture = Fixture::new("claude");
+    let upper = ModelEndpoint::with_reply(
+        json!({"data":[{"id":MODEL,"reasoningEfforts":["high"]}]}),
+        "503 Service Unavailable",
+    )
+    .await;
+    let lower = ModelEndpoint::new().await;
+    let unrelated = ModelEndpoint::new().await;
+    let endpoint =
+        ModelEndpoint::with_reply(json!({"data":[{"id":MODEL}]}), "503 Service Unavailable").await;
+    upper.failed.store(true, Relaxed);
+    unrelated.failed.store(true, Relaxed);
+    fixture.configure_endpoints(&[
+        ("a-upper", &upper),
+        ("b-lower", &lower),
+        ("z-unrelated", &unrelated),
+    ]);
+    let provider = registry_provider("claude", &endpoint);
+    fixture.request.route.provider = provider.route_id();
+    fixture.request.route.reasoning_effort = Some("high".into());
+    fixture
+        .adapter_with_customs(vec![provider.clone()])
+        .catalog()
+        .await
+        .unwrap();
+
+    // Keep the negative entries only. A live selected endpoint and lower
+    // donor must exercise the negative-cache retry without a stale-hit retry.
+    let path = fixture.dir.path().join("data/cache/probes-v1.json");
+    let mut snapshot: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    snapshot["entries"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|entry| entry["value"].is_null());
+    std::fs::write(path, snapshot.to_string()).unwrap();
+    upper.failed.store(false, Relaxed);
+
+    let adapter = fixture.adapter_with_customs(vec![provider]);
+    fixture.assert_run(adapter.as_ref(), "refresh").await;
+    assert_eq!(
+        (upper.count(), lower.count(), unrelated.count(), endpoint.count()),
+        (2, 2, 1, 2),
+    );
+}
+
+#[tokio::test]
+async fn stale_selected_catalog_is_refreshed_after_a_failed_donor_retry() {
+    for agent in ["codex", "claude"] {
+        let mut fixture = Fixture::new(agent);
+        let failed_donor = ModelEndpoint::new().await;
+        let lower_donor = ModelEndpoint::new().await;
+        let endpoint = ModelEndpoint::with_reply(
+            json!({"data":[{"id":MODEL,"reasoningEfforts":["high"]}]}),
+            "503 Service Unavailable",
+        )
+        .await;
+        failed_donor.failed.store(true, Relaxed);
+        let first = if agent == "codex" { "openai" } else { "a-upper" };
+        fixture.configure_endpoints(&[(first, &failed_donor), ("provider-b", &lower_donor)]);
+        let provider = registry_provider(agent, &endpoint);
+        fixture.request.route.provider = provider.route_id();
+        fixture.request.route.reasoning_effort = Some("high".into());
+        fixture
+            .adapter_with_customs(vec![provider.clone()])
+            .catalog()
+            .await
+            .unwrap();
+
+        // The earlier selected endpoint response contained the model ID only.
+        // Keep the lower donor warm so both forms of retry are necessary.
+        let path = fixture.dir.path().join("data/cache/probes-v1.json");
+        let mut snapshot: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let slot = custom_probe_slot(&provider.route_id());
+        let saved = snapshot["entries"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|entry| entry["slot"] == slot)
+            .unwrap();
+        saved["value"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("reasoningEfforts")
+            .unwrap();
+        std::fs::write(path, snapshot.to_string()).unwrap();
+
+        let adapter = fixture.adapter_with_customs(vec![provider]);
+        fixture.assert_run(adapter.as_ref(), "refresh").await;
+        assert_eq!(failed_donor.count(), 2, "{agent}: retry the donor once");
+        assert_eq!(
+            endpoint.count(),
+            2,
+            "{agent}: refresh the selected endpoint once",
+        );
+    }
+}
+
+#[tokio::test]
+async fn selected_custom_timeout_with_local_models_does_not_retry_borrowed_efforts() {
+    for agent in ["codex", "claude"] {
+        let mut fixture = Fixture::new(agent);
+        let skipped = ModelEndpoint::new().await;
+        skipped.failed.store(true, Relaxed);
+        fixture.configure_endpoints(&[("provider-a", &skipped)]);
+        let endpoint =
+            ModelEndpoint::with_reply(json!({"data":[{"id":MODEL}]}), "408 Request Timeout").await;
+        endpoint.failed.store(true, Relaxed);
+        let mut provider = registry_provider(agent, &endpoint);
+        provider.models.push(MODEL.into());
+        fixture.request.route.provider = provider.route_id();
+        let adapter = fixture.adapter_with_customs(vec![provider]);
+        adapter.catalog().await.unwrap();
+        assert_eq!((endpoint.count(), skipped.count()), (1, 1), "{agent}");
+
+        let (result, _) = fixture.run(adapter.as_ref()).await;
+        assert_eq!(
+            result.unwrap_err().code.as_deref(),
+            Some(sa_engine::resilience::CODE_ROUTE_PROBE_FAILED),
+            "{agent}",
+        );
+        assert_eq!((endpoint.count(), skipped.count()), (2, 1), "{agent}");
     }
 }
 

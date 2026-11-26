@@ -54,6 +54,7 @@ static int codex_turn(void) {
             const char *sandbox = strstr(line, "\"sandbox\":\"read-only\"") ? "readOnly" : "dangerFullAccess";
             if (strstr(line, "\"modelProvider\":\"provider-a\"")) provider = "provider-a";
             if (strstr(line, "\"modelProvider\":\"provider-b\"")) provider = "provider-b";
+            if (strstr(line, "\"modelProvider\":\"sa-fixture\"")) provider = "sa-fixture";
             printf("{\"id\":2,\"result\":{\"sandbox\":{\"type\":\"%s\"},"
                    "\"approvalPolicy\":\"never\",\"model\":\"" MODEL "\","
                    "\"modelProvider\":\"%s\",\"thread\":{\"id\":\"fixture-session\"}}}\n", sandbox, provider);
@@ -95,6 +96,7 @@ int main(int argc, char **argv) {
     }
     if (has_arg(argc, argv, "auth")) {
         if (!receipt("claude-auth")) return 3;
+        if (getenv("FIXTURE_FAIL_CLAUDE_AUTH")) return 2;
         puts("{\"loggedIn\":true,\"apiProvider\":\"firstParty\",\"email\":\"fixture@example.com\"}");
         return 0;
     }
