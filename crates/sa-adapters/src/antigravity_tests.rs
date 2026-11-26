@@ -1,5 +1,6 @@
 use super::*;
 use crate::antigravity::{Antigravity, SETTINGS_REL, executable, fixture_sys};
+use crate::probe_cache::{FRESHNESS, assert_timing};
 use sa_engine::{
     adapter::{AdapterEvent, Route},
     images::ImageInput,
@@ -76,7 +77,8 @@ async fn execute(
     req: RunRequest,
     cancel: CancellationToken,
 ) -> (Result<RunOutcome, AdapterError>, Vec<AdapterEvent>, usize) {
-    execute_with(|host, events| run_server(sys, req, host, Emit(events), cancel, server, true)).await
+    let timing = DiscoveryTiming::new(Instant::now(), true, false);
+    execute_with(|host, events| run_server(sys, req, host, Emit(events), cancel, server, Some(timing))).await
 }
 
 async fn execute_with<F>(
@@ -187,6 +189,35 @@ async fn antigravity_rejects_capability_route_and_effort_mismatches_before_promp
 }
 
 #[tokio::test]
+async fn antigravity_acp_only_reloads_after_a_model_or_mode_change() {
+    for (scenario, model_changes, mode_changes) in [
+        ("unchanged", 0, 0),
+        ("normal", 1, 0),
+        ("mode-only", 0, 1),
+        ("both", 1, 1),
+    ] {
+        for resumed in [false, true] {
+            let (dir, sys, server, mut req) = setup(scenario);
+            req.session_id = resumed.then(|| "agy-fixture-session".into());
+            let (result, events, _) = execute(sys, server, req, CancellationToken::new()).await;
+            assert_eq!(result.unwrap().text, "中途内容\n图片完成\n");
+            let wire = std::fs::read_to_string(dir.path().join("wire.jsonl")).unwrap();
+            let messages: Vec<Value> = wire.lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+            let count = |method: &str| messages.iter().filter(|msg| msg["method"] == method).count();
+            assert_eq!(count("session/load"), usize::from(resumed) + usize::from(model_changes + mode_changes > 0));
+            assert_eq!(count("session/set_model"), model_changes);
+            assert_eq!(count("session/set_mode"), mode_changes);
+            assert_eq!(count("session/prompt"), 1);
+            assert_timing(&events, "hit");
+        }
+    }
+    let (dir, sys, server, req) = setup("wrong-mode");
+    assert!(execute(sys, server, req, CancellationToken::new()).await.0.is_err());
+    let wire = std::fs::read_to_string(dir.path().join("wire.jsonl")).unwrap();
+    assert!(!wire.contains("session/prompt"));
+}
+
+#[tokio::test]
 async fn antigravity_partial_text_never_completes_failed_review() {
     for scenario in ["overloaded", "incomplete", "wrong-session"] {
         let (_dir, sys, server, req) = setup(scenario);
@@ -246,6 +277,7 @@ const EFFORT: &str =
 struct ProbeFixture {
     dir: tempfile::TempDir,
     adapter: Antigravity,
+    sys: Sys,
     req: RunRequest,
 }
 
@@ -262,7 +294,8 @@ impl ProbeFixture {
         sys.set("FAKE_AGY_EFFORT_FILE", "effort.json");
         sys.set("FAKE_AGY_LOG_ARGS", "1");
         let fixture = Self {
-            adapter: Antigravity::new(sys),
+            adapter: Antigravity::new(sys.clone()),
+            sys,
             req: request(dir.path(), "model-b", "high"),
             dir,
         };
@@ -658,4 +691,40 @@ async fn expired_probes_are_fetched_again() {
     fixture.adapter.set_probe_freshness(Duration::ZERO);
     fixture.run().await.unwrap();
     fixture.assert_counts(2, 2, 2);
+}
+
+#[tokio::test]
+async fn persisted_probes_survive_restart_and_recover_from_bad_files() {
+    let fixture = ProbeFixture::setup();
+    let sys = fixture.sys.clone().with_data_dir(fixture.dir.path().join("app-data"));
+    let data_dir = sys.data_dir.as_ref().unwrap();
+    let path = data_dir.join("cache/probes-v1.json");
+    for (index, state) in ["new", "restart", "corrupt", "expired", "unknown-version"].into_iter().enumerate() {
+        match state {
+            "corrupt" => fixture.write("app-data/cache/probes-v1.json", "{"),
+            "expired" | "unknown-version" => {
+                let mut disk: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+                if state == "expired" {
+                    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
+                    let old = (now - FRESHNESS - Duration::from_secs(60)).as_millis();
+                    for entry in disk["entries"].as_array_mut().unwrap() {
+                        entry["started_unix_ms"] = json!(old);
+                    }
+                } else {
+                    disk["version"] = json!(2);
+                }
+                std::fs::write(&path, disk.to_string()).unwrap();
+            }
+            _ => {}
+        }
+        let (out, events, _) = execute_with(|host, events| {
+            Antigravity::new(sys.clone()).run(fixture.req.clone(), host, events, CancellationToken::new())
+        }).await;
+        assert_eq!(out.unwrap().text, "fixture-ok");
+        let count = index + usize::from(index == 0);
+        fixture.assert_counts(count, count, index + 1);
+        assert_timing(&events, if state == "restart" { "hit" } else { "miss" });
+        let disk: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(disk["version"], 1);
+    }
 }
