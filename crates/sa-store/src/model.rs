@@ -174,6 +174,10 @@ pub struct PlanItem {
 /// `Studio.snapshot` result.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Snapshot {
+    #[serde(default)]
+    pub queue: Vec<crate::QueuedFollow>,
+    #[serde(default)]
+    pub queue_hold: Option<crate::HoldReason>,
     pub ticket: TicketDetail,
     pub jobs: Vec<JobView>,
     pub total_jobs: i64,

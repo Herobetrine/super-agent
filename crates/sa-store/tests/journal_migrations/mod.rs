@@ -18,7 +18,7 @@ fn increment(conn: &Connection) -> Result<()> {
 }
 
 fn fixture(dir: &Path) -> Connection {
-    let conn = open_journal(dir).unwrap();
+    let conn = open_with_migrations(dir, &super::MIGRATIONS[..1]).unwrap();
     conn.execute_batch(
         "PRAGMA wal_autocheckpoint=0;
          CREATE TABLE recovery_fixture(value INTEGER);
@@ -31,6 +31,27 @@ fn fixture(dir: &Path) -> Connection {
 fn value(conn: &Connection) -> i64 {
     conn.query_row("SELECT value FROM recovery_fixture", [], |row| row.get(0))
         .unwrap()
+}
+
+#[test]
+fn follow_queue_upgrade_snapshots_the_v1_journal_once() {
+    let dir = tempfile::tempdir().unwrap();
+    drop(fixture(dir.path()));
+    let tables = |conn: &Connection| conn.query_row(
+        "SELECT count(*) FROM sqlite_schema WHERE type='table' AND name IN ('follow_queue','follow_queue_status')",
+        [], |row| row.get::<_, i64>(0),
+    ).unwrap();
+    let upgraded = open_journal(dir.path()).unwrap();
+    assert_eq!(tables(&upgraded), 2);
+    assert_eq!(value(&upgraded), 42);
+    let (path, _) = backup::latest_snapshot(dir.path()).unwrap();
+    let saved = Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+    assert_eq!(saved.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0)).unwrap(), 1);
+    assert_eq!(value(&saved), 42);
+    assert_eq!(tables(&saved), 0);
+    drop(upgraded);
+    assert_eq!(tables(&open_journal(dir.path()).unwrap()), 2);
+    assert_eq!(backup::latest_snapshot(dir.path()).unwrap().0, path);
 }
 
 #[test]
@@ -144,7 +165,7 @@ fn next_snapshot_migration_cleans_only_private_pending_snapshot_files() {
     }
     fs::create_dir(&directory).unwrap();
 
-    drop(open_journal(dir.path()).unwrap());
+    drop(open_with_migrations(dir.path(), &super::MIGRATIONS[..1]).unwrap());
     assert!(
         stale.is_file(),
         "opening a current journal does not clean backups"

@@ -113,6 +113,15 @@ impl App {
                     }
                     if let Some(s) = &snap {
                         self.question_cards(ui, s);
+                        if let Some(action) = crate::follow_queue::strip(
+                            ui,
+                            s,
+                            &pal,
+                            self.writable(),
+                            &self.composer.pending_queue,
+                        ) {
+                            self.submit_queue_action(action, &s.ticket);
+                        }
                     }
                     if self.writable() {
                         self.composer(ui);

@@ -60,7 +60,7 @@ async fn image_follow_replaces_images_updates_text_and_survives_reopen() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn active_image_follow_supersedes_pending_images_without_mutating_the_running_request() {
+async fn active_image_follows_replace_images_one_turn_at_a_time() {
     let entered = Gate::new();
     let release = Gate::new();
     let (started, finish) = (entered.clone(), release.clone());
@@ -75,24 +75,26 @@ async fn active_image_follow_supersedes_pending_images_without_mutating_the_runn
                 assert_eq!(c.req.images[0].data(), original);
             } else {
                 assert_eq!(c.req.images.len(), 1);
-                assert_eq!(c.req.images[0].name(), "最新.PNG");
+                assert_eq!(c.req.images[0].name(), if c.turn() == 2 { "中间.jpeg" } else { "最新.PNG" });
                 assert!(c.req.session_id.is_some());
             }
             Ok("seen".into())
         }
     }), t1_catalog());
     write_image(&fx.project, "初始.png", image::ImageFormat::Png, 2);
-    write_image(&fx.project, "中间.jpeg", image::ImageFormat::Jpeg, 3);
+    let middle = write_image(&fx.project, "中间.jpeg", image::ImageFormat::Jpeg, 3);
     let newest = write_image(&fx.project, "最新.PNG", image::ImageFormat::Png, 4);
     let ticket = fx.begin(fx.params().profile("readonly").files(&["初始.png"])).await;
     fx.until(|| fx.shared.count(|_| true) == 1).await;
     entered.wait().await;
     fx.engine.follow_with_files(ticket, "改看中间图", false, &["中间.jpeg".into()]).await.unwrap();
     fx.engine.follow_with_files(ticket, "改看最新图", false, &["最新.PNG".into()]).await.unwrap();
+    std::fs::write(fx.project.join("中间.jpeg"), b"changed after enqueue").unwrap();
     release.open();
     fx.finish(ticket, "done").await;
-    assert_eq!(fx.shared.count(|_| true), 2);
-    assert_eq!(fx.shared.calls(|c| (c.packet["turn"] == 2).then(|| c.req.images[0].data().to_vec())), vec![newest]);
+    assert_eq!(fx.shared.count(|_| true), 3);
+    assert_eq!(fx.shared.calls(|c| (c.packet["turn"] == 2).then(|| c.req.images[0].data().to_vec())), vec![middle]);
+    assert_eq!(fx.shared.calls(|c| (c.packet["turn"] == 3).then(|| c.req.images[0].data().to_vec())), vec![newest]);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -273,6 +275,9 @@ async fn stale_progress_suppressed(action: &str) {
         fx.engine.cancel(id).unwrap();
     } else {
         fx.engine.follow(id, "新的指令", false).unwrap();
+        // The old worker reports after delivery, including when the root
+        // was still finishing the dispatch and initially queued the follow.
+        fx.until(|| fx.int("SELECT count(*) FROM events WHERE kind='user.follow'") == 1).await;
     }
     release.open();
     if action == "follow" {

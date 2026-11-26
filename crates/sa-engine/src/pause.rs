@@ -170,6 +170,7 @@ fn settle_failure(q: &Q, root: &Map<String, Value>, reason: &str) -> Result<()> 
     q.run("UPDATE jobs SET state=?,result=? WHERE id=?", &[&state, &reason, &int_of(root, "id")])?;
     if crate::protocol::is_terminal(state) { q.withdraw_question(who_of(root))?; }
     q.log(who_of(root), "turn.pause_failure", &json!({"reason": reason, "state": state}))?;
+    crate::follow_queue::finish(q, int_of(root, "ticket"))?;
     set(q, root, if pending { "draining" } else { "paused" }, false,
         if pending { "ticket.pause_draining" } else { "ticket.paused" })
 }

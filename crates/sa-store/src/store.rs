@@ -552,7 +552,14 @@ impl Store {
             .into_iter()
             .filter(|observed| agents.contains(&observed.agent))
             .collect();
+        let (queue, queue_hold) = if self.has_table("follow_queue")? {
+            crate::follow_queue::snapshot(conn, ticket)?
+        } else {
+            Default::default()
+        };
         Ok(Snapshot {
+            queue,
+            queue_hold,
             usage,
             quota,
             loading,

@@ -7,7 +7,7 @@
 //! Outcomes come back through [`App::poll_host`].
 
 use crate::app::App;
-use crate::host::{self, Action, ActionKind};
+use crate::host::{self, Action, ActionKind, QueueAction};
 use crate::labels::{self, agent_name};
 use crate::theme::{self, Palette};
 use crate::widgets;
@@ -17,7 +17,7 @@ use egui::{
     Margin, Modifiers, Response, RichText, Sense, Stroke, Ui, Vec2,
 };
 use egui_phosphor::regular as icon;
-use std::path::PathBuf;
+use std::{collections::HashSet, path::PathBuf};
 
 /// Lead choices, in the order of the Electron picker.
 pub const LEADS: [&str; 4] = ["deepseek", "codex", "claude", "antigravity"];
@@ -35,6 +35,7 @@ const RISK_SUFFIX: &str =
 pub enum Confirm {
     /// Switch the draft permission to `full` or `auto`.
     Profile(String),
+    ResumeQueue { ticket: i64 },
     /// Resume a stopped continuous ticket with a new instruction.
     Resume {
         ticket: i64,
@@ -53,6 +54,7 @@ pub struct Composer {
     pub target: Option<(i64, String)>,
     /// Actions submitted and not yet answered.
     pub pending: usize,
+    pub(crate) pending_queue: HashSet<QueueAction>,
     /// Last operator message: `(text, is_error)`.
     pub message: Option<(String, bool)>,
     pub confirm: Option<Confirm>,
@@ -102,6 +104,7 @@ impl Composer {
             attachments: Vec::new(),
             target: None,
             pending: 0,
+            pending_queue: HashSet::new(),
             message: None,
             confirm: None,
             plan_draft: String::new(),
@@ -173,8 +176,12 @@ impl Current {
         self.ticket.is_some() && labels::is_active(&self.state)
     }
     fn stopped(&self) -> bool {
-        self.profile == "auto" && self.state == "cancelled"
+        stopped_auto(&self.profile, &self.state)
     }
+}
+
+fn stopped_auto(profile: &str, state: &str) -> bool {
+    profile == "auto" && state == "cancelled"
 }
 
 /// Label and explanation of a ticket's pause state (`None`: not pausing).
@@ -265,6 +272,16 @@ impl App {
         self.host.is_some()
     }
 
+    pub(crate) fn submit_queue_action(&mut self, action: Action, ticket: &sa_store::TicketDetail) {
+        if let Action::ResumeQueue { .. } = action
+            && stopped_auto(&ticket.permission_profile, &ticket.state)
+        {
+            self.composer.confirm = Some(Confirm::ResumeQueue { ticket: ticket.id });
+        } else {
+            self.submit(action);
+        }
+    }
+
     pub fn submit(&mut self, action: Action) {
         let Some(host) = &self.host else {
             self.composer.message = Some(("只读观察模式不能修改工单".into(), true));
@@ -295,7 +312,15 @@ impl App {
             self.composer.last_create_context = Some((self.epoch, cwd.clone()));
         }
         let kind = action.kind();
+        if let ActionKind::Queue(key) = kind
+            && self.composer.pending_queue.contains(&key)
+        {
+            return;
+        }
         if host.submit(action) {
+            if let ActionKind::Queue(key) = kind {
+                self.composer.pending_queue.insert(key);
+            }
             if fork_context.is_some() {
                 self.composer.pending_fork = fork_context;
             }
@@ -353,6 +378,9 @@ impl App {
             return;
         }
         for o in outcomes {
+            if let ActionKind::Queue(key) = o.kind {
+                self.composer.pending_queue.remove(&key);
+            }
             self.composer.pending = self.composer.pending.saturating_sub(1);
             let ok = o.result.is_ok();
             let same_fork_context = if o.kind == ActionKind::Fork {
@@ -454,7 +482,7 @@ impl App {
                 (ActionKind::T3Import, r) => self.t3_projects_imported(r),
                 (ActionKind::Knowledge, r) => self.knowledge_saved(r.map(|_| ())),
                 (ActionKind::Providers, r) => self.providers_saved(r.map(|_| ())),
-                (ActionKind::Meta, Ok(_)) => {}
+                (ActionKind::Meta | ActionKind::Queue(_), Ok(_)) => {}
                 (ActionKind::Notify, r) => self.notify_saved(r.map(|_| ())),
                 (_, Err(e)) => self.composer.message = Some((e, true)),
             }
@@ -1136,7 +1164,7 @@ impl App {
                 ),
                 "了解风险并启用",
             ),
-            Confirm::Resume { .. } => (
+            Confirm::Resume { .. } | Confirm::ResumeQueue { .. } => (
                 "恢复持续自动运行".to_string(),
                 "将以这条新指令恢复完全访问和持续模型调用，可能重复产生费用。".to_string(),
                 "恢复并发送",
@@ -1179,6 +1207,7 @@ impl App {
         }
         match confirm {
             Confirm::Profile(p) => self.composer.profile = p,
+            Confirm::ResumeQueue { ticket } => self.submit(Action::ResumeQueue { ticket }),
             Confirm::Resume {
                 ticket,
                 body,

@@ -384,7 +384,7 @@ pub fn envelope(q: &Q, j: &JobCtx, harness_health: Value) -> Result<Map<String, 
             .map(|f| parse(str_of(&f, "manifest")))
             .unwrap_or_else(|| json!([])),
     );
-    m.insert("notes".into(), Value::Array(q.notes(j.id, false)?));
+    m.insert("notes".into(), Value::Array(q.packet_notes(j.id)?));
     m.insert("user_updates".into(), Value::Array(user_updates));
     if let Some((requirements, omitted)) = crate::context_selection::requirements(q, j)? {
         m.insert("requirements".into(), requirements);

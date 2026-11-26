@@ -15,6 +15,7 @@ mod efficiency;
 mod efficiency_tests;
 mod extensions;
 mod feed;
+mod follow_queue;
 mod files;
 mod host;
 mod inspector;

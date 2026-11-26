@@ -215,6 +215,214 @@ fn conversation_and_collaboration_render_while_journal_is_busy() {
     assert!(elapsed < Duration::from_secs(1), "UI waited for journal: {elapsed:?}");
 }
 
+fn queue_ticket_at_approval(h: &mut Harness<'_, App>, project: &std::path::Path) -> i64 {
+    h.state_mut().composer.project = Some(project.to_path_buf());
+    h.state_mut().composer.lead = "codex".into();
+    h.run_steps(3);
+    h.get_by_label("输入框").focus();
+    h.get_by_label("输入框").type_text("等待审批以测试排队");
+    h.run_steps(2);
+    h.key_press(egui::Key::Enter);
+    until(h, "active approval", |a| a.view.as_ref().and_then(|v| v.snap.as_ref())
+        .is_some_and(|s| !s.approvals.is_empty()));
+    h.state().view.as_ref().unwrap().id
+}
+
+#[test]
+fn follow_queue_strip_deletes_and_resumes_the_selected_ticket() {
+    let data = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let mut h = harness(data.path(), "ask");
+    let ticket = queue_ticket_at_approval(&mut h, project.path());
+    let engine = h.state().host.as_ref().unwrap().engine().clone();
+    let sa_engine::FollowOutcome::Queued { id } = engine.follow(ticket, "要删除的消息", false).unwrap()
+        else { panic!("active approval must queue") };
+    until(&mut h, "queued follow", |a| a.view.as_ref().and_then(|v| v.snap.as_ref())
+        .is_some_and(|s| s.queue.len() == 1));
+    h.run_steps(3);
+    assert!(h.query_by_label("排队中 · 1 条，本轮结束后逐条发送").is_some());
+    assert!(h.query_by_label("要删除的消息").is_some());
+    let delete = "删除这条待发指令";
+    h.get_by_role_and_label(Role::Button, delete).hover();
+    h.run_steps(40);
+    assert!(h.query_by_role_and_label(Role::Label, delete).is_some());
+    let writer = rusqlite::Connection::open(data.path().join("hub.sqlite3")).unwrap();
+    writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+    h.get_by_role_and_label(Role::Button, delete).click();
+    h.run_steps(4);
+    assert!(h.get_by_role_and_label(Role::Button, delete).accesskit_node().is_disabled());
+    h.state_mut().submit(crate::host::Action::DeleteQueued { ticket, id });
+    assert_eq!(h.state().composer.pending, 1);
+    writer.execute_batch("ROLLBACK").unwrap();
+    until(&mut h, "delete committed", |a| a.composer.pending == 0
+        && a.view.as_ref().and_then(|v| v.snap.as_ref()).is_some_and(|s| s.queue.is_empty()));
+    assert!(!kinds(h.state(), ticket).iter().any(|k| k == "user.follow"));
+    h.state_mut().submit(crate::host::Action::DeleteQueued { ticket, id });
+    until(&mut h, "late delete at composer", |a| a.composer.message.as_ref()
+        .is_some_and(|(message, error)| *error && message == "这条已开始发送，无法删除"));
+    h.run_steps(2);
+    assert!(h.query_by_label("这条已开始发送，无法删除").is_some());
+    let sa_engine::FollowOutcome::Queued { id } = engine.follow(ticket, "保留并继续", false).unwrap()
+        else { panic!("approval still running") };
+    assert_eq!(engine.promote_queued(ticket, id).unwrap(), sa_engine::Promotion::Steered);
+    until(&mut h, "pending native note", |a| a.view.as_ref().and_then(|v| v.snap.as_ref())
+        .is_some_and(|s| s.queue.iter().any(|item| item.steering)));
+    h.run_steps(3);
+    h.get_by_label("正在插入当前轮…").hover();
+    h.run_steps(40);
+    assert!(h.query_by_label("正在送入当前轮，无法删除").is_some());
+    assert!(h.query_by_role_and_label(Role::Button, delete).is_none());
+    engine.cancel(ticket).unwrap();
+    until(&mut h, "stopped queue", |a| a.view.as_ref().and_then(|v| v.snap.as_ref())
+        .is_some_and(|s| s.queue_hold == Some(sa_store::HoldReason::Stopped) && s.queue.len() == 1));
+    h.run_steps(3);
+    assert!(h.query_by_label("追加队列已暂停 · 1 条（工单已停止）").is_some());
+    writer.execute_batch(
+        "CREATE TRIGGER refuse_resume BEFORE DELETE ON follow_queue
+         BEGIN SELECT RAISE(ABORT,'测试恢复失败'); END; BEGIN IMMEDIATE",
+    ).unwrap();
+    h.get_by_role_and_label(Role::Button, "继续发送").click();
+    h.run_steps(4);
+    assert!(h.get_by_role_and_label(Role::Button, "正在继续…").accesskit_node().is_disabled());
+    writer.execute_batch("ROLLBACK").unwrap();
+    until(&mut h, "resume failure at composer", |a| a.composer.message.as_ref()
+        .is_some_and(|(message, error)| *error && message.contains("测试恢复失败")));
+    h.run_steps(3);
+    assert!(h.query_by_label_contains("测试恢复失败").is_some());
+    assert!(h.query_by_label("追加队列已暂停 · 1 条（工单已停止）").is_some());
+    assert!(h.query_by_label("保留并继续").is_some());
+    assert!(!kinds(h.state(), ticket).iter().any(|k| k == "user.follow"));
+    writer.execute_batch("DROP TRIGGER refuse_resume").unwrap();
+    h.get_by_role_and_label(Role::Button, "继续发送").click();
+    until(&mut h, "resumed follow delivered", |a| a.view.as_ref().and_then(|v| v.snap.as_ref())
+        .is_some_and(|s| s.queue_hold.is_none() && s.queue.is_empty()));
+    assert_eq!(kinds(h.state(), ticket).iter().filter(|k| *k == "user.follow").count(), 1);
+    engine.cancel(ticket).unwrap();
+}
+
+#[test]
+fn stopped_auto_queue_confirms_before_dispatch_and_cancel_preserves_the_head() {
+    let data = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let mut h = harness(data.path(), "ask");
+    let ticket = queue_ticket_at_approval(&mut h, project.path());
+    let engine = h.state().host.as_ref().unwrap().engine().clone();
+    let sa_engine::FollowOutcome::Queued { id } = engine.follow(ticket, "确认后发送", false).unwrap()
+        else { panic!("active approval must queue") };
+    engine.cancel(ticket).unwrap();
+    // The approval fixture gates admission deterministically. Set the stopped
+    // journal to the profile and continuous-run record of an auto ticket.
+    engine.db().tx(|q| {
+        q.run("UPDATE tickets SET permission_profile='auto' WHERE id=?", &[&ticket])?;
+        q.run("INSERT INTO continuous_runs(ticket) VALUES(?)", &[&ticket])?;
+        Ok(())
+    }).unwrap();
+    until(&mut h, "stopped continuous queue", |a| a.view.as_ref().and_then(|v| v.snap.as_ref())
+        .is_some_and(|s| s.ticket.state == "cancelled" && s.ticket.permission_profile == "auto"
+            && s.queue_hold == Some(sa_store::HoldReason::Stopped)));
+    for confirm in [false, true] {
+        h.run_steps(3);
+        h.get_by_role_and_label(Role::Button, "继续发送").click();
+        h.run_steps(4);
+        assert!(h.query_by_label_contains("恢复持续自动运行").is_some());
+        assert_eq!(h.state().composer.pending, 0);
+        assert!(!kinds(h.state(), ticket).iter().any(|k| k == "user.follow"));
+        if confirm {
+            h.get_by_role_and_label(Role::Button, "恢复并发送").click();
+        } else {
+            h.get_by_role_and_label(Role::Button, "取消").click();
+            h.run_steps(4);
+            assert!(h.state().composer.confirm.is_none());
+            assert_eq!(h.state().composer.pending, 0);
+            let snap = h.state().view.as_ref().unwrap().snap.as_ref().unwrap();
+            assert_eq!(snap.queue_hold, Some(sa_store::HoldReason::Stopped));
+            assert_eq!(snap.queue[0].id, id);
+        }
+    }
+    until(&mut h, "confirmed queue resumed", |a| a.view.as_ref().and_then(|v| v.snap.as_ref())
+        .is_some_and(|s| s.queue_hold.is_none() && s.queue.is_empty()));
+    assert_eq!(kinds(h.state(), ticket).iter().filter(|k| *k == "user.follow").count(), 1);
+    engine.cancel(ticket).unwrap();
+}
+
+#[test]
+fn observer_queue_scrolls_three_rows_and_reveals_truncated_text_and_files_on_hover() {
+    use crate::data::DataSource;
+    use sa_store::{HoldReason, QueuedFollow};
+
+    const LONG: &str = "队列第一条的首行\n队列第一条的次行\n队列第一条的全文末行";
+    let mut h = Harness::builder().with_size(egui::vec2(1280.0, 900.0)).build_eframe(|cc| {
+        crate::theme::install_fonts(&cc.egui_ctx);
+        let worker = worker::spawn(Box::new(|| {
+            let mut source = FrozenDemo::new();
+            for (ticket, reason) in [(42, HoldReason::Failed), (41, HoldReason::Interrupted)] {
+                let snap = source.snapshots.get_mut(&ticket).unwrap();
+                let job = snap.jobs.iter().find(|job| job.parent.is_none()).unwrap().id;
+                snap.queue_hold = Some(reason);
+                snap.queue = (1..=6).map(|id| QueuedFollow {
+                    id, job, position: id,
+                    body: if id == 1 { LONG.into() } else { format!("队列测试第{id}条") },
+                    files: if id == 1 { vec!["计划.md".into(), "截图.png".into()] } else { vec![] },
+                    steering: false,
+                }).collect();
+            }
+            Ok(Box::new(source) as Box<dyn DataSource>)
+        }), cc.egui_ctx.clone());
+        App::new(cc, Options { observe: true, ticket: Some(42), ..Default::default() },
+            worker, Arc::new(Mutex::new(None)), Err("只读观察".into()))
+    });
+    until(&mut h, "observer queue", |a| a.view.as_ref().and_then(|v| v.snap.as_ref())
+        .is_some_and(|s| s.queue.len() == 6));
+    h.run_steps(4);
+    assert!(h.query_by_label("追加队列已暂停 · 6 条（上一轮失败）").is_some());
+    assert!(h.query_by_label("队列已暂停 · 请在主窗口继续").is_some());
+    assert!(h.query_by_role_and_label(Role::Button, "继续发送").is_none());
+    assert!(h.query_by_role_and_label(Role::Button, "删除这条待发指令").is_none());
+
+    // Inspect clipped paint output: a virtualized overscan row may still have an accessibility node.
+    let visible = |h: &Harness<'_, App>| -> Vec<String> {
+        h.output().shapes.iter().filter_map(|shape| {
+            let egui::Shape::Text(text) = &shape.shape else { return None };
+            let body = text.galley.text();
+            if (body == LONG || body.starts_with("队列测试第"))
+                && shape.clip_rect.contains(text.pos + text.galley.rect.center().to_vec2())
+            {
+                if body == LONG {
+                    assert!(text.galley.elided);
+                    assert_eq!(text.galley.rows.len(), 2);
+                    assert!(text.galley.rows[1].text().ends_with('…'));
+                }
+                Some(body.to_owned())
+            } else {
+                None
+            }
+        }).collect()
+    };
+    assert_eq!(visible(&h), [LONG, "队列测试第2条", "队列测试第3条"]);
+    h.get_by_label(LONG).hover();
+    h.run_steps(40);
+    assert_eq!(h.get_all_by_label(LONG).count(), 2);
+    h.get_by_label("含 2 个附件").hover();
+    h.run_steps(40);
+    assert!(h.query_by_label("计划.md").is_some());
+    assert!(h.query_by_label("截图.png").is_some());
+    h.get_by_label("队列测试第3条").hover();
+    h.run_steps(40);
+    assert_eq!(h.get_all_by_label("队列测试第3条").count(), 1);
+    h.event(egui::Event::MouseWheel {
+        unit: egui::MouseWheelUnit::Point,
+        delta: egui::vec2(0.0, -800.0),
+        modifiers: egui::Modifiers::NONE,
+    });
+    h.run_steps(40);
+    assert_eq!(visible(&h), ["队列测试第4条", "队列测试第5条", "队列测试第6条"]);
+    h.state_mut().select(Some(41));
+    until(&mut h, "interrupted observer queue", |a| a.view.as_ref().and_then(|v| v.snap.as_ref())
+        .is_some_and(|s| s.queue_hold == Some(HoldReason::Interrupted)));
+    h.run_steps(3);
+    assert!(h.query_by_label("追加队列已暂停 · 6 条（上一轮已中断）").is_some());
+}
+
 #[test]
 fn handoff_pause_clicks_keep_active_work_and_require_explicit_resume() {
     let data = tempfile::tempdir().unwrap();
