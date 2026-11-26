@@ -3390,6 +3390,7 @@ dependencies = [
  "ignore",
  "image",
  "pulldown-cmark",
+ "raw-window-handle",
  "rfd",
  "rusqlite",
  "sa-adapters",
