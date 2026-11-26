@@ -297,14 +297,15 @@ pub(crate) async fn run_server(
     let spawning = Instant::now();
     let mut process = proc::start(&exe, &server.args, &req.cwd, &env)?;
     let timing = discovery.spawned(spawning);
-    let stdin = process
-        .stdin
-        .take()
-        .ok_or_else(|| failure(ErrorClass::Protocol, "acp:stdin"))?;
-    let stdout = process
-        .stdout
-        .take()
-        .ok_or_else(|| failure(ErrorClass::Protocol, "acp:stdout"))?;
+    let stdin = process.stdin.take().ok_or_else(|| {
+        timing.emit_with_outcome(&emit, "failed_during_handshake");
+        failure(ErrorClass::Protocol, "acp:stdin")
+    })?;
+    let stdout = process.stdout.take().ok_or_else(|| {
+        timing.emit_with_outcome(&emit, "failed_during_handshake");
+        failure(ErrorClass::Protocol, "acp:stdout")
+    })?;
+    let handshake_timing = Arc::new(Mutex::new(Some(timing)));
     let active = Arc::new(Mutex::new(None::<String>));
     let text = Arc::new(Mutex::new(String::new()));
     let prompting = Arc::new(AtomicBool::new(false));
@@ -328,6 +329,7 @@ pub(crate) async fn run_server(
     let callback_emit = emit.clone();
     let callback_cancel = cancel.clone();
     let callback_req = req.clone();
+    let callback_timing = handshake_timing.clone();
     let operation = Client.v1()
         .on_receive_notification(async move |notification: SessionNotification,_cx| {
             let value=serde_json::to_value(&notification).map_err(|_|sdk::Error::invalid_params())?;
@@ -393,13 +395,19 @@ pub(crate) async fn run_server(
             }
             callback_emit.journal("adapter.permission",json!({"profile":callback_req.profile,"scope":if unrestricted{"danger-full-access"}else if antigravity{"cli-deny-policy+mode"}else{"operator-verified-acp-mode"}}));
             callback_emit.journal("adapter.route",json!({"agent":callback_req.agent,"provider":callback_req.route.provider,"requested_model":callback_req.route.model,"mode":"cli","protocol":"acp-v1"}));
-            prompting.store(true,Ordering::SeqCst);
             let mut content = vec![ContentBlock::Text(TextContent::new(callback_req.prompt.clone()))];
             for image in &callback_req.images {
                 content.push(ContentBlock::Image(ImageContent::new(STANDARD.encode(image.data()), image.media_type())));
             }
             let request = PromptRequest::new(sid.clone(), content);
+            if callback_cancel.is_cancelled() {
+                return Err(sdk::Error::new(sdk::ErrorCode::REQUEST_CANCELLED,"cancelled"));
+            }
+            let Some(timing) = callback_timing.lock().unwrap().take() else {
+                return Err(sdk::Error::new(sdk::ErrorCode::REQUEST_CANCELLED,"cancelled"));
+            };
             timing.emit(&callback_emit);
+            prompting.store(true,Ordering::SeqCst);
             let prompt=connection.send_request(request).block_task();
             tokio::pin!(prompt);
             let reply=tokio::select! {
@@ -415,13 +423,21 @@ pub(crate) async fn run_server(
             Ok(())
         });
     tokio::pin!(operation);
-    let result = tokio::select! {
-        result=&mut operation=>result.map_err(|error| sdk_failure(error, antigravity)),
-        ()=cancel.cancelled()=>{
-            let _=tokio::time::timeout(Duration::from_millis(500),&mut operation).await;
-            Err(failure(ErrorClass::Cancelled,"acp:cancelled"))
-        }
+    let (result, drain_cancelled) = tokio::select! {
+        result = &mut operation => (result.map_err(|error| sdk_failure(error, antigravity)), false),
+        () = cancel.cancelled() => (Err(failure(ErrorClass::Cancelled, "acp:cancelled")), true),
     };
+    if let Some(timing) = handshake_timing.lock().unwrap().take() {
+        let outcome = if result.as_ref().is_err_and(|error| error.class == ErrorClass::Cancelled) {
+            "cancelled_during_handshake"
+        } else {
+            "failed_during_handshake"
+        };
+        timing.emit_with_outcome(&emit, outcome);
+    }
+    if drain_cancelled {
+        let _ = tokio::time::timeout(Duration::from_millis(500), &mut operation).await;
+    }
     process.kill_tree().await;
     process.wait().await;
     let sid = active.lock().unwrap().clone().or(req.session_id);

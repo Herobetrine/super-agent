@@ -30,6 +30,7 @@ readline.createInterface({input: process.stdin}).on('line', line => {
   if (method === 'initialize') return send({id, result: {protocolVersion: 1,
     agentCapabilities: {loadSession: scenario !== 'no-load', promptCapabilities: {image: scenario !== 'no-image'}}, authMethods: []}});
   if (method === 'session/new' || method === 'session/load') {
+    if (method === 'session/new' && scenario === 'exit-new') process.exit(2);
     if (method === 'session/load') {
       if (scenario !== 'wrong-load') session = params.sessionId;
       else session = 'wrong-loaded-session';

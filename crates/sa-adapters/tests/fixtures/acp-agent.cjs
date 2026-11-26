@@ -13,6 +13,8 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
  const {id,method,params}=message;
  if(method==='initialize')return send({id,result:{protocolVersion:1,agentCapabilities:{loadSession:mode!=='no-load'},authMethods:[]}});
  if(method==='session/new'||method==='session/load'){
+   if(method==='session/new' && mode==='exit-new')process.exit(2);
+   if(method==='session/new' && mode==='wait-new')return;
    if(method==='session/load'){session=params.sessionId;note('agent_message_chunk',{content:{type:'text',text:'OLD HISTORY'}});}
    const reply=()=>send({id,result:{...(method==='session/new'?{sessionId:session}:{}),modes:{currentModeId:'safe',availableModes:[{id:'safe',name:'Safe'}]},configOptions:[{id:'model',name:'Model',category:'model',type:'select',currentValue:'m1',options:[{value:'m1',name:'Model 1'}]}]}});
    if(method==='session/new' && mode==='slow-new')return setTimeout(reply,200);

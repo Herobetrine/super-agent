@@ -909,7 +909,7 @@ async fn run(
     })
     .await;
     if let Some(timing) = timing {
-        timing.failed_before_first_frame(&emit);
+        timing.emit_with_outcome(&emit, "failed_before_first_frame");
     }
     if let Err(mut err) = streamed {
         // A nonzero exit may accompany an upstream ERROR terminal. Preserve

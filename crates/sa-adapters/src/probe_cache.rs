@@ -491,12 +491,19 @@ pub(crate) struct Probes<'a> {
 pub(crate) struct ProbeUse {
     slot: String,
     started: Stamp,
-    pub(crate) cached: bool,
+    cached: bool,
 }
 
 impl ProbeUse {
     pub(crate) fn all_cached(used: &[Self]) -> bool {
         !used.is_empty() && used.iter().all(|probe| probe.cached)
+    }
+
+    pub(crate) fn cached_slots_except(used: &[Self], retried: &HashSet<String>) -> HashSet<String> {
+        used.iter()
+            .filter(|probe| probe.cached && !retried.contains(&probe.slot))
+            .map(|probe| probe.slot.clone())
+            .collect()
     }
 }
 
@@ -522,7 +529,7 @@ impl<'a> Probes<'a> {
 
     pub(crate) fn read<T: DeserializeOwned>(&self, slot: &str) -> Option<T> {
         let (value, started) = self
-            .reuse
+            .can_reuse(slot)
             .then(|| self.cache.read_stamped(self.key, slot))
             .flatten()?;
         self.observed
@@ -533,14 +540,15 @@ impl<'a> Probes<'a> {
     }
 
     pub(crate) fn failure_is_fresh(&self, slot: &str, optional: bool) -> bool {
-        let skip = self.reuse
-            && optional
-            && self.retry_slots.is_none_or(|slots| !slots.contains(slot))
-            && self.cache.failure_is_fresh(self.key, slot);
+        let skip = self.can_reuse(slot) && optional && self.cache.failure_is_fresh(self.key, slot);
         if skip {
             self.skipped_failures.lock().unwrap().insert(slot.into());
         }
         skip
+    }
+
+    fn can_reuse(&self, slot: &str) -> bool {
+        self.reuse && self.retry_slots.is_none_or(|slots| !slots.contains(slot))
     }
 
     pub(crate) fn deferred_effort_slots<'slot>(
@@ -566,6 +574,12 @@ impl<'a> Probes<'a> {
         let Some(provider) = providers.iter().find(|p| p["id"] == route.provider) else {
             return retry;
         };
+        let custom = provider["custom"] == true;
+        // A hard failure keeps only the configured model IDs. Enrichment
+        // runs when refresh_with obtained online or last-good models.
+        if custom && provider["catalog_complete"] != true && provider["cachedModels"] != true {
+            return retry;
+        }
         let Some(model) = provider["models"]
             .as_array()
             .into_iter()
@@ -583,7 +597,7 @@ impl<'a> Probes<'a> {
         }
         // A donor is reported only when the custom endpoint omitted effort
         // declarations. An earlier skipped provider could replace that donor.
-        if provider["custom"] == true && (donor.is_some() || missing) {
+        if custom && (donor.is_some() || missing) {
             for native in providers.iter().filter(|p| p["custom"] != true) {
                 if let Some(slot) = native["id"].as_str().and_then(&primary_slot)
                     && skipped.contains(slot)
@@ -789,9 +803,9 @@ impl TurnTiming {
         emit.journal("turn.timing", self.data());
     }
 
-    pub(crate) fn failed_before_first_frame(self, emit: &Emit) {
+    pub(crate) fn emit_with_outcome(self, emit: &Emit, outcome: &str) {
         let mut data = self.data();
-        data["outcome"] = json!("failed_before_first_frame");
+        data["outcome"] = json!(outcome);
         emit.journal("turn.timing", data);
     }
 
