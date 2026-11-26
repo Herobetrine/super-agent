@@ -18,6 +18,11 @@ use std::{
 #[path = "journal_backup.rs"]
 mod backup;
 
+pub use backup::{
+    RestoreError, RestorePlan, Restored, journal_busy, restore_backup_stamp, restore_from_snapshot,
+    restore_from_snapshot_at, restore_plan,
+};
+
 #[cfg(test)]
 #[path = "../tests/journal_migrations/mod.rs"]
 mod migration_tests;

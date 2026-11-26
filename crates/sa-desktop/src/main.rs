@@ -50,11 +50,108 @@ mod workflow_tests;
 
 use std::{
     path::PathBuf,
+    process::Command,
     sync::{Arc, Mutex},
+    time::Duration,
 };
 
 pub(crate) const DEFAULT_WINDOW: (f32, f32) = (1440.0, 900.0);
 pub(crate) const MIN_WINDOW: (f32, f32) = (880.0, 600.0);
+
+const RELAUNCH_AFTER_PID: &str = "SA_RELAUNCH_AFTER_PID";
+const RELAUNCH_WAIT: Duration = Duration::from_secs(15);
+
+fn relaunch() -> anyhow::Result<()> {
+    let mut command = Command::new(std::env::current_exe()?);
+    command
+        .args(std::env::args_os().skip(1))
+        .env(RELAUNCH_AFTER_PID, std::process::id().to_string());
+    sa_engine::owner::allow_breakaway()?;
+    spawn_relaunch(&mut command)?;
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn spawn_relaunch(command: &mut Command) -> std::io::Result<()> {
+    command.spawn().map(|_| ())
+}
+
+#[cfg(windows)]
+fn spawn_relaunch(command: &mut Command) -> std::io::Result<()> {
+    use std::os::windows::process::CommandExt;
+    use windows::Win32::{
+        Foundation::ERROR_ACCESS_DENIED,
+        System::Threading::{CREATE_BREAKAWAY_FROM_JOB, CREATE_NEW_PROCESS_GROUP},
+    };
+
+    match command
+        .creation_flags((CREATE_BREAKAWAY_FROM_JOB | CREATE_NEW_PROCESS_GROUP).0)
+        .spawn()
+    {
+        Err(error) if error.raw_os_error() == Some(ERROR_ACCESS_DENIED.0 as i32) => {
+            command.creation_flags(CREATE_NEW_PROCESS_GROUP.0).spawn()?;
+        }
+        result => {
+            result?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn wait_for_process_exit(pid: u32) {
+    use windows::Win32::{
+        Foundation::CloseHandle,
+        System::Threading::{OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject},
+    };
+
+    // SAFETY: this process owns the non-inheritable handle until the wait returns.
+    unsafe {
+        if let Ok(process) = OpenProcess(PROCESS_SYNCHRONIZE, false, pid) {
+            let _ = WaitForSingleObject(process, RELAUNCH_WAIT.as_millis() as u32);
+            let _ = CloseHandle(process);
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn wait_for_process_exit(pid: u32) {
+    use std::{ffi::c_int, time::Instant};
+
+    unsafe extern "C" {
+        fn kill(pid: c_int, sig: c_int) -> c_int;
+    }
+
+    let Ok(pid) = c_int::try_from(pid) else {
+        return;
+    };
+    if pid == 0 {
+        return;
+    }
+    let deadline = Instant::now() + RELAUNCH_WAIT;
+    loop {
+        // SAFETY: a positive PID and signal zero only probe process existence.
+        if unsafe { kill(pid, 0) } != 0 {
+            break;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        std::thread::sleep(remaining.min(Duration::from_millis(50)));
+    }
+}
+
+fn await_previous_instance() {
+    let Some(pid) = std::env::var_os(RELAUNCH_AFTER_PID) else {
+        return;
+    };
+    // SAFETY: main calls this before starting the UI, scheduler, or any threads.
+    unsafe { std::env::remove_var(RELAUNCH_AFTER_PID) };
+    if let Some(pid) = pid.to_str().and_then(|pid| pid.parse().ok()) {
+        wait_for_process_exit(pid);
+    }
+}
 
 /// Drop a corrupted or collapsed eframe `"window"` entry from `app.ron` before startup
 /// so Windows minimization/off-screen saves cannot reopen the workbench at postage-stamp size.
@@ -150,6 +247,13 @@ fn create_app(
             .and_then(|error| error.downcast_ref::<sa_store::journal::JournalError>())
             .map(|error| recovery_ui::RecoveryPanel::from_journal(error, &dir, false))
     };
+    // This window's own read-only connection would also keep SQLite files open
+    // on Windows. Pause it before opening any journal eligible for restore.
+    let opener = if let Some(panel) = &panel {
+        panel.gate_reader(opener)
+    } else {
+        opener
+    };
     let worker = worker::spawn(opener, cc.egui_ctx.clone());
     let mut app = app::App::new(
         cc,
@@ -166,6 +270,7 @@ fn create_app(
 }
 
 fn main() {
+    await_previous_instance();
     let opts = match cli::parse(std::env::args().skip(1)) {
         Ok(o) => o,
         Err(e) => {
@@ -240,6 +345,57 @@ fn main() {
                 std::process::exit(1);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod relaunch_tests {
+    use super::{RELAUNCH_WAIT, wait_for_process_exit};
+    use std::{
+        io::{Read, Write},
+        process::{Command, Stdio},
+        time::{Duration, Instant},
+    };
+
+    #[test]
+    fn waits_for_a_short_lived_child() {
+        const CHILD: &str = "SA_TEST_RELAUNCH_WAIT_CHILD";
+        const DELAY: Duration = Duration::from_millis(250);
+        // Reuse the test binary as a child that exits when its stdin is released.
+        if std::env::var_os(CHILD).is_some() {
+            std::io::stdin().read_exact(&mut [0]).unwrap();
+            return;
+        }
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "relaunch_tests::waits_for_a_short_lived_child"])
+            .env(CHILD, "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let mut stdin = child.stdin.take().unwrap();
+        let start = Instant::now();
+        let reaper = std::thread::spawn(move || {
+            std::thread::sleep(DELAY);
+            let release = stdin.write_all(&[1]);
+            drop(stdin);
+            let status = child.wait().unwrap();
+            release.unwrap();
+            status
+        });
+        // Reaping also removes the Unix PID, since kill(pid, 0) sees zombies.
+        wait_for_process_exit(pid);
+        let elapsed = start.elapsed();
+        assert!(reaper.join().unwrap().success());
+        assert!(elapsed >= DELAY && elapsed < RELAUNCH_WAIT);
+    }
+
+    #[test]
+    fn an_unknown_pid_returns_immediately() {
+        let start = Instant::now();
+        wait_for_process_exit(i32::MAX as u32);
+        assert!(start.elapsed() < Duration::from_secs(2));
     }
 }
 
