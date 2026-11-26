@@ -482,8 +482,9 @@ pub(crate) struct Probes<'a> {
     cache: &'a ProbeCache,
     key: &'a ProbeKey,
     reuse: bool,
+    retry_slots: Option<&'a HashSet<String>>,
     probed: AtomicBool,
-    skipped_failure: AtomicBool,
+    skipped_failures: Mutex<HashSet<String>>,
     observed: Mutex<HashMap<String, (Stamp, bool)>>,
 }
 
@@ -507,10 +508,16 @@ impl<'a> Probes<'a> {
             cache,
             key,
             reuse,
+            retry_slots: None,
             probed: false.into(),
-            skipped_failure: false.into(),
+            skipped_failures: Mutex::default(),
             observed: Mutex::default(),
         }
+    }
+
+    pub(crate) fn retrying(mut self, slots: &'a HashSet<String>) -> Self {
+        self.retry_slots = Some(slots);
+        self
     }
 
     pub(crate) fn read<T: DeserializeOwned>(&self, slot: &str) -> Option<T> {
@@ -526,15 +533,69 @@ impl<'a> Probes<'a> {
     }
 
     pub(crate) fn failure_is_fresh(&self, slot: &str, optional: bool) -> bool {
-        let skip = self.reuse && optional && self.cache.failure_is_fresh(self.key, slot);
+        let skip = self.reuse
+            && optional
+            && self.retry_slots.is_none_or(|slots| !slots.contains(slot))
+            && self.cache.failure_is_fresh(self.key, slot);
         if skip {
-            self.skipped_failure.store(true, Relaxed);
+            self.skipped_failures.lock().unwrap().insert(slot.into());
         }
         skip
     }
 
-    pub(crate) fn skipped_failure(&self) -> bool {
-        self.skipped_failure.load(Relaxed)
+    pub(crate) fn deferred_effort_slots<'slot>(
+        &self,
+        catalog: &Value,
+        route: &Route,
+        donor: Option<&Route>,
+        shared_effort_slot: &str,
+        primary_slot: impl Fn(&str) -> Option<&'slot str>,
+    ) -> HashSet<String> {
+        let skipped = self.skipped_failures.lock().unwrap();
+        let mut retry = HashSet::new();
+        if skipped.is_empty() {
+            return retry;
+        }
+        let Some((effort, providers)) = route
+            .reasoning_effort
+            .as_ref()
+            .zip(catalog["providers"].as_array())
+        else {
+            return retry;
+        };
+        let Some(provider) = providers.iter().find(|p| p["id"] == route.provider) else {
+            return retry;
+        };
+        let Some(model) = provider["models"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|model| model["id"] == route.model)
+        else {
+            return retry;
+        };
+        if crate::catalog::efforts(model).contains(effort) {
+            return retry;
+        }
+        let missing = model.get("reasoningEfforts").is_none();
+        if missing && skipped.contains(shared_effort_slot) {
+            retry.insert(shared_effort_slot.to_string());
+        }
+        // A donor is reported only when the custom endpoint omitted effort
+        // declarations. An earlier skipped provider could replace that donor.
+        if provider["custom"] == true && (donor.is_some() || missing) {
+            for native in providers.iter().filter(|p| p["custom"] != true) {
+                if let Some(slot) = native["id"].as_str().and_then(&primary_slot)
+                    && skipped.contains(slot)
+                {
+                    retry.insert(slot.to_string());
+                }
+                if donor.is_some_and(|donor| native["id"] == donor.provider) {
+                    break;
+                }
+            }
+        }
+        retry
     }
 
     pub(crate) fn record<T: Serialize>(&self, slot: &str, started: Stamp, value: Option<&T>) {
@@ -596,19 +657,6 @@ impl<'a> Probes<'a> {
         }
         result
     }
-}
-
-// A provider may borrow effort metadata from a different probe. When a listed
-// model still lacks that metadata, retry discovery even if its own slot ran live.
-pub(crate) fn missing_effort_metadata(catalog: &Value, route: &Route) -> bool {
-    route.reasoning_effort.is_some()
-        && catalog["providers"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter(|provider| provider["id"] == route.provider)
-            .flat_map(|provider| provider["models"].as_array().into_iter().flatten())
-            .any(|model| model["id"] == route.model && model.get("reasoningEfforts").is_none())
 }
 
 pub(crate) fn probe_slot(kind: &str, identity: &Value) -> String {
@@ -738,16 +786,23 @@ pub(crate) struct TurnTiming {
 
 impl TurnTiming {
     pub(crate) fn emit(self, emit: &Emit) {
-        emit.journal(
-            "turn.timing",
-            json!({
-                "discover_ms": self.discovery.ms,
-                "preflight_ms": self.preflight_ms,
-                "spawn_ms": self.spawn_ms,
-                "handshake_ms": self.started.elapsed().as_millis(),
-                "cache": self.discovery.cache,
-            }),
-        );
+        emit.journal("turn.timing", self.data());
+    }
+
+    pub(crate) fn failed_before_first_frame(self, emit: &Emit) {
+        let mut data = self.data();
+        data["outcome"] = json!("failed_before_first_frame");
+        emit.journal("turn.timing", data);
+    }
+
+    fn data(self) -> Value {
+        json!({
+            "discover_ms": self.discovery.ms,
+            "preflight_ms": self.preflight_ms,
+            "spawn_ms": self.spawn_ms,
+            "handshake_ms": self.started.elapsed().as_millis(),
+            "cache": self.discovery.cache,
+        })
     }
 }
 

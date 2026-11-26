@@ -95,6 +95,7 @@ int main(int argc, char **argv) {
     }
     if (has_arg(argc, argv, "auth")) {
         if (!receipt("claude-auth")) return 3;
+        if (getenv("FIXTURE_FAIL_CLAUDE_AUTH")) return 2;
         puts("{\"loggedIn\":true,\"apiProvider\":\"firstParty\",\"email\":\"fixture@example.com\"}");
         return 0;
     }

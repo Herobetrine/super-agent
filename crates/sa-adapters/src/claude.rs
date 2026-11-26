@@ -7,8 +7,8 @@ use crate::common::{
 use crate::custom::{self, CustomProvider, Registry};
 use crate::probe_cache::{
     CACHED_FAILURE, DiscoveryTiming, ModelProbeResult, ProbeCache, ProbeKey, ProbeUse, Probes, Stamp,
-    TurnTiming, config_digest, custom_probe_slot, file_stamp, missing_effort_metadata, probe_slot,
-    refresh_custom, safe_models, supplement_efforts,
+    TurnTiming, config_digest, custom_probe_slot, file_stamp, probe_slot, refresh_custom,
+    safe_models, supplement_efforts,
 };
 use crate::proc::{Proc, cancelled, capture, start, stream};
 use crate::sys::Sys;
@@ -517,6 +517,14 @@ struct Discovery {
 }
 
 impl Discovery {
+    fn primary_slot(&self, provider: &str) -> Option<&str> {
+        self.records
+            .iter()
+            .find(|record| record.id() == provider)?
+            .probe_slot
+            .as_deref()
+    }
+
     fn route_slots(&self, route: &Route) -> Vec<&str> {
         let Some(record) = self.records.iter().find(|record| record.id() == route.provider)
         else { return Vec::new() };
@@ -663,11 +671,40 @@ async fn discover_with(
     let device = read_json_or(&dir.join("settings.json"));
     let state = read_json_or(&dir.join("live-state.json"))["apps"]["claude-desktop"].clone();
     let bound = read_json_or(&sys.platform_dir().join("claude-route.json"));
-    let rows = cc_rows(sys, &["claude", "claude-desktop"])?;
-    let row_id = |id: &Value| match id {
-        Value::String(s) => s.clone(),
-        other => other.to_string(),
-    };
+    let sources = cc_rows(sys, &["claude", "claude-desktop"])?
+        .into_iter()
+        .map(|row| {
+            let app = row["app_type"].as_str().unwrap_or_default();
+            let id = match &row["id"] {
+                Value::String(s) => s.clone(),
+                other => other.to_string(),
+            };
+            let name = row["name"].as_str().unwrap_or_default();
+            let cfg: Option<Value> = row["settings_config"]
+                .as_str()
+                .and_then(|s| serde_json::from_str(s).ok());
+            let meta: Option<Value> = match row["meta"].as_str() {
+                Some(m) => serde_json::from_str(m).ok(),
+                None => Some(json!({})),
+            };
+            let Some((cfg, meta)) = cfg.zip(meta) else {
+                let record = Record {
+                    app: app.into(),
+                    row: id,
+                    name: name.into(),
+                    reason: "无效的来源记录".into(),
+                    ..Default::default()
+                };
+                return (record, None, false);
+            };
+            let mut record = configured_record(app, &id, name, &cfg);
+            let uses_official = row["category"] == "official" && record.base.is_empty();
+            if uses_official {
+                record.auth = "sdk-login".into();
+            }
+            (record, Some((cfg, meta)), uses_official)
+        })
+        .collect::<Vec<_>>();
     let cfg = if sys.var("ANTHROPIC_BASE_URL").is_some() {
         let env: serde_json::Map<String, Value> = sys
             .vars()
@@ -710,15 +747,10 @@ async fn discover_with(
     });
     let optional_official = selected.is_some_and(|route| {
         route.provider != official_record().id()
-            && !rows.iter().filter(|row| row["category"] == "official").any(|row| {
-                let alias = Record {
-                    app: row["app_type"].as_str().unwrap_or_default().into(),
-                    row: row_id(&row["id"]),
-                    auth: "sdk-login".into(),
-                    ..Record::default()
-                };
-                route.provider == alias.id()
-                    || (alias.app == "claude" && routed_member == Some(alias.row.as_str()))
+            && !sources.iter().any(|(alias, _, uses_official)| {
+                *uses_official
+                    && (route.provider == alias.id()
+                        || (alias.app == "claude" && routed_member == Some(alias.row.as_str())))
             })
     });
     let official_probe = discover_official(
@@ -727,33 +759,15 @@ async fn discover_with(
     let cache = DiscoveryProbes {
         http: AsyncMutex::default(), reusable, selected, routed_member,
     };
-    let records = join_all(rows.iter().map(|row| {
+    let records = join_all(sources.into_iter().map(|(record, config, uses_official)| {
         let (cache, official) = (online.then_some(&cache), official_probe.clone());
         async move {
-            let app = row["app_type"].as_str().unwrap_or_default();
-            let id = row_id(&row["id"]);
-            let name = row["name"].as_str().unwrap_or_default();
-            let cfg: Option<Value> = row["settings_config"]
-                .as_str()
-                .and_then(|s| serde_json::from_str(s).ok());
-            let meta: Option<Value> = match row["meta"].as_str() {
-                Some(m) => serde_json::from_str(m).ok(),
-                None => Some(json!({})),
+            let Some((cfg, meta)) = config else {
+                return record;
             };
-            let (Some(cfg), Some(meta)) = (cfg, meta) else {
-                return Record {
-                    app: app.into(),
-                    row: id,
-                    name: name.into(),
-                    reason: "无效的来源记录".into(),
-                    ..Default::default()
-                };
-            };
-            let record = configured_record(app, &id, name, &cfg);
             let mut record = make_record(record, &cfg, &meta, cache, cancel).await;
-            if row["category"] == json!("official") && record.base.is_empty() {
+            if uses_official {
                 let official = official.await;
-                record.auth = official.auth;
                 record.models = official.models;
                 record.model_info = official.model_info;
                 record.reason = official.reason;
@@ -1064,12 +1078,12 @@ async fn run(
     let exe = executable(&sys);
     let key = probe_key(&sys, exe.as_deref(), &customs);
     let mut reuse = true;
+    let mut retry_slots = HashSet::new();
     let (d, s, timing, used) = loop {
-        let probes = Probes::new(&cache, &key, reuse);
+        let probes = Probes::new(&cache, &key, reuse).retrying(&retry_slots);
         let mut d = discover_with(&sys, exe.clone(), &cancel, true, Some(&probes), Some(&req.route))
             .await
             .map_err(|e| if cancel.is_cancelled() { cancelled() } else { probe_failed(&e.to_string()) })?;
-        let deferred_donor = probes.skipped_failure();
         let donor = refresh_custom(&mut d.catalog, &customs, &sys, &cancel, &probes, Some(&req.route)).await;
         probes.flush().await;
         if cancel.is_cancelled() {
@@ -1080,22 +1094,35 @@ async fn run(
         } else {
             probes.observed(&d.route_slots(&req.route))
         };
-        if let Some(donor) = donor {
-            used.extend(probes.observed(&d.route_slots(&donor)));
+        if let Some(donor) = &donor {
+            used.extend(probes.observed(&d.route_slots(donor)));
         }
         match select(&d.catalog, &req.route) {
             Ok(s) => {
-                let timing = DiscoveryTiming::new(started, ProbeUse::all_cached(&used), !reuse);
+                let timing = DiscoveryTiming::new(
+                    started,
+                    ProbeUse::all_cached(&used),
+                    !reuse || !retry_slots.is_empty(),
+                );
                 break (d, s, timing, used);
             }
-            Err(_)
-                if reuse
-                    && (used.iter().any(|probe| probe.cached)
-                        || (deferred_donor && missing_effort_metadata(&d.catalog, &req.route))) =>
-            {
-                reuse = false;
-            }
             Err(error) => {
+                if reuse && retry_slots.is_empty() {
+                    retry_slots = probes.deferred_effort_slots(
+                        &d.catalog,
+                        &req.route,
+                        donor.as_ref(),
+                        OFFICIAL_SLOT,
+                        |provider| d.primary_slot(provider),
+                    );
+                    if !retry_slots.is_empty() {
+                        continue;
+                    }
+                    if used.iter().any(|probe| probe.cached) {
+                        reuse = false;
+                        continue;
+                    }
+                }
                 cache.evict_used(&key, &used).await;
                 return Err(error);
             }
