@@ -4,7 +4,7 @@ use crate::{
     app::App,
     cli::Options,
     host::{Host, tests::fakes},
-    recovery_ui::State,
+    recovery_ui::{RecoveryPanel, State, Success},
 };
 use egui::accesskit::Role;
 use egui_kittest::{
@@ -13,13 +13,13 @@ use egui_kittest::{
 };
 use sa_store::{
     DB_FILE,
-    journal::{RestoreError, restore_from_snapshot_at},
+    journal::{RestoreError, SnapshotCheck, restore_backup_stamp, restore_from_snapshot_at},
 };
 use std::{
     fs,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, mpsc},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 const SNAPSHOT: &str = "hub-00000000000000012345.sqlite3";
@@ -152,7 +152,7 @@ fn interrupted_migration_offers_restore_and_folded_manual_steps() {
     let marker = data.path().join("backups").join("migration.json");
     let before = [&live, &snapshot, &marker].map(|path| fs::read(path).unwrap());
     let mut h = harness(data.path(), false);
-    h.run_steps(4);
+    wait_for_snapshot_check(&mut h);
     assert!(h.state().host.is_none());
     assert!(has_text(&h, "上次工单数据库升级没有完成"));
     assert!(has_text(
@@ -180,7 +180,7 @@ fn interrupted_migration_without_snapshot_shows_missing_copy() {
     let data = tempfile::tempdir().unwrap();
     let snapshot = interrupted(data.path(), false);
     let mut h = harness(data.path(), false);
-    h.run_steps(4);
+    wait_for_snapshot_check(&mut h);
     assert!(has_text(&h, "上次工单数据库升级没有完成"));
     assert!(has_text(
         &h,
@@ -228,7 +228,7 @@ fn corrupt_code_11_with_snapshot_offers_restore_with_short_local_time() {
     bytes[28..32].copy_from_slice(&200_u32.to_be_bytes());
     fs::write(&live, &bytes).unwrap();
     let mut h = harness(data.path(), false);
-    h.run_steps(4);
+    wait_for_snapshot_check(&mut h);
     assert!(has_text(&h, "工单数据库已损坏"));
     assert!(has_text(
         &h,
@@ -284,7 +284,7 @@ fn observer_inspects_without_starting_host_and_shows_same_manual_copy() {
     let data = tempfile::tempdir().unwrap();
     interrupted(data.path(), true);
     let mut h = harness(data.path(), true);
-    until(&mut h, "observer inspection", |app| app.recovery.is_some());
+    wait_for_snapshot_check(&mut h);
     assert!(h.state().host.is_none());
     assert!(!data.path().join(sa_engine::owner::LOCK_FILE).exists());
     assert!(!data.path().join(".journal-migration.lock").exists());
@@ -300,12 +300,214 @@ fn recovery_state(app: &App) -> &State {
     &app.recovery.as_ref().unwrap().state
 }
 
+fn wait_for_snapshot_check(h: &mut Harness<'_, App>) {
+    until(h, "snapshot check", |app| {
+        app.recovery
+            .as_ref()
+            .is_some_and(|panel| matches!(panel.state, State::Ready | State::Busy))
+    });
+}
+
+#[test]
+fn diagnosis_is_visible_while_the_snapshot_check_is_pending() {
+    let data = tempfile::tempdir().unwrap();
+    interrupted(data.path(), true);
+    let error = sa_store::journal::inspect(data.path()).unwrap();
+    let panel = RecoveryPanel::from_journal(&error, data.path(), false, &egui::Context::default());
+    assert!(matches!(panel.state, State::Checking(_)));
+
+    let mut h = harness(data.path(), false);
+    let (check, complete) = crate::ops::Pending::controlled();
+    h.state_mut().recovery.as_mut().unwrap().state = State::Checking(check);
+    h.run_steps(4);
+    assert!(has_text(&h, "上次工单数据库升级没有完成"));
+    assert!(has_text(&h, "正在检查可用的快照…"));
+    assert!(!has_text(&h, OFFER));
+    let plan = sa_store::journal::restore_plan(data.path(), &error).unwrap();
+    complete.send(Ok(SnapshotCheck::Available(plan))).unwrap();
+    wait_for_snapshot_check(&mut h);
+    assert!(has_text(&h, OFFER));
+    assert!(!has_text(&h, "正在检查可用的快照…"));
+}
+
+#[test]
+fn rejected_corruption_snapshot_never_appears_as_available() {
+    let data = tempfile::tempdir().unwrap();
+    let snapshot = interrupted(data.path(), true);
+    fs::remove_file(data.path().join("backups/migration.json")).unwrap();
+    fs::write(data.path().join(DB_FILE), [0xcd; 4096]).unwrap();
+    fs::write(snapshot, b"corrupt snapshot").unwrap();
+    let mut h = harness(data.path(), false);
+    wait_for_snapshot_check(&mut h);
+    assert!(has_text(&h, "工单数据库已损坏"));
+    assert!(has_text(
+        &h,
+        "找到的快照都没有通过完整性校验，不能自动恢复。"
+    ));
+    assert!(!has_text(&h, "有可用的快照："));
+    assert!(!has_text(&h, "用最近快照恢复"));
+    assert!(has_text(&h, SALVAGE));
+    assert!(has_text(&h, EMPTY));
+}
+
+#[test]
+fn stale_plan_requires_a_fresh_diagnosis_and_never_moves_the_originals() {
+    let data = tempfile::tempdir().unwrap();
+    let snapshot = interrupted(data.path(), true);
+    let live_path = data.path().join(DB_FILE);
+    let live = fs::read(&live_path).unwrap();
+    let mut h = harness(data.path(), false);
+    wait_for_snapshot_check(&mut h);
+    click(&mut h, OFFER);
+    fs::write(snapshot, b"snapshot replaced after confirmation opened").unwrap();
+    click(&mut h, "确认恢复");
+    until(&mut h, "stale plan", |app| {
+        matches!(recovery_state(app), State::Stale)
+    });
+    assert!(has_text(&h, "数据文件夹已经变化，请重新检查。"));
+    assert_eq!(fs::read(&live_path).unwrap(), live);
+    assert!(!data.path().join("backups/restore-pending.json").exists());
+    click(&mut h, "重新检查");
+    wait_for_snapshot_check(&mut h);
+    assert!(has_text(
+        &h,
+        "找到的快照都没有通过完整性校验，不能自动恢复。"
+    ));
+    assert!(!has_text(&h, OFFER));
+}
+
+fn pending_restore_fixture(dir: &Path) -> PathBuf {
+    let snapshot = interrupted(dir, true);
+    let live = dir.join(DB_FILE);
+    let marker = dir.join("backups/migration.json");
+    let time = SystemTime::now();
+    let stamp = restore_backup_stamp(time).unwrap();
+    let broken_name = format!("broken-{stamp}");
+    let broken = dir.join("backups").join(&broken_name);
+    let describe = |path: &Path| {
+        let metadata = fs::metadata(path).unwrap();
+        serde_json::json!({ "len": metadata.len(), "modified": metadata.modified().unwrap() })
+    };
+    let snapshot_stamp = describe(&snapshot);
+    let pending = serde_json::json!({
+        "snapshot": SNAPSHOT,
+        "snapshot_stamp": snapshot_stamp,
+        "confirmed_at": time,
+        "broken_dir": broken_name,
+        "originals": [describe(&live), null, null, null, describe(&marker)],
+        "files_moved": [DB_FILE, "migration.json"],
+        "copy": { "name": ".journal-restore-100-200.tmp", "stamp": snapshot_stamp }
+    });
+    fs::create_dir(&broken).unwrap();
+    fs::write(
+        dir.join("backups/restore-pending.json"),
+        pending.to_string(),
+    )
+    .unwrap();
+    fs::rename(live, broken.join(DB_FILE)).unwrap();
+    fs::rename(marker, broken.join("migration.json")).unwrap();
+    broken
+}
+
+#[test]
+fn interrupted_restore_ui_can_install_the_copy_or_put_back_the_originals() {
+    for put_back in [false, true] {
+        let data = tempfile::tempdir().unwrap();
+        let broken = pending_restore_fixture(data.path());
+        let mut h = harness(data.path(), false);
+        h.run_steps(4);
+        assert!(h.state().host.is_none());
+        assert!(!data.path().join(DB_FILE).exists());
+        assert!(has_text(&h, "上次从快照恢复没有完成"));
+        assert!(has_text(
+            &h,
+            &format!(
+                "原来的文件已移到 {}，新的数据库还没有装好。",
+                broken.display()
+            )
+        ));
+        assert_buttons(&h, false);
+        assert!(
+            h.query_by_role_and_label(Role::Button, "继续恢复")
+                .is_some()
+        );
+        assert!(
+            h.query_by_role_and_label(Role::Button, "放回原来的文件")
+                .is_some()
+        );
+        click(
+            &mut h,
+            if put_back {
+                "放回原来的文件"
+            } else {
+                "继续恢复"
+            },
+        );
+        until(&mut h, "resumed recovery", |app| {
+            matches!(recovery_state(app), State::Succeeded(_))
+        });
+        assert!(data.path().join(DB_FILE).is_file());
+        assert!(!data.path().join("backups/restore-pending.json").exists());
+        assert!(
+            h.query_by_role_and_label(Role::Button, "重新打开")
+                .is_some()
+        );
+        if put_back {
+            assert!(matches!(
+                recovery_state(h.state()),
+                State::Succeeded(Success::Originals)
+            ));
+            assert!(has_text(&h, "已放回原来的文件。"));
+            assert!(data.path().join("backups/migration.json").is_file());
+        } else {
+            assert!(has_text(&h, "已恢复到 "));
+            assert!(broken.join(DB_FILE).is_file());
+        }
+    }
+}
+
+#[test]
+fn interrupted_restore_in_an_observer_does_not_offer_write_actions() {
+    let data = tempfile::tempdir().unwrap();
+    pending_restore_fixture(data.path());
+    let mut h = harness(data.path(), true);
+    until(&mut h, "observer recovery marker", |app| {
+        app.recovery.is_some()
+    });
+    assert!(has_text(&h, "上次从快照恢复没有完成"));
+    assert!(has_text(&h, "请在主窗口处理。"));
+    assert!(
+        h.query_by_role_and_label(Role::Button, "继续恢复")
+            .is_none()
+    );
+    assert!(
+        h.query_by_role_and_label(Role::Button, "放回原来的文件")
+            .is_none()
+    );
+    assert_buttons(&h, false);
+}
+
+#[test]
+fn desktop_store_holds_the_shared_reader_lock_for_its_lifetime() {
+    let data = tempfile::tempdir().unwrap();
+    interrupted(data.path(), true);
+    let error = sa_store::journal::inspect(data.path()).unwrap();
+    let plan = sa_store::journal::restore_plan(data.path(), &error).unwrap();
+    let reader = crate::data::StoreSource::open(data.path()).unwrap();
+    assert!(matches!(
+        sa_store::journal::restore_from_snapshot(data.path(), &plan),
+        Err(RestoreError::Busy)
+    ));
+    drop(reader);
+    sa_store::journal::restore_from_snapshot(data.path(), &plan).unwrap();
+}
+
 #[test]
 fn confirm_button_is_centered_on_the_first_rendered_frame() {
     let data = tempfile::tempdir().unwrap();
     interrupted(data.path(), true);
     let mut h = harness(data.path(), false);
-    h.run_steps(4);
+    wait_for_snapshot_check(&mut h);
 
     h.get_by_role_and_label(Role::Button, OFFER).click();
     h.step();
@@ -329,7 +531,7 @@ fn confirming_names_the_backup_and_cancel_keeps_the_originals() {
     let data = tempfile::tempdir().unwrap();
     let snapshot = interrupted(data.path(), true);
     let mut h = harness(data.path(), false);
-    h.run_steps(4);
+    wait_for_snapshot_check(&mut h);
     h.state_mut().recovery.as_mut().unwrap().restore =
         Arc::new(|_, _, _| panic!("restore ran before confirmation"));
     click(&mut h, OFFER);
@@ -404,7 +606,7 @@ fn restore_runs_off_thread_preserves_files_and_success_relaunches() {
     let data = tempfile::tempdir().unwrap();
     interrupted(data.path(), true);
     let mut h = harness(data.path(), false);
-    h.run_steps(4);
+    wait_for_snapshot_check(&mut h);
     let (release, wait) = mpsc::channel();
     let wait = Mutex::new(wait);
     let ui_thread = std::thread::current().id();
@@ -478,7 +680,7 @@ fn failed_relaunch_offers_manual_window_close() {
     let data = tempfile::tempdir().unwrap();
     interrupted(data.path(), true);
     let mut h = harness(data.path(), false);
-    h.run_steps(4);
+    wait_for_snapshot_check(&mut h);
     h.state_mut().recovery.as_mut().unwrap().relaunch = Arc::new(|| anyhow::bail!("无法启动进程"));
     click(&mut h, OFFER);
     click(&mut h, "确认恢复");
@@ -503,10 +705,14 @@ fn failed_relaunch_offers_manual_window_close() {
 #[test]
 fn an_untouched_failure_can_retry_through_confirmation() {
     let data = tempfile::tempdir().unwrap();
-    let snapshot = interrupted(data.path(), true);
-    fs::write(snapshot, b"not a database").unwrap();
+    interrupted(data.path(), true);
     let mut h = harness(data.path(), false);
-    h.run_steps(4);
+    wait_for_snapshot_check(&mut h);
+    h.state_mut().recovery.as_mut().unwrap().restore = Arc::new(|_, _, _| {
+        Err(RestoreError::Untouched {
+            reason: "无法创建临时副本".into(),
+        })
+    });
     click(&mut h, OFFER);
     click(&mut h, "确认恢复");
     until(&mut h, "untouched failure", |app| {
@@ -526,7 +732,7 @@ fn a_moved_failure_displays_the_saved_path_and_cannot_retry() {
     let backup = data.path().join("backups/broken-20261126-015200");
     let saved = backup.clone();
     let mut h = harness(data.path(), false);
-    h.run_steps(4);
+    wait_for_snapshot_check(&mut h);
     h.state_mut().recovery.as_mut().unwrap().restore = Arc::new(move |_, _, _| {
         Err(RestoreError::Moved {
             reason: "无法移回".into(),
@@ -554,7 +760,7 @@ fn busy_restore_waits_for_explicit_recheck() {
     let data = tempfile::tempdir().unwrap();
     interrupted(data.path(), true);
     let mut h = harness(data.path(), false);
-    h.run_steps(4);
+    wait_for_snapshot_check(&mut h);
     let owner = sa_engine::owner::claim(data.path()).unwrap();
     click(&mut h, OFFER);
     click(&mut h, "确认恢复");
@@ -590,9 +796,7 @@ fn losing_the_owner_lock_also_inspects_the_journal() {
     interrupted(data.path(), true);
     let _owner = sa_engine::owner::claim(data.path()).unwrap();
     let mut h = harness(data.path(), false);
-    until(&mut h, "owner-lock observer inspection", |app| {
-        app.recovery.is_some()
-    });
+    wait_for_snapshot_check(&mut h);
     assert!(h.state().host.is_none());
     assert!(has_text(&h, MANUAL));
     assert!(has_text(&h, "请在主窗口处理。"));
@@ -617,7 +821,7 @@ fn open_folder_runs_off_thread_and_displays_launch_errors() {
     let data = tempfile::tempdir().unwrap();
     interrupted(data.path(), true);
     let mut h = harness(data.path(), false);
-    h.run_steps(4);
+    wait_for_snapshot_check(&mut h);
     let opened = Arc::new(Mutex::new(None));
     let observed = Arc::clone(&opened);
     let ui_thread = std::thread::current().id();

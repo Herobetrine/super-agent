@@ -245,7 +245,7 @@ fn create_app(
     } else {
         host_error
             .and_then(|error| error.downcast_ref::<sa_store::journal::JournalError>())
-            .map(|error| recovery_ui::RecoveryPanel::from_journal(error, &dir, false))
+            .map(|error| recovery_ui::RecoveryPanel::from_journal(error, &dir, false, &cc.egui_ctx))
     };
     // This window's own read-only connection would also keep SQLite files open
     // on Windows. Pause it before opening any journal eligible for restore.

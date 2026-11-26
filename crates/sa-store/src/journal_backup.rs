@@ -8,6 +8,7 @@ use std::{
     fs::{self, File, OpenOptions, TryLockError},
     io::{self, Write},
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -15,6 +16,46 @@ use std::{
 pub struct RestorePlan {
     pub snapshot: PathBuf,
     pub snapshot_time: SystemTime,
+    snapshot_stamp: FileStamp,
+    observed: JournalObservation,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct FileStamp {
+    len: u64,
+    modified: SystemTime,
+}
+
+fn file_stamp(path: &Path) -> io::Result<Option<FileStamp>> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.is_file() => Ok(Some(FileStamp {
+            len: meta.len(),
+            modified: meta.modified()?,
+        })),
+        Ok(_) => Err(io::Error::new(io::ErrorKind::InvalidData, "不是普通文件")),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct JournalObservation {
+    live: Option<FileStamp>,
+    migration: Option<FileStamp>,
+}
+
+pub(super) fn observe_journal(dir: &Path) -> io::Result<JournalObservation> {
+    Ok(JournalObservation {
+        live: file_stamp(&dir.join(DB_FILE))?,
+        migration: file_stamp(&marker_path(dir))?,
+    })
+}
+
+#[derive(Debug)]
+pub enum SnapshotCheck {
+    Available(RestorePlan),
+    Missing,
+    Rejected,
 }
 
 #[derive(Debug)]
@@ -26,13 +67,24 @@ pub struct Restored {
 #[derive(Debug)]
 pub enum RestoreError {
     Busy,
+    Stale,
     Untouched { reason: String },
     Moved { reason: String, broken_dir: PathBuf },
 }
 
 // The scheduler owns desktop.lock for its entire lifetime, including shutdown.
 // Keep the name in sync with sa_engine::owner::LOCK_FILE (sa-engine depends on sa-store).
-const RESTORE_LOCKS: [&str; 2] = [".journal-migration.lock", "desktop.lock"];
+const READERS_LOCK: &str = ".journal-readers.lock";
+const RESTORE_LOCKS: [&str; 3] = [".journal-migration.lock", "desktop.lock", READERS_LOCK];
+
+pub fn lock_journal_reader(data_dir: &Path) -> Result<File> {
+    let file = open_lock(&data_dir.join(READERS_LOCK), true)?;
+    file.lock_shared()?;
+    if let Some(error) = inspect_restore(data_dir) {
+        return Err(error.into());
+    }
+    Ok(file)
+}
 
 pub fn journal_busy(data_dir: &Path) -> bool {
     RESTORE_LOCKS
@@ -43,13 +95,17 @@ pub fn journal_busy(data_dir: &Path) -> bool {
         })
 }
 
-fn lock_file(path: &Path, create: bool) -> io::Result<File> {
-    let file = OpenOptions::new()
+fn open_lock(path: &Path, create: bool) -> io::Result<File> {
+    OpenOptions::new()
         .read(true)
         .write(true)
         .create(create)
         .truncate(false)
-        .open(path)?;
+        .open(path)
+}
+
+fn lock_file(path: &Path, create: bool) -> io::Result<File> {
+    let file = open_lock(path, create)?;
     file.try_lock().map_err(|error| match error {
         TryLockError::WouldBlock => io::ErrorKind::WouldBlock.into(),
         TryLockError::Error(error) => error,
@@ -58,24 +114,57 @@ fn lock_file(path: &Path, create: bool) -> io::Result<File> {
 }
 
 pub fn restore_plan(data_dir: &Path, error: &JournalError) -> Option<RestorePlan> {
-    let (snapshot, snapshot_time) = match error {
-        JournalError::MigrationInterrupted { snapshot, .. } => {
-            let metadata = fs::symlink_metadata(snapshot).ok()?;
-            if !metadata.is_file() {
-                return None;
-            }
-            (snapshot.clone(), metadata.modified().ok()?)
-        }
-        JournalError::Corrupt { .. } => snapshots(data_dir)
-            .ok()?
-            .into_iter()
-            .find(|(path, _)| quick_check(path).is_ok())?,
-        JournalError::InvalidMigrationMarker { .. } => return None,
+    match check_restore_plan(data_dir, error) {
+        SnapshotCheck::Available(plan) => Some(plan),
+        SnapshotCheck::Missing | SnapshotCheck::Rejected => None,
+    }
+}
+
+pub fn check_restore_plan(data_dir: &Path, error: &JournalError) -> SnapshotCheck {
+    let (candidates, observed) = match error {
+        JournalError::MigrationInterrupted {
+            snapshot, observed, ..
+        } => (vec![snapshot.clone()], observed),
+        JournalError::Corrupt { observed, .. } => (
+            snapshots(data_dir)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(path, _)| path)
+                .collect(),
+            observed,
+        ),
+        _ => return SnapshotCheck::Missing,
     };
-    Some(RestorePlan {
-        snapshot,
-        snapshot_time,
-    })
+    let Some(observed) = observed else {
+        return SnapshotCheck::Missing;
+    };
+    let mut rejected = false;
+    for snapshot in candidates {
+        let snapshot_stamp = match file_stamp(&snapshot) {
+            Ok(Some(stamp)) => stamp,
+            Ok(None) => continue,
+            Err(_) => {
+                rejected = true;
+                continue;
+            }
+        };
+        if quick_check(&snapshot).is_ok()
+            && file_stamp(&snapshot).is_ok_and(|after| after.as_ref() == Some(&snapshot_stamp))
+        {
+            return SnapshotCheck::Available(RestorePlan {
+                snapshot,
+                snapshot_time: snapshot_stamp.modified,
+                snapshot_stamp,
+                observed: observed.clone(),
+            });
+        }
+        rejected = true;
+    }
+    if rejected {
+        SnapshotCheck::Rejected
+    } else {
+        SnapshotCheck::Missing
+    }
 }
 
 fn quick_check(path: &Path) -> Result<()> {
@@ -129,90 +218,275 @@ struct RestoreRecord<'a> {
     restored_at: SystemTime,
 }
 
-fn restore_with(
-    data_dir: &Path,
-    plan: &RestorePlan,
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PendingRestore {
+    snapshot: String,
+    snapshot_stamp: FileStamp,
     confirmed_at: SystemTime,
-    install: impl FnOnce(&Path, &Path) -> io::Result<()>,
-) -> Result<Restored, RestoreError> {
-    let [migration, owner] = RESTORE_LOCKS.map(|name| data_dir.join(name));
-    let claim = |path: &Path| {
-        lock_file(path, true).map_err(|error| {
-            if error.kind() == io::ErrorKind::WouldBlock {
-                RestoreError::Busy
-            } else {
-                untouched(format!("无法锁定 {}：{error}", path.display()))
-            }
-        })
-    };
-    let _migration_lock = claim(&migration)?;
-    let _owner_lock = claim(&owner)?;
+    broken_dir: String,
+    originals: [Option<FileStamp>; 5],
+    files_moved: Vec<String>,
+    copy: InstallCopy,
+}
 
-    let mut temp = tempfile::Builder::new()
-        .prefix(".journal-restore-")
-        .tempfile_in(data_dir)
-        .map_err(untouched)?;
-    let mut snapshot = File::open(&plan.snapshot)
-        .with_context(|| format!("无法打开快照 {}", plan.snapshot.display()))
-        .map_err(|error| untouched(format!("{error:#}")))?;
-    io::copy(&mut snapshot, temp.as_file_mut()).map_err(untouched)?;
-    temp.as_file().sync_all().map_err(untouched)?;
-    // Close the writable handle before validating and renaming on Windows.
-    let temp = temp.into_temp_path();
-    quick_check(&temp).map_err(untouched)?;
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct InstallCopy {
+    name: String,
+    stamp: FileStamp,
+}
 
-    let backups = data_dir.join("backups");
-    let stamp = restore_backup_stamp(confirmed_at).map_err(untouched)?;
-    let broken_dir = backups.join(format!("broken-{stamp}"));
-    fs::create_dir(&broken_dir).map_err(|error| {
-        untouched(format!(
-            "无法创建备份目录 {}：{error}",
-            broken_dir.display()
-        ))
-    })?;
-    let live = data_dir.join(DB_FILE);
-    let files = [
+struct OriginalLocation {
+    active: PathBuf,
+    backup: PathBuf,
+    archived: bool,
+}
+
+fn pending_restore_path(dir: &Path) -> PathBuf {
+    dir.join("backups").join("restore-pending.json")
+}
+
+fn original_paths(dir: &Path) -> [PathBuf; 5] {
+    let live = dir.join(DB_FILE);
+    [
         live.clone(),
         with_suffix(&live, "-wal"),
         with_suffix(&live, "-shm"),
         with_suffix(&live, "-journal"),
-        marker_path(data_dir),
-    ];
-    let mut moved = Vec::new();
-    let staged = files.iter().try_for_each(|path| -> Result<()> {
-        match fs::symlink_metadata(path) {
-            Ok(metadata) => ensure!(!metadata.is_dir(), "{} 是目录", path.display()),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        marker_path(dir),
+    ]
+}
+
+impl PendingRestore {
+    fn directory(&self, dir: &Path) -> PathBuf {
+        dir.join("backups").join(&self.broken_dir)
+    }
+
+    fn snapshot_path(&self, dir: &Path) -> PathBuf {
+        dir.join("backups").join(&self.snapshot)
+    }
+
+    fn save(&self, dir: &Path) -> Result<()> {
+        write_record(&pending_restore_path(dir), self)
+    }
+
+    fn locations(&self, dir: &Path) -> Result<Vec<OriginalLocation>> {
+        let broken = self.directory(dir);
+        ensure!(fs::symlink_metadata(&broken)?.is_dir(), "备份目录无效");
+        let mut locations = Vec::new();
+        for (active, expected) in original_paths(dir).into_iter().zip(&self.originals) {
+            let backup = broken.join(active.file_name().context("缺少原文件名称")?);
+            let live_stamp = file_stamp(&active)?;
+            let backup_stamp = file_stamp(&backup)?;
+            let archived = live_stamp.is_none() && expected.is_some() && &backup_stamp == expected;
+            ensure!(
+                archived || (backup_stamp.is_none() && &live_stamp == expected),
+                "无法确认原文件的位置：{}",
+                active.display()
+            );
+            if expected.is_some() {
+                locations.push(OriginalLocation {
+                    active,
+                    backup,
+                    archived,
+                });
+            }
+        }
+        Ok(locations)
+    }
+
+    fn installed(&self, dir: &Path) -> Result<bool> {
+        if file_stamp(&dir.join(DB_FILE))?.as_ref() != Some(&self.copy.stamp)
+            || file_stamp(&dir.join(&self.copy.name))?.is_some()
+        {
+            return Ok(false);
+        }
+        let broken = self.directory(dir);
+        ensure!(fs::symlink_metadata(&broken)?.is_dir(), "备份目录无效");
+        let originals = original_paths(dir);
+        for path in &originals[1..] {
+            if file_stamp(path)?.is_some() {
+                return Ok(false);
+            }
+        }
+        let originals_archived =
+            originals
+                .iter()
+                .zip(&self.originals)
+                .all(|(original, expected)| {
+                    file_stamp(&broken.join(original.file_name().unwrap()))
+                        .is_ok_and(|saved| &saved == expected)
+                });
+        Ok(originals_archived)
+    }
+}
+
+fn load_pending_restore(dir: &Path) -> Result<Option<PendingRestore>> {
+    let Some(bytes) = read_optional(&pending_restore_path(dir))? else {
+        return Ok(None);
+    };
+    let pending: PendingRestore = serde_json::from_slice(&bytes)?;
+    ensure!(
+        local_name(Path::new(&pending.snapshot))? == pending.snapshot
+            && pending.broken_dir
+                == format!("broken-{}", restore_backup_stamp(pending.confirmed_at)?)
+            && local_name(Path::new(&pending.copy.name))? == pending.copy.name
+            && pending.copy.name.starts_with(".journal-restore-")
+            && pending.copy.name.ends_with(".tmp"),
+        "恢复标记中的路径无效"
+    );
+    Ok(Some(pending))
+}
+
+fn inspect_restore(dir: &Path) -> Option<JournalError> {
+    match load_pending_restore(dir) {
+        Ok(Some(pending)) => Some(JournalError::RestoreInterrupted {
+            broken_dir: pending.directory(dir),
+            pending: Box::new(pending),
+            can_put_back: matches!(file_stamp(&dir.join(DB_FILE)), Ok(None)),
+        }),
+        Ok(None) => None,
+        Err(error) => Some(JournalError::InvalidRestoreMarker {
+            path: pending_restore_path(dir),
+            reason: format!("{error:#}"),
+        }),
+    }
+}
+
+fn restore_locks(data_dir: &Path) -> Result<Vec<File>, RestoreError> {
+    RESTORE_LOCKS
+        .iter()
+        .map(|name| {
+            let path = data_dir.join(name);
+            lock_file(&path, true).map_err(|error| {
+                if error.kind() == io::ErrorKind::WouldBlock {
+                    RestoreError::Busy
+                } else {
+                    untouched(format!("无法锁定 {}：{error}", path.display()))
+                }
+            })
+        })
+        .collect()
+}
+
+fn same_stamp(path: &Path, expected: &FileStamp) -> bool {
+    file_stamp(path).is_ok_and(|actual| actual.as_ref() == Some(expected))
+}
+
+struct RestoreCopy(PathBuf);
+
+impl Drop for RestoreCopy {
+    fn drop(&mut self) {
+        let _ = remove_file(&self.0);
+    }
+}
+
+fn copy_snapshot(dir: &Path, snapshot: &Path) -> Result<(RestoreCopy, InstallCopy)> {
+    static NEXT_COPY: AtomicU64 = AtomicU64::new(0);
+    let start = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+    let (copy, mut file) = loop {
+        let nanos = start + u128::from(NEXT_COPY.fetch_add(1, Ordering::Relaxed));
+        let name = format!(".journal-restore-{}-{nanos}.tmp", std::process::id());
+        let path = dir.join(name);
+        match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(file) => break (RestoreCopy(path), file),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(error) => return Err(error.into()),
         }
-        let target = broken_dir.join(path.file_name().context("缺少文件名")?);
-        rename_restore_file(path, &target)
-            .with_context(|| format!("无法移走 {}", path.display()))?;
-        moved.push((path.as_path(), target));
-        Ok(())
-    });
-    let published = staged.and_then(|()| {
-        sync_directory(&broken_dir)?;
-        sync_directory(&backups)?;
-        sync_directory(data_dir)?;
-        install(&temp, &live).context("无法安装快照")
-    });
-    if let Err(error) = published {
-        return Err(rollback_restore(&moved, broken_dir, error));
-    }
-    let reason = |error: anyhow::Error| RestoreError::Moved {
-        reason: format!("{error:#}"),
-        broken_dir: broken_dir.clone(),
     };
+    let mut source =
+        File::open(snapshot).with_context(|| format!("无法打开快照 {}", snapshot.display()))?;
+    io::copy(&mut source, &mut file)?;
+    file.sync_all()?;
+    drop(file);
+    quick_check(&copy.0)?;
+    let install = InstallCopy {
+        name: local_name(&copy.0)?.to_owned(),
+        stamp: file_stamp(&copy.0)?.context("临时快照不存在")?,
+    };
+    Ok((copy, install))
+}
+
+fn clear_restore_marker(dir: &Path) -> Result<()> {
+    retire_marker(&pending_restore_path(dir))?;
+    sync_directory(&dir.join("backups"))?;
+    Ok(())
+}
+
+fn sync_restore_directories(dir: &Path, pending: &PendingRestore) -> io::Result<()> {
+    sync_directory(&pending.directory(dir))?;
+    sync_directory(&dir.join("backups"))?;
+    sync_directory(dir)
+}
+
+fn stage_originals(dir: &Path, pending: &mut PendingRestore) -> Result<()> {
+    pending.files_moved.clear();
+    for file in pending.locations(dir)? {
+        if !file.archived {
+            rename_restore_file(&file.active, &file.backup)
+                .with_context(|| format!("无法移走 {}", file.active.display()))?;
+            sync_restore_directories(dir, pending)?;
+        }
+        // A crash can happen between renaming and updating the record. The
+        // original names and stamps let locations() recover that last move.
+        pending
+            .files_moved
+            .push(local_name(&file.backup)?.to_owned());
+        pending.save(dir)?;
+    }
+    Ok(())
+}
+
+fn move_originals_back(dir: &Path, pending: &PendingRestore) -> Result<()> {
+    let mut returned: Vec<OriginalLocation> = Vec::new();
+    for file in pending.locations(dir)?.into_iter().rev() {
+        if !file.archived {
+            continue;
+        }
+        if let Err(move_error) = rename_restore_file(&file.backup, &file.active) {
+            let mut failures = vec![format!(
+                "无法将 {} 移回：{move_error}",
+                file.active.display()
+            )];
+            for file in returned.into_iter().rev() {
+                if let Err(error) = rename_restore_file(&file.active, &file.backup) {
+                    failures.push(format!(
+                        "{} 已移回数据文件夹：{error}",
+                        file.active.display()
+                    ));
+                }
+            }
+            anyhow::bail!(failures.join("；"));
+        }
+        sync_restore_directories(dir, pending)?;
+        returned.push(file);
+    }
+    clear_restore_marker(dir)
+}
+
+fn moved_error(dir: &Path, pending: &PendingRestore, error: anyhow::Error) -> RestoreError {
+    RestoreError::Moved {
+        reason: format!("{error:#}"),
+        broken_dir: pending.directory(dir),
+    }
+}
+
+fn finish_restore(dir: &Path, pending: &PendingRestore) -> Result<Restored> {
+    sync_directory(dir).context("无法同步恢复后的工单库目录")?;
+    clear_restore_marker(dir).context("无法清除恢复标记")?;
+    let broken_dir = pending.directory(dir);
+    let snapshot = pending.snapshot_path(dir);
+    let files: Vec<_> = original_paths(dir)
+        .iter()
+        .zip(&pending.originals)
+        .filter(|(_, stamp)| stamp.is_some())
+        .map(|(path, _)| broken_dir.join(path.file_name().unwrap()))
+        .collect();
     let record = RestoreRecord {
-        snapshot: &plan.snapshot,
-        snapshot_time: plan.snapshot_time,
-        files_moved: moved.iter().map(|(_, saved)| saved.as_path()).collect(),
+        snapshot: &snapshot,
+        snapshot_time: pending.snapshot_stamp.modified,
+        files_moved: files.iter().map(PathBuf::as_path).collect(),
         restored_at: SystemTime::now(),
     };
-    sync_directory(data_dir)
-        .context("无法同步恢复后的工单库目录")
-        .map_err(reason)?;
     let record_path = broken_dir.join("restore.json");
     if let Err(error) = write_record(&record_path, &record) {
         let _ = writeln!(
@@ -223,34 +497,143 @@ fn restore_with(
     }
     Ok(Restored {
         broken_dir,
-        snapshot_time: plan.snapshot_time,
+        snapshot_time: pending.snapshot_stamp.modified,
     })
 }
 
-fn rollback_restore(
-    moved: &[(&Path, PathBuf)],
-    broken_dir: PathBuf,
-    error: anyhow::Error,
-) -> RestoreError {
-    let mut returned = Vec::new();
-    for (original, saved) in moved.iter().rev() {
-        if let Err(move_error) = rename_restore_file(saved, original) {
-            let mut failures = vec![format!("无法将 {} 移回：{move_error}", original.display())];
-            // Keep the originals together if only part of the rollback worked.
-            for (original, saved) in returned {
-                if let Err(error) = rename_restore_file(original, saved) {
-                    failures.push(format!("{} 已移回数据文件夹：{error}", original.display()));
-                }
-            }
-            return RestoreError::Moved {
-                reason: format!("{error:#}；{}", failures.join("；")),
-                broken_dir,
-            };
-        }
-        returned.push((*original, saved.as_path()));
+fn require_pending(dir: &Path, expected: &PendingRestore) -> Result<PendingRestore, RestoreError> {
+    match load_pending_restore(dir).map_err(untouched)? {
+        Some(pending) if &pending == expected => Ok(pending),
+        _ => Err(RestoreError::Stale),
     }
-    let _ = fs::remove_dir(&broken_dir);
-    untouched(format!("{error:#}"))
+}
+
+fn remove_previous_copy(dir: &Path, pending: &PendingRestore) -> io::Result<()> {
+    let copy = dir.join(&pending.copy.name);
+    if same_stamp(&copy, &pending.copy.stamp) {
+        remove_file(&copy)?;
+    }
+    Ok(())
+}
+
+pub fn continue_restore(dir: &Path, expected: &PendingRestore) -> Result<Restored, RestoreError> {
+    let _locks = restore_locks(dir)?;
+    let mut pending = require_pending(dir, expected)?;
+    let installed = pending
+        .installed(dir)
+        .map_err(|error| moved_error(dir, &pending, error))?;
+    let snapshot = pending.snapshot_path(dir);
+    if !installed
+        && (!same_stamp(&snapshot, &pending.snapshot_stamp) || pending.locations(dir).is_err())
+    {
+        return Err(RestoreError::Stale);
+    }
+    let mut action = || -> Result<Restored> {
+        let live = dir.join(DB_FILE);
+        if installed {
+            quick_check(&live)?;
+        } else {
+            let (copy, install) = copy_snapshot(dir, &snapshot)?;
+            ensure!(
+                same_stamp(&snapshot, &pending.snapshot_stamp),
+                "记录的快照已经变化"
+            );
+            remove_previous_copy(dir, &pending)?;
+            pending.copy = install;
+            pending.save(dir)?;
+            stage_originals(dir, &mut pending)?;
+            rename_restore_file(&copy.0, &live).context("无法安装快照")?;
+        }
+        finish_restore(dir, &pending)
+    };
+    action().map_err(|error| moved_error(dir, &pending, error))
+}
+
+pub fn put_back_originals(dir: &Path, expected: &PendingRestore) -> Result<(), RestoreError> {
+    let _locks = restore_locks(dir)?;
+    let pending = require_pending(dir, expected)?;
+    if !matches!(file_stamp(&dir.join(DB_FILE)), Ok(None)) {
+        return Err(RestoreError::Stale);
+    }
+    remove_previous_copy(dir, &pending)
+        .context("无法清理临时快照")
+        .and_then(|()| move_originals_back(dir, &pending))
+        .map_err(|error| moved_error(dir, &pending, error))
+}
+
+fn restore_with(
+    data_dir: &Path,
+    plan: &RestorePlan,
+    confirmed_at: SystemTime,
+    install: impl FnOnce(&Path, &Path) -> io::Result<()>,
+) -> Result<Restored, RestoreError> {
+    let _locks = restore_locks(data_dir)?;
+    if inspect_restore(data_dir).is_some()
+        || !observe_journal(data_dir).is_ok_and(|observed| observed == plan.observed)
+        || !same_stamp(&plan.snapshot, &plan.snapshot_stamp)
+    {
+        return Err(RestoreError::Stale);
+    }
+    let (copy, install_copy) =
+        copy_snapshot(data_dir, &plan.snapshot).map_err(|error| untouched(format!("{error:#}")))?;
+    if !observe_journal(data_dir).is_ok_and(|observed| observed == plan.observed)
+        || !same_stamp(&plan.snapshot, &plan.snapshot_stamp)
+    {
+        return Err(RestoreError::Stale);
+    }
+
+    let snapshot = local_name(&plan.snapshot).map_err(untouched)?.to_owned();
+    let backups = data_dir.join("backups");
+    if backups.join(&snapshot) != plan.snapshot {
+        return Err(RestoreError::Stale);
+    }
+    let mut originals = std::array::from_fn(|_| None);
+    for (stamp, path) in originals.iter_mut().zip(original_paths(data_dir)) {
+        *stamp = file_stamp(&path).map_err(untouched)?;
+    }
+    if originals[0] != plan.observed.live || originals[4] != plan.observed.migration {
+        return Err(RestoreError::Stale);
+    }
+    let stamp = restore_backup_stamp(confirmed_at).map_err(untouched)?;
+    let mut pending = PendingRestore {
+        snapshot,
+        snapshot_stamp: plan.snapshot_stamp.clone(),
+        confirmed_at,
+        broken_dir: format!("broken-{stamp}"),
+        originals,
+        files_moved: Vec::new(),
+        copy: install_copy,
+    };
+    let broken_dir = pending.directory(data_dir);
+    fs::create_dir(&broken_dir).map_err(|error| {
+        untouched(format!(
+            "无法创建备份目录 {}：{error}",
+            broken_dir.display()
+        ))
+    })?;
+    if let Err(error) = pending.save(data_dir) {
+        if matches!(load_pending_restore(data_dir), Ok(None)) {
+            let _ = fs::remove_dir(&broken_dir);
+        }
+        return Err(untouched(format!("{error:#}")));
+    }
+
+    let published = stage_originals(data_dir, &mut pending)
+        .and_then(|()| install(&copy.0, &data_dir.join(DB_FILE)).context("无法安装快照"));
+    if let Err(error) = published {
+        return match move_originals_back(data_dir, &pending) {
+            Ok(()) => {
+                let _ = fs::remove_dir(&broken_dir);
+                Err(untouched(format!("{error:#}")))
+            }
+            Err(rollback) => Err(moved_error(
+                data_dir,
+                &pending,
+                error.context(format!("无法放回原文件：{rollback:#}")),
+            )),
+        };
+    }
+    finish_restore(data_dir, &pending).map_err(|error| moved_error(data_dir, &pending, error))
 }
 
 #[cfg(windows)]
@@ -281,8 +664,12 @@ pub(super) fn marker_path(dir: &Path) -> PathBuf {
 }
 
 pub(super) fn inspect_marker(dir: &Path) -> Option<JournalError> {
+    if let Some(error) = inspect_restore(dir) {
+        return Some(error);
+    }
     let path = marker_path(dir);
     let read = || -> Result<Option<JournalError>> {
+        let observed = observe_journal(dir).ok();
         let Some(contents) = read_optional(&path)? else {
             return Ok(None);
         };
@@ -292,6 +679,7 @@ pub(super) fn inspect_marker(dir: &Path) -> Option<JournalError> {
             snapshot: dir.join("backups").join(name),
             from: marker.from,
             to: marker.to,
+            observed,
         }))
     };
     read().unwrap_or_else(|error| {
@@ -669,8 +1057,11 @@ mod restore_tests {
     #[test]
     fn rejects_a_corrupt_copy_before_moving_anything() {
         let dir = tempfile::tempdir().unwrap();
-        let plan = fixture(dir.path());
+        let mut plan = fixture(dir.path());
         fs::write(&plan.snapshot, b"invalid SQLite data").unwrap();
+        // Model corruption with matching observations so the final copied-file
+        // check, rather than stale-plan detection, must reject these bytes.
+        plan.snapshot_stamp = file_stamp(&plan.snapshot).unwrap().unwrap();
         let originals = originals(dir.path());
         let bytes = originals.each_ref().map(|path| fs::read(path).unwrap());
         assert!(matches!(
@@ -692,7 +1083,7 @@ mod restore_tests {
     }
 
     #[test]
-    fn both_exclusive_locks_prevent_restore_and_clear_when_released() {
+    fn each_exclusive_lock_prevents_restore_and_clears_when_released() {
         let dir = tempfile::tempdir().unwrap();
         let plan = fixture(dir.path());
         for name in RESTORE_LOCKS {
@@ -706,6 +1097,203 @@ mod restore_tests {
             assert!(!journal_busy(dir.path()));
         }
         assert_eq!(fs::read_dir(dir.path().join("backups")).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn a_shared_reader_blocks_restore_until_the_connection_releases_its_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let plan = fixture(dir.path());
+        let first = lock_journal_reader(dir.path()).unwrap();
+        let second = lock_journal_reader(dir.path()).unwrap();
+        assert!(journal_busy(dir.path()));
+        assert!(matches!(
+            restore_from_snapshot(dir.path(), &plan),
+            Err(RestoreError::Busy)
+        ));
+        assert!(!pending_restore_path(dir.path()).exists());
+        drop(first);
+        assert!(journal_busy(dir.path()));
+        drop(second);
+        assert!(!journal_busy(dir.path()));
+        restore_from_snapshot(dir.path(), &plan).unwrap();
+    }
+
+    #[test]
+    fn stale_plan_cannot_replace_a_restored_journal_with_new_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let plan = fixture(dir.path());
+        let first = restore_from_snapshot(dir.path(), &plan).unwrap();
+        let journal = open_journal(dir.path()).unwrap();
+        journal
+            .execute("INSERT INTO fixture VALUES (100)", [])
+            .unwrap();
+        drop(journal);
+        let live = dir.path().join(DB_FILE);
+        let bytes = fs::read(&live).unwrap();
+        assert!(matches!(
+            restore_from_snapshot(dir.path(), &plan),
+            Err(RestoreError::Stale)
+        ));
+        assert_eq!(fs::read(live).unwrap(), bytes);
+        assert!(!pending_restore_path(dir.path()).exists());
+        assert!(first.broken_dir.join(DB_FILE).is_file());
+    }
+
+    #[test]
+    fn changes_to_each_observed_path_make_the_plan_stale() {
+        for name in [DB_FILE, "migration.json", "snapshot"] {
+            let dir = tempfile::tempdir().unwrap();
+            let plan = fixture(dir.path());
+            let path = match name {
+                DB_FILE => dir.path().join(DB_FILE),
+                "migration.json" => marker_path(dir.path()),
+                _ => plan.snapshot.clone(),
+            };
+            fs::write(&path, b"new bytes").unwrap();
+            let original = fs::read(dir.path().join(DB_FILE)).unwrap();
+            assert!(
+                matches!(
+                    restore_from_snapshot(dir.path(), &plan),
+                    Err(RestoreError::Stale)
+                ),
+                "{name}"
+            );
+            assert_eq!(fs::read(path).unwrap(), b"new bytes");
+            assert_eq!(fs::read(dir.path().join(DB_FILE)).unwrap(), original);
+            assert!(!pending_restore_path(dir.path()).exists());
+        }
+    }
+
+    #[test]
+    fn snapshot_modified_time_alone_can_make_a_plan_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let plan = fixture(dir.path());
+        let file = OpenOptions::new().write(true).open(&plan.snapshot).unwrap();
+        let modified = plan.snapshot_time + std::time::Duration::from_secs(120);
+        file.set_times(fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        drop(file);
+        let actual = file_stamp(&plan.snapshot).unwrap().unwrap();
+        assert_eq!(actual.len, plan.snapshot_stamp.len);
+        assert_ne!(actual.modified, plan.snapshot_stamp.modified);
+        assert!(matches!(
+            restore_from_snapshot(dir.path(), &plan),
+            Err(RestoreError::Stale)
+        ));
+        assert!(marker_path(dir.path()).exists());
+        assert!(!pending_restore_path(dir.path()).exists());
+    }
+
+    fn interrupted_restore(dir: &Path, plan: &RestorePlan, installed: bool) -> Box<PendingRestore> {
+        let crash = std::panic::catch_unwind(|| {
+            restore_with(dir, plan, SystemTime::now(), |copy, live| {
+                assert!(pending_restore_path(dir).is_file());
+                assert!(!live.exists());
+                if installed {
+                    rename_restore_file(copy, live).unwrap();
+                }
+                panic!("simulated stop before clearing the pending marker");
+            })
+        });
+        assert!(crash.is_err());
+        let Some(JournalError::RestoreInterrupted {
+            pending,
+            can_put_back,
+            ..
+        }) = inspect(dir)
+        else {
+            panic!("startup should diagnose the pending restore");
+        };
+        assert_eq!(can_put_back, !installed);
+        assert!(matches!(
+            open_journal(dir)
+                .unwrap_err()
+                .downcast_ref::<JournalError>(),
+            Some(JournalError::RestoreInterrupted { .. })
+        ));
+        assert_eq!(dir.join(DB_FILE).is_file(), installed);
+        pending
+    }
+
+    #[test]
+    fn pending_restore_blocks_startup_and_continues_with_or_without_an_installed_copy() {
+        for installed in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let plan = fixture(dir.path());
+            let mut pending = interrupted_restore(dir.path(), &plan, installed);
+            assert_eq!(pending.files_moved.len(), 5);
+            if !installed {
+                // The rename can reach disk before the progress update.
+                pending.files_moved.pop();
+                pending.save(dir.path()).unwrap();
+            }
+            let result = continue_restore(dir.path(), &pending).unwrap();
+            assert_eq!(result.snapshot_time, plan.snapshot_time);
+            assert!(!pending_restore_path(dir.path()).exists());
+            assert_eq!(
+                fs::read(dir.path().join(DB_FILE)).unwrap(),
+                fs::read(plan.snapshot).unwrap()
+            );
+            assert!(result.broken_dir.join(DB_FILE).exists());
+            assert!(result.broken_dir.join("restore.json").exists());
+            assert!(open_journal(dir.path()).is_ok());
+        }
+    }
+
+    #[test]
+    fn pending_restore_can_put_back_every_original_and_cannot_overwrite_a_live_journal() {
+        let dir = tempfile::tempdir().unwrap();
+        let plan = fixture(dir.path());
+        let originals = originals(dir.path());
+        let bytes = originals.each_ref().map(|path| fs::read(path).unwrap());
+        let pending = interrupted_restore(dir.path(), &plan, false);
+        fs::write(&originals[0], b"another journal").unwrap();
+        assert!(matches!(
+            put_back_originals(dir.path(), &pending),
+            Err(RestoreError::Stale)
+        ));
+        assert_eq!(fs::read(&originals[0]).unwrap(), b"another journal");
+        fs::remove_file(&originals[0]).unwrap();
+
+        put_back_originals(dir.path(), &pending).unwrap();
+        assert!(!pending_restore_path(dir.path()).exists());
+        assert_eq!(
+            originals.each_ref().map(|path| fs::read(path).unwrap()),
+            bytes
+        );
+    }
+
+    #[test]
+    fn an_unreadable_pending_record_still_blocks_journal_creation() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("backups")).unwrap();
+        fs::write(pending_restore_path(dir.path()), "truncated").unwrap();
+        assert!(matches!(
+            inspect(dir.path()),
+            Some(JournalError::InvalidRestoreMarker { .. })
+        ));
+        assert!(matches!(
+            open_journal(dir.path())
+                .unwrap_err()
+                .downcast_ref::<JournalError>(),
+            Some(JournalError::InvalidRestoreMarker { .. })
+        ));
+        assert!(!dir.path().join(DB_FILE).exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn installed_journal_has_no_temporary_attribute() {
+        use std::os::windows::fs::MetadataExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_TEMPORARY;
+
+        let dir = tempfile::tempdir().unwrap();
+        let plan = fixture(dir.path());
+        restore_from_snapshot(dir.path(), &plan).unwrap();
+        let attrs = fs::metadata(dir.path().join(DB_FILE))
+            .unwrap()
+            .file_attributes();
+        assert_eq!(attrs & FILE_ATTRIBUTE_TEMPORARY, 0);
     }
 
     #[test]
@@ -760,7 +1348,8 @@ mod restore_tests {
                 &JournalError::Corrupt {
                     path: dir.path().join(DB_FILE),
                     code: 26,
-                    latest_snapshot: None
+                    latest_snapshot: None,
+                    observed: observe_journal(dir.path()).ok(),
                 }
             )
             .is_none()
@@ -790,6 +1379,7 @@ mod restore_tests {
             path: dir.path().join(DB_FILE),
             code: 26,
             latest_snapshot: Some((newer, SystemTime::now())),
+            observed: observe_journal(dir.path()).ok(),
         };
         assert_eq!(
             restore_plan(dir.path(), &error).unwrap().snapshot,

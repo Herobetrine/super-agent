@@ -4,8 +4,9 @@ use crate::{app::App, ops::Pending, theme, theme::Palette, widgets};
 use anyhow::{Context, Result};
 use egui::{RichText, TextFormat, Ui, text::LayoutJob};
 use sa_store::journal::{
-    JournalError, RestoreError, RestorePlan, Restored, journal_busy, restore_backup_stamp,
-    restore_from_snapshot_at, restore_plan,
+    JournalError, PendingRestore, RestoreError, RestorePlan, Restored, SnapshotCheck,
+    check_restore_plan, continue_restore, journal_busy, put_back_originals, restore_backup_stamp,
+    restore_from_snapshot_at,
 };
 use std::{
     mem::{Discriminant, discriminant},
@@ -18,20 +19,24 @@ use std::{
 };
 
 type OpenFolder = Arc<dyn Fn(&Path) -> Result<()> + Send + Sync>;
-type RestoreResult = std::result::Result<Restored, RestoreError>;
-type Restore = Arc<dyn Fn(&Path, &RestorePlan, SystemTime) -> RestoreResult + Send + Sync>;
+type RestoreResult = std::result::Result<Success, RestoreError>;
+type RestoreSnapshot = std::result::Result<Restored, RestoreError>;
+type Restore = Arc<dyn Fn(&Path, &RestorePlan, SystemTime) -> RestoreSnapshot + Send + Sync>;
 type Relaunch = Arc<dyn Fn() -> Result<()> + Send + Sync>;
 
 pub(crate) enum State {
     Ready,
     Busy,
+    Checking(Pending<SnapshotCheck>),
+    Stale,
+    Rechecking(Pending<Option<JournalError>>),
     Confirm {
         time: SystemTime,
         folder_stamp: String,
     },
     Running(Pending<RestoreResult>),
-    Succeeded(Restored),
-    Relaunching(Restored, Pending<()>),
+    Succeeded(Success),
+    Relaunching(Success, Pending<()>),
     RelaunchFailed(String),
     Untouched(String),
     Moved {
@@ -39,6 +44,11 @@ pub(crate) enum State {
         broken_dir: PathBuf,
     },
     Interrupted(String),
+}
+
+pub(crate) enum Success {
+    Snapshot(Restored),
+    Originals,
 }
 
 fn open_folder(dir: &Path) -> Result<()> {
@@ -60,14 +70,21 @@ fn open_folder(dir: &Path) -> Result<()> {
 enum Kind {
     Migration {
         snapshot: PathBuf,
-        saved: Option<SystemTime>,
     },
     Corrupt {
         path: PathBuf,
         code: i32,
-        snapshot: Option<(PathBuf, SystemTime)>,
     },
     InvalidMigrationMarker {
+        path: PathBuf,
+        reason: String,
+    },
+    RestoreInterrupted {
+        broken_dir: PathBuf,
+        pending: Box<PendingRestore>,
+        can_put_back: bool,
+    },
+    InvalidRestoreMarker {
         path: PathBuf,
         reason: String,
     },
@@ -79,6 +96,7 @@ pub(crate) struct RecoveryPanel {
     observer: bool,
     dismissed: bool,
     plan: Option<RestorePlan>,
+    rejected: bool,
     reader_paused: Arc<AtomicBool>,
     pub(crate) state: State,
     measured_state: Option<Discriminant<State>>,
@@ -87,12 +105,6 @@ pub(crate) struct RecoveryPanel {
     opening: Option<Pending<()>>,
     pub(crate) error: Option<String>,
     pub(crate) open_folder: OpenFolder,
-}
-
-fn readable(path: &Path) -> Option<SystemTime> {
-    let file = std::fs::File::open(path).ok()?;
-    let meta = file.metadata().ok().filter(|m| m.is_file())?;
-    Some(meta.modified().unwrap_or(SystemTime::UNIX_EPOCH))
 }
 
 fn stamp(time: SystemTime) -> String {
@@ -108,40 +120,47 @@ fn short_stamp(time: SystemTime) -> String {
 }
 
 impl RecoveryPanel {
-    pub(crate) fn from_journal(journal: &JournalError, data_dir: &Path, observer: bool) -> Self {
-        let plan = if observer {
-            None
-        } else {
-            restore_plan(data_dir, journal)
-        };
+    pub(crate) fn from_journal(
+        journal: &JournalError,
+        data_dir: &Path,
+        observer: bool,
+        ctx: &egui::Context,
+    ) -> Self {
         let kind = match journal {
             JournalError::MigrationInterrupted { snapshot, .. } => Kind::Migration {
                 snapshot: snapshot.clone(),
-                saved: readable(snapshot),
             },
-            JournalError::Corrupt {
-                path,
-                code,
-                latest_snapshot,
-            } => Kind::Corrupt {
+            JournalError::Corrupt { path, code, .. } => Kind::Corrupt {
                 path: path.clone(),
                 code: *code,
-                snapshot: plan
-                    .as_ref()
-                    .map(|plan| (plan.snapshot.clone(), plan.snapshot_time))
-                    .or_else(|| {
-                        latest_snapshot
-                            .as_ref()
-                            .filter(|(path, _)| readable(path).is_some())
-                            .cloned()
-                    }),
             },
             JournalError::InvalidMigrationMarker { path, reason } => Kind::InvalidMigrationMarker {
                 path: path.clone(),
                 reason: reason.clone(),
             },
+            JournalError::RestoreInterrupted {
+                broken_dir,
+                pending,
+                can_put_back,
+            } => Kind::RestoreInterrupted {
+                broken_dir: broken_dir.clone(),
+                pending: pending.clone(),
+                can_put_back: *can_put_back,
+            },
+            JournalError::InvalidRestoreMarker { path, reason } => Kind::InvalidRestoreMarker {
+                path: path.clone(),
+                reason: reason.clone(),
+            },
         };
-        let state = if plan.is_some() && journal_busy(data_dir) {
+        let check = matches!(kind, Kind::Migration { .. } | Kind::Corrupt { .. });
+        let interrupted = matches!(kind, Kind::RestoreInterrupted { .. });
+        let state = if check {
+            let dir = data_dir.to_path_buf();
+            let journal = journal.clone();
+            State::Checking(Pending::spawn(ctx, move || {
+                Ok(check_restore_plan(&dir, &journal))
+            }))
+        } else if interrupted && !observer && journal_busy(data_dir) {
             State::Busy
         } else {
             State::Ready
@@ -151,8 +170,9 @@ impl RecoveryPanel {
             data_dir: data_dir.to_path_buf(),
             observer,
             dismissed: false,
-            reader_paused: Arc::new(AtomicBool::new(plan.is_some())),
-            plan,
+            reader_paused: Arc::new(AtomicBool::new(!observer && (check || interrupted))),
+            plan: None,
+            rejected: false,
             state,
             measured_state: None,
             restore: Arc::new(restore_from_snapshot_at),
@@ -181,6 +201,8 @@ impl RecoveryPanel {
             Kind::Migration { .. } => "上次工单数据库升级没有完成",
             Kind::Corrupt { .. } => "工单数据库已损坏",
             Kind::InvalidMigrationMarker { .. } => "升级标记无法识别",
+            Kind::RestoreInterrupted { .. } => "上次从快照恢复没有完成",
+            Kind::InvalidRestoreMarker { .. } => "恢复标记无法识别",
         }
     }
 
@@ -213,7 +235,62 @@ impl RecoveryPanel {
         };
         let dir = self.data_dir.clone();
         let restore = Arc::clone(&self.restore);
-        self.state = State::Running(Pending::spawn(ctx, move || Ok(restore(&dir, &plan, time))));
+        self.state = State::Running(Pending::spawn(ctx, move || {
+            Ok(restore(&dir, &plan, time).map(Success::Snapshot))
+        }));
+    }
+
+    fn resume_interrupted(&mut self, ctx: &egui::Context, put_back: bool) {
+        let Kind::RestoreInterrupted { pending, .. } = &self.kind else {
+            return;
+        };
+        let dir = self.data_dir.clone();
+        let pending = pending.clone();
+        self.state = State::Running(Pending::spawn(ctx, move || {
+            Ok(if put_back {
+                put_back_originals(&dir, &pending).map(|()| Success::Originals)
+            } else {
+                continue_restore(&dir, &pending).map(Success::Snapshot)
+            })
+        }));
+    }
+
+    fn recheck(&mut self, ctx: &egui::Context) {
+        let dir = self.data_dir.clone();
+        self.state = State::Rechecking(Pending::spawn(ctx, move || {
+            Ok(sa_store::journal::inspect(&dir))
+        }));
+    }
+
+    fn poll_diagnosis(&mut self, ctx: &egui::Context) {
+        match &self.state {
+            State::Checking(task) => {
+                let Some(result) = task.poll() else { return };
+                match result {
+                    Ok(SnapshotCheck::Available(plan)) => self.plan = Some(plan),
+                    Ok(SnapshotCheck::Missing) => {}
+                    Ok(SnapshotCheck::Rejected) | Err(_) => self.rejected = true,
+                }
+                self.state =
+                    if !self.observer && self.plan.is_some() && journal_busy(&self.data_dir) {
+                        State::Busy
+                    } else {
+                        State::Ready
+                    };
+            }
+            State::Rechecking(task) => match task.poll() {
+                Some(Ok(Some(journal))) => {
+                    let mut panel =
+                        Self::from_journal(&journal, &self.data_dir, self.observer, ctx);
+                    panel.reader_paused = Arc::clone(&self.reader_paused);
+                    *self = panel;
+                }
+                Some(Ok(None)) => self.dismiss(),
+                Some(Err(_)) => self.state = State::Stale,
+                None => {}
+            },
+            _ => {}
+        }
     }
 
     fn poll_restore(&mut self) -> bool {
@@ -223,6 +300,7 @@ impl RecoveryPanel {
                     self.state = match result {
                         Ok(Ok(restored)) => State::Succeeded(restored),
                         Ok(Err(RestoreError::Busy)) => State::Busy,
+                        Ok(Err(RestoreError::Stale)) => State::Stale,
                         Ok(Err(RestoreError::Untouched { reason })) => State::Untouched(reason),
                         Ok(Err(RestoreError::Moved { reason, broken_dir })) => {
                             State::Moved { reason, broken_dir }
@@ -254,7 +332,14 @@ impl RecoveryPanel {
 
     fn diagnostics(&mut self, ui: &mut Ui, pal: &Palette) -> bool {
         let mut dismiss = widgets::modal_header(ui, "", self.title(), "", pal);
-        body(ui, pal, &self.kind, self.plan.is_some());
+        body(ui, pal, self);
+        if self.rejected {
+            paragraph(
+                ui,
+                pal,
+                &[Seg::Text("找到的快照都没有通过完整性校验，不能自动恢复。")],
+            );
+        }
         if self.observer {
             ui.label(
                 RichText::new("请在主窗口处理。")
@@ -274,7 +359,22 @@ impl RecoveryPanel {
         }
         ui.add_space(16.0);
         ui.horizontal_wrapped(|ui| {
-            if let Some(plan) = &self.plan {
+            if matches!(self.state, State::Checking(_)) {
+                paragraph(ui, pal, &[Seg::Text("正在检查可用的快照…")]);
+            } else if !self.observer
+                && let Kind::RestoreInterrupted { can_put_back, .. } = self.kind
+            {
+                if widgets::primary_button(ui, "", "继续恢复", pal, !busy).clicked() {
+                    self.resume_interrupted(ui.ctx(), false);
+                }
+                ui.add_enabled_ui(!busy && can_put_back, |ui| {
+                    if widgets::outline_button(ui, "", "放回原来的文件", pal).clicked() {
+                        self.resume_interrupted(ui.ctx(), true);
+                    }
+                });
+            } else if !self.observer
+                && let Some(plan) = &self.plan
+            {
                 let label = match self.kind {
                     Kind::Migration { .. } => "用升级前的快照恢复".to_owned(),
                     _ => format!("用最近快照恢复（{}）", short_stamp(plan.snapshot_time)),
@@ -287,10 +387,19 @@ impl RecoveryPanel {
                 && widgets::outline_button(ui, "", "重新检查", pal).clicked()
                 && !journal_busy(&self.data_dir)
             {
-                self.state = State::Ready;
+                if matches!(self.kind, Kind::RestoreInterrupted { .. }) {
+                    self.recheck(ui.ctx());
+                } else {
+                    self.state = State::Ready;
+                }
             }
             self.data_folder_button(ui, pal);
-            if !matches!(self.kind, Kind::InvalidMigrationMarker { .. }) {
+            if !matches!(
+                self.kind,
+                Kind::InvalidMigrationMarker { .. }
+                    | Kind::RestoreInterrupted { .. }
+                    | Kind::InvalidRestoreMarker { .. }
+            ) {
                 dismiss |= widgets::quiet_button(ui, "", "知道了", pal, false).clicked();
             }
         });
@@ -299,7 +408,18 @@ impl RecoveryPanel {
 
     fn contents(&mut self, ui: &mut Ui, pal: &Palette) -> bool {
         let dismiss = match &self.state {
-            State::Ready | State::Busy => self.diagnostics(ui, pal),
+            State::Ready | State::Busy | State::Checking(_) => self.diagnostics(ui, pal),
+            State::Stale | State::Rechecking(_) => {
+                let checking = matches!(self.state, State::Rechecking(_));
+                paragraph(ui, pal, &[Seg::Text("数据文件夹已经变化，请重新检查。")]);
+                ui.add_space(16.0);
+                ui.add_enabled_ui(!checking, |ui| {
+                    if widgets::outline_button(ui, "", "重新检查", pal).clicked() {
+                        self.recheck(ui.ctx());
+                    }
+                });
+                false
+            }
             State::Confirm { time, folder_stamp } => {
                 let time = *time;
                 let close = widgets::modal_header(ui, "", "确认从快照恢复", "", pal);
@@ -334,20 +454,28 @@ impl RecoveryPanel {
                 });
                 false
             }
-            State::Succeeded(restored) | State::Relaunching(restored, _) => {
+            State::Succeeded(success) | State::Relaunching(success, _) => {
                 let launching = matches!(self.state, State::Relaunching(..));
-                paragraph(
-                    ui,
-                    pal,
-                    &[
-                        Seg::Text(&format!(
-                            "已恢复到 {} 的快照。原来的文件保存在：",
-                            stamp(restored.snapshot_time)
-                        )),
-                        Seg::Path(&restored.broken_dir),
-                    ],
-                );
-                let backup = restored.broken_dir.clone();
+                let backup = match success {
+                    Success::Snapshot(restored) => {
+                        paragraph(
+                            ui,
+                            pal,
+                            &[
+                                Seg::Text(&format!(
+                                    "已恢复到 {} 的快照。原来的文件保存在：",
+                                    stamp(restored.snapshot_time)
+                                )),
+                                Seg::Path(&restored.broken_dir),
+                            ],
+                        );
+                        Some(restored.broken_dir.clone())
+                    }
+                    Success::Originals => {
+                        paragraph(ui, pal, &[Seg::Text("已放回原来的文件。")]);
+                        None
+                    }
+                };
                 ui.add_space(16.0);
                 ui.horizontal(|ui| {
                     if widgets::primary_button(ui, "", "重新打开", pal, !launching).clicked() {
@@ -360,11 +488,14 @@ impl RecoveryPanel {
                         };
                         self.state = State::Relaunching(restored, task);
                     }
-                    ui.add_enabled_ui(self.opening.is_none(), |ui| {
-                        if widgets::outline_button(ui, "", "打开备份文件夹", pal).clicked() {
-                            self.open_path(ui.ctx(), backup);
-                        }
-                    });
+                    if let Some(backup) = backup {
+                        ui.add_enabled_ui(self.opening.is_none(), |ui| {
+                            if widgets::outline_button(ui, "", "打开备份文件夹", pal).clicked()
+                            {
+                                self.open_path(ui.ctx(), backup);
+                            }
+                        });
+                    }
                 });
                 false
             }
@@ -411,7 +542,11 @@ impl RecoveryPanel {
                 ui.add_space(16.0);
                 ui.horizontal(|ui| {
                     if can_retry && widgets::primary_button(ui, "", "重试", pal, true).clicked() {
-                        self.confirm();
+                        if matches!(self.kind, Kind::RestoreInterrupted { .. }) {
+                            self.recheck(ui.ctx());
+                        } else {
+                            self.confirm();
+                        }
                     }
                     self.data_folder_button(ui, pal);
                     widgets::quiet_button(ui, "", "知道了", pal, false).clicked()
@@ -469,13 +604,37 @@ fn paragraph(ui: &mut Ui, pal: &Palette, segs: &[Seg<'_>]) {
     ui.add(egui::Label::new(job).wrap().selectable(true));
 }
 
-fn body(ui: &mut Ui, pal: &Palette, kind: &Kind, offer: bool) {
+fn body(ui: &mut Ui, pal: &Palette, panel: &RecoveryPanel) {
     ui.spacing_mut().item_spacing.y = 8.0;
-    match kind {
-        Kind::Migration {
-            snapshot,
-            saved: Some(saved),
-        } => {
+    let plan = panel.plan.as_ref();
+    let offer = plan.is_some() && !panel.observer;
+    match &panel.kind {
+        Kind::Migration { snapshot } => {
+            let Some(plan) = plan else {
+                if panel.rejected || matches!(panel.state, State::Checking(_)) {
+                    paragraph(
+                        ui,
+                        pal,
+                        &[Seg::Text("Super Agent 已停止调度，没有继续升级。")],
+                    );
+                    if panel.rejected {
+                        salvage_steps(ui, pal);
+                    }
+                } else {
+                    paragraph(
+                        ui,
+                        pal,
+                        &[
+                            Seg::Text("找不到升级前的快照（"),
+                            Seg::Path(snapshot),
+                            Seg::Text(
+                                "）。Super Agent 已停止调度，没有继续升级。可以打开数据文件夹手动处理。",
+                            ),
+                        ],
+                    );
+                }
+                return;
+            };
             paragraph(
                 ui,
                 pal,
@@ -484,7 +643,7 @@ fn body(ui: &mut Ui, pal: &Palette, kind: &Kind, offer: bool) {
                     Seg::Path(snapshot),
                     Seg::Text(&format!(
                         "（保存于 {}）。Super Agent 已停止调度，没有继续升级。",
-                        stamp(*saved)
+                        stamp(plan.snapshot_time)
                     )),
                 ],
             );
@@ -498,27 +657,7 @@ fn body(ui: &mut Ui, pal: &Palette, kind: &Kind, offer: bool) {
                 );
             });
         }
-        Kind::Migration {
-            snapshot,
-            saved: None,
-        } => {
-            paragraph(
-                ui,
-                pal,
-                &[
-                    Seg::Text("找不到升级前的快照（"),
-                    Seg::Path(snapshot),
-                    Seg::Text(
-                        "）。Super Agent 已停止调度，没有继续升级。可以打开数据文件夹手动处理。",
-                    ),
-                ],
-            );
-        }
-        Kind::Corrupt {
-            path,
-            code,
-            snapshot,
-        } => {
+        Kind::Corrupt { path, code } => {
             let reason = match code {
                 11 => "文件内容损坏",
                 26 => "不是有效的数据库文件",
@@ -535,16 +674,16 @@ fn body(ui: &mut Ui, pal: &Palette, kind: &Kind, offer: bool) {
                     )),
                 ],
             );
-            if let Some((path, saved)) = snapshot {
+            if let Some(plan) = plan {
                 paragraph(
                     ui,
                     pal,
                     &[
                         Seg::Text("有可用的快照："),
-                        Seg::Path(path),
+                        Seg::Path(&plan.snapshot),
                         Seg::Text(&format!(
                             "（保存于 {}）。{}",
-                            stamp(*saved),
+                            stamp(plan.snapshot_time),
                             if offer { "" } else { CORRUPT_MANUAL }
                         )),
                     ],
@@ -554,23 +693,11 @@ fn body(ui: &mut Ui, pal: &Palette, kind: &Kind, offer: bool) {
                 if offer {
                     paragraph(ui, pal, &[Seg::Text(CORRUPT_MANUAL)]);
                 }
-                paragraph(
-                    ui,
-                    pal,
-                    &[Seg::Text(
-                        "也可以退出所有 Super Agent 窗口，把 hub.sqlite3 和同一目录下存在的 hub.sqlite3-wal、hub.sqlite3-shm、hub.sqlite3-journal 一起复制到别处保存，再对副本用 sqlite3 的 .recover 命令尝试抢救。",
-                    )],
-                );
-                paragraph(
-                    ui,
-                    pal,
-                    &[Seg::Text(
-                        "如果不需要旧数据，可以退出后把这些文件一起移走或改名，再次打开 Super Agent 会新建空的工单数据库。",
-                    )],
-                );
+                salvage_steps(ui, pal);
             });
         }
-        Kind::InvalidMigrationMarker { path, reason } => {
+        Kind::InvalidMigrationMarker { path, reason }
+        | Kind::InvalidRestoreMarker { path, reason } => {
             paragraph(
                 ui,
                 pal,
@@ -580,7 +707,35 @@ fn body(ui: &mut Ui, pal: &Palette, kind: &Kind, offer: bool) {
                 ],
             );
         }
+        Kind::RestoreInterrupted { broken_dir, .. } => {
+            paragraph(
+                ui,
+                pal,
+                &[
+                    Seg::Text("原来的文件已移到 "),
+                    Seg::Path(broken_dir),
+                    Seg::Text("，新的数据库还没有装好。"),
+                ],
+            );
+        }
     }
+}
+
+fn salvage_steps(ui: &mut Ui, pal: &Palette) {
+    paragraph(
+        ui,
+        pal,
+        &[Seg::Text(
+            "也可以退出所有 Super Agent 窗口，把 hub.sqlite3 和同一目录下存在的 hub.sqlite3-wal、hub.sqlite3-shm、hub.sqlite3-journal 一起复制到别处保存，再对副本用 sqlite3 的 .recover 命令尝试抢救。",
+        )],
+    );
+    paragraph(
+        ui,
+        pal,
+        &[Seg::Text(
+            "如果不需要旧数据，可以退出后把这些文件一起移走或改名，再次打开 Super Agent 会新建空的工单数据库。",
+        )],
+    );
 }
 
 const CORRUPT_MANUAL: &str = "可以按上面的步骤把它恢复为 hub.sqlite3（先关闭所有窗口并移走当前文件及其 -wal、-shm、-journal 文件）。";
@@ -595,9 +750,10 @@ fn manual(ui: &mut Ui, offer: bool, show: impl FnOnce(&mut Ui)) {
 
 impl App {
     pub(crate) fn inspect_recovery(&mut self, ctx: &egui::Context, dir: PathBuf) {
+        let repaint = ctx.clone();
         self.recovery_probe = Some(Pending::spawn(ctx, move || {
             Ok(sa_store::journal::inspect(&dir)
-                .map(|error| RecoveryPanel::from_journal(&error, &dir, true)))
+                .map(|error| RecoveryPanel::from_journal(&error, &dir, true, &repaint)))
         }));
     }
 
@@ -613,6 +769,10 @@ impl App {
             return;
         };
         panel.poll_open();
+        panel.poll_diagnosis(ctx);
+        if panel.dismissed {
+            return;
+        }
         if panel.poll_restore() {
             panel.dismissed = true;
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
