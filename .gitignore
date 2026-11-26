@@ -26,6 +26,8 @@ credentials.json
 *.db-shm
 *.db-wal
 *.jsonl
+# Synthetic replay transcripts are test fixtures, not runtime state.
+!/crates/sa-adapters/tests/fixtures/transcripts/**/*.jsonl
 *.log
 *.lnk
 /control-room/

@@ -1,0 +1,14 @@
+{"expect":{"method":"initialize","params":{"clientInfo":{"name":"superagent_local"},"capabilities":{"experimentalApi":false}}}}
+{"respond":{"userAgent":"replay-cli"}}
+{"expect":{"method":"initialized","params":{}}}
+{"expect":{"method":"thread/start","params":{"modelProvider":"openai","model":"codex-fixture","sandbox":"danger-full-access","approvalPolicy":"never"}}}
+{"respond":{"thread":{"id":"00000000-0000-4000-8000-000000000001","sessionId":"00000000-0000-4000-8000-000000000001","preview":"","ephemeral":false,"modelProvider":"openai","model":"codex-fixture","createdAt":1,"updatedAt":1,"status":{"type":"idle"},"path":null,"cwd":".","originator":"fixture","source":"cli","gitInfo":null,"turns":[]},"model":"codex-fixture","modelProvider":"openai","approvalPolicy":"never","sandbox":{"type":"dangerFullAccess"}}}
+{"expect":{"method":"account/rateLimits/read","params":{}}}
+{"respond":{"rateLimits":{"primary":null,"secondary":null}}}
+{"expect":{"method":"turn/start","params":{"threadId":"00000000-0000-4000-8000-000000000001","input":[{"type":"text","text":"Inspect fixture.txt."}]}}}
+{"respond":{"turn":{"id":"00000000-0000-4000-8000-000000000002","rootTurnId":"00000000-0000-4000-8000-000000000002","items":[],"itemsView":"summary","status":"inProgress","error":null,"startedAt":1,"completedAt":null,"durationMs":null}}}
+{"emit":{"method":"turn/started","params":{"threadId":"00000000-0000-4000-8000-000000000001","turn":{"id":"00000000-0000-4000-8000-000000000002","rootTurnId":"00000000-0000-4000-8000-000000000002","items":[],"itemsView":"summary","status":"inProgress","error":null,"startedAt":1,"completedAt":null,"durationMs":null}},"emittedAtMs":1000}}
+{"emit":{"method":"item/agentMessage/delta","params":{"threadId":"00000000-0000-4000-8000-000000000001","turnId":"00000000-0000-4000-8000-000000000002","itemId":"message-1","delta":"Replay in progress."},"emittedAtMs":1000}}
+{"expect":{"method":"turn/interrupt","params":{"threadId":"00000000-0000-4000-8000-000000000001","turnId":"00000000-0000-4000-8000-000000000002"}}}
+{"respond":{}}
+{"wait_for_close":true}
