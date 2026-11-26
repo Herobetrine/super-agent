@@ -457,12 +457,13 @@ async fn readonly_child_cannot_launder_the_grant_through_a_grandchild() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn human_redirect_during_discovery_suppresses_old_sends_and_completion() {
+async fn follow_during_catalog_discovery_preserves_current_dispatch_then_resets_the_objective() {
     let fx = setup(script(|c| async move {
+        if c.depth() > 0 { return Ok("checked".into()); }
         if c.turn() == 1 {
             return Ok(format!(
                 "{}\n{}",
-                cmd("SA_SEND", json!({"id": "stale", "to": "claude", "body": "must not run"})),
+                cmd("SA_SEND", json!({"id": "current", "to": "claude", "body": "check current objective"})),
                 done()
             ));
         }
@@ -470,7 +471,7 @@ async fn human_redirect_during_discovery_suppresses_old_sends_and_completion() {
             c.prove();
             return Ok(ended());
         }
-        assert_eq!(c.packet["user_updates"], json!(["new objective"]));
+        assert_eq!(c.full_packet()["user_updates"], json!(["new objective"]));
         Ok(done())
     }));
     let (entered, gate) = (Gate::new(), Gate::new());
@@ -488,14 +489,14 @@ async fn human_redirect_during_discovery_suppresses_old_sends_and_completion() {
     fx.engine.start().unwrap();
     fx.engine.step();
     entered.wait().await;
-    fx.engine.follow(id, "new objective", false).unwrap();
+    assert!(matches!(fx.engine.follow(id, "new objective", false).unwrap(), sa_engine::FollowOutcome::Queued { .. }));
+    assert_eq!(fx.int("SELECT count(*) FROM events WHERE kind='user.follow'"), 0);
     gate.open();
     fx.finish(id, "done").await;
-    assert!(fx.all("SELECT id FROM jobs WHERE parent IS NOT NULL").is_empty());
-    let turns: Vec<Value> = fx
-        .all(&format!("SELECT turn FROM events WHERE ticket={id} AND kind='auto.milestone'"))
-        .iter()
-        .map(|r| r["turn"].clone())
-        .collect();
-    assert_eq!(turns, vec![json!(2)]);
+    assert_eq!(fx.int("SELECT count(*) FROM jobs WHERE parent IS NOT NULL AND body='check current objective' AND state='done'"), 1);
+    let boundary = fx.int("SELECT seq FROM events WHERE kind='user.follow'");
+    assert!(fx.int("SELECT seq FROM events WHERE kind='send'") < boundary);
+    assert!(fx.int("SELECT seq FROM events WHERE kind='reply' AND job=(SELECT id FROM jobs WHERE parent IS NULL) AND turn=1") < boundary);
+    assert_eq!(fx.int("SELECT count(*) FROM events WHERE kind='auto.milestone'"), 1);
+    assert!(fx.int("SELECT seq FROM events WHERE kind='auto.milestone'") > boundary);
 }

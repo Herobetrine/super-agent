@@ -60,7 +60,110 @@ async fn image_follow_replaces_images_updates_text_and_survives_reopen() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn active_image_follow_supersedes_pending_images_without_mutating_the_running_request() {
+async fn delivered_image_keeps_its_turn_when_another_follow_arrives_before_admission() {
+    assigned_images(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stop_and_resume_between_assignment_and_admission_preserves_both_image_turns() {
+    assigned_images(true).await;
+}
+
+async fn assigned_images(stop_before_admission: bool) {
+    let gate = Gate::new();
+    let fx = Fx::new(
+        script({
+            let gate = gate.clone();
+            move |c| {
+                let gate = gate.clone();
+                async move {
+                    if c.turn() == 1 {
+                        gate.wait().await;
+                    } else {
+                        assert_eq!(c.req.images.len(), 1);
+                        let first_business_turn = if stop_before_admission { 3 } else { 2 };
+                        if c.turn() == first_business_turn {
+                            assert_eq!(c.full_packet()["user_updates"], json!(["A"]));
+                        } else {
+                            assert_eq!(c.turn(), first_business_turn + 1);
+                            assert_eq!(c.full_packet()["user_updates"], json!(["A", "B"]));
+                        }
+                    }
+                    Ok("done".into())
+                }
+            }
+        }),
+        t1_catalog(),
+    );
+    let a = write_image(&fx.project, "a.png", image::ImageFormat::Png, 2);
+    let b = write_image(&fx.project, "b.png", image::ImageFormat::Png, 4);
+    let t = fx.begin(fx.params()).await;
+    fx.until(|| fx.shared.count(|_| true) == 1).await;
+    let sa_engine::FollowOutcome::Queued { id: a_id } = fx.engine
+        .follow_with_files(t, "A", false, &["a.png".into()]).await.unwrap() else {
+        panic!("A must queue during the active turn");
+    };
+    // Delay admission while allowing the first reply and assignment to commit.
+    fx.engine
+        .db()
+        .tx(|q| {
+            q.run(
+                "UPDATE jobs SET ready_after=4102444800 WHERE ticket=?",
+                &[&t],
+            )
+        })
+        .unwrap();
+    gate.open();
+    fx.until(|| root_state(&fx.engine, t) == "queued").await;
+    assert!(fx.engine.delete_queued(t, a_id).unwrap_err().is::<sa_engine::NotQueued>());
+    assert_eq!(
+        fx.int("SELECT count(*) FROM follow_queue WHERE state='assigned'"),
+        1
+    );
+    assert_eq!(
+        fx.int("SELECT count(*) FROM events WHERE kind='user.follow'"),
+        0
+    );
+    let sa_engine::FollowOutcome::Queued { id: b_id } = fx.engine
+        .follow_with_files(t, "B", false, &["b.png".into()]).await.unwrap() else {
+        panic!("B must wait for its own turn");
+    };
+    if stop_before_admission {
+        assert_eq!(fx.engine.promote_queued(t,b_id).unwrap(),sa_engine::Promotion::NextTurn);
+        fx.engine.cancel(t).unwrap();
+        assert_eq!(
+            fx.int("SELECT count(*) FROM follow_queue WHERE state='queued'"),
+            2
+        );
+        assert_eq!(
+            fx.int("SELECT count(*) FROM job_files WHERE manifest!='[]'"),
+            0
+        );
+        assert_eq!(
+            fx.int("SELECT count(*) FROM events WHERE kind='user.follow'"),
+            0
+        );
+        fx.engine.resume_queue(t, false).unwrap();
+        assert_eq!(
+            fx.int("SELECT count(*) FROM follow_queue WHERE state='assigned' AND body='A'"),
+            1
+        );
+    }
+    fx.engine
+        .db()
+        .tx(|q| q.run("UPDATE jobs SET ready_after=0 WHERE ticket=?", &[&t]))
+        .unwrap();
+    fx.finish(t, "done").await;
+    assert_eq!(
+        fx.shared
+            .calls(|call| call.req.images.first().map(|im| im.data().to_vec())),
+        [a, b]
+    );
+    assert_eq!(fx.shared.count(|_| true), 3);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn active_image_follows_replace_images_one_turn_at_a_time() {
     let entered = Gate::new();
     let release = Gate::new();
     let (started, finish) = (entered.clone(), release.clone());
@@ -75,24 +178,26 @@ async fn active_image_follow_supersedes_pending_images_without_mutating_the_runn
                 assert_eq!(c.req.images[0].data(), original);
             } else {
                 assert_eq!(c.req.images.len(), 1);
-                assert_eq!(c.req.images[0].name(), "最新.PNG");
+                assert_eq!(c.req.images[0].name(), if c.turn() == 2 { "中间.jpeg" } else { "最新.PNG" });
                 assert!(c.req.session_id.is_some());
             }
             Ok("seen".into())
         }
     }), t1_catalog());
     write_image(&fx.project, "初始.png", image::ImageFormat::Png, 2);
-    write_image(&fx.project, "中间.jpeg", image::ImageFormat::Jpeg, 3);
+    let middle = write_image(&fx.project, "中间.jpeg", image::ImageFormat::Jpeg, 3);
     let newest = write_image(&fx.project, "最新.PNG", image::ImageFormat::Png, 4);
     let ticket = fx.begin(fx.params().profile("readonly").files(&["初始.png"])).await;
     fx.until(|| fx.shared.count(|_| true) == 1).await;
     entered.wait().await;
     fx.engine.follow_with_files(ticket, "改看中间图", false, &["中间.jpeg".into()]).await.unwrap();
     fx.engine.follow_with_files(ticket, "改看最新图", false, &["最新.PNG".into()]).await.unwrap();
+    std::fs::write(fx.project.join("中间.jpeg"), b"changed after enqueue").unwrap();
     release.open();
     fx.finish(ticket, "done").await;
-    assert_eq!(fx.shared.count(|_| true), 2);
-    assert_eq!(fx.shared.calls(|c| (c.packet["turn"] == 2).then(|| c.req.images[0].data().to_vec())), vec![newest]);
+    assert_eq!(fx.shared.count(|_| true), 3);
+    assert_eq!(fx.shared.calls(|c| (c.packet["turn"] == 2).then(|| c.req.images[0].data().to_vec())), vec![middle]);
+    assert_eq!(fx.shared.calls(|c| (c.packet["turn"] == 3).then(|| c.req.images[0].data().to_vec())), vec![newest]);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -273,6 +378,9 @@ async fn stale_progress_suppressed(action: &str) {
         fx.engine.cancel(id).unwrap();
     } else {
         fx.engine.follow(id, "新的指令", false).unwrap();
+        // The old worker reports after delivery, including when the root
+        // was still finishing the dispatch and initially queued the follow.
+        fx.until(|| fx.int("SELECT count(*) FROM events WHERE kind='user.follow'") == 1).await;
     }
     release.open();
     if action == "follow" {

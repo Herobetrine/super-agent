@@ -989,6 +989,8 @@ impl DataSource for DemoSource {
         let total_jobs = jobs.len() as i64;
         jobs.truncate(80);
         Ok(Snapshot {
+            queue: Vec::new(),
+            queue_hold: None,
             ticket: t.detail.clone(),
             running_peers: t
                 .jobs

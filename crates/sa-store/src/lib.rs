@@ -3,6 +3,8 @@
 mod activity;
 pub mod catalog_cache;
 mod feed;
+mod follow_queue;
+pub use follow_queue::{HoldReason, QueuedFollow};
 pub mod efficiency;
 pub mod delivery;
 mod harness_activity;

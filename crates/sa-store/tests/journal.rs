@@ -18,7 +18,7 @@ fn new_journal_sets_writer_pragmas_and_generation() {
     assert_eq!(pragma(&conn, "journal_size_limit"), 134_217_728);
     assert_eq!(pragma(&conn, "synchronous"), 2);
     assert_eq!(pragma(&conn, "auto_vacuum"), 2);
-    assert_eq!(pragma(&conn, "user_version"), 1);
+    assert_eq!(pragma(&conn, "user_version"), 2);
     drop(conn);
     assert_eq!(pragma(&open_journal(dir.path()).unwrap(), "auto_vacuum"), 2);
 }
@@ -42,7 +42,7 @@ fn legacy_journal_keeps_its_vacuum_mode_and_rows() {
         drop(conn);
         let conn = open_journal(dir.path()).unwrap();
         assert_eq!(pragma(&conn, "auto_vacuum"), expected);
-        assert_eq!(pragma(&conn, "user_version"), 1);
+        assert_eq!(pragma(&conn, "user_version"), 2);
         let id: i64 = conn
             .query_row("SELECT id FROM legacy", [], |row| row.get(0))
             .unwrap();

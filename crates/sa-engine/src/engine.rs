@@ -20,6 +20,7 @@ use crate::context::{self, MAX_PROMPT_BYTES};
 use crate::db::{BeginBusy, Db, Q, Who, int_of, now, sqlite_error_codes, str_of, who_of};
 use crate::dispatch::{self, CmdError};
 use crate::guides;
+use crate::follow_queue::{self, FollowOutcome};
 use crate::job::{JobCtx, envelope};
 use crate::knowledge;
 use crate::pause::{self, PauseStatus};
@@ -405,6 +406,7 @@ impl Engine {
     pub fn open(dir: impl AsRef<Path>, adapters: Vec<Arc<dyn Adapter>>, opts: EngineOptions) -> Result<Self> {
         let data_dir = std::path::absolute(dir.as_ref())?;
         let db = Db::open(&data_dir)?;
+        db.tx(follow_queue::recover)?;
         let catalog_cache = db.with(|q| catalog_cache::load(q.conn()))?;
         let adapters = adapters.into_iter().map(|a| (a.agent().to_string(), a)).collect();
         let limits = opts.runner.stall_limits();
@@ -1044,15 +1046,15 @@ impl Engine {
         })
     }
 
-    /// `follow({ticket, body, resume})` (S:175-203); returns the event seq.
-    pub fn follow(&self, ticket: i64, body: &str, resume: bool) -> Result<i64> {
+    /// `follow({ticket, body, resume})` (S:175-203); returns the event sequence or queue item ID.
+    pub fn follow(&self, ticket: i64, body: &str, resume: bool) -> Result<FollowOutcome> {
         self.follow_snapshot(ticket, body, resume, &[])
     }
 
     /// Add immutable attachments to a root follow-up. New images replace the
     /// current image set; text attachments replace matching names. An empty
     /// list preserves existing attachments, like `follow`.
-    pub async fn follow_with_files(&self, ticket: i64, body: &str, resume: bool, files: &[String]) -> Result<i64> {
+    pub async fn follow_with_files(&self, ticket: i64, body: &str, resume: bool, files: &[String]) -> Result<FollowOutcome> {
         if !p::valid_str(body, usize::MAX) {
             bail!("追加指令为空");
         }
@@ -1080,96 +1082,61 @@ impl Engine {
         self.follow_snapshot(ticket, body, resume, &manifest)
     }
 
-    fn follow_snapshot(&self, ticket: i64, body: &str, resume: bool, additions: &[Value]) -> Result<i64> {
+    fn follow_snapshot(&self, ticket: i64, body: &str, resume: bool, additions: &[Value]) -> Result<FollowOutcome> {
         if !p::valid_str(body, usize::MAX) {
             bail!("追加指令为空");
         }
         self.inner.db.tx(|q| {
             let root = q.root(ticket)?;
-            let state = str_of(&root, "state");
-            let cont = q.exists("SELECT 1 FROM continuous_runs WHERE ticket=?", &[&ticket])?;
-            if !cont && matches!(state, "interrupted" | "draining") {
-                bail!("请先处理上级中断或失败");
-            }
-            if cont && state == "cancelled" && !resume {
-                bail!("停止的工单需要明确恢复");
-            }
-            let id = int_of(&root, "id");
-            if !additions.is_empty() {
-                let new_images = additions.iter().any(|file| file["name"].as_str().is_some_and(crate::images::is_image_name));
-                if new_images && !crate::images::supports_native_images(str_of(&root, "agent")) {
-                    bail!(crate::images::UNSUPPORTED);
-                }
-                let mut manifest = q.one("SELECT manifest FROM job_files WHERE job=?", &[&id])?
-                    .and_then(|row| parse(Some(str_of(&row, "manifest"))).as_array().cloned())
-                    .unwrap_or_default();
-                manifest.retain(|old| {
-                    !(new_images && old["name"].as_str().is_some_and(crate::images::is_image_name))
-                        && !additions.iter().any(|new| new["name"] == old["name"])
-                });
-                manifest.extend_from_slice(additions);
-                if manifest.len() > 16
-                    || manifest.iter().try_fold(0u64, |sum, file| sum.checked_add(file["bytes"].as_u64()?))
-                        .is_none_or(|bytes| bytes > 64 * 1024 * 1024)
-                {
-                    bail!("当前附件最多 16 个文件，总量不得超过 64 MiB");
-                }
-                q.run("INSERT OR REPLACE INTO job_files(job,manifest) VALUES(?,?)", &[&id, &stringify(&json!(manifest))])?;
-                q.log(who_of(&root), "files", &json!(manifest))?;
-            }
-            q.withdraw_question(who_of(&root))?;
-            let seq = q.log(who_of(&root), "user.follow", &json!(body))?;
-            if cont {
-                q.run(
-                    "UPDATE continuous_runs SET phase='work',probe=0,success=0,stalls=0,last_signal='',
-          boundary_seq=? WHERE ticket=?",
-                    &[&seq, &ticket],
-                )?;
-                q.run("UPDATE jobs SET ready_after=0 WHERE id=?", &[&id])?;
-            }
-            let auto = q
-                .one("SELECT permission_profile FROM tickets WHERE id=?", &[&ticket])?
-                .is_some_and(|t| str_of(&t, "permission_profile") == "auto");
-            if auto {
-                q.run("UPDATE tickets SET auto_cycles=0,objective=? WHERE id=?", &[&body, &ticket])?;
-            }
-            if p::is_terminal(state)
-                || (auto && (state == "waiting" || (cont && matches!(state, "interrupted" | "draining"))))
-            {
-                q.run(
-                    "UPDATE jobs SET state='queued',turn=turn+1,dispatch_turn=NULL WHERE id=?",
-                    &[&id],
-                )?;
-            }
-            Ok(seq)
+            follow_queue::submit(q, ticket, &root, body, resume, additions)
         })
     }
 
-    /// `retry({job})` (S:204-219): same logical turn, receipts kept.
+    /// Retry the same logical turn, retaining dispatch receipts.
     pub fn retry(&self, id: i64) -> Result<()> {
-        self.inner.db.tx(|q| {
-            ensure!(!q.exists("SELECT 1 FROM job_workspaces WHERE job=? AND state='merged'", &[&id])?,"该工作区已合入，请创建新任务继续修改");
-            let job = q.one("SELECT * FROM jobs WHERE id=?", &[&id])?;
-            let Some(job) = job.filter(|j| matches!(str_of(j, "state"), "failed" | "interrupted")) else {
-                bail!("只能重试失败或中断的任务");
+        self.db().tx(|q| Self::retry_in(q, id))
+    }
+
+    pub(crate) fn retry_in(q: &Q, id: i64) -> Result<()> {
+        ensure!(
+            !q.exists(
+                "SELECT 1 FROM job_workspaces WHERE job=? AND state='merged'",
+                &[&id]
+            )?,
+            "该工作区已合入，请创建新任务继续修改"
+        );
+        let job = q.one("SELECT * FROM jobs WHERE id=?", &[&id])?;
+        let Some(job) = job.filter(|j| matches!(str_of(j, "state"), "failed" | "interrupted")) else {
+            bail!("只能重试失败或中断的任务");
+        };
+        let mut parent = job.get("parent").and_then(Value::as_i64);
+        while let Some(pid) = parent {
+            let row = q.one("SELECT * FROM jobs WHERE id=?", &[&pid])?;
+            let Some(row) =
+                row.filter(|r| !matches!(str_of(r, "state"), "running" | "cancelled" | "interrupted"))
+            else {
+                bail!("请先处理上级任务");
             };
-            let mut parent = job.get("parent").and_then(Value::as_i64);
-            while let Some(pid) = parent {
-                let row = q.one("SELECT * FROM jobs WHERE id=?", &[&pid])?;
-                let Some(row) = row.filter(|r| !matches!(str_of(r, "state"), "running" | "cancelled" | "interrupted"))
-                else {
-                    bail!("请先处理上级任务");
-                };
-                if str_of(&row, "state") != "draining" {
-                    q.run("UPDATE jobs SET state='waiting' WHERE id=?", &[&pid])?;
-                }
-                q.run("UPDATE questions SET parked=0 WHERE job=? AND state='pending'", &[&pid])?;
-                parent = row.get("parent").and_then(Value::as_i64);
+            if str_of(&row, "state") != "draining" {
+                q.run("UPDATE jobs SET state='waiting' WHERE id=?", &[&pid])?;
             }
-            q.run("UPDATE jobs SET state='queued',ready_after=0 WHERE id=?", &[&id])?;
-            q.log(who_of(&job), "retry", &json!("重试同一逻辑轮次，保留已提交消息的幂等收据。"))?;
-            Ok(())
-        })
+            q.run(
+                "UPDATE questions SET parked=0 WHERE job=? AND state='pending'",
+                &[&pid],
+            )?;
+            parent = row.get("parent").and_then(Value::as_i64);
+        }
+        q.run(
+            "UPDATE jobs SET state='queued',ready_after=0 WHERE id=?",
+            &[&id],
+        )?;
+        if job["parent"].is_null() { follow_queue::fresh_turn(q, id)?; }
+        q.log(
+            who_of(&job),
+            "retry",
+            &json!("重试同一逻辑轮次，保留已提交消息的幂等收据。"),
+        )?;
+        Ok(())
     }
 
     /// `note({ticket, job, body})` (S:273-275) from the operator.
@@ -2073,12 +2040,12 @@ impl Inner {
                         "reason": if reserve { "quota_reserve" } else { "quota_window" }, "window": kind}))?;
                     continue;
                 }
+                if job.is_root() && follow_queue::admit(q, &row)? {
+                    job.auto_cycles = 0;
+                }
                 if job.auto_root() {
                     if !job.continuous && job.auto_cycles >= 64 {
-                        let state = if q.pending_children(job.id)? { "draining" } else { "failed" };
-                        q.run("UPDATE jobs SET state=?,result=? WHERE id=?", &[&state, &BUDGET_REASON, &job.id])?;
-                        if p::is_terminal(state) { q.withdraw_question(job.who())?; }
-                        q.log(job.who(), state, &json!(BUDGET_REASON))?;
+                        self.give_up(q, &job, BUDGET_REASON)?;
                         continue;
                     }
                     q.run("UPDATE tickets SET auto_cycles=auto_cycles+1 WHERE id=?", &[&job.ticket])?;
@@ -3251,6 +3218,7 @@ impl Inner {
             return Ok(());
         }
         let check_failed = checked.is_some_and(checks::Outcome::failed);
+        if job.is_root() { follow_queue::restore_steering(q, job.id)?; }
         // P2 repair gate: in apply mode an exhausted ticket budget ends the
         // repair loop through the existing limit-reached branch below.
         let bounce = checked.is_some_and(checks::Outcome::bounced)
@@ -3404,6 +3372,7 @@ impl Inner {
         let ids:Vec<i64>=turn.packet().get("scm_feedback").and_then(Value::as_array).into_iter().flatten().filter_map(|v|v["id"].as_i64()).collect();
         crate::scm::acknowledge(q,job.id,&ids,job.turn)?;
         pause::after_reply(q, job, outstanding)?;
+        if job.is_root() { follow_queue::finish(q, job.ticket)?; }
         Ok(())
     }
 
@@ -3416,6 +3385,7 @@ impl Inner {
         }
         let timed_out = turn.timed_out.load(Ordering::SeqCst);
         let reason = if timed_out { TIMEOUT_REASON.to_string() } else { err.message() };
+        if job.is_root() { follow_queue::restore_steering(q, job.id)?; }
         if self.stopping.load(Ordering::SeqCst) {
             return q.interrupt(who, &job.ticket_profile);
         }
@@ -3439,7 +3409,7 @@ impl Inner {
                 &[&reason, &job.id],
             )?;
             q.log(who, "auto.retry", &json!({"after_seconds": 0, "reason": "按新追加的要求重新核对。"}))?;
-            return Ok(());
+            return follow_queue::finish(q, job.ticket);
         }
         let route = lock(&turn.route).clone();
         if let TurnError::Wait(until) = err {
@@ -3546,6 +3516,7 @@ impl Inner {
         q.run("UPDATE jobs SET state=?,result=? WHERE id=?", &[&state, &reason, &job.id])?;
         if p::is_terminal(state) { q.withdraw_question(job.who())?; }
         q.log(job.who(), state, &json!(reason))?;
+        if job.is_root() { follow_queue::hold(q, job.id, sa_store::HoldReason::Failed)?; }
         Ok(())
     }
 
@@ -3994,7 +3965,8 @@ fn ledger(q: &Q, job: i64) -> Result<TurnLedger> {
 }
 
 fn cancel_ticket(q: &Q, ticket: i64) -> Result<()> {
-    q.root(ticket)?;
+    let root = q.root(ticket)?;
+    follow_queue::hold(q, int_of(&root, "id"), sa_store::HoldReason::Stopped)?;
     q.run("UPDATE approvals SET decision='expired' WHERE ticket=? AND decision='pending'", &[&ticket])?;
     for job in q.all(&format!("SELECT * FROM jobs WHERE ticket=? AND state NOT IN {END_SQL}"), &[&ticket])? {
         q.run("UPDATE jobs SET state='cancelled' WHERE id=?", &[&int_of(&job, "id")])?;
@@ -4521,7 +4493,11 @@ impl TurnHost for Host {
             // A bus `reply` reaches its asker through `ask` (or `inbox` after a
             // timeout); steering it too would deliver the answer twice.
             .filter(|n| !n["id"].as_str().is_some_and(|id| id.starts_with("bus-r-")))
-            .map(|n| json!({"seq": n["seq"], "sender": n["sender"], "body": n["body"]}))
+            .map(|n| {
+                let mut note = json!({"seq": n["seq"], "sender": n["sender"], "body": n["body"]});
+                if let Some(files) = n.get("files") { note["files"] = files.clone(); }
+                note
+            })
             .collect()
     }
 

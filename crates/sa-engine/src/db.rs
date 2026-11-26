@@ -321,7 +321,12 @@ impl Q<'_> {
 
     /// `interrupt(job)` (S:63-76).
     pub fn interrupt(&self, who: Who, ticket_profile: &str) -> Result<()> {
+        let root = self.exists("SELECT 1 FROM jobs WHERE id=? AND parent IS NULL", &[&who.id])?;
         if ticket_profile == "auto" {
+            if root {
+                crate::follow_queue::revoke_assignment(self, who.id)?;
+                crate::follow_queue::restore_steering(self, who.id)?;
+            }
             self.run(
                 "UPDATE jobs SET state='queued',dispatch_turn=coalesce(dispatch_turn,turn),turn=turn+1,result=? WHERE id=?",
                 &[&INTERRUPT_REASON, &who.id],
@@ -333,6 +338,7 @@ impl Q<'_> {
                 &[&INTERRUPT_REASON, &who.id],
             )?;
             self.log(who, "interrupted", &json!(INTERRUPT_REASON))?;
+            if root { crate::follow_queue::hold(self, who.id, sa_store::HoldReason::Interrupted)?; }
         }
         Ok(())
     }
@@ -381,9 +387,16 @@ impl Q<'_> {
 
     /// `notes(id, pending)` (S:276-283): `{seq, ...payload}`.
     pub fn notes(&self, id: i64, pending: bool) -> Result<Vec<Value>> {
+        self.read_notes(id, if pending { " AND consumed_turn IS NULL" } else { "" })
+    }
+
+    pub(crate) fn packet_notes(&self, id: i64) -> Result<Vec<Value>> {
+        self.read_notes(id, " AND (e.kind!='queue.steering' OR consumed_turn IS NOT NULL)")
+    }
+
+    fn read_notes(&self, id: i64, filter: &str) -> Result<Vec<Value>> {
         let sql = format!(
-            "SELECT m.seq,e.payload FROM mailbox m JOIN events e ON m.seq=e.seq WHERE m.target=?{} ORDER BY m.seq",
-            if pending { " AND consumed_turn IS NULL" } else { "" }
+            "SELECT m.seq,e.payload FROM mailbox m JOIN events e ON m.seq=e.seq WHERE m.target=?{filter} ORDER BY m.seq"
         );
         let mut out = vec![];
         for r in self.all(&sql, &[&id])? {
@@ -417,6 +430,12 @@ impl Q<'_> {
                 &[&who.turn, &seq, &who.id],
             )?;
             if changed > 0 {
+                if self.run("DELETE FROM follow_queue WHERE job=? AND note_seq=? AND state='steering'", &[&who.id, &seq])? == 1 {
+                    // Publish the note in the feed only after actual delivery. The
+                    // private mailbox event remains the stable native/bus receipt.
+                    self.run("INSERT INTO events(ts,ticket,job,turn,kind,payload,sha256)
+                        SELECT ?,ticket,job,?,'note',payload,sha256 FROM events WHERE seq=?", &[&now(), &who.turn, &seq])?;
+                }
                 accepted.push(seq);
             }
         }
@@ -449,7 +468,12 @@ impl Q<'_> {
         key: Option<&str>,
         budget: i64,
     ) -> Result<i64> {
-        self.record_note_checked(ticket, dest, body, source, key, NoteDelivery { budget, answering: false })
+        self.record_note_checked(ticket, dest, body, source, key, NoteDelivery { budget, answering: false, steering: false })
+    }
+
+    pub(crate) fn steering_note(&self, ticket: i64, job: i64, body: &Value) -> Result<i64> {
+        self.record_note_checked(ticket, Some(&json!(job)), Some(body), None, None,
+            NoteDelivery { budget: 128, answering: false, steering: true })
     }
 
     /// A pending question can outlive an interrupted or draining turn. Its
@@ -457,7 +481,7 @@ impl Q<'_> {
     pub fn record_answer_note(&self, ticket: i64, job: i64, body: &str) -> Result<i64> {
         self.record_note_checked(
             ticket, Some(&json!(job)), Some(&json!(body)), None, None,
-            NoteDelivery { budget: 128, answering: true },
+            NoteDelivery { budget: 128, answering: true, steering: false },
         )
     }
 
@@ -540,7 +564,8 @@ impl Q<'_> {
             (None, Some(r)) => who_of(r),
             (None, None) => return Err(anyhow!("目标不属于本工单或已停止收信")),
         };
-        let kind = if rejection.is_some() { "note.rejected" } else { "note" };
+        let kind = if rejection.is_some() { "note.rejected" }
+            else if delivery.steering { "queue.steering" } else { "note" };
         let seq = self.log(who, kind, &Value::Object(payload))?;
         let target = if rejection.is_some() { None } else { Some(dest) };
         let source_id = source.map(|s| s.who.id);
@@ -627,7 +652,8 @@ impl Q<'_> {
             format!("NOT EXISTS(SELECT 1 FROM jobs c WHERE c.parent=p.id AND c.state NOT IN {END_SQL})");
         self.run(
             &format!(
-                "UPDATE jobs AS p SET state='queued',turn=turn+1 WHERE state='waiting' AND (({settled} AND NOT EXISTS(SELECT 1 FROM questions a WHERE a.job=p.id AND a.state='pending' AND a.parked=1)) OR EXISTS(SELECT 1 FROM mailbox m JOIN events e ON e.seq=m.seq WHERE m.target=p.id AND m.consumed_turn IS NULL
+                "UPDATE jobs AS p SET state='queued',turn=turn+1 WHERE state='waiting' AND (({settled} AND NOT EXISTS(SELECT 1 FROM questions a WHERE a.job=p.id AND a.state='pending' AND a.parked=1
+                    AND (a.origin='platform' OR NOT EXISTS(SELECT 1 FROM follow_queue_status s WHERE s.job=p.id AND s.delivery_turn=p.turn+1)))) OR EXISTS(SELECT 1 FROM mailbox m JOIN events e ON e.seq=m.seq WHERE m.target=p.id AND m.consumed_turn IS NULL
             AND (NOT EXISTS(SELECT 1 FROM questions a WHERE a.job=p.id AND a.state='pending' AND a.origin='platform' AND a.parked=1)
               OR (m.source IS NULL AND json_extract(e.payload,'$.sender')='user'))))"
             ),
@@ -637,12 +663,16 @@ impl Q<'_> {
             self.run("UPDATE jobs SET state='failed' WHERE id=?", &[&j["id"].as_i64()])?;
             self.withdraw_question(who_of(&j))?;
             self.log(who_of(&j), "failed", &j["result"])?;
+            if j["parent"].is_null() {
+                crate::follow_queue::drain_finished(self, int_of(&j, "ticket"))?;
+            }
         }
         Ok(())
     }
 }
 
 struct NoteDelivery {
+    steering: bool,
     budget: i64,
     answering: bool,
 }

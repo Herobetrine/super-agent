@@ -18,7 +18,7 @@ fn increment(conn: &Connection) -> Result<()> {
 }
 
 fn fixture(dir: &Path) -> Connection {
-    let conn = open_journal(dir).unwrap();
+    let conn = open_with_migrations(dir, &super::MIGRATIONS[..1]).unwrap();
     conn.execute_batch(
         "PRAGMA wal_autocheckpoint=0;
          CREATE TABLE recovery_fixture(value INTEGER);
@@ -31,6 +31,72 @@ fn fixture(dir: &Path) -> Connection {
 fn value(conn: &Connection) -> i64 {
     conn.query_row("SELECT value FROM recovery_fixture", [], |row| row.get(0))
         .unwrap()
+}
+
+#[test]
+fn follow_queue_upgrade_snapshots_the_v1_journal_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let v1 = fixture(dir.path());
+    v1.execute_batch("INSERT INTO tickets(id,goal,cwd,writes,lead,created) VALUES(1,'g','.',0,'codex',0);
+        INSERT INTO jobs(id,ticket,agent,body,writing,depth,state) VALUES(1,1,'codex','g',0,0,'queued');").unwrap();
+    drop(v1);
+    let tables = |conn: &Connection| {
+        conn.query_row(
+        "SELECT count(*) FROM sqlite_schema WHERE type='table' AND name IN ('follow_queue','follow_queue_status')",
+        [], |row| row.get::<_, i64>(0),
+    ).unwrap()
+    };
+    let upgraded = open_journal(dir.path()).unwrap();
+    assert_eq!(
+        upgraded
+            .pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
+            .unwrap(),
+        2
+    );
+    assert_eq!(tables(&upgraded), 2);
+    assert_eq!(value(&upgraded), 42);
+    assert_eq!(fs::read_dir(dir.path().join("backups")).unwrap().count(), 1);
+    let (path, _) = backup::latest_snapshot(dir.path()).unwrap();
+    let saved =
+        Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+    assert_eq!(
+        saved
+            .pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+    assert_eq!(value(&saved), 42);
+    assert_eq!(tables(&saved), 0);
+    drop(saved);
+    upgraded
+        .execute_batch(
+            "INSERT INTO follow_queue(ticket,job,position,body,manifest,resume,state)
+        VALUES(1,1,1,'A','[]',0,'assigned'),(1,1,2,'B','[]',0,'queued');
+        DELETE FROM follow_queue WHERE id=2;",
+        )
+        .unwrap();
+    drop(upgraded);
+    let reopened = open_journal(dir.path()).unwrap();
+    assert_eq!(tables(&reopened), 2);
+    assert_eq!(
+        reopened
+            .query_row(
+                "SELECT body FROM follow_queue WHERE id=1 AND state='assigned'",
+                [],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+        "A"
+    );
+    reopened
+        .execute(
+            "INSERT INTO follow_queue(ticket,job,position,body,manifest,resume,state)
+        VALUES(1,1,2,'C','[]',0,'queued')",
+            [],
+        )
+        .unwrap();
+    assert_eq!(reopened.last_insert_rowid(), 3);
+    assert_eq!(backup::latest_snapshot(dir.path()).unwrap().0, path);
 }
 
 #[test]
@@ -145,7 +211,7 @@ fn next_snapshot_migration_cleans_only_private_pending_snapshot_files() {
     }
     fs::create_dir(&directory).unwrap();
 
-    drop(open_journal(dir.path()).unwrap());
+    drop(open_with_migrations(dir.path(), &super::MIGRATIONS[..1]).unwrap());
     assert!(
         stale.is_file(),
         "opening a current journal does not clean backups"

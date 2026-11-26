@@ -1426,11 +1426,11 @@ async fn collect_turn(
                 if text.len() > MAX_STEER_BYTES {
                     return None;
                 }
-                host.accept_notes(&[seq]);
-                Some(format!(
+                let line = format!(
                     "{}\n",
                     json!({"type": "user", "message": {"role": "user", "content": text}})
-                ))
+                );
+                Some((line, move || host.accept_notes(&[seq])))
             };
             crate::proc::stream_live(proc, input, cancel, &mut on_event, on_tick).await
         }

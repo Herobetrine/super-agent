@@ -250,9 +250,14 @@ impl Store {
     /// `ProgressJournal.ensure(ticket, end)`: project every row up to `end`,
     /// or stop after the batch that crosses `deadline` (at least one batch
     /// runs per call). Returns whether the projection reached `end`.
-    fn ensure(&mut self, ticket: i64, end: i64, deadline: Option<Instant>) -> Result<bool> {
-        let entry = self.progress.entry(ticket).or_default();
-        let mut stmt = self.conn.prepare_cached(PROGRESS_SCAN)?;
+    fn scan_progress(
+        conn: &Connection,
+        entry: &mut Entry,
+        ticket: i64,
+        end: i64,
+        deadline: Option<Instant>,
+    ) -> Result<bool> {
+        let mut stmt = conn.prepare_cached(PROGRESS_SCAN)?;
         let mut batches = 0;
         while entry.seq < end {
             if batches > 0 && deadline.is_some_and(|at| Instant::now() >= at) {
@@ -354,17 +359,26 @@ impl Store {
     fn load(&mut self, ticket: i64, after: i64, deadline: Option<Instant>) -> Result<Snapshot> {
         id(ticket)?;
         expect((0..=MAX_SAFE).contains(&after), "事件游标无效")?;
+        // A turn can settle between SELECTs. Read its job state, pause gate,
+        // queue and events from the same commit, starting at the event cursor.
+        let tx = self.conn.unchecked_transaction()?;
         let end = self.max_seq(ticket, MAX_SAFE)?;
-        let loaded = self.ensure(ticket, end, deadline)?;
+        let loaded = Self::scan_progress(
+            &tx,
+            self.progress.entry(ticket).or_default(),
+            ticket,
+            end,
+            deadline,
+        )?;
         let projection = self.usage.entry(ticket).or_default();
-        projection.scan(&self.conn, ticket, end)?;
+        projection.scan(&tx, ticket, end)?;
         if let Some(at) = deadline {
             while !projection.caught_up(end) && Instant::now() < at {
-                projection.scan(&self.conn, ticket, end)?;
+                projection.scan(&tx, ticket, end)?;
             }
         }
         let loading = !loaded;
-        let conn = &self.conn;
+        let conn: &Connection = &tx;
 
         let attention = self.attention_sql()?;
         let ticket_row = conn
@@ -552,7 +566,15 @@ impl Store {
             .into_iter()
             .filter(|observed| agents.contains(&observed.agent))
             .collect();
+        let (queue, queue_hold) = if self.has_table("follow_queue")? {
+            crate::follow_queue::snapshot(conn, ticket)?
+        } else {
+            Default::default()
+        };
+        tx.commit()?;
         Ok(Snapshot {
+            queue,
+            queue_hold,
             usage,
             quota,
             loading,
@@ -604,8 +626,9 @@ impl Store {
             Some(b) => id(b)? - 1,
         };
         let end = self.max_seq(ticket, high)?;
-        self.ensure(ticket, end, None)?;
-        let mut events = self.progress[&ticket].read(0, end, true, 81, false, &|_, _, _| true);
+        let entry = self.progress.entry(ticket).or_default();
+        Self::scan_progress(&self.conn, entry, ticket, end, None)?;
+        let mut events = entry.read(0, end, true, 81, false, &|_, _, _| true);
         let more = events.len() > 80;
         events.truncate(80);
         let next = events.last().map(|e| e.seq);

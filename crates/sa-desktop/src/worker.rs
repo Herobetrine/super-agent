@@ -443,6 +443,8 @@ mod tests {
 
     fn quota_snapshot() -> Snapshot {
         Snapshot {
+            queue: Vec::new(),
+            queue_hold: None,
             ticket: sa_store::TicketDetail {
                 id: 1,
                 goal: "quota polling".into(),

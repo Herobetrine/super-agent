@@ -23,6 +23,7 @@ pub mod delivery;
 pub mod dispatch;
 pub mod engine;
 pub mod execution_policy;
+pub mod follow_queue;
 pub mod guides;
 pub mod images;
 pub mod integration_queue;
@@ -45,5 +46,7 @@ pub mod trials;
 
 pub use activity::{ActivityPhase, BadgeTone, JobActivity, RetryInfo};
 pub use engine::{CreateParams, Engine, EngineOptions};
+pub use follow_queue::{FollowOutcome, Promotion, NotQueued, ResumeConfirmationRequired};
+pub use sa_store::{HoldReason, QueuedFollow};
 pub use pause::PauseStatus;
 pub use sa_store::knowledge::KnowledgeEntry;

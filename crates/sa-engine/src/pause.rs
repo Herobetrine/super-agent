@@ -71,6 +71,7 @@ pub(crate) fn request(q: &Q, ticket: i64) -> Result<PauseStatus> {
     } else {
         ("paused", false)
     };
+    crate::follow_queue::revoke_assignment(q, int_of(&root, "id"))?;
     set(q, &root, phase, consolidation, "ticket.pause_requested")?;
     if state == "queued" && queued_recovery(q, &root)? {
         settle_failure(q, &root, "暂停请求终止已排队的恢复尝试。")?;
@@ -120,6 +121,7 @@ pub(crate) fn resume(q: &Q, ticket: i64) -> Result<PauseStatus> {
         for row in stale {
             q.record_note(ticket, Some(&row["id"]), Some(&json!(CHILD_RESUME)), None, None)?;
         }
+        crate::follow_queue::scheduling_resumed(q, &q.root(ticket)?)?;
     }
     Ok(PauseStatus::Running)
 }
@@ -170,6 +172,7 @@ fn settle_failure(q: &Q, root: &Map<String, Value>, reason: &str) -> Result<()> 
     q.run("UPDATE jobs SET state=?,result=? WHERE id=?", &[&state, &reason, &int_of(root, "id")])?;
     if crate::protocol::is_terminal(state) { q.withdraw_question(who_of(root))?; }
     q.log(who_of(root), "turn.pause_failure", &json!({"reason": reason, "state": state}))?;
+    crate::follow_queue::finish(q, int_of(root, "ticket"))?;
     set(q, root, if pending { "draining" } else { "paused" }, false,
         if pending { "ticket.pause_draining" } else { "ticket.paused" })
 }

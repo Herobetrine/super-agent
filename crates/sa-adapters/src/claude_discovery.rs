@@ -5,6 +5,132 @@ use std::net::TcpListener;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+#[tokio::test]
+async fn broken_steering_pipe_leaves_the_follow_available_for_the_next_turn() {
+    use sa_engine::{Engine, FollowOutcome, Promotion, db::Who};
+
+    struct Mailbox {
+        engine: Engine,
+        polled: PathBuf,
+    }
+    impl TurnHost for Mailbox {
+        fn approve(&self, _: Value) -> BoxFuture<'static, bool> {
+            Box::pin(async { false })
+        }
+        fn pending_notes(&self) -> Vec<Value> {
+            let notes = self.engine.db().with(|q| q.notes(1, true)).unwrap();
+            assert_eq!(notes.len(), 1);
+            std::fs::write(&self.polled, b"").unwrap();
+            notes
+        }
+        fn accept_notes(&self, seqs: &[i64]) {
+            self.engine
+                .db()
+                .tx(|q| {
+                    q.accept(
+                        Who {
+                            ticket: 1,
+                            id: 1,
+                            turn: 1,
+                        },
+                        seqs,
+                    )
+                })
+                .unwrap();
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::open(dir.path(), vec![], Default::default()).unwrap();
+    engine
+        .db()
+        .tx(|q| {
+            q.conn().execute_batch(
+                "INSERT INTO tickets(id,goal,cwd,writes,lead,created) VALUES(1,'g','c',0,'claude',0);
+                 INSERT INTO jobs(id,ticket,parent,agent,body,writing,depth,turn,state)
+                 VALUES(1,1,NULL,'claude','b',0,0,1,'running');",
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let FollowOutcome::Queued { id } = engine.follow(1, "read next turn", false).unwrap() else {
+        panic!("running lead must queue")
+    };
+    assert_eq!(engine.promote_queued(1, id).unwrap(), Promotion::Steered);
+    let host = Arc::new(Mailbox {
+        engine,
+        polled: dir.path().join("polled"),
+    });
+    let sys = Sys::from_process();
+    let node = sys
+        .which(if cfg!(windows) { "node.exe" } else { "node" })
+        .unwrap();
+    let start_peer =
+        |script: &str| start(&node, &["-e".into(), script.into()], dir.path(), &sys).unwrap();
+    let mut closed = start_peer("process.exit(0)");
+    let pipe = closed.stdin.take().unwrap();
+    assert_eq!(closed.wait().await, Some(0));
+    let mut proc = start_peer(
+        r#"
+        console.log(JSON.stringify({type:'assistant',message:{content:[{type:'tool_use',id:'t'}]}}));
+        const timer = setInterval(() => {
+            if (!require('node:fs').existsSync('polled')) return;
+            clearInterval(timer);
+            console.log(JSON.stringify({type:'result',subtype:'success',result:'done',session_id:'test'}));
+        }, 10);
+    "#,
+    );
+    // stdout remains live during the tool call, but the stdin reader has exited.
+    proc.stdin = Some(pipe);
+    let (events, _rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::time::timeout(
+        Duration::from_secs(15),
+        collect_turn(
+            &mut proc,
+            "",
+            None,
+            None,
+            Emit(events),
+            &CancellationToken::new(),
+            Some(host.clone()),
+            None,
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(host.polled.exists());
+    host.engine
+        .db()
+        .with(|q| {
+            assert_eq!(
+                q.int(
+                    "SELECT count(*) FROM events WHERE kind='note.accepted'",
+                    &[]
+                )?,
+                0
+            );
+            assert_eq!(
+                q.int("SELECT id FROM follow_queue WHERE state='steering'", &[])?,
+                id
+            );
+            Ok(())
+        })
+        .unwrap();
+    host.engine.close().await;
+    let reopened = Engine::open(dir.path(), vec![], Default::default()).unwrap();
+    reopened
+        .db()
+        .with(|q| {
+            assert_eq!(
+                q.int("SELECT id FROM follow_queue WHERE state='queued'", &[])?,
+                id
+            );
+            Ok(())
+        })
+        .unwrap();
+    reopened.close().await;
+}
+
 struct HttpFixture {
     base: String,
     requests: Arc<Mutex<Vec<String>>>,

@@ -59,6 +59,69 @@ async fn stalled(fx: &Fx, ticket: i64) -> Value {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn queued_follow_cannot_answer_the_platform_continue_or_stop_question() {
+    let gate = Gate::new();
+    let mut fx = Fx::new(
+        script({
+            let gate = gate.clone();
+            move |c| {
+                let gate = gate.clone();
+                async move {
+                    if c.turn() == 4 {
+                        gate.wait().await;
+                    }
+                    Ok(continuation())
+                }
+            }
+        }),
+        t1_catalog(),
+    );
+    let ticket = fx.begin(fx.params().profile("auto")).await;
+    for turn in 1..4 {
+        replied(&fx, ticket, turn).await;
+        fx.engine
+            .db()
+            .tx(|q| q.run("UPDATE jobs SET ready_after=0 WHERE ticket=?", &[&ticket]))
+            .unwrap();
+    }
+    fx.until(|| fx.shared.count(|_| true) == 4).await;
+    assert!(matches!(
+        fx.engine.follow(ticket, "later work", false).unwrap(),
+        sa_engine::FollowOutcome::Queued { .. }
+    ));
+    gate.open();
+    replied(&fx, ticket, 4).await;
+    let questions = fx.engine.questions(ticket).unwrap();
+    assert_eq!(questions.len(), 1);
+    assert_eq!(questions[0]["origin"], "platform");
+    fx.restart(quiet()).await;
+    assert_eq!(fx.engine.questions(ticket).unwrap(), questions);
+    assert_eq!(root_state(&fx.engine, ticket), "waiting");
+    assert_eq!(fx.int("SELECT count(*) FROM follow_queue"), 1);
+    assert!(matches!(
+        fx.engine.follow(ticket, "behind A", false).unwrap(),
+        sa_engine::FollowOutcome::Queued { .. }
+    ));
+    assert_eq!(fx.engine.questions(ticket).unwrap(), questions);
+    assert_eq!(
+        fx.all("SELECT body FROM follow_queue ORDER BY position,id")
+            .iter()
+            .map(|row| row["body"].clone())
+            .collect::<Vec<_>>(),
+        [json!("later work"), json!("behind A")]
+    );
+    assert_eq!(
+        fx.int("SELECT count(*) FROM events WHERE kind='user.follow'"),
+        0
+    );
+    fx.engine
+        .answer(questions[0]["id"].as_i64().unwrap(), "停止")
+        .unwrap();
+    assert_eq!(root_state(&fx.engine, ticket), "cancelled");
+    assert_eq!(fx.int("SELECT count(*) FROM follow_queue"), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn repeated_unchanged_continuation_parks_across_scheduler_passes_and_restart() {
     let mut fx = Fx::new(script(|_| async { Ok(continuation()) }), t1_catalog());
     let ticket = fx.begin(fx.params().profile("auto")).await;

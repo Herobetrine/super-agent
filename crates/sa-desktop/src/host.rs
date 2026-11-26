@@ -45,6 +45,15 @@ pub enum Action {
         resume: bool,
         files: Vec<String>,
     },
+    // The full editor in M2.5 will expose these three host actions.
+    #[allow(dead_code)]
+    EditQueued { ticket: i64, id: i64, body: String },
+    DeleteQueued { ticket: i64, id: i64 },
+    #[allow(dead_code)]
+    MoveQueued { ticket: i64, id: i64, before: Option<i64> },
+    #[allow(dead_code)]
+    PromoteQueued { ticket: i64, id: i64 },
+    ResumeQueue { ticket: i64, confirmed_resume: bool },
     Note {
         ticket: i64,
         job: i64,
@@ -255,6 +264,16 @@ impl Action {
             Action::Create { .. } => ActionKind::Create,
             Action::ForkCheckpoint { .. } => ActionKind::Fork,
             Action::Follow { .. } => ActionKind::Follow,
+            Action::DeleteQueued { ticket, id } => ActionKind::Queue(QueueAction::Delete {
+                ticket: *ticket,
+                id: *id,
+            }),
+            Action::ResumeQueue { ticket, .. } => {
+                ActionKind::Queue(QueueAction::Resume { ticket: *ticket })
+            }
+            Action::EditQueued { .. } | Action::MoveQueued { .. } | Action::PromoteQueued { .. } => {
+                ActionKind::Meta
+            }
             Action::Note { .. } => ActionKind::Note,
             Action::Answer { question, .. } => ActionKind::Answer { question: *question },
             Action::SaveProjectChecks { request, .. } => ActionKind::ProjectChecks { request: *request },
@@ -316,8 +335,16 @@ impl Action {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum QueueAction {
+    Delete { ticket: i64, id: i64 },
+    Resume { ticket: i64 },
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ActionKind {
+    Queue(QueueAction),
+    ConfirmQueueResume { ticket: i64 },
     Create,
     Fork,
     Follow,
@@ -407,7 +434,14 @@ async fn action_loop(
                     });
                     kinds.insert(task.id(), kind);
                 } else {
-                    let result = execute(engine, shared, action).await.map_err(|e| format!("{e:#}"));
+                    let result = execute(engine, shared, action).await;
+                    let kind = match (&result, kind) {
+                        (Err(e), ActionKind::Queue(QueueAction::Resume { ticket }))
+                            if e.is::<sa_engine::ResumeConfirmationRequired>() =>
+                                ActionKind::ConfirmQueueResume { ticket },
+                        _ => kind,
+                    };
+                    let result = result.map_err(|e| format!("{e:#}"));
                     deliver(out, wake, Outcome { kind, result });
                 }
             }
@@ -1018,6 +1052,26 @@ async fn execute(engine: &Engine, shared: &Shared, action: Action) -> Result<Opt
         }
         Action::Note { ticket, job, body } => {
             engine.note(ticket, job, &body)?;
+            Ok(None)
+        }
+        Action::EditQueued { ticket, id, body } => {
+            engine.edit_queued(ticket, id, &body)?;
+            Ok(None)
+        }
+        Action::DeleteQueued { ticket, id } => {
+            engine.delete_queued(ticket, id)?;
+            Ok(None)
+        }
+        Action::MoveQueued { ticket, id, before } => {
+            engine.move_queued(ticket, id, before)?;
+            Ok(None)
+        }
+        Action::PromoteQueued { ticket, id } => {
+            engine.promote_queued(ticket, id)?;
+            Ok(None)
+        }
+        Action::ResumeQueue { ticket, confirmed_resume } => {
+            engine.resume_queue(ticket, confirmed_resume)?;
             Ok(None)
         }
         Action::Answer { question, body } => {

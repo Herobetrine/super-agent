@@ -179,11 +179,18 @@ struct Migration {
 
 // Append a step for each new generation. The step and its version update
 // commit together. Mark any step that isn't purely additive for backup.
-const MIGRATIONS: &[Migration] = &[Migration {
-    to: 1,
-    needs_snapshot: false,
-    apply: baseline_schema,
-}];
+const MIGRATIONS: &[Migration] = &[
+    Migration {
+        to: 1,
+        needs_snapshot: false,
+        apply: baseline_schema,
+    },
+    Migration {
+        to: 2,
+        needs_snapshot: true,
+        apply: crate::follow_queue::migrate,
+    },
+];
 
 fn open_with_migrations(dir: &Path, migrations: &[Migration]) -> Result<Connection> {
     fs::create_dir_all(dir)?;
@@ -225,12 +232,20 @@ fn open_with_migrations(dir: &Path, migrations: &[Migration]) -> Result<Connecti
             .iter()
             .find(|step| step.to == from + 1)
             .with_context(|| format!("缺少工单库从版本 {from} 开始的迁移"))?;
-        if empty && page_count(&tx)? == 0 {
-            tx.pragma_update(None, "auto_vacuum", "INCREMENTAL")?;
-        }
         // The migration writer owns this directory until the marker lifecycle
         // is complete. Clean up abandoned copies before every migration step.
         backup::clean_pending_snapshots(dir)?;
+        if empty && page_count(&tx)? == 0 {
+            tx.pragma_update(None, "auto_vacuum", "INCREMENTAL")?;
+            // Bootstrap a brand-new journal in one transaction. No prior user
+            // data exists to snapshot, and no other writer can add any between steps.
+            for step in migrations {
+                (step.apply)(&tx)?;
+                tx.pragma_update(None, "user_version", step.to)?;
+            }
+            tx.commit()?;
+            break;
+        }
         if step.needs_snapshot {
             ensure!(!empty, "需要快照的迁移必须在初始建表之后运行");
             backup::prepare_migration(dir, &path, from, step.to)?;
