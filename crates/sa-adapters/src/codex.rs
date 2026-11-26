@@ -8,7 +8,7 @@
 use crate::codex_config::{self, Discovery, discover_cached, routing};
 use crate::common::{Emit, denied, probe_failed, protocol, route_gone, select, session_mismatch};
 use crate::custom::{self, CustomProvider, Registry};
-use crate::probe_cache::{DiscoveryTiming, ProbeCache, Probes, Stamp, TurnTiming, refresh_custom};
+use crate::probe_cache::{DiscoveryTiming, ProbeCache, Probes, TurnTiming, custom_probe_slot, refresh_custom};
 use crate::proc::{Lines, Proc, cancelled, capture, start};
 use crate::sys::Sys;
 use futures::future::BoxFuture;
@@ -226,8 +226,9 @@ impl Adapter for Codex {
             let key = codex_config::probe_key(&sys, exe.as_deref(), &customs);
             let probes = Probes::new(&cache, &key, false);
             let cancel = CancellationToken::new();
-            let mut d = discover_cached(&sys, exe, &cancel, &probes).await?;
+            let (mut d, _) = discover_cached(&sys, exe, &cancel, &probes).await?;
             refresh_custom(&mut d.catalog, &customs, &sys, &cancel, &probes).await;
+            probes.flush();
             Ok(Catalog { value: d.catalog })
         })
     }
@@ -261,27 +262,37 @@ async fn run(
     let exe = codex_config::executable(&sys);
     let key = codex_config::probe_key(&sys, exe.as_deref(), &customs);
     let mut reuse = true;
-    let (d, s, timing, cutoff) = loop {
+    let (d, s, timing, used) = loop {
         let probes = Probes::new(&cache, &key, reuse);
-        let mut d = discover_cached(&sys, exe.clone(), &cancel, &probes).await
-            .map_err(|e| if cancel.is_cancelled() { cancelled() } else { probe_failed(&e.to_string()) })?;
+        let (mut d, route_probes) = match discover_cached(&sys, exe.clone(), &cancel, &probes).await {
+            Ok(discovery) => discovery,
+            Err(error) => {
+                probes.flush();
+                return Err(if cancel.is_cancelled() { cancelled() } else { probe_failed(&error.to_string()) });
+            }
+        };
         refresh_custom(&mut d.catalog, &customs, &sys, &cancel, &probes).await;
-        let cutoff = Stamp::now();
+        probes.flush();
         if cancel.is_cancelled() {
             return Err(cancelled());
         }
+        let used = if custom::lookup(&d.catalog, &customs, &req.route.provider).is_some() {
+            probes.observed(&[&custom_probe_slot(&req.route.provider)])
+        } else {
+            probes.observed(&route_probes.route_slots(&req.route))
+        };
         match select(&d.catalog, &req.route) {
-            Ok(s) => break (d, s, DiscoveryTiming::new(started, probes.reused_all(), !reuse), cutoff),
+            Ok(s) => break (d, s, DiscoveryTiming::new(started, probes.reused_all(), !reuse), used),
             Err(_) if probes.used_cache() => reuse = false,
             Err(error) => {
-                cache.evict_through(&key, cutoff);
+                cache.evict_used(&key, &used);
                 return Err(error);
             }
         }
     };
     let result = run_selected(sys, customs, req, host, emit, cancel, d, s, perm, timing).await;
     if result.as_ref().is_err_and(|error| error.class != ErrorClass::Cancelled) {
-        cache.evict_through(&key, cutoff);
+        cache.evict_used(&key, &used);
     }
     result
 }

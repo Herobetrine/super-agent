@@ -694,6 +694,17 @@ async fn expired_probes_are_fetched_again() {
 }
 
 #[tokio::test]
+async fn versioned_native_model_stays_cached() {
+    let mut fixture = ProbeFixture::setup();
+    fixture.req.route.model = "model-b@20250101".into();
+    fixture.write("models.txt", "model-b@20250101\tVersioned Model B\n");
+    for _ in 0..2 {
+        assert_eq!(fixture.run().await.unwrap().text, "fixture-ok");
+    }
+    fixture.assert_counts(1, 1, 2);
+}
+
+#[tokio::test]
 async fn persisted_probes_survive_restart_and_recover_from_bad_files() {
     let fixture = ProbeFixture::setup();
     let sys = fixture.sys.clone().with_data_dir(fixture.dir.path().join("app-data"));

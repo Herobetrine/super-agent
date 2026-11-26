@@ -29,9 +29,6 @@ use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
-static MODEL_ID: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^[\w./-]{1,150}$").expect("valid regex"));
-
 pub(crate) const SETTINGS_REL: &str = ".gemini/antigravity-cli/settings.json";
 const FAILED: &str = "Antigravity 未返回匹配会话的成功终态";
 
@@ -119,17 +116,6 @@ impl DiscoveryInputs {
 enum Effort {
     Fixed,
     Adjustable { available: Vec<String>, current: String },
-}
-
-impl Effort {
-    fn cacheable(&self) -> bool {
-        match self {
-            Self::Fixed => true,
-            Self::Adjustable { available, current } => {
-                !current.contains('@') && available.iter().all(|level| !level.contains('@'))
-            }
-        }
-    }
 }
 
 pub fn executable(sys: &Sys) -> Option<PathBuf> {
@@ -295,7 +281,7 @@ fn native_models(output: &str) -> Result<Vec<Value>, String> {
         .lines()
         .filter_map(|line| {
             let (id, label) = line.split_once('\t')?;
-            (MODEL_ID.is_match(id) && !label.trim().is_empty())
+            (sa_store::providers::valid_model_id(id) && !label.trim().is_empty())
                 .then(|| json!({"id":id,"label":label.trim()}))
         })
         .collect();
@@ -362,6 +348,20 @@ async fn probe_effort(
 
 /// `discover(signal)` (AG:105-150).
 async fn discover(
+    adapter: &Antigravity,
+    inputs: &DiscoveryInputs,
+    cancel: &CancellationToken,
+    route: Option<&Route>,
+    read_cache: bool,
+) -> Result<Discovery, AdapterError> {
+    let result = discover_sources(adapter, inputs, cancel, route, read_cache).await;
+    if result.as_ref().map_or(true, |discovery| discovery.probed) {
+        adapter.probes.flush();
+    }
+    result
+}
+
+async fn discover_sources(
     adapter: &Antigravity,
     inputs: &DiscoveryInputs,
     cancel: &CancellationToken,
@@ -459,7 +459,7 @@ async fn discover(
                             let started = Stamp::now();
                             let effort = probe_effort(cli, overrides, env, cancel, id).await;
                             if (complete || effort.is_none()) && !cancel.is_cancelled() {
-                                probes.record(key, id, started, effort.as_ref().filter(|effort| effort.cacheable()));
+                                probes.record(key, id, started, effort.as_ref());
                             }
                             effort
                         };
@@ -677,24 +677,21 @@ impl Adapter for Antigravity {
     ) -> BoxFuture<'static, Result<RunOutcome, AdapterError>> {
         let adapter = self.clone();
         Box::pin(async move {
-            let inputs = DiscoveryInputs::read(&adapter.sys);
-            let source = request.route.provider.clone();
-            let mut discovery_completed = None;
+            let mut eviction = None;
             let result = run(
                 &adapter,
-                &inputs,
                 request,
                 host,
                 Emit(events),
                 cancel,
-                &mut discovery_completed,
+                &mut eviction,
             )
             .await;
             if result.as_ref().is_err_and(|e| e.class != ErrorClass::Cancelled)
-                && let Some(completed) = discovery_completed
-                && let Some(key) = inputs.route_key(&adapter.sys, &source)
+                && let Some((key, completed)) = eviction
             {
                 adapter.probes.evict_through(&key, completed);
+                adapter.probes.flush();
             }
             result
         })
@@ -713,20 +710,20 @@ fn tool_key(step: &Value) -> Option<String> {
 /// `run(o)` (AG:151-205).
 async fn run(
     adapter: &Antigravity,
-    inputs: &DiscoveryInputs,
     req: RunRequest,
     host: Arc<dyn TurnHost>,
     emit: Emit,
     cancel: CancellationToken,
-    discovery_completed: &mut Option<Stamp>,
+    eviction: &mut Option<(ProbeKey, Stamp)>,
 ) -> Result<RunOutcome, AdapterError> {
     let sys = &adapter.sys;
     crate::images::check(&req)?;
     let boundary = scope("antigravity", &req, &host, &cancel, false).await?;
     let started = Instant::now();
+    let inputs = DiscoveryInputs::read(sys);
     let mut read_cache = true;
     let (d, s) = loop {
-        let d = discover(adapter, inputs, &cancel, Some(&req.route), read_cache)
+        let d = discover(adapter, &inputs, &cancel, Some(&req.route), read_cache)
             .await
             .map_err(|e| {
                 if e.class == ErrorClass::Cancelled {
@@ -735,7 +732,7 @@ async fn run(
                     probe_failed(&e.message)
                 }
             })?;
-        *discovery_completed = Some(Stamp::now());
+        *eviction = inputs.route_key(sys, &req.route.provider).map(|key| (key, Stamp::now()));
         if cancel.is_cancelled() {
             return Err(crate::proc::cancelled());
         }

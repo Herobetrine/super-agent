@@ -3,6 +3,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#define MODEL "fixture-model@20250101"
+
 static int has_arg(int argc, char **argv, const char *arg) {
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], arg) == 0) return 1;
@@ -31,9 +33,12 @@ static int codex_turn(void) {
         if (strstr(line, "\"method\":\"initialize\"")) {
             puts("{\"id\":1,\"result\":{}}");
         } else if (strstr(line, "\"method\":\"thread/start\"")) {
-            puts("{\"id\":2,\"result\":{\"sandbox\":{\"type\":\"dangerFullAccess\"},"
-                 "\"approvalPolicy\":\"never\",\"model\":\"fixture-model\","
-                 "\"modelProvider\":\"openai\",\"thread\":{\"id\":\"fixture-session\"}}}");
+            const char *provider = "openai";
+            if (strstr(line, "\"modelProvider\":\"provider-a\"")) provider = "provider-a";
+            if (strstr(line, "\"modelProvider\":\"provider-b\"")) provider = "provider-b";
+            printf("{\"id\":2,\"result\":{\"sandbox\":{\"type\":\"dangerFullAccess\"},"
+                   "\"approvalPolicy\":\"never\",\"model\":\"" MODEL "\","
+                   "\"modelProvider\":\"%s\",\"thread\":{\"id\":\"fixture-session\"}}}\n", provider);
         } else if (strstr(line, "\"method\":\"turn/start\"")) {
             if (fail_turn()) {
                 puts("{\"id\":3,\"error\":{\"code\":-32000,\"message\":\"fixture failure\"}}");
@@ -54,7 +59,7 @@ static int codex_turn(void) {
 int main(int argc, char **argv) {
     if (has_arg(argc, argv, "debug")) {
         if (!receipt("codex-models")) return 3;
-        puts("{\"models\":[{\"slug\":\"fixture-model\",\"display_name\":\"Fixture\","
+        puts("{\"models\":[{\"slug\":\"" MODEL "\",\"display_name\":\"Fixture\","
              "\"reasoningEfforts\":[\"low\"],\"capabilities\":{\"private\":\"fixture-secret\"}}]}");
         return 0;
     }
@@ -70,11 +75,11 @@ int main(int argc, char **argv) {
     if (strstr(line, "\"subtype\":\"initialize\"")) {
         if (!receipt("claude-models")) return 3;
         puts("{\"response\":{\"request_id\":\"catalog\",\"subtype\":\"success\","
-             "\"response\":{\"models\":[{\"value\":\"fixture-model\",\"label\":\"Fixture\","
+             "\"response\":{\"models\":[{\"value\":\"" MODEL "\",\"label\":\"Fixture\","
              "\"reasoningEfforts\":[\"low\"],\"capabilities\":{\"private\":\"fixture-secret\"}}]}}}");
         return 0;
     }
-    puts("{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"fixture-session\",\"model\":\"fixture-model\"}");
+    puts("{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"fixture-session\",\"model\":\"" MODEL "\"}");
     if (fail_turn()) {
         puts("{\"type\":\"result\",\"subtype\":\"error\",\"session_id\":\"fixture-session\",\"is_error\":true}");
     } else {
