@@ -145,10 +145,15 @@ impl Fixture {
     }
 
     fn adapter(&self) -> Box<dyn Adapter> {
+        self.adapter_with_customs(Vec::new())
+    }
+
+    fn adapter_with_customs(&self, providers: Vec<custom::CustomProvider>) -> Box<dyn Adapter> {
+        let registry = custom::registry(providers);
         if self.request.agent == "codex" {
-            Box::new(Codex::new(self.sys.clone()))
+            Box::new(Codex::with_registry(self.sys.clone(), registry))
         } else {
-            Box::new(Claude::new(self.sys.clone()))
+            Box::new(Claude::with_registry(self.sys.clone(), registry))
         }
     }
 
@@ -315,13 +320,21 @@ struct ModelEndpoint {
 
 impl ModelEndpoint {
     async fn new() -> Self {
+        Self::with_reply(
+            json!({"data":[{"id":MODEL,"reasoningEfforts":["low"]}]}),
+            "503 Service Unavailable",
+        )
+        .await
+    }
+
+    async fn with_reply(reply: Value, failure_status: &'static str) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let failed = Arc::new(AtomicBool::new(false));
         let requests = Arc::new(AtomicUsize::new(0));
         let (failure, count) = (failed.clone(), requests.clone());
         let worker = tokio::spawn(async move {
-            let body = json!({"data":[{"id":MODEL,"reasoningEfforts":["low"]}]}).to_string();
+            let body = reply.to_string();
             loop {
                 let (stream, _) = listener.accept().await.unwrap();
                 let mut stream = BufReader::new(stream);
@@ -333,7 +346,7 @@ impl ModelEndpoint {
                 }
                 count.fetch_add(1, Relaxed);
                 let status = if failure.load(Relaxed) {
-                    "503 Service Unavailable"
+                    failure_status
                 } else {
                     "200 OK"
                 };
@@ -427,5 +440,163 @@ async fn provider_failure_keeps_the_other_provider_warm() {
         assert_eq!((a.count(), b.count()), (2, 1), "{agent}");
         fixture.assert_run(adapter.as_ref(), "hit").await;
         assert_eq!((a.count(), b.count()), (2, 1), "{agent}");
+    }
+}
+
+fn registry_provider(agent: &str, endpoint: &ModelEndpoint) -> custom::CustomProvider {
+    custom::CustomProvider {
+        id: "fixture".into(),
+        agent: agent.into(),
+        name: "Fixture".into(),
+        base_url: endpoint.base.clone(),
+        key_env: String::new(),
+        models: vec![],
+        enabled: true,
+    }
+}
+
+#[tokio::test]
+async fn cached_custom_models_are_enriched_from_current_native_efforts() {
+    let endpoint =
+        ModelEndpoint::with_reply(json!({"data":[{"id":MODEL}]}), "503 Service Unavailable").await;
+    for agent in ["codex", "claude"] {
+        let data = tempfile::tempdir().unwrap();
+        let sys = Sys::new(vec![], data.path().into(), data.path().into());
+        let provider = registry_provider(agent, &endpoint);
+        let route = Route {
+            provider: provider.route_id(),
+            model: MODEL.into(),
+            mode: "cli".into(),
+            reasoning_effort: Some("high".into()),
+        };
+        let key = ProbeKey::new(agent, &sys, None, Value::Null);
+        let cancel = CancellationToken::new();
+        let native = |efforts: &[&str]| {
+            json!({
+                "modes":[{"id":"cli","available":true}],
+                "providers":[{"id":"native","models":[{"id":MODEL,"reasoningEfforts":efforts}]}],
+            })
+        };
+        let before = endpoint.count();
+        {
+            let cache = ProbeCache::new(Some(data.path()));
+            let probes = Probes::new(&cache, &key, true);
+            let mut catalog = native(&["low", "high"]);
+            let donor = refresh_custom(
+                &mut catalog,
+                std::slice::from_ref(&provider),
+                &sys,
+                &cancel,
+                &probes,
+                Some(&route),
+            )
+            .await
+            .unwrap();
+            assert_eq!(donor.provider, "native");
+            crate::common::select(&catalog, &route).unwrap();
+            probes.flush().await;
+        }
+        let cache = ProbeCache::new(Some(data.path()));
+        let probes = Probes::new(&cache, &key, true);
+        let mut catalog = native(&["low"]);
+        let donor = refresh_custom(
+            &mut catalog,
+            &[provider],
+            &sys,
+            &cancel,
+            &probes,
+            Some(&route),
+        )
+        .await;
+        assert!(crate::common::select(&catalog, &route).is_err(), "{agent}");
+        assert_eq!(donor.unwrap().model, MODEL);
+        let low = Route {
+            reasoning_effort: Some("low".into()),
+            ..route
+        };
+        crate::common::select(&catalog, &low).unwrap();
+        assert_eq!(endpoint.count(), before + 1, "{agent}");
+    }
+}
+
+#[tokio::test]
+async fn selected_custom_timeout_does_not_retry_an_unrelated_cached_native_probe() {
+    for agent in ["codex", "claude"] {
+        let mut fixture = Fixture::new(agent);
+        let endpoint =
+            ModelEndpoint::with_reply(json!({"data":[{"id":MODEL}]}), "408 Request Timeout").await;
+        endpoint.failed.store(true, Relaxed);
+        let provider = registry_provider(agent, &endpoint);
+        fixture.request.route.provider = provider.route_id();
+        let adapter = fixture.adapter_with_customs(vec![provider]);
+        adapter.catalog().await.unwrap();
+        fixture.assert_discoveries(1);
+        assert_eq!(endpoint.count(), 1);
+
+        let (result, _) = fixture.run(adapter.as_ref()).await;
+        let error = result.unwrap_err();
+        assert_eq!(
+            error.code.as_deref(),
+            Some(sa_engine::resilience::CODE_ROUTE_PROBE_FAILED),
+            "{agent}"
+        );
+        assert_eq!(endpoint.count(), 2, "{agent}");
+        fixture.assert_discoveries(1);
+    }
+}
+
+#[tokio::test]
+async fn selected_model_missing_from_its_cached_catalog_retries_once() {
+    for agent in ["codex", "claude"] {
+        let mut fixture = Fixture::new(agent);
+        let endpoint = ModelEndpoint::new().await;
+        let provider = registry_provider(agent, &endpoint);
+        fixture.request.route.provider = provider.route_id();
+        fixture.request.route.model = "unlisted-fixture-model".into();
+        let adapter = fixture.adapter_with_customs(vec![provider]);
+        adapter.catalog().await.unwrap();
+        assert_eq!(endpoint.count(), 1);
+
+        let (result, _) = fixture.run(adapter.as_ref()).await;
+        assert_eq!(
+            result.unwrap_err().code.as_deref(),
+            Some(sa_engine::resilience::CODE_ROUTE_PROBE_FAILED),
+            "{agent}"
+        );
+        assert_eq!(endpoint.count(), 2, "{agent}");
+        fixture.assert_discoveries(2);
+    }
+}
+
+#[tokio::test]
+async fn delayed_preflight_checks_are_measured_before_spawn() {
+    for (agent, expected_probe) in [("codex", "mcp-list"), ("claude", "claude-version")] {
+        let mut fixture = Fixture::new(agent);
+        if agent == "codex" {
+            fixture.request.profile = "readonly".into();
+            fixture.request.writable = false;
+        } else {
+            fixture.sys.set("SUPERAGENT_CLAUDE_CACHE_TTL", "5m");
+        }
+        let (result, events) = fixture.run(fixture.adapter().as_ref()).await;
+        assert_eq!(result.unwrap().text, "fixture-ok");
+        assert_timing(&events, "miss");
+        let timing = events
+            .iter()
+            .find_map(|event| match event {
+                AdapterEvent::Journal { kind, data } if kind == "turn.timing" => Some(data),
+                _ => None,
+            })
+            .unwrap();
+        assert!(
+            timing["preflight_ms"].as_u64().unwrap() >= 125,
+            "{agent}: {timing}"
+        );
+        let calls = std::fs::read_to_string(fixture.dir.path().join("calls")).unwrap();
+        assert_eq!(
+            calls.lines().filter(|line| *line == expected_probe).count(),
+            1,
+            "{agent}"
+        );
     }
 }

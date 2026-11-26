@@ -12,6 +12,7 @@ use crate::sys::Sys;
 use anyhow::{Result, anyhow, bail};
 use futures::{StreamExt, stream};
 pub use sa_store::providers::CustomProvider;
+use sa_engine::adapter::Route;
 use sa_store::providers::{MAX_MODELS, ROUTE_PREFIX, valid_model_id, validate};
 use serde_json::{Map, Value, json};
 use std::collections::HashSet;
@@ -293,7 +294,7 @@ pub async fn probe_models(
         .collect())
 }
 
-async fn probe_catalog(
+pub(crate) async fn probe_catalog(
     provider: &CustomProvider,
     sys: &Sys,
     cancel: &CancellationToken,
@@ -330,6 +331,42 @@ pub async fn refresh(
     sys: &Sys,
     cancel: &CancellationToken,
 ) {
+    let _ = refresh_with(catalog, customs, sys, None, |provider| {
+        probe_catalog(provider, sys, cancel)
+    })
+    .await;
+}
+
+/// The selected route's native donor is returned when the endpoint omitted
+/// effort metadata for that model. Keep the dependency even if the donor no
+/// longer advertises the requested level.
+pub(crate) async fn refresh_with<'a, F>(
+    catalog: &mut Value,
+    customs: &'a [CustomProvider],
+    sys: &Sys,
+    selected: Option<&Route>,
+    fetch: impl Fn(&'a CustomProvider) -> F,
+) -> Option<Route>
+where
+    F: Future<Output = Result<(Vec<Value>, Option<String>)>>,
+{
+    if customs.is_empty() {
+        return None;
+    }
+    let mut donor = selected
+        .filter(|route| route.reasoning_effort.is_some())
+        .and_then(|route| {
+            catalog["providers"].as_array()?.iter().find_map(|provider| {
+                let row = provider["models"].as_array()?.iter().find(|row| {
+                    row["id"] == route.model || row["resolvedModel"] == route.model
+                })?;
+                Some(Route {
+                    provider: provider["id"].as_str()?.into(),
+                    model: row["id"].as_str()?.into(),
+                    ..route.clone()
+                })
+            })
+        });
     let metadata: Vec<Value> = catalog["providers"]
         .as_array()
         .into_iter()
@@ -346,9 +383,13 @@ pub async fn refresh(
                 .flatten()
                 .any(|row| row["id"] == p.route_id() && row["custom"] == true)
         })
-        .map(|p| async move { (p, probe_catalog(p, sys, cancel).await) })
+        .map(|p| {
+            let result = fetch(p);
+            async move { (p, result.await) }
+        })
         .collect();
     let results = stream::iter(probes).buffered(4).collect::<Vec<_>>().await;
+    let mut used_donor = None;
     for (p, result) in results {
         let Some(row) = catalog["providers"].as_array_mut().and_then(|ps| {
             ps.iter_mut()
@@ -358,6 +399,13 @@ pub async fn refresh(
         };
         match result {
             Ok((mut models, error)) => {
+                if selected.is_some_and(|route| {
+                    route.provider == p.route_id() && models.iter().any(|row| {
+                        row["id"] == route.model && row.get("reasoningEfforts").is_none()
+                    })
+                }) {
+                    used_donor = donor.take();
+                }
                 crate::catalog::supplement(&mut models, &metadata);
                 if p.agent == "claude" {
                     crate::catalog::restrict_efforts(
@@ -388,6 +436,7 @@ pub async fn refresh(
             }
         }
     }
+    used_donor
 }
 
 #[cfg(test)]

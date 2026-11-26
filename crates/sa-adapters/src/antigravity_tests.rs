@@ -705,6 +705,27 @@ async fn versioned_native_model_stays_cached() {
 }
 
 #[tokio::test]
+async fn cc_switch_database_touch_keeps_google_probes_warm() {
+    let fixture = ProbeFixture::setup();
+    let dir = fixture.dir.path().join(".cc-switch");
+    std::fs::create_dir_all(&dir).unwrap();
+    let database = dir.join("cc-switch.db");
+    let db = rusqlite::Connection::open(&database).unwrap();
+    db.execute_batch("CREATE TABLE providers(app_type TEXT,id TEXT,name TEXT,settings_config TEXT,is_current INTEGER);
+                      INSERT INTO providers VALUES ('claude','fixture','Fixture','{}',0);").unwrap();
+    drop(db);
+    fixture.run().await.unwrap();
+    fixture.assert_counts(1, 1, 1);
+
+    let before = std::fs::metadata(&database).unwrap().modified().unwrap();
+    std::fs::OpenOptions::new().write(true).open(&database).unwrap()
+        .set_modified(before - Duration::from_secs(60)).unwrap();
+    assert_ne!(std::fs::metadata(&database).unwrap().modified().unwrap(), before);
+    fixture.run().await.unwrap();
+    fixture.assert_counts(1, 1, 2);
+}
+
+#[tokio::test]
 async fn persisted_probes_survive_restart_and_recover_from_bad_files() {
     let fixture = ProbeFixture::setup();
     let sys = fixture.sys.clone().with_data_dir(fixture.dir.path().join("app-data"));

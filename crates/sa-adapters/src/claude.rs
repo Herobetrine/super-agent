@@ -898,8 +898,8 @@ impl Adapter for Claude {
             let mut value = discover_with(&sys, exe, &cancel, true, Some(&probes))
                 .await?
                 .catalog;
-            refresh_custom(&mut value, &customs, &sys, &cancel, &probes).await;
-            probes.flush();
+            let _ = refresh_custom(&mut value, &customs, &sys, &cancel, &probes, None).await;
+            probes.flush().await;
             Ok(Catalog { value })
         })
     }
@@ -1018,28 +1018,31 @@ async fn run(
         let mut d = discover_with(&sys, exe.clone(), &cancel, true, Some(&probes))
             .await
             .map_err(|e| if cancel.is_cancelled() { cancelled() } else { probe_failed(&e.to_string()) })?;
-        refresh_custom(&mut d.catalog, &customs, &sys, &cancel, &probes).await;
-        probes.flush();
+        let donor = refresh_custom(&mut d.catalog, &customs, &sys, &cancel, &probes, Some(&req.route)).await;
+        probes.flush().await;
         if cancel.is_cancelled() {
             return Err(cancelled());
         }
-        let used = if custom::lookup(&d.catalog, &customs, &req.route.provider).is_some() {
+        let mut used = if custom::lookup(&d.catalog, &customs, &req.route.provider).is_some() {
             probes.observed(&[&custom_probe_slot(&req.route.provider)])
         } else {
             probes.observed(&d.route_slots(&req.route))
         };
+        if let Some(donor) = donor {
+            used.extend(probes.observed(&d.route_slots(&donor)));
+        }
         match select(&d.catalog, &req.route) {
             Ok(s) => break (d, s, DiscoveryTiming::new(started, probes.reused_all(), !reuse), used),
-            Err(_) if probes.used_cache() => reuse = false,
+            Err(_) if reuse && used.iter().any(|probe| probe.cached) => reuse = false,
             Err(error) => {
-                cache.evict_used(&key, &used);
+                cache.evict_used(&key, &used).await;
                 return Err(error);
             }
         }
     };
     let result = run_selected(sys, customs, req, host, emit, cancel, fork, d, s, boundary, timing).await;
     if result.as_ref().is_err_and(|error| error.class != ErrorClass::Cancelled) {
-        cache.evict_used(&key, &used);
+        cache.evict_used(&key, &used).await;
     }
     result
 }
