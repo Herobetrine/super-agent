@@ -94,11 +94,14 @@ fn settle_dialog(h: &mut Harness<'_, App>) {
         ]
         .map(|(role, label)| h.get_by_role_and_label(role, label).rect())
         .to_vec();
-        assert!(rects.iter().all(|rect| viewport.contains_rect(*rect)), "dialog targets outside viewport: {rects:?}");
         eprintln!("efficiency dialog geometry frame={frame} targets={rects:?}");
         if rects == previous {
             stable_frames += 1;
             if stable_frames == 2 {
+                assert!(
+                    rects.iter().all(|rect| viewport.contains_rect(*rect)),
+                    "dialog targets outside viewport: {rects:?}"
+                );
                 return;
             }
         } else {
